@@ -5,11 +5,13 @@
 //!   [`Sample`] into the [`Store`], keeps a small in-memory [`RecentWindow`], and
 //!   evaluates the [`TriggerEngine`] on every sample. A store write error is
 //!   logged (the gap is recorded) but never stops the loop.
-//! - [`spawn_collector`] — a supervised interval task that builds samples on the
-//!   blocking pool and forwards them onto the stream. If a probe panics it emits
-//!   a `SKIP`-bearing sample in its place and keeps ticking — one failing
-//!   collector must never take down the others ("absence of a signal is itself
-//!   diagnostic").
+//! - [`spawn_interval_collector`] / [`spawn_event_collector`] — supervised tasks
+//!   that drive a [`Collector`] by its cadence and forward its samples onto the
+//!   stream. The interval spawner runs `collect()` on the blocking pool; if a
+//!   probe panics it emits a `SKIP`-bearing sample in its place and keeps ticking
+//!   — one failing collector must never take down the others ("absence of a
+//!   signal is itself diagnostic"). The event spawner drives a blocking
+//!   [`EventSource`] on its own thread.
 //!
 //! It also provides [`FreezePcapHandler`], the passive handler wired onto the
 //! `gw-change` trigger: on any gateway-verdict change it synchronously freezes
@@ -17,8 +19,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
+use collector_core::{Collector, Source};
 use store::{DuckdbStore, Store};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -54,46 +56,67 @@ pub async fn run(
     tracing::info!("sample stream closed; pipeline consumer exiting");
 }
 
-/// Spawn a supervised collector that ticks every `interval`, builds a batch of
-/// samples via `build` (run on the blocking pool), and forwards each onto `tx`.
+/// Interval cadence: drive a timer loop, running `collect()` on the blocking pool.
 ///
 /// Isolation guarantees (spec: "one collector failing must never take down the
 /// others; a probe that cannot run emits SKIP, never silence"):
-/// - if `build` panics, `skip(ts_us)` is emitted in its place and the task keeps
-///   ticking — it never exits on a probe error;
+/// - if `collect()` panics, `skip(ts_us)` is emitted in its place and the task
+///   keeps ticking — it never exits on a probe error;
 /// - the task exits cleanly only once the receiver is gone (channel closed).
-pub fn spawn_collector<F>(
-    name: &'static str,
-    interval: Duration,
-    tx: mpsc::Sender<Sample>,
-    build: F,
-    skip: fn(i64) -> Vec<Sample>,
-) -> JoinHandle<()>
-where
-    F: Fn(i64) -> Vec<Sample> + Send + Sync + 'static,
-{
-    let build = Arc::new(build);
+pub fn spawn_interval_collector(c: Box<dyn Collector>, tx: mpsc::Sender<Sample>) -> JoinHandle<()> {
+    let Source::Interval(interval) = c.source() else {
+        unreachable!("interval spawner")
+    };
+    let name = c.meta().name;
+    let c: Arc<dyn Collector> = Arc::from(c);
     tokio::spawn(async move {
         let mut ticker = time::interval(interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             let ts_us = types::now_us();
-            let build = Arc::clone(&build);
-            let samples = match tokio::task::spawn_blocking(move || build(ts_us)).await {
-                Ok(samples) => samples,
+            let c2 = Arc::clone(&c);
+            let samples = match tokio::task::spawn_blocking(move || c2.collect(ts_us)).await {
+                Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!(collector = name, error = %e, "collector probe failed; emitting SKIP");
-                    skip(ts_us)
+                    tracing::warn!(collector = name, error = %e, "probe failed; SKIP");
+                    c.skip(ts_us)
                 }
             };
-            for sample in samples {
-                if tx.send(sample).await.is_err() {
+            for s in samples {
+                if tx.send(s).await.is_err() {
                     tracing::info!(collector = name, "receiver dropped; collector exiting");
                     return;
                 }
             }
         }
+    })
+}
+
+/// Event cadence: a long-lived blocking source belongs on its own OS thread
+/// (not repeated `spawn_blocking`), forwarding via the channel's `blocking_send`.
+///
+/// No `Event` collector ships in v1; this spawner + the `source()` dispatch exist
+/// so an event collector plugs in later with zero daemon changes.
+pub fn spawn_event_collector(c: Box<dyn Collector>, tx: mpsc::Sender<Sample>) -> JoinHandle<()> {
+    let name = c.meta().name;
+    let Some(mut src) = c.into_event_source() else {
+        tracing::error!(
+            collector = name,
+            "Event cadence but into_event_source() is None"
+        );
+        return tokio::spawn(async {});
+    };
+    // Bridge the blocking source into async via a dedicated thread.
+    tokio::task::spawn_blocking(move || {
+        while let Some(samples) = src.next() {
+            for s in samples {
+                if tx.blocking_send(s).is_err() {
+                    return; // consumer gone
+                }
+            }
+        }
+        tracing::info!(collector = name, "event source ended");
     })
 }
 
@@ -161,6 +184,8 @@ impl<S: Store + Send + Sync> Handler for FreezePcapHandler<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use collector_core::{CollectorMeta, Os, Readiness};
+    use std::time::Duration;
     use triggers::conditions::{GwChange, GwDrop};
     use triggers::engine::Trigger;
     use triggers::handlers::RecordHandler;
@@ -263,9 +288,30 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn collector_emits_skip_on_panic_and_survives() {
-        fn proxy_skip(ts_us: i64) -> Vec<Sample> {
+    /// A tiny `Source::Interval` collector whose `collect()` panics, so
+    /// `spawn_interval_collector` must emit its `skip()` sample instead and keep
+    /// ticking (probe-failure isolation, spec "SKIP, never silence").
+    struct BoomCollector;
+
+    static BOOM_META: CollectorMeta = CollectorMeta {
+        name: "boom",
+        supported_os: &[Os::MacOs],
+    };
+
+    impl Collector for BoomCollector {
+        fn meta(&self) -> &'static CollectorMeta {
+            &BOOM_META
+        }
+        fn source(&self) -> Source {
+            Source::Interval(Duration::from_millis(5))
+        }
+        fn preflight(&self) -> Readiness {
+            Readiness::Ready
+        }
+        fn collect(&self, _ts_us: i64) -> Vec<Sample> {
+            panic!("probe blew up")
+        }
+        fn skip(&self, ts_us: i64) -> Vec<Sample> {
             vec![Sample::Proxy(ProxySample {
                 ts_us,
                 server_ip: "-".into(),
@@ -275,17 +321,14 @@ mod tests {
                 selector: None,
             })]
         }
+    }
 
+    #[tokio::test]
+    async fn interval_collector_emits_skip_on_panic_and_survives() {
         let (tx, mut rx) = mpsc::channel(4);
-        let handle = spawn_collector(
-            "boom",
-            Duration::from_millis(5),
-            tx,
-            |_ts| panic!("probe blew up"),
-            proxy_skip,
-        );
+        let handle = spawn_interval_collector(Box::new(BoomCollector), tx);
 
-        // First tick: the build panics, so a SKIP-bearing sample is emitted instead.
+        // First tick: collect() panics, so a SKIP-bearing sample is emitted instead.
         let first = rx.recv().await.unwrap();
         match first {
             Sample::Proxy(p) => assert_eq!(p.tcp, TcpVerdict::Skip),

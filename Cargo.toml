@@ -4,7 +4,9 @@ members = [
     "crates/types",
     "crates/config",
     "crates/store",
-    "crates/collectors",
+    "crates/collector-core",
+    "crates/collector-link",
+    "crates/collector-proxy",
     "crates/triggers",
     "crates/macos",
     "bin/observerd",
@@ -36,6 +38,8 @@ tempfile = "3"
 types = { path = "crates/types" }
 config = { path = "crates/config" }
 store = { path = "crates/store" }
-collectors = { path = "crates/collectors" }
+collector-core = { path = "crates/collector-core" }
+collector-link = { path = "crates/collector-link" }
+collector-proxy = { path = "crates/collector-proxy" }
 triggers = { path = "crates/triggers" }
 macos = { path = "crates/macos" }

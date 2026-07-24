@@ -1,0 +1,32 @@
+name: lints
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  lints:
+    # v1 is macOS-only (raw ICMP, IP_BOUND_IF, PF_ROUTE, Clash/sing-box);
+    # the arm64 runner matches the pinned aarch64-apple-darwin target.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust-toolchain.toml and installs the pinned channel with
+      # the rustfmt + clippy components it declares.
+      - name: Install toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings

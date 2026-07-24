@@ -165,6 +165,80 @@ struct Trigger {
   add/loss, default-route changes). **[next]**
 - `host-metrics` — host load / starvation signals. **[next]**
 
+## Collector abstraction (`collector-core`)
+
+Every collector implements one trait and carries two capability signals — a
+static OS declaration and a runtime preflight — so the daemon can decide, per
+collector, whether to run it at all.
+
+```rust
+pub enum Os { MacOs, Linux }
+impl Os { pub fn current() -> Os; }        // via cfg!(target_os = ...)
+
+pub struct CollectorMeta {
+    pub name: &'static str,
+    pub supported_os: &'static [Os],        // static: which OSes this collector targets
+}
+impl CollectorMeta { pub fn supports(&self, os: Os) -> bool; }
+
+pub enum Readiness { Ready, Unavailable(String) }   // runtime: CAN it work here/now?
+
+/// How a collector produces samples — not everything is a timer.
+pub enum Source {
+    Interval(Duration),   // poll on a timer: link, proxy, dns, host
+    Event,                // driven by an OS event stream: route-events (PF_ROUTE), ...
+}
+
+/// A blocking system-event source. `next()` blocks until the next event and
+/// returns its sample(s); `None` ends the stream. A blocking read on a PF_ROUTE
+/// socket maps onto this directly; the daemon runs it on the blocking pool.
+pub trait EventSource: Send {
+    fn next(&mut self) -> Option<Vec<Sample>>;
+}
+
+pub trait Collector: Send + Sync {
+    fn meta(&self) -> &'static CollectorMeta;
+    fn source(&self) -> Source;             // Interval(d) or Event
+    fn preflight(&self) -> Readiness;       // deps present? perms? interface exists?
+    // Interval collectors implement collect()/skip(); event collectors leave the
+    // defaults and override into_event_source().
+    fn collect(&self, ts_us: i64) -> Vec<Sample> { Vec::new() }  // one tick (blocking pool)
+    fn skip(&self, ts_us: i64) -> Vec<Sample> { Vec::new() }     // SKIP on probe failure
+    fn into_event_source(self: Box<Self>) -> Option<Box<dyn EventSource>> { None }
+}
+```
+
+**Cadence — timer vs event.** The daemon dispatches on `source()`:
+- `Interval(d)` — the daemon drives a timer loop calling `collect(ts_us)` on the
+  blocking pool every `d` (link, proxy, and the future dns/host).
+- `Event` — the daemon takes `into_event_source()` and runs its blocking
+  `next()` loop on the blocking pool, forwarding samples as they arrive. This is
+  how `route-events` (a PF_ROUTE socket `recv` that blocks until the kernel
+  announces an interface/route change) will plug in without a poll. `collector-core`
+  stays runtime-agnostic (no tokio); the async driving lives in `observerd`.
+
+`pcap-ring` is not a sample-producing collector — it is continuous capture
+infrastructure (in `macos`) frozen on a trigger, not a stream of `Sample` rows.
+
+- **Static OS metadata** (`supported_os`) — v1 collectors declare `&[Os::MacOs]`;
+  a future Linux collector adds `Os::Linux`. The daemon skips a collector whose
+  meta does not `supports(Os::current())`.
+- **Preflight probe** (`preflight`) — the runtime "can this collector work at
+  all here?" check, delegated to the collector's port facts:
+  - `link` — Ready iff a physical interface is resolvable; else
+    `Unavailable("no physical interface")`.
+  - `proxy` — Ready iff the sing-box config path exists (or the Clash API is
+    configured); else `Unavailable("no sing-box config / clash api")`.
+  A collector that fails preflight is not spawned; the reason is logged (absence
+  of a signal is itself diagnostic) and may be recorded as an incident later.
+
+The daemon holds `Vec<Box<dyn Collector>>`, filters by `meta().supports(...)`
+then `preflight()`, and spawns the survivors with one uniform interval loop
+(replacing the per-collector `spawn_link`/`spawn_proxy` glue). The port traits
+(`Pinger`, `TcpProber` in `collector-core`; `LinkFacts` in `collector-link`,
+`ProxyFacts` in `collector-proxy`, each gaining a `preflight()`) keep all
+mapping logic unit-testable with fakes; `macos` provides the real adapters.
+
 ## Workspace layout
 
 ```
@@ -176,11 +250,21 @@ observer/
   crates/
     types/            # Sample, Verdict enums, Incident, TriggerEvent
     store/            # Store trait + DuckDB backend, schema, migrations, blob refs
-    collectors/       # Collector trait + per-subsystem impls
+    collector-core/   # ABSTRACTIONS ONLY: Collector trait, probe ports (Pinger/
+                      #   TcpProber), CollectorMeta (name + supported OS), Os,
+                      #   Readiness + preflight. No concrete collectors.
+    collector-link/   # link collector: LinkFacts port, build_link_sample, META, preflight
+    collector-proxy/  # proxy collector: ProxyFacts port, build_proxy_samples, META, preflight
+    # collector-dns/ collector-route/ collector-host/  [next] — one crate each
     triggers/         # Condition/Handler/Trigger + engine, re-arm/backoff
     config/           # figment: per-subsystem toggles (constructor, not a dial)
-    macos/            # PF_ROUTE socket, raw ICMP, IP_BOUND_IF, CoreCapture, Clash API
+    macos/            # PF_ROUTE socket, raw ICMP, IP_BOUND_IF, CoreCapture, Clash API;
+                      #   implements the collector port traits (+ preflight checks)
 ```
+
+Each collector is its own crate; `collector-core` holds only the shared
+abstractions. Adding a subsystem (`dns`, `route`, `host`) means adding a crate
+that depends on `collector-core`, never touching the others.
 
 ## Configuration
 

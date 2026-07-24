@@ -3,7 +3,9 @@ name = "macos"
 edition.workspace = true
 
 [dependencies]
-collectors.workspace = true
+collector-core.workspace = true
+collector-link.workspace = true
+collector-proxy.workspace = true
 surge-ping.workspace = true
 socket2.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }

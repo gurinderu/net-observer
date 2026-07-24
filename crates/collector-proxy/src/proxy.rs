@@ -1,5 +1,7 @@
-use crate::probes::{ProxyFacts, TcpProber};
+use collector_core::TcpProber;
 use types::{ProxySample, TcpVerdict};
+
+use crate::probes::ProxyFacts;
 
 /// Pure mapping: one [`ProxySample`] per VLESS server, with the shared
 /// `tun_code`/`selector` attached to every row. Emits a single `SKIP` row when
@@ -46,7 +48,7 @@ pub fn build_proxy_samples(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::probes::*;
+    use collector_core::{PingOutcome, Readiness};
     use types::TcpVerdict;
     struct T(bool);
     impl TcpProber for T {
@@ -67,6 +69,9 @@ mod tests {
         }
         fn selector(&self) -> Option<String> {
             Some("node-a".into())
+        }
+        fn preflight(&self) -> Readiness {
+            Readiness::Ready
         }
     }
     #[test]
@@ -89,6 +94,9 @@ mod tests {
             }
             fn selector(&self) -> Option<String> {
                 None
+            }
+            fn preflight(&self) -> Readiness {
+                Readiness::Ready
             }
         }
         let rows = build_proxy_samples(7, &T(false), &Empty, "http://x/204", "en0");

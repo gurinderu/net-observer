@@ -9,7 +9,8 @@
 use std::process::Command;
 use std::time::Duration;
 
-use collectors::probes::LinkFacts;
+use collector_core::Readiness;
+use collector_link::LinkFacts;
 
 use crate::wifi;
 
@@ -90,6 +91,14 @@ impl LinkFacts for SystemFacts {
 
     fn wifi_capture_present(&self) -> bool {
         wifi::wifi_capture_present(self.capture_window)
+    }
+
+    fn preflight(&self) -> Readiness {
+        if self.phys_iface().is_some() {
+            Readiness::Ready
+        } else {
+            Readiness::Unavailable("no physical interface".into())
+        }
     }
 }
 

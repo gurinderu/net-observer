@@ -11,7 +11,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-use collectors::probes::{PingOutcome, Pinger, TcpProber};
+use collector_core::{PingOutcome, Pinger, TcpProber};
 use socket2::{Domain, Protocol, Socket, Type};
 use surge_ping::{Client, Config, ICMP, PingIdentifier, PingSequence};
 

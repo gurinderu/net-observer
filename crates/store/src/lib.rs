@@ -1,7 +1,7 @@
 mod duckdb_store;
 mod schema;
 
-pub use duckdb_store::{DuckdbStore, StoreError};
+pub use duckdb_store::{DuckdbStore, QueryTable, StoreError};
 use types::{BlobRef, Incident, Sample, TriggerFired};
 
 pub trait Store {

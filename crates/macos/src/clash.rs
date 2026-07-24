@@ -2,14 +2,15 @@
 //!
 //! [`ClashClient`] reads the currently selected node from a proxy *group* via
 //! `GET /proxies/<group>`. [`ProxySystemFacts`] implements
-//! [`collectors::probes::ProxyFacts`]: it reads the VLESS server IPs from the
+//! [`collector_proxy::ProxyFacts`]: it reads the VLESS server IPs from the
 //! rendered sing-box config at runtime (never baked into the binary — secret
 //! hygiene), probes the TUN with an HTTP request, and reports the selected node.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use collectors::probes::ProxyFacts;
+use collector_core::Readiness;
+use collector_proxy::ProxyFacts;
 
 /// HTTP timeout for every Clash/TUN request. A stalled proxy control plane is
 /// itself a signal, so we fail fast.
@@ -122,6 +123,14 @@ impl ProxyFacts for ProxySystemFacts {
 
     fn selector(&self) -> Option<String> {
         self.clash.selected(&self.selector_group)
+    }
+
+    fn preflight(&self) -> Readiness {
+        if self.singbox_config.exists() || !self.clash.base.is_empty() {
+            Readiness::Ready
+        } else {
+            Readiness::Unavailable("no sing-box config / clash api".into())
+        }
     }
 }
 

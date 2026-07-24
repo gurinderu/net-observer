@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tests:
+    # v1 is macOS-only; the arm64 runner matches the pinned target and lets the
+    # macos crate's platform code (raw ICMP, IP_BOUND_IF, PF_ROUTE) compile.
+    runs-on: macos-latest
+    # The DuckDB crate builds its C++ engine from source (`bundled`), which can
+    # take several minutes on a cold cache.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust-toolchain.toml and installs the pinned channel.
+      - name: Install toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build
+        run: cargo build --all
+
+      - name: test
+        run: cargo test --all

@@ -16,18 +16,20 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use collectors::link::build_link_sample;
-use collectors::probes::LinkFacts;
-use collectors::proxy::build_proxy_samples;
+use collector_core::{Collector, Os, Readiness, Source};
+use collector_link::{LinkCollector, LinkFacts};
+use collector_proxy::ProxyCollector;
 use config::Config;
 use macos::{BoundTcpProber, IcmpPinger, PcapRing, ProxySystemFacts, SystemFacts};
 use store::DuckdbStore;
 use triggers::conditions::{FakeIp, GwChange, GwDrop, Starvation, Wedge};
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
-use types::{GwVerdict, LinkSample, ProxySample, Sample, TcpVerdict};
+use types::Sample;
 
-use pipeline::{FreezePcapHandler, PcapFreezer, run, spawn_collector};
+use pipeline::{
+    FreezePcapHandler, PcapFreezer, run, spawn_event_collector, spawn_interval_collector,
+};
 
 /// Minimum interval between fires for one trigger (5 minutes, in microseconds),
 /// mirroring net-observer so a captive portal can't storm the incident log.
@@ -91,13 +93,53 @@ async fn main() -> anyhow::Result<()> {
     )
     .phys_iface();
 
-    // Spawn the enabled collectors onto the stream.
-    let mut collectors: Vec<JoinHandle<()>> = Vec::new();
+    // Build the enabled collectors as Box<dyn Collector>.
+    let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
     if cfg.collectors.link.enabled {
-        collectors.push(spawn_link_collector(&cfg, tx.clone()));
+        collectors.push(Box::new(LinkCollector::new(
+            Arc::new(IcmpPinger::new()),
+            Arc::new(BoundTcpProber::new()),
+            Arc::new(SystemFacts::new(
+                cfg.collectors.link.gw.clone(),
+                cfg.collectors.link.phys_iface.clone(),
+            )),
+            cfg.collectors.link.interval,
+        )));
     }
     if cfg.collectors.proxy.enabled {
-        collectors.push(spawn_proxy_collector(&cfg, phys_iface.clone(), tx.clone()));
+        collectors.push(Box::new(ProxyCollector::new(
+            Arc::new(BoundTcpProber::new()),
+            Arc::new(ProxySystemFacts::new(
+                SINGBOX_CONFIG_PATH,
+                cfg.collectors.proxy.clash_api.clone(),
+                CLASH_SELECTOR_GROUP,
+            )),
+            cfg.collectors.proxy.tun_probe_url.clone(),
+            phys_iface.clone().unwrap_or_default(),
+            cfg.collectors.proxy.interval,
+        )));
+    }
+
+    // Filter by OS meta + preflight, then spawn survivors with one uniform loop.
+    let os = Os::current();
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    for c in collectors {
+        let name = c.meta().name;
+        if !c.meta().supports(os) {
+            tracing::warn!(collector = name, ?os, "unsupported OS; skipping");
+            continue;
+        }
+        if !c.preflight().is_ready() {
+            if let Readiness::Unavailable(reason) = c.preflight() {
+                tracing::warn!(collector = name, %reason, "preflight failed; skipping");
+            }
+            continue;
+        }
+        // Dispatch on cadence — timer vs event stream.
+        match c.source() {
+            Source::Interval(_) => handles.push(spawn_interval_collector(c, tx.clone())),
+            Source::Event => handles.push(spawn_event_collector(c, tx.clone())),
+        }
     }
     // Drop our own sender so the consumer stops once every collector is gone.
     drop(tx);
@@ -121,14 +163,14 @@ async fn main() -> anyhow::Result<()> {
                 Ok(()) => tracing::info!("consumer exited (stream closed)"),
                 Err(e) => tracing::error!(error = %e, "consumer task failed"),
             }
-            abort_all(&collectors);
+            abort_all(&handles);
             return Ok(());
         }
     }
 
     // Signal path: stop the collectors, which closes the stream, then let the
     // consumer drain what remains and exit cleanly.
-    abort_all(&collectors);
+    abort_all(&handles);
     if let Err(e) = consumer.await {
         tracing::error!(error = %e, "consumer join failed during shutdown");
     }
@@ -137,76 +179,10 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Abort every collector task, dropping their stream senders.
-fn abort_all(collectors: &[JoinHandle<()>]) {
-    for c in collectors {
-        c.abort();
+fn abort_all(handles: &[JoinHandle<()>]) {
+    for h in handles {
+        h.abort();
     }
-}
-
-/// Spawn the `link` collector: gateway ping + iface-bound direct TCP + link facts.
-fn spawn_link_collector(cfg: &Config, tx: mpsc::Sender<Sample>) -> JoinHandle<()> {
-    let interval = cfg.collectors.link.interval;
-    // Left as config overrides (usually `None`) so the gateway is re-resolved
-    // every tick — gw-change detection depends on a fresh verdict each time.
-    let gw = cfg.collectors.link.gw.clone();
-    let phys = cfg.collectors.link.phys_iface.clone();
-    let build = move |ts_us: i64| -> Vec<Sample> {
-        let facts = SystemFacts::new(gw.clone(), phys.clone());
-        let ping = IcmpPinger::new();
-        let tcp = BoundTcpProber::new();
-        vec![Sample::Link(build_link_sample(ts_us, &ping, &tcp, &facts))]
-    };
-    spawn_collector("link", interval, tx, build, link_skip)
-}
-
-/// Spawn the `proxy` collector: per-VLESS TCP reachability + tun 204 + selector.
-fn spawn_proxy_collector(
-    cfg: &Config,
-    phys_iface: Option<String>,
-    tx: mpsc::Sender<Sample>,
-) -> JoinHandle<()> {
-    let interval = cfg.collectors.proxy.interval;
-    let tun_url = cfg.collectors.proxy.tun_probe_url.clone();
-    let clash_api = cfg.collectors.proxy.clash_api.clone();
-    let iface = phys_iface.unwrap_or_default();
-    let build = move |ts_us: i64| -> Vec<Sample> {
-        let facts =
-            ProxySystemFacts::new(SINGBOX_CONFIG_PATH, clash_api.clone(), CLASH_SELECTOR_GROUP);
-        let tcp = BoundTcpProber::new();
-        build_proxy_samples(ts_us, &tcp, &facts, &tun_url, &iface)
-            .into_iter()
-            .map(Sample::Proxy)
-            .collect()
-    };
-    spawn_collector("proxy", interval, tx, build, proxy_skip)
-}
-
-/// SKIP-bearing link sample emitted when the link probe cannot run.
-fn link_skip(ts_us: i64) -> Vec<Sample> {
-    vec![Sample::Link(LinkSample {
-        ts_us,
-        gw: GwVerdict::NoGw,
-        gw_rtt_ms: None,
-        direct: TcpVerdict::Skip,
-        direct_rtt_ms: None,
-        dhcp_router: None,
-        dhcp_dns: None,
-        gw_arp_mac: None,
-        ssid: None,
-        wifi_capture_present: false,
-    })]
-}
-
-/// SKIP-bearing proxy sample emitted when the proxy probe cannot run.
-fn proxy_skip(ts_us: i64) -> Vec<Sample> {
-    vec![Sample::Proxy(ProxySample {
-        ts_us,
-        server_ip: "-".into(),
-        tcp: TcpVerdict::Skip,
-        rtt_ms: None,
-        tun_code: None,
-        selector: None,
-    })]
 }
 
 /// Start the pcap ring on the physical interface, or return `None` if disabled,

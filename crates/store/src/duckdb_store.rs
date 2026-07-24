@@ -11,6 +11,16 @@ pub struct DuckdbStore {
     conn: Mutex<Connection>,
 }
 
+/// A generic query result: column names plus already-stringified rows.
+///
+/// Cells are rendered to `String` inside the store so that callers (e.g. the
+/// CLI) never need to depend on `duckdb`'s value types directly.
+#[derive(Debug, Clone, Default)]
+pub struct QueryTable {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+}
+
 impl DuckdbStore {
     pub fn in_memory() -> Result<Self, StoreError> {
         Self::from_conn(Connection::open_in_memory()?)
@@ -23,6 +33,67 @@ impl DuckdbStore {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// List incidents as `(trigger_id, opened_us, closed_us)`, newest first.
+    pub fn list_incidents(&self) -> Result<Vec<(String, i64, Option<i64>)>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT trigger_id, opened_us, closed_us FROM incident ORDER BY opened_us DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, duckdb::Error>>()?;
+        Ok(rows)
+    }
+
+    /// Run an arbitrary query and return its column names plus stringified rows.
+    pub fn query_table(&self, sql: &str) -> Result<QueryTable, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        let columns = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
+        let ncols = columns.len();
+        let mut out_rows = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut cells = Vec::with_capacity(ncols);
+            for i in 0..ncols {
+                let value: duckdb::types::Value = row.get(i)?;
+                cells.push(value_to_string(&value));
+            }
+            out_rows.push(cells);
+        }
+        Ok(QueryTable {
+            columns,
+            rows: out_rows,
+        })
+    }
+}
+
+fn value_to_string(v: &duckdb::types::Value) -> String {
+    use duckdb::types::Value;
+    match v {
+        Value::Null => String::new(),
+        Value::Boolean(b) => b.to_string(),
+        Value::TinyInt(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::HugeInt(n) => n.to_string(),
+        Value::UTinyInt(n) => n.to_string(),
+        Value::USmallInt(n) => n.to_string(),
+        Value::UInt(n) => n.to_string(),
+        Value::UBigInt(n) => n.to_string(),
+        Value::Float(n) => n.to_string(),
+        Value::Double(n) => n.to_string(),
+        Value::Text(s) => s.clone(),
+        other => format!("{other:?}"),
     }
 }
 
@@ -181,5 +252,53 @@ mod tests {
             s.query_scalar_i64("SELECT count(*) FROM blob_ref").unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn list_incidents_returns_rows_newest_first() {
+        use types::Incident;
+        let s = DuckdbStore::in_memory().unwrap();
+        s.open_incident(&Incident {
+            id: "old".into(),
+            opened_us: 1000,
+            closed_us: Some(2000),
+            trigger_id: "gw-drop".into(),
+            signature: "gw=FAIL".into(),
+        })
+        .unwrap();
+        s.open_incident(&Incident {
+            id: "new".into(),
+            opened_us: 3000,
+            closed_us: None,
+            trigger_id: "wedge".into(),
+            signature: "tun dead".into(),
+        })
+        .unwrap();
+        let rows = s.list_incidents().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("wedge".into(), 3000, None));
+        assert_eq!(rows[1], ("gw-drop".into(), 1000, Some(2000)));
+    }
+
+    #[test]
+    fn query_table_returns_columns_and_stringified_rows() {
+        use types::{GwVerdict, LinkSample, Sample, TcpVerdict};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 42,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+        }))
+        .unwrap();
+        let t = s.query_table("SELECT ts_us, gw FROM link_sample").unwrap();
+        assert_eq!(t.columns, vec!["ts_us".to_string(), "gw".to_string()]);
+        assert_eq!(t.rows, vec![vec!["42".to_string(), "OK".to_string()]]);
     }
 }

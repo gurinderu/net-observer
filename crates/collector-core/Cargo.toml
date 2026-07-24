@@ -1,0 +1,6 @@
+[package]
+name = "collector-core"
+edition.workspace = true
+
+[dependencies]
+types.workspace = true

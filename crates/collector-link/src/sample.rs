@@ -1,5 +1,7 @@
-use crate::probes::{LinkFacts, Pinger, TcpProber};
+use collector_core::{Pinger, TcpProber};
 use types::{GwVerdict, LinkSample, TcpVerdict};
+
+use crate::facts::LinkFacts;
 
 /// Pure mapping from probe outcomes + link facts to a [`LinkSample`].
 pub fn build_link_sample(
@@ -51,7 +53,7 @@ pub fn build_link_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::probes::*;
+    use collector_core::{PingOutcome, Readiness};
     use types::{GwVerdict, TcpVerdict};
 
     struct FakePing(bool);
@@ -93,6 +95,9 @@ mod tests {
         }
         fn wifi_capture_present(&self) -> bool {
             false
+        }
+        fn preflight(&self) -> Readiness {
+            Readiness::Ready
         }
     }
 
