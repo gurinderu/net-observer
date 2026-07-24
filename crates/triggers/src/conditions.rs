@@ -7,7 +7,10 @@ pub struct Fire {
 }
 
 /// A trigger condition evaluated against the recent-sample window.
-pub trait Condition {
+///
+/// `Send + Sync` so a `Box<dyn Condition>` inside a [`crate::engine::Trigger`] keeps the
+/// whole [`crate::engine::TriggerEngine`] shareable across tokio tasks in the daemon.
+pub trait Condition: Send + Sync {
     fn id(&self) -> &'static str;
     fn eval(&self, w: &RecentWindow) -> Option<Fire>;
 }

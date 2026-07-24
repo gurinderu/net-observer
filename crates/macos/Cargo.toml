@@ -3,3 +3,14 @@ name = "macos"
 edition.workspace = true
 
 [dependencies]
+collectors.workspace = true
+surge-ping.workspace = true
+socket2.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+serde_json.workspace = true
+libc.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
