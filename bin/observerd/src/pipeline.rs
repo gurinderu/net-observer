@@ -1,0 +1,300 @@
+//! The observerd data pipeline (plan Task 13).
+//!
+//! Two halves of the streaming architecture from the spec:
+//! - [`run`] — the consumer loop: drains the sample stream, persists each
+//!   [`Sample`] into the [`Store`], keeps a small in-memory [`RecentWindow`], and
+//!   evaluates the [`TriggerEngine`] on every sample. A store write error is
+//!   logged (the gap is recorded) but never stops the loop.
+//! - [`spawn_collector`] — a supervised interval task that builds samples on the
+//!   blocking pool and forwards them onto the stream. If a probe panics it emits
+//!   a `SKIP`-bearing sample in its place and keeps ticking — one failing
+//!   collector must never take down the others ("absence of a signal is itself
+//!   diagnostic").
+//!
+//! It also provides [`FreezePcapHandler`], the passive handler wired onto the
+//! `gw-change` trigger: on any gateway-verdict change it synchronously freezes
+//! the pcap ring *before* slow forensic work and records a [`BlobRef`] per file.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use store::{DuckdbStore, Store};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::{self, MissedTickBehavior};
+use triggers::engine::TriggerEngine;
+use triggers::handlers::Handler;
+use triggers::window::RecentWindow;
+use types::{BlobRef, Sample};
+
+/// Capacity of the recent-sample window handed to the trigger engine.
+const WINDOW_CAP: usize = 64;
+
+/// Drain `rx` until the stream closes, persisting and evaluating each sample.
+///
+/// For every [`Sample`]: write it to the store, push it into the recent window,
+/// then evaluate all triggers at the sample's own timestamp. A store write
+/// failure is logged and the loop continues (a DB outage must not silently drop
+/// the live detection stream — the gap is recorded, per the spec).
+pub async fn run(
+    store: Arc<DuckdbStore>,
+    mut engine: TriggerEngine,
+    mut rx: mpsc::Receiver<Sample>,
+) {
+    let mut window = RecentWindow::new(WINDOW_CAP);
+    while let Some(sample) = rx.recv().await {
+        let now_us = sample.ts_us();
+        if let Err(e) = store.write_sample(&sample) {
+            tracing::warn!(error = %e, "store write failed; sample dropped from DB (gap logged)");
+        }
+        window.push(sample);
+        engine.on_sample(&window, now_us);
+    }
+    tracing::info!("sample stream closed; pipeline consumer exiting");
+}
+
+/// Spawn a supervised collector that ticks every `interval`, builds a batch of
+/// samples via `build` (run on the blocking pool), and forwards each onto `tx`.
+///
+/// Isolation guarantees (spec: "one collector failing must never take down the
+/// others; a probe that cannot run emits SKIP, never silence"):
+/// - if `build` panics, `skip(ts_us)` is emitted in its place and the task keeps
+///   ticking — it never exits on a probe error;
+/// - the task exits cleanly only once the receiver is gone (channel closed).
+pub fn spawn_collector<F>(
+    name: &'static str,
+    interval: Duration,
+    tx: mpsc::Sender<Sample>,
+    build: F,
+    skip: fn(i64) -> Vec<Sample>,
+) -> JoinHandle<()>
+where
+    F: Fn(i64) -> Vec<Sample> + Send + Sync + 'static,
+{
+    let build = Arc::new(build);
+    tokio::spawn(async move {
+        let mut ticker = time::interval(interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let ts_us = types::now_us();
+            let build = Arc::clone(&build);
+            let samples = match tokio::task::spawn_blocking(move || build(ts_us)).await {
+                Ok(samples) => samples,
+                Err(e) => {
+                    tracing::warn!(collector = name, error = %e, "collector probe failed; emitting SKIP");
+                    skip(ts_us)
+                }
+            };
+            for sample in samples {
+                if tx.send(sample).await.is_err() {
+                    tracing::info!(collector = name, "receiver dropped; collector exiting");
+                    return;
+                }
+            }
+        }
+    })
+}
+
+/// The pcap ring's freeze operation behind a trait, so [`FreezePcapHandler`] is
+/// testable without a live `tcpdump` (which needs root). The production impl is
+/// `macos::PcapRing`.
+pub trait PcapFreezer: Send + Sync {
+    /// Copy the current ring into `dest_dir`, returning the written file paths.
+    fn freeze(&self, dest_dir: &Path) -> Vec<PathBuf>;
+}
+
+impl PcapFreezer for macos::PcapRing {
+    fn freeze(&self, dest_dir: &Path) -> Vec<PathBuf> {
+        macos::PcapRing::freeze(self, dest_dir)
+    }
+}
+
+/// A passive [`Handler`] that freezes the pcap ring on fire and records a
+/// [`BlobRef`] per copied file. Wired onto the `gw-change` trigger so the
+/// volatile ring is preserved *before* any slow forensic work (spec regression
+/// risk: "freeze BEFORE the slow arp/`log show` work ... UNCONDITIONALLY on any
+/// gateway change").
+pub struct FreezePcapHandler<S: Store> {
+    ring: Arc<dyn PcapFreezer>,
+    store: Arc<S>,
+    blob_dir: PathBuf,
+}
+
+impl<S: Store> FreezePcapHandler<S> {
+    /// Build a handler that freezes `ring` into a per-incident sub-directory of
+    /// `blob_dir` and records the copied files through `store`.
+    pub fn new(ring: Arc<dyn PcapFreezer>, store: Arc<S>, blob_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            ring,
+            store,
+            blob_dir: blob_dir.into(),
+        }
+    }
+}
+
+impl<S: Store + Send + Sync> Handler for FreezePcapHandler<S> {
+    fn on_fire(&self, incident_id: &str, ts_us: i64, _detail: &str) {
+        let dest = self.blob_dir.join(format!("freeze-{incident_id}"));
+        let paths = self.ring.freeze(&dest);
+        for (i, path) in paths.iter().enumerate() {
+            let blob = BlobRef {
+                id: format!("{incident_id}-pcap-{i}"),
+                incident_id: incident_id.to_string(),
+                ts_us,
+                kind: "pcap".into(),
+                path: path.display().to_string(),
+            };
+            if let Err(e) = self.store.write_blob_ref(&blob) {
+                tracing::warn!(incident_id, error = %e, "failed to write pcap blob_ref");
+            }
+        }
+        tracing::info!(
+            incident_id,
+            frozen = paths.len(),
+            "froze pcap ring on gateway change"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use triggers::conditions::{GwChange, GwDrop};
+    use triggers::engine::Trigger;
+    use triggers::handlers::RecordHandler;
+    use types::{GwVerdict, LinkSample, ProxySample, TcpVerdict};
+
+    fn link(ts_us: i64, gw: GwVerdict) -> Sample {
+        Sample::Link(LinkSample {
+            ts_us,
+            gw,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn pipeline_stores_and_fires() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 0)]);
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(store.clone(), eng, rx));
+        tx.send(Sample::Link(LinkSample {
+            ts_us: 1,
+            gw: GwVerdict::Fail,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+        h.await.unwrap();
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM link_sample")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_freezes_pcap_on_gw_change() {
+        // A fake freezer stands in for `macos::PcapRing` (no tcpdump / root needed):
+        // it returns a plausible ring-file path without touching the filesystem.
+        struct FakeFreezer;
+        impl PcapFreezer for FakeFreezer {
+            fn freeze(&self, dest_dir: &Path) -> Vec<PathBuf> {
+                vec![dest_dir.join("ring.pcap0")]
+            }
+        }
+
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let freezer: Arc<dyn PcapFreezer> = Arc::new(FakeFreezer);
+        let freeze: Arc<dyn Handler> = Arc::new(FreezePcapHandler::new(
+            freezer,
+            store.clone(),
+            "/tmp/observer-blobs",
+        ));
+        let handlers: Vec<Arc<dyn Handler>> = vec![rec, freeze];
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwChange), handlers, 0)]);
+
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(store.clone(), eng, rx));
+        // Ok -> Fail is a gateway-verdict change: gw-change must fire.
+        tx.send(link(1, GwVerdict::Ok)).await.unwrap();
+        tx.send(link(2, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        // The RecordHandler opened the incident; the FreezePcapHandler recorded a blob.
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM blob_ref WHERE kind='pcap'")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn collector_emits_skip_on_panic_and_survives() {
+        fn proxy_skip(ts_us: i64) -> Vec<Sample> {
+            vec![Sample::Proxy(ProxySample {
+                ts_us,
+                server_ip: "-".into(),
+                tcp: TcpVerdict::Skip,
+                rtt_ms: None,
+                tun_code: None,
+                selector: None,
+            })]
+        }
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = spawn_collector(
+            "boom",
+            Duration::from_millis(5),
+            tx,
+            |_ts| panic!("probe blew up"),
+            proxy_skip,
+        );
+
+        // First tick: the build panics, so a SKIP-bearing sample is emitted instead.
+        let first = rx.recv().await.unwrap();
+        match first {
+            Sample::Proxy(p) => assert_eq!(p.tcp, TcpVerdict::Skip),
+            other => panic!("expected a proxy SKIP sample, got {other:?}"),
+        }
+        // Second tick: the collector is still alive (it never exits on a probe error).
+        let second = rx.recv().await.unwrap();
+        assert!(matches!(second, Sample::Proxy(_)));
+
+        handle.abort();
+    }
+}

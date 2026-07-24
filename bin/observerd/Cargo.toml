@@ -3,3 +3,14 @@ name = "observerd"
 edition.workspace = true
 
 [dependencies]
+types.workspace = true
+config.workspace = true
+store.workspace = true
+collectors.workspace = true
+triggers.workspace = true
+macos.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
