@@ -3,3 +3,7 @@ name = "collectors"
 edition.workspace = true
 
 [dependencies]
+types.workspace = true
+config.workspace = true
+tokio.workspace = true
+tracing.workspace = true

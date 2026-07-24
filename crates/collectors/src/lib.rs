@@ -1,1 +1,3 @@
-//! `collectors` crate stub — implemented in a later wave (plan Tasks 6-7).
+pub mod link;
+pub mod probes;
+pub mod proxy;

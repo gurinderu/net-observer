@@ -3,3 +3,6 @@ name = "triggers"
 edition.workspace = true
 
 [dependencies]
+types.workspace = true
+store.workspace = true
+tracing.workspace = true

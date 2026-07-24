@@ -1,1 +1,4 @@
-//! `triggers` crate stub — implemented in a later wave (plan Tasks 8-10).
+//! `triggers` crate — recent-sample window and firing conditions (plan Tasks 8-10).
+
+pub mod conditions;
+pub mod window;

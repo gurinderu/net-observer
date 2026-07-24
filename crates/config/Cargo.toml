@@ -3,3 +3,9 @@ name = "config"
 edition.workspace = true
 
 [dependencies]
+serde.workspace = true
+figment.workspace = true
+humantime-serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

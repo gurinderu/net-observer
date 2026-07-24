@@ -3,3 +3,6 @@ name = "store"
 edition.workspace = true
 
 [dependencies]
+types.workspace = true
+duckdb.workspace = true
+thiserror.workspace = true

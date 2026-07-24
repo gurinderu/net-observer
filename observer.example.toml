@@ -1,0 +1,43 @@
+# observer configuration — copy to observer.toml and edit.
+#
+# Every field has a built-in default (see crates/config). This file mirrors
+# those defaults; uncomment and change only what you need. Values here are
+# overridden, in turn, by `OBSERVER_`-prefixed environment variables, where
+# nested keys use `__` as the separator, e.g.
+#   OBSERVER_COLLECTORS__LINK__INTERVAL="5s"
+
+# DuckDB database file. Large blobs (pcap, `log show`) live on disk under
+# `blob_dir`; only `blob_ref` metadata rows go in the DB.
+db_path = "/var/lib/observer/observer.duckdb"
+
+# Directory for captured blobs (pcap ring files, log dumps).
+blob_dir = "/var/lib/observer/blobs"
+
+# The `link` collector probes the local network path: default gateway
+# reachability, a direct TCP connectivity check, DHCP/ARP facts and Wi-Fi SSID.
+[collectors.link]
+enabled = true
+# Sampling interval (humantime format, e.g. "15s", "1m").
+interval = "15s"
+# Override the auto-detected default gateway (e.g. "10.20.0.1"). None = detect.
+# gw = "10.20.0.1"
+# Override the auto-detected physical interface (e.g. "en0"). None = detect.
+# phys_iface = "en0"
+
+# The `proxy` collector probes VLESS servers plus the local TUN/Clash stack.
+[collectors.proxy]
+enabled = true
+interval = "15s"
+# URL used to probe whether traffic flows through the TUN (expects HTTP 204).
+tun_probe_url = "http://connectivitycheck.gstatic.com/generate_204"
+# Clash/Mihomo RESTful API base URL.
+clash_api = "http://127.0.0.1:9090"
+
+# The `pcap_ring` collector keeps a rolling in-memory capture (via tcpdump) so a
+# passive incident trigger can freeze the last few MB to disk for forensics.
+[collectors.pcap_ring]
+enabled = true
+# Ring buffer size in megabytes.
+ring_mb = 8
+# BPF filter — keep it cheap: link-layer control traffic only.
+filter = "arp or icmp or udp port 67 or udp port 68 or ether broadcast"
