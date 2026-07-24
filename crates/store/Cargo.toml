@@ -1,0 +1,5 @@
+[package]
+name = "store"
+edition.workspace = true
+
+[dependencies]

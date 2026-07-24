@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/types",
+    "crates/config",
+    "crates/store",
+    "crates/collectors",
+    "crates/triggers",
+    "crates/macos",
+    "bin/observerd",
+    "bin/observer-cli",
+]
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+figment = { version = "0.10", features = ["toml", "env"] }
+humantime-serde = "1"
+jiff = { version = "0.2", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+duckdb = { version = "1", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+surge-ping = "0.8"
+socket2 = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+libc = "0.2"
+tempfile = "3"
+# local crates
+types = { path = "crates/types" }
+config = { path = "crates/config" }
+store = { path = "crates/store" }
+collectors = { path = "crates/collectors" }
+triggers = { path = "crates/triggers" }
+macos = { path = "crates/macos" }

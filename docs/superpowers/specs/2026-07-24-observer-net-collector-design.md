@@ -1,0 +1,265 @@
+# observer — Rust network-forensics collector (design)
+
+_Date: 2026-07-24. Seed: `~/projects/wiki/.raw/2026-07-24-net-collector-idea.md`.
+Behavioral oracle: `~/projects/nix-config/hosts/mac_aarch64/net-observer.nix`._
+
+## Purpose
+
+Replace the hand-rolled shell daemon `net-observer` (~470-line bash LaunchDaemon)
+with a Rust daemon that collects structured network/system telemetry into a
+queryable database, so post-incident analysis is a SQL query ("что было в 17:26")
+instead of grepping a columnar text log.
+
+**North star: incident forensics.** Optimize for a rich, queryable snapshot of
+state *around outages*. Not a live dashboard, not long-term analytics (both can
+come later on top of the same DB).
+
+## Scope
+
+**v1 = observation + detection. No acting.** No `launchctl kickstart`, no
+watchdog in v1. The daemon collects telemetry and *fires triggers* when a
+condition is met, but a trigger's v1 action is passive (record an incident,
+freeze the pcap ring, capture one-shot forensics). Notification and acting
+(kickstart) are later handlers behind the same interface.
+
+Out of scope for v1: the macOS menu-bar UI, runtime config reload / control
+socket, notification channels, any recovery action.
+
+## Locked decisions
+
+- **Maximize Rust.** Prefer pure-Rust crates for every component where a viable
+  one exists. Native (C/C++) dependencies are allowed only where there is no
+  adequate pure-Rust equivalent, and each such exception is named and justified
+  in this doc. Current known native deps: **DuckDB** (C++; the one core
+  exception — no pure-Rust engine offers native `ASOF JOIN`, see below) and, for
+  v1 only, the **`tcpdump` child** used by `pcap-ring` (the pure-Rust target is
+  the `pcap` crate / in-process BPF — see Subsystems).
+- **UI: gpui.** Any GUI (the future macOS menu-bar / toolbar) is built with
+  `gpui` (Zed's GPU-accelerated Rust UI framework), keeping the UI in Rust too.
+  The macOS status-bar item (`NSStatusItem`) needs thin AppKit interop via
+  `objc2`; the panel/popover content is gpui. Post-v1, a separate unprivileged
+  binary talking to the daemon over a local socket.
+- **Language / layout:** Rust cargo workspace, structured like `lightmare`/`beam`
+  — `bin/` for binaries, `crates/` for libraries, `flake.nix` + direnv +
+  `rust-toolchain.toml`, `Justfile`, `AGENTS.md` (with `CLAUDE.md` symlink),
+  `ARCHITECTURE.md`, CI under `.github/workflows`. Config via `figment`, async
+  via `tokio`, errors via `thiserror` (libs) / `anyhow` (bins), logging via
+  `tracing`.
+- **Database: DuckDB**, behind a `Store` trait. Chosen for the forensics north
+  star — analytical SQL, columnar scans over months of ticks, and native
+  `ASOF JOIN` / `time_bucket`. The correlation work done by hand in the wiki
+  ("every gateway-drop is preceded ~5–40s by a CoreCapture Wi-Fi event") is an
+  ASOF join. Big blobs (pcap freezes, `log show` dumps, CoreCapture refs) live
+  as files on disk, referenced by path from a `blob_ref` row; only metadata in
+  the DB.
+- **Three layers, v1 ships the first two:** Collect → Detect/Trigger → (Act
+  later). The trigger engine is a first-class, generic abstraction:
+  `condition → handler`. Concrete actions are swappable handler implementations.
+- **Per-subsystem toggles, not a verbosity tier.** Each collector is
+  independently enabled/disabled with its own frequency (a constructor, not an
+  off/normal/debug dial).
+- **Privilege split:** `observerd` is a headless **root** LaunchDaemon (needs raw
+  ICMP, PF_ROUTE, tcpdump, `arp -d`, reading the sing-box config). `observer-cli`
+  is unprivileged and reads the DB. A future toolbar is a separate unprivileged
+  UI over a local socket — never the daemon itself.
+
+## Architecture
+
+```
+Collectors ──Sample──▶ [stream: mpsc/broadcast] ──┬──▶ StoreWriter ──▶ DuckDB
+                                                   └──▶ TriggerEngine ──▶ Handlers
+```
+
+- **Collectors** — one tokio task per subsystem, each on its own interval,
+  emitting typed `Sample`s onto the stream.
+- **StoreWriter** — batches `Sample`s into DuckDB via the Appender API (single
+  writer). Big blobs are written to disk; a `blob_ref` row records the path.
+- **TriggerEngine** — holds a small in-memory window of the last N ticks.
+  Two-level rules:
+  - **Hot rules** (wedge, gw-drop) evaluated synchronously on each `Sample` off
+    the stream, so a freeze happens *before* the slow `arp`/`log show` work and
+    before the pcap ring rotates over the packets around the drop.
+  - **Analytical rules** (ASOF correlations) expressed as SQL views over DuckDB
+    for post-hoc analysis.
+- **observerd** — the root daemon: load config, spawn enabled collectors + the
+  store writer + the trigger engine, supervise them.
+- **observer-cli** — ad-hoc DB queries, status, manual trigger/dump (debugging).
+
+### Communication model (chosen: streaming pipeline)
+
+Considered: (A) event-stream pipeline, (B) store-centric SQL polling, (C) hybrid
+with a shared in-memory ring. Chosen **A** with a small recent-window kept inside
+the TriggerEngine (a light C). Rationale: clean collect/store/detect separation,
+synchronous freeze timing, and the future toolbar becomes just another stream
+subscriber. SQL polling (B) was rejected because freeze-before-slow-work timing
+is hard when triggers wait on DB round-trips.
+
+## Data model (DuckDB)
+
+Normalized per subsystem — each has its own timestamp and cadence; cross-stream
+correlation is via `ASOF JOIN`.
+
+- `link_sample(ts, gw_verdict, gw_rtt_ms, direct_verdict, direct_rtt_ms,
+  dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present)`
+- `dns_sample(ts, probe, server, verdict, ip, rtt_ms)` — probe/server dims:
+  `nks[sb]`, `ru[sb]`, `nks[rtr]`, `nks[doh]`, `site`
+- `proxy_sample(ts, server_ip, tcp_verdict, rtt_ms, tun_code, selector)`
+- `host_sample(ts, load1, load5, load15)`
+- `route_event(ts, kind, iface, detail)` — PF_ROUTE event stream
+- `incident(id, opened_ts, closed_ts, trigger_id, signature)`
+- `blob_ref(id, incident_id, ts, kind, path)` — pcap freeze, `log show` dumps,
+  CoreCapture refs
+- `trigger_event(ts, trigger_id, incident_id, detail)`
+
+**Verdict vocabulary** ported from the oracle: DNS
+`OK / FAKEIP / EMPTY / SERVFAIL / NXDOMAIN / TIMEOUT / SKIP`; gateway
+`OK / FAIL / NOGW`. `FAKEIP` on a `.ru` name is always a bug. `SKIP` means a
+prerequisite was missing — it is recorded explicitly, never omitted (absence of
+a signal is itself diagnostic).
+
+## Trigger engine
+
+```rust
+trait Condition { fn eval(&self, window: &RecentWindow) -> Option<Fire>; }
+trait Handler   { async fn on_fire(&self, ctx: &FireCtx) -> Result<Vec<BlobRef>>; }
+
+struct Trigger {
+    id: TriggerId,
+    condition: Box<dyn Condition>,
+    handlers: Vec<Box<dyn Handler>>,
+    backoff: Duration,     // min interval between fires
+    armed: bool,           // disarm on fire, re-arm on return to OK
+}
+```
+
+- **Re-arm / backoff** mirror net-observer: fire → disarm; return to OK → re-arm;
+  at most one fire per 5 minutes per trigger (a captive portal can mimic a wedge
+  signature — don't storm).
+- **v1 handlers (passive):** `OpenIncident`, `FreezePcap`, `CaptureDumps`
+  (`log show`, CoreCapture refs).
+- **Later, same interface:** `Notify` (Notification Center / ntfy), `Act`
+  (kickstart sing-box).
+- **Starter rules** (ported from the oracle):
+  - **wedge:** `tun=000 && direct=OK` for 3 consecutive ticks (~2 min).
+  - **gw-drop:** `gw=FAIL` / `NOGW`.
+  - **unconditional pcap freeze on any gateway change** (fast router-side drops
+    fail over within one tick — the 2026-07-15 coworking signature).
+  - **fakeip:** a `.ru` name answered from the fakeip range.
+  - **starvation:** `load` in the tens while `tun=000`.
+
+## Subsystems (per-subsystem toggle + interval)
+
+- `link` — gw ping, direct TCP to 1.1.1.1 bound to the physical iface, DHCP
+  lease router/dns, gw ARP entry, Wi-Fi CoreCapture presence, SSID. **[v1]**
+- `proxy-probes` — per-VLESS TCP reachability, tun HTTP 204, clash selector
+  (`now` via Clash API on 127.0.0.1:9090), sing-box pid. **[v1]**
+- `pcap-ring` — continuous small ring capture (control traffic only:
+  `arp or icmp or udp port 67/68 or ether broadcast`, `-s128`, ~8 MB) on the
+  physical iface, frozen on incident. v1 wraps a `tcpdump` child and freezes by
+  copying the ring files (the proven net-observer path); the pure-Rust target is
+  in-process capture via the `pcap` crate / raw BPF, which also serves the
+  "fewer subprocess spawns" goal — migrate once v1 parity is proven. **[v1]**
+- `dns` — resolver probes (sing-box TUN DNS, DHCP resolver, DoH, control
+  domain). **[next]**
+- `route-events` — persistent PF_ROUTE socket monitor (iface up/down, addr
+  add/loss, default-route changes). **[next]**
+- `host-metrics` — host load / starvation signals. **[next]**
+
+## Workspace layout
+
+```
+observer/
+  bin/
+    observerd/        # headless root LaunchDaemon
+    observer-cli/     # ad-hoc queries, status, manual trigger/dump
+    # observer-bar/   # [post-v1] gpui menu-bar UI over a local socket
+  crates/
+    types/            # Sample, Verdict enums, Incident, TriggerEvent
+    store/            # Store trait + DuckDB backend, schema, migrations, blob refs
+    collectors/       # Collector trait + per-subsystem impls
+    triggers/         # Condition/Handler/Trigger + engine, re-arm/backoff
+    config/           # figment: per-subsystem toggles (constructor, not a dial)
+    macos/            # PF_ROUTE socket, raw ICMP, IP_BOUND_IF, CoreCapture, Clash API
+```
+
+## Configuration
+
+`figment` (file + env), like lightmare. Per-subsystem section, e.g.:
+
+```toml
+[collectors.link]
+enabled  = true
+interval = "15s"
+
+[collectors.pcap_ring]
+enabled  = true
+ring_mb  = 8
+```
+
+v1 config is static (change → Nix rebuild). Runtime reload / control socket is a
+later addition for the toolbar; the config type is shaped so a subsystem knob can
+become runtime-mutable without reworking collectors.
+
+## Error handling & isolation
+
+- `thiserror` in crates, `anyhow` in bins.
+- One collector failing must **not** take down the others: each runs as a
+  supervised task (log + retry). A probe that cannot run emits a `SKIP` verdict
+  rather than going silent — absence of a signal is itself diagnostic.
+- StoreWriter write failures are buffered and retried; a DB outage must not drop
+  the live stream on the floor silently (log the gap).
+
+## Testing
+
+- Unit tests per crate. `store` tested against an in-memory DuckDB.
+- **Trigger engine tested by replaying real incident signatures** from the wiki
+  as synthetic `Sample` streams: gw-drop (2026-07-15 coworking), wedge
+  (2026-07-03), fakeip. Assert the right trigger fires, disarms, and re-arms.
+- `net-observer.nix` is the behavioral oracle: the verdict vocabulary is
+  cross-checked against recorded log excerpts so the rewrite does not silently
+  drift from months of hard-won incident-capture behavior.
+
+## Regression risks to preserve (from the oracle)
+
+- **pcap ring freeze timing** — freeze BEFORE the slow arp/`log show` work and
+  before the 8 MB buffer rotates; freeze UNCONDITIONALLY on any gateway change.
+- **"Absence of a fresh CoreCapture is itself the diagnostic"** — no
+  beacon-loss/deauth capture near a drop ⇒ L2 was fine ⇒ router-side drop, a
+  different failure class than an RF drop. Encode the absence, not just presence.
+- **DHCP-vs-unicast DNS nuance** — `type: dhcp` probing hit deadlines at the
+  coworking while plain unicast to the same gateway resolved fine; slow DNS
+  failure induces macOS Wi-Fi reassociation (manufacturing the very drop we
+  hunt).
+- **Coworking gateway signature** (user memory `coworking-gw-ping-issue`): link
+  active, gw ARP alive, +100 broadcast dupes, but gw silent on unicast — Mode B
+  (router-side), triggered by full-tunnel VPN ~2 min after lease.
+- Keep the shell net-observer alive alongside during migration as a cross-check
+  oracle (its watchdog kickstart is the only current auto-recovery — do not lose
+  it before an acting handler replaces it).
+
+## Engineering wins to preserve as goals
+
+- **Fewer subprocess spawns** — do per-tick probes in-process (raw ICMP, a DNS
+  crate, an HTTP client) instead of forking route/curl/dig/jq/awk/… every 15 s.
+  (Ironic given a recent incident was load *starving* the TUN path.)
+- **Persistent PF_ROUTE socket** — hold the socket properly, unlike sing-tun's
+  darwin monitor (opens/closes a socket per message and misses events) and the
+  shell `route -n monitor`.
+- **Structured, queryable data** instead of columnar text meant for `awk`.
+
+## Open questions deferred past v1
+
+- Watchdog / acting: an `Act` handler (kickstart) behind a flag — kept out of v1;
+  the shell watchdog stays as the recovery path meanwhile.
+- Notification channel(s) for a `Notify` handler.
+- Runtime config mechanism (reload / control socket / CLI) for the toolbar.
+- macOS menu-bar UI in **gpui** (`NSStatusItem` via `objc2` + gpui panel),
+  a separate unprivileged binary over a local socket / XPC.
+- Migrating `pcap-ring` from the `tcpdump` child to in-process capture
+  (`pcap` crate / BPF).
+
+## Next step
+
+`writing-plans` for a v1 that does `link` + `proxy-probes` end-to-end into DuckDB
+with the wedge/gw-drop triggers and pcap-ring freeze, before fanning out to
+`dns` / `route-events` / `host-metrics`.

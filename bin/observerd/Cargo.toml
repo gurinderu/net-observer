@@ -1,0 +1,5 @@
+[package]
+name = "observerd"
+edition.workspace = true
+
+[dependencies]
