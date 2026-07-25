@@ -106,7 +106,7 @@ graph TD
     macos["macos\nreal adapters: ICMP, IP_BOUND_IF,\nClash API, DHCP/ARP, pcap ring,\nDNS resolve, PF_ROUTE, loadavg"]
     observerd["bin/observerd\nroot LaunchDaemon"]
     cli["bin/observer-cli\nunprivileged reader"]
-    bar["bin/observer-bar\nread-only glance (headless;\ngpui menu-bar deferred)"]
+    bar["bin/observer-bar\ngpui menu-bar (NSStatusItem\n+ panel); read-only glance"]
 
     types --> ccore
     types --> store
@@ -168,13 +168,16 @@ graph TD
   persistent PF_ROUTE `EventSource`, `getloadavg`) plus the pcap ring and the
   per-collector `preflight()` checks.
 - `bin/observerd` wires everything; `bin/observer-cli` and `bin/observer-bar`
-  only read `store`. `bin/observer-bar` is a **read-only glance** at the DuckDB
-  file (latest link/proxy tick + recent incidents); the gpui/`NSStatusItem`
-  menu-bar UI is deferred (gpui's build script needs the macOS **Metal
-  Toolchain**), so it ships today as a headless printer with a `TODO(menu-bar)`.
-  It is a full workspace member but is excluded from `default-members` so a bare
-  `cargo build` needs no GUI toolchain; build it with `--workspace` / `-p
-  observer-bar`.
+  only read `store`. `bin/observer-bar` is a macOS **menu-bar app**: a dockless
+  (`.accessory`) `NSStatusItem` (AppKit interop via `objc2` / `objc2-app-kit`)
+  whose glyph shows the latest link/proxy health and whose click opens a **gpui**
+  panel rendering the full `Status` (latest link/proxy tick + recent incidents),
+  re-read on a ~3s timer. It never writes: the panel snapshots the DuckDB file
+  through a `read_only` connection (see the read-only glance below). gpui's build
+  script needs the macOS **Metal Toolchain**, so the crate is a full workspace
+  member but is excluded from `default-members` — a bare `cargo build` needs no
+  GUI toolchain; build the bar with `--workspace` / `-p observer-bar` on a
+  machine that has the Metal Toolchain installed.
 
 ## Data model (DuckDB)
 
@@ -213,8 +216,11 @@ itself diagnostic.
 
 `observerd` is a headless **root** LaunchDaemon (needs raw ICMP, PF_ROUTE,
 `tcpdump`, reading the sing-box config). `observer-cli` and `observer-bar` are
-**unprivileged** and only read the DuckDB file (`observer-bar` opens it
-`access_mode=read_only` to avoid contending for DuckDB's single read-write slot
-while the daemon holds it). `observer-bar` is today a read-only glance; its
-eventual gpui/`NSStatusItem` menu-bar UI (deferred pending the macOS Metal
-Toolchain) stays a separate unprivileged binary — never the daemon itself.
+**unprivileged** and only read the DuckDB file; `observer-bar`, the gpui
+menu-bar app, opens it `access_mode=read_only` (no DDL, never contends for
+DuckDB's single read-write slot). DuckDB 1.x takes a per-process file lock, so
+the read-only open succeeds only when no `observerd` is holding the store
+read-write (offline forensics); while the daemon runs, the open fails and the
+panel surfaces "store unavailable", retried each tick. Concurrent live access
+(a local socket / exported snapshot) is a post-v1 concern. The menu-bar UI
+stays a separate unprivileged binary — never the daemon itself.

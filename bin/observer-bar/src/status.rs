@@ -186,11 +186,178 @@ pub fn render_status(status: &Status) -> String {
     out
 }
 
+/// The three-state health of a [`Status`], derived from the gateway verdict and
+/// the tun probe code. The single source of truth for both the menu-bar glyph
+/// ([`status_glyph`]) and the panel's header dot (`ui::health_dot`), so the two
+/// can never drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    /// No link and no proxy tick yet — nothing to judge.
+    NoData,
+    /// Gateway `OK` and the tun probe returned HTTP 204.
+    Ok,
+    /// Gateway or tun is bad / degraded.
+    Bad,
+}
+
+/// Classify a [`Status`] into a [`Health`]: [`Health::NoData`] when there is no
+/// link *and* no proxy tick, [`Health::Ok`] when the gateway verdict is `OK`
+/// *and* the tun probe returned HTTP 204 (the healthy reachability code), and
+/// [`Health::Bad`] otherwise (gw or tun bad / degraded — e.g. tun `0` = wedge).
+/// Pure over its input, so it is unit-tested without a store or a GUI.
+pub fn health(status: &Status) -> Health {
+    if status.link.is_none() && status.proxy.is_none() {
+        return Health::NoData;
+    }
+    let gw_ok = status.link.as_ref().is_some_and(|l| l.gw == "OK");
+    // The tun HTTP 204 probe: 204 means the tunnel path is reachable; anything
+    // else (0 = wedge, other codes, or missing) is not healthy.
+    let tun_ok = status.proxy.as_ref().and_then(|p| p.tun_code) == Some(204);
+    if gw_ok && tun_ok {
+        Health::Ok
+    } else {
+        Health::Bad
+    }
+}
+
+/// A compact, single-line health glyph for the menu-bar status item, derived
+/// from a [`Status`]: a colored dot plus `gw:<verdict> tun:<code>`. Pure over
+/// its input so it can be unit-tested without a store or a GUI.
+///
+/// - green (`🟢`) when the gateway verdict is `OK` and the tun probe returned
+///   HTTP 204 (the healthy reachability code),
+/// - white (`⚪`) when there is no data at all yet,
+/// - red (`🔴`) otherwise (gw or tun is bad / degraded).
+///
+/// The dot follows [`health`], the shared classifier the panel header dot uses.
+pub fn status_glyph(status: &Status) -> String {
+    let dot = match health(status) {
+        Health::NoData => "⚪",
+        Health::Ok => "🟢",
+        Health::Bad => "🔴",
+    };
+
+    let gw = status
+        .link
+        .as_ref()
+        .map(|l| l.gw.clone())
+        .unwrap_or_else(|| "?".to_string());
+    let tun = status
+        .proxy
+        .as_ref()
+        .and_then(|p| p.tun_code)
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    format!("{dot} gw:{gw} tun:{tun}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use store::Store;
     use types::{GwVerdict, Incident, LinkSample, ProxySample, Sample, TcpVerdict};
+
+    #[test]
+    fn glyph_green_when_gw_ok_and_tun_204() {
+        let status = Status {
+            link: Some(LinkGlance {
+                ts_us: 1,
+                gw: "OK".into(),
+                direct: "OK".into(),
+            }),
+            proxy: Some(ProxyGlance {
+                ts_us: 1,
+                tun_code: Some(204),
+                selector: Some("auto".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(status_glyph(&status), "🟢 gw:OK tun:204");
+    }
+
+    #[test]
+    fn glyph_red_when_gw_fail_or_tun_wedged() {
+        let wedged = Status {
+            link: Some(LinkGlance {
+                ts_us: 1,
+                gw: "OK".into(),
+                direct: "OK".into(),
+            }),
+            proxy: Some(ProxyGlance {
+                ts_us: 1,
+                tun_code: Some(0),
+                selector: None,
+            }),
+            ..Default::default()
+        };
+        // tun=0 is the wedge signature -> red, and the raw code must render.
+        assert_eq!(status_glyph(&wedged), "🔴 gw:OK tun:0");
+
+        let gw_down = Status {
+            link: Some(LinkGlance {
+                ts_us: 1,
+                gw: "FAIL".into(),
+                direct: "OK".into(),
+            }),
+            proxy: Some(ProxyGlance {
+                ts_us: 1,
+                tun_code: Some(204),
+                selector: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(status_glyph(&gw_down), "🔴 gw:FAIL tun:204");
+    }
+
+    #[test]
+    fn glyph_white_and_placeholders_when_no_data() {
+        assert_eq!(status_glyph(&Status::default()), "⚪ gw:? tun:-");
+    }
+
+    #[test]
+    fn health_classifier_matches_glyph_states() {
+        // No data at all -> NoData.
+        assert_eq!(health(&Status::default()), Health::NoData);
+
+        // gw OK + tun 204 -> Ok.
+        let ok = Status {
+            link: Some(LinkGlance {
+                ts_us: 1,
+                gw: "OK".into(),
+                direct: "OK".into(),
+            }),
+            proxy: Some(ProxyGlance {
+                ts_us: 1,
+                tun_code: Some(204),
+                selector: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(health(&ok), Health::Ok);
+
+        // tun wedged (0) -> Bad, even with gw OK.
+        let wedged = Status {
+            proxy: Some(ProxyGlance {
+                ts_us: 1,
+                tun_code: Some(0),
+                selector: None,
+            }),
+            ..ok.clone()
+        };
+        assert_eq!(health(&wedged), Health::Bad);
+
+        // gw FAIL -> Bad, even with tun 204.
+        let gw_down = Status {
+            link: Some(LinkGlance {
+                ts_us: 1,
+                gw: "FAIL".into(),
+                direct: "OK".into(),
+            }),
+            ..ok
+        };
+        assert_eq!(health(&gw_down), Health::Bad);
+    }
 
     #[test]
     fn render_full_status_lists_link_proxy_and_incidents() {

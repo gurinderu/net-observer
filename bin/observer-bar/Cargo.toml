@@ -10,19 +10,37 @@ anyhow.workspace = true
 # `observer-bar` is a read-only glance at the observer DuckDB store, so it opens
 # the file directly with `access_mode=read_only` (see `src/db.rs`) rather than
 # through `store::DuckdbStore::open`, which runs `CREATE TABLE IF NOT EXISTS` on a
-# read-write connection and would contend for DuckDB's single read-write slot
-# while `observerd` holds it. That needs the `duckdb` crate directly.
+# read-write connection. Opening read-only skips that DDL and never takes DuckDB's
+# write slot. It does NOT make the glance safe alongside a live `observerd`:
+# DuckDB's per-process file lock blocks even read-only opens while the daemon
+# holds the store, so the bar reads it only when observerd is not (offline
+# forensics), degrading gracefully otherwise. That needs the `duckdb` crate
+# directly.
 duckdb.workspace = true
 
-# The intended UI is a macOS menu-bar app (NSStatusItem via objc2, panel via
-# gpui). gpui's build script compiles Metal shaders and requires the macOS Metal
-# Toolchain, which is not present on every dev machine / CI runner, and the
-# NSStatusItem+gpui integration cannot be verified in a headless pass. Rather
-# than ship a `gui` feature that pulls gpui/objc2 but cannot compile here (no
-# module, no Metal toolchain), the GUI is left as a documented follow-up
-# (TODO(menu-bar) in `src/main.rs`); the crate today is a headless read-only
-# glance that prints the `Status`. Re-add gpui/objc2 (workspace deps already
-# declared) when implementing the menu-bar on a machine with the Metal Toolchain.
+# macOS menu-bar UI. The rich panel is drawn with gpui (Zed's GPU-accelerated
+# Rust UI framework); the system status-bar item (`NSStatusItem`) plus the
+# dockless activation policy are thin AppKit interop via `objc2` + `objc2-app-kit`.
+# gpui's build script compiles Metal shaders and needs the macOS Metal Toolchain,
+# which is why this crate is excluded from the workspace default-members (a plain
+# `cargo build` skips it); build it explicitly with `cargo build -p observer-bar`
+# on a machine that has the Metal Toolchain installed.
+gpui.workspace = true
+objc2.workspace = true
+objc2-foundation = { version = "0.3", features = ["NSString"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSRunningApplication",
+    "NSResponder",
+    "NSView",
+    "NSControl",
+    "NSButton",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    # CGFloat-typed APIs: `statusItemWithLength:` + `NSVariableStatusItemLength`.
+    "objc2-core-foundation",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,19 +1,36 @@
-//! A genuinely read-only DuckDB connection for the glance.
+//! A read-only DuckDB connection for the glance.
 //!
-//! `observer-bar` only ever reads. Opening through [`store::DuckdbStore::open`]
-//! would run `CREATE TABLE IF NOT EXISTS` on a read-write connection and take
-//! DuckDB's single read-write slot per file — which `observerd` already holds —
-//! so the glance would fail to open the DB while the daemon is running. Instead
-//! this opens with `access_mode=read_only`: no DDL, no read-write lock, safe to
-//! run alongside `observerd`.
+//! `observer-bar` only ever reads, so it opens with `access_mode=read_only`:
+//! no `CREATE TABLE IF NOT EXISTS` DDL runs (unlike [`store::DuckdbStore::open`],
+//! which does), and the connection never tries to take DuckDB's read-write slot.
+//!
+//! ## Concurrency with `observerd` — important caveat
+//!
+//! This does **not** make the glance safe to run *concurrently* with a live
+//! `observerd`. DuckDB 1.x takes a single-process file lock: while `observerd`
+//! holds the store open read-write, DuckDB refuses **every** other-process open
+//! of that file — read-only opens included ("Conflicting lock is held ..."). So
+//! [`ReadOnlyDb::open`] succeeds only when no `observerd` is holding the store
+//! (e.g. offline forensics with the daemon stopped, or a copied/detached file).
+//! While the daemon runs, the open fails and the panel surfaces "store
+//! unavailable" (see [`crate::ui::read_fresh`], retried each tick).
+//!
+//! Concurrent live access is a post-v1 concern: the toolbar is specified to talk
+//! to the daemon over a local socket (or read a snapshot the daemon exports),
+//! never to open the daemon's DB file directly. `access_mode=read_only` still
+//! matters here (no DDL, never contends for the write slot), but it is not what
+//! makes cross-process access work.
 
 use crate::status::QuerySource;
 use duckdb::{AccessMode, Config, Connection};
 use store::{QueryTable, StoreError};
 
 /// A read-only handle to the observer DuckDB file. Opening it runs no DDL and
-/// does not take the read-write lock, so it can glance at the store while
-/// `observerd` holds it open for writing.
+/// never takes DuckDB's read-write slot.
+///
+/// Note: this can only open the file when no `observerd` is holding it open
+/// read-write — DuckDB's file lock is exclusive per process and blocks even
+/// read-only opens while the daemon runs (see the module docs).
 pub struct ReadOnlyDb {
     conn: Connection,
 }
@@ -21,7 +38,9 @@ pub struct ReadOnlyDb {
 impl ReadOnlyDb {
     /// Open `path` read-only (`access_mode=read_only`). Fails if the file does
     /// not exist yet — there is nothing to glance at until `observerd` has
-    /// created the store.
+    /// created the store — and also fails while a live `observerd` holds the
+    /// store open read-write (DuckDB's per-process file lock blocks read-only
+    /// opens too; see the module docs).
     pub fn open(path: &str) -> Result<Self, StoreError> {
         let config = Config::default().access_mode(AccessMode::ReadOnly)?;
         let conn = Connection::open_with_flags(path, config)?;
