@@ -16,6 +16,9 @@ pub struct Config {
 pub struct Collectors {
     pub link: LinkCfg,
     pub proxy: ProxyCfg,
+    pub dns: DnsCfg,
+    pub route: RouteCfg,
+    pub host: HostCfg,
     pub pcap_ring: PcapCfg,
 }
 
@@ -35,6 +38,32 @@ pub struct ProxyCfg {
     pub interval: Duration,
     pub tun_probe_url: String,
     pub clash_api: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsCfg {
+    pub enabled: bool,
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+    /// The monitored service domain (the `nks[*]` probes resolve this).
+    pub monitored_domain: String,
+    /// A `.ru` control domain (the `ru[*]` probes resolve this); a fakeip answer
+    /// on it is always a bug.
+    pub ru_control_domain: String,
+    /// DNS-over-HTTPS endpoint used by the `doh` resolver path.
+    pub doh_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteCfg {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostCfg {
+    pub enabled: bool,
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +90,18 @@ impl Default for Config {
                     interval: Duration::from_secs(15),
                     tun_probe_url: "http://connectivitycheck.gstatic.com/generate_204".into(),
                     clash_api: "http://127.0.0.1:9090".into(),
+                },
+                dns: DnsCfg {
+                    enabled: true,
+                    interval: Duration::from_secs(15),
+                    monitored_domain: "nks.lab.mirari.ru".into(),
+                    ru_control_domain: "ya.ru".into(),
+                    doh_url: "https://1.1.1.1/dns-query".into(),
+                },
+                route: RouteCfg { enabled: true },
+                host: HostCfg {
+                    enabled: true,
+                    interval: Duration::from_secs(15),
                 },
                 pcap_ring: PcapCfg {
                     enabled: true,
@@ -93,6 +134,18 @@ mod tests {
         let c = Config::load(None).unwrap();
         assert!(c.collectors.link.enabled);
         assert_eq!(c.collectors.link.interval.as_secs(), 15);
+    }
+    #[test]
+    fn dns_route_host_defaults_apply() {
+        let c = Config::load(None).unwrap();
+        assert!(c.collectors.dns.enabled);
+        assert_eq!(c.collectors.dns.interval.as_secs(), 15);
+        assert_eq!(c.collectors.dns.monitored_domain, "nks.lab.mirari.ru");
+        assert_eq!(c.collectors.dns.ru_control_domain, "ya.ru");
+        assert_eq!(c.collectors.dns.doh_url, "https://1.1.1.1/dns-query");
+        assert!(c.collectors.route.enabled);
+        assert!(c.collectors.host.enabled);
+        assert_eq!(c.collectors.host.interval.as_secs(), 15);
     }
     #[test]
     fn toml_overrides_defaults() {

@@ -1,0 +1,7 @@
+[package]
+name = "collector-dns"
+edition.workspace = true
+
+[dependencies]
+types.workspace = true
+collector-core.workspace = true

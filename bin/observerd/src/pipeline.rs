@@ -96,8 +96,12 @@ pub fn spawn_interval_collector(c: Box<dyn Collector>, tx: mpsc::Sender<Sample>)
 /// Event cadence: a long-lived blocking source belongs on its own OS thread
 /// (not repeated `spawn_blocking`), forwarding via the channel's `blocking_send`.
 ///
-/// No `Event` collector ships in v1; this spawner + the `source()` dispatch exist
-/// so an event collector plugs in later with zero daemon changes.
+/// The `route` collector (persistent PF_ROUTE socket) is the live Event-cadence
+/// consumer: its `next()` is a blocking `read(2)` driven here on the blocking
+/// pool. Because a `spawn_blocking` closure cannot be aborted, a `next()` parked
+/// on an idle socket keeps this task's stream sender alive through `abort_all`;
+/// the daemon therefore bounds its shutdown drain (see `observerd::main`) rather
+/// than relying on this task to release the sender.
 pub fn spawn_event_collector(c: Box<dyn Collector>, tx: mpsc::Sender<Sample>) -> JoinHandle<()> {
     let name = c.meta().name;
     let Some(mut src) = c.into_event_source() else {

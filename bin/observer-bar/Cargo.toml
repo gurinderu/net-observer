@@ -1,0 +1,28 @@
+[package]
+name = "observer-bar"
+edition.workspace = true
+
+[dependencies]
+store.workspace = true
+types.workspace = true
+config.workspace = true
+anyhow.workspace = true
+# `observer-bar` is a read-only glance at the observer DuckDB store, so it opens
+# the file directly with `access_mode=read_only` (see `src/db.rs`) rather than
+# through `store::DuckdbStore::open`, which runs `CREATE TABLE IF NOT EXISTS` on a
+# read-write connection and would contend for DuckDB's single read-write slot
+# while `observerd` holds it. That needs the `duckdb` crate directly.
+duckdb.workspace = true
+
+# The intended UI is a macOS menu-bar app (NSStatusItem via objc2, panel via
+# gpui). gpui's build script compiles Metal shaders and requires the macOS Metal
+# Toolchain, which is not present on every dev machine / CI runner, and the
+# NSStatusItem+gpui integration cannot be verified in a headless pass. Rather
+# than ship a `gui` feature that pulls gpui/objc2 but cannot compile here (no
+# module, no Metal toolchain), the GUI is left as a documented follow-up
+# (TODO(menu-bar) in `src/main.rs`); the crate today is a headless read-only
+# glance that prints the `Status`. Re-add gpui/objc2 (workspace deps already
+# declared) when implementing the menu-bar on a machine with the Metal Toolchain.
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use types::{LinkSample, ProxySample, Sample};
+use types::{DnsSample, HostSample, LinkSample, ProxySample, Sample};
 
 /// Ring buffer of the most recent `cap` [`Sample`]s.
 pub struct RecentWindow {
@@ -32,7 +32,7 @@ impl RecentWindow {
             .rev()
             .filter_map(|s| match s {
                 Sample::Link(l) => Some(l),
-                Sample::Proxy(_) => None,
+                Sample::Proxy(_) | Sample::Dns(_) | Sample::Route(_) | Sample::Host(_) => None,
             })
             .take(n)
             .collect()
@@ -45,7 +45,7 @@ impl RecentWindow {
             .rev()
             .filter_map(|s| match s {
                 Sample::Proxy(p) => Some(p),
-                Sample::Link(_) => None,
+                Sample::Link(_) | Sample::Dns(_) | Sample::Route(_) | Sample::Host(_) => None,
             })
             .take(n)
             .collect()
@@ -55,7 +55,7 @@ impl RecentWindow {
     pub fn last_link(&self) -> Option<&LinkSample> {
         self.buf.iter().rev().find_map(|s| match s {
             Sample::Link(l) => Some(l),
-            Sample::Proxy(_) => None,
+            Sample::Proxy(_) | Sample::Dns(_) | Sample::Route(_) | Sample::Host(_) => None,
         })
     }
 
@@ -63,7 +63,36 @@ impl RecentWindow {
     pub fn last_proxy(&self) -> Option<&ProxySample> {
         self.buf.iter().rev().find_map(|s| match s {
             Sample::Proxy(p) => Some(p),
-            Sample::Link(_) => None,
+            Sample::Link(_) | Sample::Dns(_) | Sample::Route(_) | Sample::Host(_) => None,
+        })
+    }
+
+    /// The most recent `n` DNS samples, newest first.
+    pub fn recent_dns(&self, n: usize) -> Vec<&DnsSample> {
+        self.buf
+            .iter()
+            .rev()
+            .filter_map(|s| match s {
+                Sample::Dns(d) => Some(d),
+                Sample::Link(_) | Sample::Proxy(_) | Sample::Route(_) | Sample::Host(_) => None,
+            })
+            .take(n)
+            .collect()
+    }
+
+    /// The newest DNS sample, if any.
+    pub fn last_dns(&self) -> Option<&DnsSample> {
+        self.buf.iter().rev().find_map(|s| match s {
+            Sample::Dns(d) => Some(d),
+            Sample::Link(_) | Sample::Proxy(_) | Sample::Route(_) | Sample::Host(_) => None,
+        })
+    }
+
+    /// The newest host sample, if any.
+    pub fn last_host(&self) -> Option<&HostSample> {
+        self.buf.iter().rev().find_map(|s| match s {
+            Sample::Host(h) => Some(h),
+            Sample::Link(_) | Sample::Proxy(_) | Sample::Dns(_) | Sample::Route(_) => None,
         })
     }
 
@@ -74,7 +103,7 @@ impl RecentWindow {
             .rev()
             .filter_map(|s| match s {
                 Sample::Link(l) => Some(l),
-                Sample::Proxy(_) => None,
+                Sample::Proxy(_) | Sample::Dns(_) | Sample::Route(_) | Sample::Host(_) => None,
             })
             .nth(1)
     }

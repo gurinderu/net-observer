@@ -7,6 +7,31 @@ members = [
     "crates/collector-core",
     "crates/collector-link",
     "crates/collector-proxy",
+    "crates/collector-dns",
+    "crates/collector-route",
+    "crates/collector-host",
+    "crates/triggers",
+    "crates/macos",
+    "bin/observerd",
+    "bin/observer-cli",
+    "bin/observer-bar",
+]
+# `observer-bar` (gpui GUI) is intentionally excluded from the default build set:
+# gpui's build script requires the macOS Metal Toolchain, which is not present on
+# every dev machine / CI runner. A plain `cargo build` therefore builds the
+# daemon workspace without the GUI toolchain. `observer-bar` remains a full
+# workspace member — build it explicitly with `cargo build -p observer-bar` (or
+# `--workspace`) on a machine that has the Metal Toolchain installed.
+default-members = [
+    "crates/types",
+    "crates/config",
+    "crates/store",
+    "crates/collector-core",
+    "crates/collector-link",
+    "crates/collector-proxy",
+    "crates/collector-dns",
+    "crates/collector-route",
+    "crates/collector-host",
     "crates/triggers",
     "crates/macos",
     "bin/observerd",
@@ -34,6 +59,8 @@ socket2 = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 libc = "0.2"
 tempfile = "3"
+gpui = "0.2.2"
+objc2 = "0.6.4"
 # local crates
 types = { path = "crates/types" }
 config = { path = "crates/config" }
@@ -41,5 +68,8 @@ store = { path = "crates/store" }
 collector-core = { path = "crates/collector-core" }
 collector-link = { path = "crates/collector-link" }
 collector-proxy = { path = "crates/collector-proxy" }
+collector-dns = { path = "crates/collector-dns" }
+collector-route = { path = "crates/collector-route" }
+collector-host = { path = "crates/collector-host" }
 triggers = { path = "crates/triggers" }
 macos = { path = "crates/macos" }

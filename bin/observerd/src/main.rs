@@ -9,6 +9,7 @@ mod pipeline;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
@@ -16,11 +17,17 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use collector_core::{Collector, Os, Readiness, Source};
+use collector_core::{Collector, EventSource, Os, Readiness, Source};
+use collector_dns::DnsCollector;
+use collector_host::HostCollector;
 use collector_link::{LinkCollector, LinkFacts};
 use collector_proxy::ProxyCollector;
+use collector_route::RouteCollector;
 use config::Config;
-use macos::{BoundTcpProber, IcmpPinger, PcapRing, ProxySystemFacts, SystemFacts};
+use macos::{
+    BoundTcpProber, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource, ProxySystemFacts,
+    SystemFacts,
+};
 use store::DuckdbStore;
 use triggers::conditions::{FakeIp, GwChange, GwDrop, Starvation, Wedge};
 use triggers::engine::{Trigger, TriggerEngine};
@@ -41,8 +48,8 @@ const CHANNEL_CAP: usize = 256;
 /// Wedge signal: tun dead while the direct path is healthy, for this many ticks.
 const WEDGE_CONSECUTIVE: usize = 3;
 
-/// Host load above which a dead tun counts as starvation (dormant until the
-/// `host-metrics` collector lands, but wired now so the rule set is complete).
+/// Host load above which a dead tun counts as starvation (read from the `host`
+/// collector's newest sample by the `Starvation` condition).
 const STARVATION_LOAD: f64 = 10.0;
 
 /// Path to the rendered sing-box config (read at runtime — server addresses are
@@ -51,6 +58,14 @@ const SINGBOX_CONFIG_PATH: &str = "/etc/sing-box/config.json";
 
 /// Clash/Mihomo proxy group whose current selection identifies the active node.
 const CLASH_SELECTOR_GROUP: &str = "GLOBAL";
+
+/// Upper bound on the post-signal drain. The `route` collector's PF_ROUTE
+/// `read(2)` runs on a blocking thread that `abort()` cannot interrupt, so it
+/// keeps a stream sender alive and the consumer's `rx.recv()` may never observe
+/// the stream close. Bounding the drain here (and reaping the leftover blocking
+/// thread with [`tokio::runtime::Runtime::shutdown_timeout`] in [`main`]) keeps
+/// shutdown from hanging forever on an idle routing socket.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -63,8 +78,25 @@ struct Cli {
     config: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Build the runtime explicitly (instead of `#[tokio::main]`) so shutdown can
+    // be *bounded*. The route collector's PF_ROUTE `read(2)` runs on a blocking
+    // pool thread that cannot be aborted; `shutdown_timeout` guarantees the
+    // process still exits even if that read is parked on an idle socket at exit.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    let result = runtime.block_on(run_daemon());
+    runtime.shutdown_timeout(SHUTDOWN_GRACE);
+    result
+}
+
+/// The async daemon body: load config, open the store, spawn the enabled
+/// collectors, run the consumer loop, and shut down on SIGTERM/SIGINT. The final
+/// drain is bounded (see [`SHUTDOWN_GRACE`]) so an un-abortable event source can
+/// never keep the daemon from exiting.
+async fn run_daemon() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -119,6 +151,36 @@ async fn main() -> anyhow::Result<()> {
             cfg.collectors.proxy.interval,
         )));
     }
+    if cfg.collectors.dns.enabled {
+        collectors.push(Box::new(DnsCollector::new(
+            Arc::new(DnsResolver::new(
+                cfg.collectors.dns.monitored_domain.clone(),
+                cfg.collectors.dns.ru_control_domain.clone(),
+                cfg.collectors.dns.doh_url.clone(),
+            )),
+            cfg.collectors.dns.interval,
+        )));
+    }
+    if cfg.collectors.host.enabled {
+        collectors.push(Box::new(HostCollector::new(
+            Arc::new(HostLoad::new()),
+            cfg.collectors.host.interval,
+        )));
+    }
+    if cfg.collectors.route.enabled {
+        // The route collector is Event-cadence, driven by a persistent PF_ROUTE
+        // socket. Opening it here decides its readiness; if it cannot open, the
+        // collector is constructed Unavailable (with a no-op source) so the
+        // uniform preflight filter below drops it, mirroring every other probe.
+        let (source, ready): (Box<dyn EventSource>, Readiness) = match PfRouteSource::open() {
+            Ok(src) => (Box::new(src), Readiness::Ready),
+            Err(e) => (
+                Box::new(NullEventSource),
+                Readiness::Unavailable(format!("PF_ROUTE socket: {e}")),
+            ),
+        };
+        collectors.push(Box::new(RouteCollector::new(source, ready)));
+    }
 
     // Filter by OS meta + preflight, then spawn survivors with one uniform loop.
     let os = Os::current();
@@ -129,8 +191,9 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(collector = name, ?os, "unsupported OS; skipping");
             continue;
         }
-        if !c.preflight().is_ready() {
-            if let Readiness::Unavailable(reason) = c.preflight() {
+        let ready = c.preflight();
+        if !ready.is_ready() {
+            if let Readiness::Unavailable(reason) = ready {
                 tracing::warn!(collector = name, %reason, "preflight failed; skipping");
             }
             continue;
@@ -169,13 +232,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Signal path: stop the collectors, which closes the stream, then let the
-    // consumer drain what remains and exit cleanly.
+    // consumer drain what remains and exit. The route collector's blocking
+    // PF_ROUTE `read(2)` cannot be aborted, so its task can keep a stream sender
+    // alive and `rx.recv()` may never see the stream close; bound the drain so
+    // shutdown cannot hang (the leftover blocking thread is reaped by
+    // `shutdown_timeout` in `main`).
     abort_all(&handles);
-    if let Err(e) = consumer.await {
-        tracing::error!(error = %e, "consumer join failed during shutdown");
+    match tokio::time::timeout(SHUTDOWN_GRACE, &mut consumer).await {
+        Ok(Ok(())) => tracing::info!("observerd shut down cleanly"),
+        Ok(Err(e)) => tracing::error!(error = %e, "consumer join failed during shutdown"),
+        Err(_) => tracing::warn!(
+            grace_s = SHUTDOWN_GRACE.as_secs(),
+            "consumer did not drain within grace; forcing shutdown"
+        ),
     }
-    tracing::info!("observerd shut down cleanly");
     Ok(())
+}
+
+/// A no-op [`EventSource`] used only when the PF_ROUTE socket fails to open, so
+/// the `route` collector can still be constructed carrying an `Unavailable`
+/// readiness and be dropped by the uniform preflight filter. Its `next()` ends
+/// the stream immediately (it is never actually driven — preflight filters it).
+struct NullEventSource;
+impl EventSource for NullEventSource {
+    fn next(&mut self) -> Option<Vec<Sample>> {
+        None
+    }
 }
 
 /// Abort every collector task, dropping their stream senders.

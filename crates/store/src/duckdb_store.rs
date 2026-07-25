@@ -127,6 +127,25 @@ impl Store for DuckdbStore {
                     p.selector
                 ],
             )?,
+            Sample::Dns(d) => c.execute(
+                "INSERT INTO dns_sample VALUES (?,?,?,?,?,?)",
+                params![
+                    d.ts_us,
+                    d.probe,
+                    d.server,
+                    d.verdict.to_string(),
+                    d.ip,
+                    d.rtt_ms
+                ],
+            )?,
+            Sample::Route(r) => c.execute(
+                "INSERT INTO route_event VALUES (?,?,?,?)",
+                params![r.ts_us, r.kind, r.iface, r.detail],
+            )?,
+            Sample::Host(h) => c.execute(
+                "INSERT INTO host_sample VALUES (?,?,?,?)",
+                params![h.ts_us, h.load1, h.load5, h.load15],
+            )?,
         };
         Ok(())
     }
@@ -187,6 +206,24 @@ mod tests {
         s.write_sample(&sample).unwrap();
         assert_eq!(
             s.query_scalar_i64("SELECT count(*) FROM link_sample WHERE gw='FAIL'")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn write_and_count_host_sample() {
+        use types::{HostSample, Sample};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Host(HostSample {
+            ts_us: 5000,
+            load1: 12.0,
+            load5: 8.0,
+            load15: 4.0,
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM host_sample WHERE load1 > 10")
                 .unwrap(),
             1
         );

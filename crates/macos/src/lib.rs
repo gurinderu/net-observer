@@ -12,11 +12,17 @@
 
 pub mod clash;
 pub mod dhcp_arp;
+pub mod dns;
+pub mod host;
 pub mod net;
 pub mod pcap;
+pub mod route;
 pub mod wifi;
 
 pub use clash::{ClashClient, ProxySystemFacts};
 pub use dhcp_arp::SystemFacts;
+pub use dns::DnsResolver;
+pub use host::HostLoad;
 pub use net::{BoundTcpProber, IcmpPinger};
 pub use pcap::PcapRing;
+pub use route::PfRouteSource;

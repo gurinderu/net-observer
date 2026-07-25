@@ -160,10 +160,10 @@ struct Trigger {
   in-process capture via the `pcap` crate / raw BPF, which also serves the
   "fewer subprocess spawns" goal — migrate once v1 parity is proven. **[v1]**
 - `dns` — resolver probes (sing-box TUN DNS, DHCP resolver, DoH, control
-  domain). **[next]**
+  domain). **[v1.1]**
 - `route-events` — persistent PF_ROUTE socket monitor (iface up/down, addr
-  add/loss, default-route changes). **[next]**
-- `host-metrics` — host load / starvation signals. **[next]**
+  add/loss, default-route changes); first **Event**-cadence collector. **[v1.1]**
+- `host-metrics` — host load / starvation signals. **[v1.1]**
 
 ## Collector abstraction (`collector-core`)
 
@@ -331,19 +331,24 @@ become runtime-mutable without reworking collectors.
   shell `route -n monitor`.
 - **Structured, queryable data** instead of columnar text meant for `awk`.
 
-## Open questions deferred past v1
+## v1.1 — in progress
 
-- Watchdog / acting: an `Act` handler (kickstart) behind a flag — kept out of v1;
-  the shell watchdog stays as the recovery path meanwhile.
+Plan: `docs/superpowers/plans/2026-07-25-next-collectors-and-bar.md`.
+
+- `dns`, `route-events`, `host-metrics` collectors (own crates), activating the
+  `FakeIp` and `Starvation` trigger conditions with real data. `route-events` is
+  the first **Event**-cadence collector (PF_ROUTE via `EventSource`).
+- **gpui menu-bar** (`bin/observer-bar`) — first cut is a **read-only glance**:
+  `NSStatusItem` (via `objc2`) + a gpui panel that reads the DuckDB file
+  (last tick per collector + recent incidents). No toggles yet.
+
+## Open questions still deferred
+
+- Watchdog / acting: an `Act` handler (kickstart) behind a flag — the shell
+  watchdog stays as the recovery path meanwhile.
 - Notification channel(s) for a `Notify` handler.
-- Runtime config mechanism (reload / control socket / CLI) for the toolbar.
-- macOS menu-bar UI in **gpui** (`NSStatusItem` via `objc2` + gpui panel),
-  a separate unprivileged binary over a local socket / XPC.
+- Runtime config mechanism (reload / **control socket** / CLI) — required before
+  the menu-bar gains live **toggles** (portal / kill-switch); the read-only bar
+  does not need it.
 - Migrating `pcap-ring` from the `tcpdump` child to in-process capture
   (`pcap` crate / BPF).
-
-## Next step
-
-`writing-plans` for a v1 that does `link` + `proxy-probes` end-to-end into DuckDB
-with the wedge/gw-drop triggers and pcap-ring freeze, before fanning out to
-`dns` / `route-events` / `host-metrics`.

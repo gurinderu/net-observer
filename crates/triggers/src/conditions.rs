@@ -1,5 +1,15 @@
 use crate::window::RecentWindow;
-use types::{GwVerdict, TcpVerdict};
+use types::{DnsVerdict, GwVerdict, TcpVerdict};
+
+/// How many recent DNS samples the `fakeip` condition scans (one polling tick
+/// emits several probe rows, so a small window covers the latest tick).
+const FAKEIP_SCAN: usize = 16;
+
+/// Whether `name` is a `.ru` name — either the short `ru` probe label or a
+/// fully-qualified `*.ru` domain. A fakeip answer on such a name is always a bug.
+fn is_ru_name(name: &str) -> bool {
+    name == "ru" || name.ends_with(".ru")
+}
 
 /// A fired condition, carrying a human-readable detail string.
 pub struct Fire {
@@ -67,21 +77,32 @@ impl Condition for GwChange {
     }
 }
 
-/// Fires on a fake-IP DNS answer. Dormant in v1 (returns `None`) until the `dns`
-/// collector lands; defined now so the engine wires the full rule set.
+/// Fires on a fake-IP DNS answer for a `.ru` name — the sing-box fakeip range
+/// leaking onto a control domain that must resolve to a real address. Driven by
+/// the `dns` collector's [`types::DnsSample`]s in the window.
 pub struct FakeIp;
 impl Condition for FakeIp {
     fn id(&self) -> &'static str {
         "fakeip"
     }
-    fn eval(&self, _w: &RecentWindow) -> Option<Fire> {
-        None
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        w.recent_dns(FAKEIP_SCAN)
+            .into_iter()
+            .find(|d| d.verdict == DnsVerdict::FakeIp && is_ru_name(&d.probe))
+            .map(|d| Fire {
+                detail: format!(
+                    "fakeip on {} via {} -> {}",
+                    d.probe,
+                    d.server,
+                    d.ip.as_deref().unwrap_or("?")
+                ),
+            })
     }
 }
 
-/// Fires when the tun is dead while host load exceeds `load_threshold`. Dormant in v1:
-/// `load1` arrives via the `host` collector (post-v1) and defaults to `0.0`, so this
-/// never fires yet; defined now so the engine wires the full rule set.
+/// Fires when the tun is dead while host load exceeds `load_threshold` — the
+/// starvation discriminator: a wedge caused by CPU/IO pressure rather than a
+/// network fault. `load1` is read from the `host` collector's newest sample.
 pub struct Starvation {
     pub load_threshold: f64,
 }
@@ -91,8 +112,8 @@ impl Condition for Starvation {
     }
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let last = w.last_proxy()?;
-        // `load1` is not yet in the window (no `host-metrics` collector in v1); default 0.0.
-        let load1 = 0.0_f64;
+        // Load from the newest `host` sample; absent ⇒ 0.0 (cannot be starvation).
+        let load1 = w.last_host().map_or(0.0, |h| h.load1);
         (last.tun_code.unwrap_or(0) == 0 && load1 > self.load_threshold).then(|| Fire {
             detail: format!("tun dead under load {load1:.2}"),
         })
@@ -103,7 +124,28 @@ impl Condition for Starvation {
 mod tests {
     use super::*;
     use crate::window::RecentWindow;
-    use types::{GwVerdict, LinkSample, ProxySample, Sample, TcpVerdict};
+    use types::{
+        DnsSample, DnsVerdict, GwVerdict, HostSample, LinkSample, ProxySample, Sample, TcpVerdict,
+    };
+
+    fn dns(ts: i64, probe: &str, verdict: DnsVerdict, ip: Option<&str>) -> Sample {
+        Sample::Dns(DnsSample {
+            ts_us: ts,
+            probe: probe.into(),
+            server: "sb".into(),
+            verdict,
+            ip: ip.map(str::to_string),
+            rtt_ms: None,
+        })
+    }
+    fn host(ts: i64, load1: f64) -> Sample {
+        Sample::Host(HostSample {
+            ts_us: ts,
+            load1,
+            load5: load1,
+            load15: load1,
+        })
+    }
 
     fn link(ts: i64, direct: TcpVerdict) -> Sample {
         Sample::Link(LinkSample {
@@ -152,6 +194,58 @@ mod tests {
             w.push(proxy(t * 2 + 1, 0));
         }
         assert!(c.eval(&w).is_none()); // whole-network down, not a wedge
+    }
+
+    #[test]
+    fn fakeip_fires_on_ru_fakeip_answer() {
+        let mut w = RecentWindow::new(16);
+        // A healthy .ru answer and a monitored-domain answer do not fire.
+        w.push(dns(1, "ru", DnsVerdict::Ok, Some("87.250.250.242")));
+        w.push(dns(2, "nks", DnsVerdict::Ok, Some("10.0.0.1")));
+        assert!(FakeIp.eval(&w).is_none());
+        // A fakeip answer on the .ru control domain fires.
+        w.push(dns(3, "ru", DnsVerdict::FakeIp, Some("198.18.0.7")));
+        let fire = FakeIp
+            .eval(&w)
+            .expect("fakeip must fire on a .ru fakeip answer");
+        assert!(fire.detail.contains("198.18.0.7"));
+    }
+
+    #[test]
+    fn fakeip_silent_when_fakeip_is_not_a_ru_name() {
+        let mut w = RecentWindow::new(16);
+        // Fakeip on the monitored (non-.ru) domain is expected routing, not a bug.
+        w.push(dns(1, "nks", DnsVerdict::FakeIp, Some("198.18.0.9")));
+        assert!(FakeIp.eval(&w).is_none());
+    }
+
+    #[test]
+    fn starvation_fires_when_tun_dead_under_high_load() {
+        let mut w = RecentWindow::new(16);
+        let c = Starvation {
+            load_threshold: 10.0,
+        };
+        // Dead tun but no host sample yet ⇒ load defaults to 0.0 ⇒ no fire.
+        w.push(proxy(1, 0));
+        assert!(c.eval(&w).is_none());
+        // Dead tun under a low load ⇒ no fire.
+        w.push(host(2, 3.0));
+        assert!(c.eval(&w).is_none());
+        // Dead tun under a high load ⇒ starvation fires.
+        w.push(host(3, 12.5));
+        let fire = c.eval(&w).expect("starvation must fire under high load");
+        assert!(fire.detail.contains("12.5"));
+    }
+
+    #[test]
+    fn starvation_silent_when_tun_alive_under_high_load() {
+        let mut w = RecentWindow::new(16);
+        let c = Starvation {
+            load_threshold: 10.0,
+        };
+        w.push(proxy(1, 204)); // tun healthy
+        w.push(host(2, 20.0)); // high load, but the tun is fine
+        assert!(c.eval(&w).is_none());
     }
 
     #[test]

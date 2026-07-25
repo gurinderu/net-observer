@@ -33,6 +33,30 @@ tun_probe_url = "http://connectivitycheck.gstatic.com/generate_204"
 # Clash/Mihomo RESTful API base URL.
 clash_api = "http://127.0.0.1:9090"
 
+# The `dns` collector probes resolvers (sing-box TUN DNS, DHCP resolver, DoH) for
+# the monitored service domain plus a `.ru` control domain. A fakeip answer on a
+# `.ru` name is always a bug (activates the `fakeip` trigger).
+[collectors.dns]
+enabled = true
+interval = "15s"
+# The monitored service domain (the `nks[*]` probes resolve this).
+monitored_domain = "nks.lab.mirari.ru"
+# A `.ru` control domain (the `ru[*]` probes resolve this).
+ru_control_domain = "ya.ru"
+# DNS-over-HTTPS endpoint used by the `doh` resolver path.
+doh_url = "https://1.1.1.1/dns-query"
+
+# The `route` collector is Event-cadence: it holds a persistent PF_ROUTE socket
+# and emits a row on every interface/address/default-route change.
+[collectors.route]
+enabled = true
+
+# The `host` collector samples the 1/5/15-minute load averages — the starvation
+# discriminator (high load while the TUN is dead activates the `starvation` trigger).
+[collectors.host]
+enabled = true
+interval = "15s"
+
 # The `pcap_ring` collector keeps a rolling in-memory capture (via tcpdump) so a
 # passive incident trigger can freeze the last few MB to disk for forensics.
 [collectors.pcap_ring]

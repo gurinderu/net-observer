@@ -10,4 +10,10 @@ CREATE TABLE IF NOT EXISTS blob_ref (
   id VARCHAR, incident_id VARCHAR, ts_us BIGINT, kind VARCHAR, path VARCHAR);
 CREATE TABLE IF NOT EXISTS trigger_fired (
   ts_us BIGINT, trigger_id VARCHAR, incident_id VARCHAR, detail VARCHAR);
+CREATE TABLE IF NOT EXISTS dns_sample (
+  ts_us BIGINT, probe VARCHAR, server VARCHAR, verdict VARCHAR, ip VARCHAR, rtt_ms DOUBLE);
+CREATE TABLE IF NOT EXISTS route_event (
+  ts_us BIGINT, kind VARCHAR, iface VARCHAR, detail VARCHAR);
+CREATE TABLE IF NOT EXISTS host_sample (
+  ts_us BIGINT, load1 DOUBLE, load5 DOUBLE, load15 DOUBLE);
 "#;
