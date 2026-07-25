@@ -99,7 +99,9 @@ impl ProxySystemFacts {
 }
 
 impl ProxyFacts for ProxySystemFacts {
-    fn vless_ips(&self) -> Vec<String> {
+    /// The upstream server addresses: the `server` field of every `vless`
+    /// outbound in the rendered sing-box config.
+    fn server_endpoints(&self) -> Vec<String> {
         let Ok(text) = std::fs::read_to_string(&self.singbox_config) else {
             tracing::debug!(path = ?self.singbox_config, "sing-box config unreadable");
             return Vec::new();

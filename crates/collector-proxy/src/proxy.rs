@@ -3,7 +3,7 @@ use types::{ProxySample, TcpVerdict};
 
 use crate::probes::ProxyFacts;
 
-/// Pure mapping: one [`ProxySample`] per VLESS server, with the shared
+/// Pure mapping: one [`ProxySample`] per upstream server, with the shared
 /// `tun_code`/`selector` attached to every row. Emits a single `SKIP` row when
 /// no servers are configured (absence of a signal is itself diagnostic).
 pub fn build_proxy_samples(
@@ -15,7 +15,7 @@ pub fn build_proxy_samples(
 ) -> Vec<ProxySample> {
     let tun_code = facts.tun_probe(tun_url);
     let selector = facts.selector();
-    let ips = facts.vless_ips();
+    let ips = facts.server_endpoints();
     if ips.is_empty() {
         return vec![ProxySample {
             ts_us,
@@ -61,7 +61,7 @@ mod tests {
     }
     struct F;
     impl ProxyFacts for F {
-        fn vless_ips(&self) -> Vec<String> {
+        fn server_endpoints(&self) -> Vec<String> {
             vec!["1.1.1.1".into(), "2.2.2.2".into()]
         }
         fn tun_probe(&self, _: &str) -> Option<u16> {
@@ -86,7 +86,7 @@ mod tests {
     fn skip_verdict_when_no_servers() {
         struct Empty;
         impl ProxyFacts for Empty {
-            fn vless_ips(&self) -> Vec<String> {
+            fn server_endpoints(&self) -> Vec<String> {
                 vec![]
             }
             fn tun_probe(&self, _: &str) -> Option<u16> {

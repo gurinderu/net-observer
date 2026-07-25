@@ -4,9 +4,11 @@
 
 use collector_core::Readiness;
 
-/// Proxy facts: the VLESS server IPs, the TUN HTTP 204 probe, and the Clash selector.
+/// Proxy facts: the upstream proxy server addresses, the TUN HTTP 204 probe, and
+/// the active upstream node selection.
 pub trait ProxyFacts: Send + Sync {
-    fn vless_ips(&self) -> Vec<String>;
+    /// The upstream proxy server addresses to TCP-probe.
+    fn server_endpoints(&self) -> Vec<String>;
     fn tun_probe(&self, url: &str) -> Option<u16>;
     fn selector(&self) -> Option<String>;
     /// Runtime capability probe: can the proxy collector work here/now?

@@ -16,8 +16,8 @@ pub const META: CollectorMeta = CollectorMeta {
     supported_os: &[Os::MacOs],
 };
 
-/// Interval collector for per-VLESS TCP reachability, the TUN 204 probe, and the
-/// Clash selector.
+/// Interval collector for per-upstream-server TCP reachability, the TUN 204
+/// probe, and the active upstream node selection.
 pub struct ProxyCollector {
     tcp: Arc<dyn TcpProber>,
     facts: Arc<dyn ProxyFacts>,
@@ -94,7 +94,7 @@ mod tests {
 
     struct Facts(Readiness);
     impl ProxyFacts for Facts {
-        fn vless_ips(&self) -> Vec<String> {
+        fn server_endpoints(&self) -> Vec<String> {
             vec!["1.1.1.1".into()]
         }
         fn tun_probe(&self, _: &str) -> Option<u16> {
@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn preflight_unavailable_is_not_ready() {
         let c = collector(Readiness::Unavailable(
-            "no sing-box config / clash api".into(),
+            "no upstream proxy facts available".into(),
         ));
         assert!(!c.preflight().is_ready());
     }

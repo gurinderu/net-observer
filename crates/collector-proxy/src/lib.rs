@@ -1,5 +1,6 @@
-//! `collector-proxy` — the proxy collector: per-VLESS TCP reachability, the TUN
-//! HTTP 204 probe, and the Clash selector. Holds the [`ProxyFacts`] port trait,
+//! `collector-proxy` — the proxy collector: per-upstream-server TCP reachability,
+//! the TUN HTTP 204 probe, and the active upstream node selection. Holds the
+//! [`ProxyFacts`] port trait,
 //! the pure [`build_proxy_samples`] mapping, static [`META`], and the
 //! [`ProxyCollector`] implementing [`collector_core::Collector`]. Real macOS
 //! adapters for `ProxyFacts` live in the `macos` crate.
