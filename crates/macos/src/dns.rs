@@ -32,7 +32,7 @@ pub struct DnsResolver {
     monitored_domain: String,
     ru_control_domain: String,
     doh_url: String,
-    client: reqwest::blocking::Client,
+    agent: ureq::Agent,
 }
 
 impl DnsResolver {
@@ -40,15 +40,15 @@ impl DnsResolver {
     /// `doh_url` for the DoH path.
     #[must_use]
     pub fn new(monitored_domain: String, ru_control_domain: String, doh_url: String) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(RESOLVE_TIMEOUT)
-            .build()
-            .unwrap_or_default();
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(RESOLVE_TIMEOUT))
+            .build();
+        let agent: ureq::Agent = config.into();
         Self {
             monitored_domain,
             ru_control_domain,
             doh_url,
-            client,
+            agent,
         }
     }
 
@@ -74,14 +74,15 @@ impl DnsResolver {
     /// Resolve `domain`'s A records via Cloudflare's DoH JSON API. `None` on any
     /// request/parse error.
     fn doh_lookup(&self, domain: &str) -> Option<Vec<IpAddr>> {
-        let resp = self
-            .client
+        let mut resp = self
+            .agent
             .get(&self.doh_url)
-            .query(&[("name", domain), ("type", "A")])
-            .header(reqwest::header::ACCEPT, "application/dns-json")
-            .send()
+            .query("name", domain)
+            .query("type", "A")
+            .header("Accept", "application/dns-json")
+            .call()
             .ok()?;
-        let body: serde_json::Value = resp.json().ok()?;
+        let body: serde_json::Value = resp.body_mut().read_json().ok()?;
         let answers = body.get("Answer")?.as_array()?;
         let ips = answers
             .iter()

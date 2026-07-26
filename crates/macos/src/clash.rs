@@ -41,11 +41,19 @@ impl ClashClient {
     #[must_use]
     pub fn selected(&self, group: &str) -> Option<String> {
         let url = format!("{}/proxies/{}", self.base.trim_end_matches('/'), group);
-        let client = reqwest::blocking::Client::builder()
-            .timeout(HTTP_TIMEOUT)
+        let mut resp = match ureq::get(&url)
+            .config()
+            .timeout_global(Some(HTTP_TIMEOUT))
             .build()
-            .ok()?;
-        let body = match client.get(&url).send().and_then(|r| r.text()) {
+            .call()
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::debug!(url, error = %e, "clash proxies query failed");
+                return None;
+            }
+        };
+        let body = match resp.body_mut().read_to_string() {
             Ok(b) => b,
             Err(e) => {
                 tracing::debug!(url, error = %e, "clash proxies query failed");
@@ -110,11 +118,17 @@ impl ProxyFacts for ProxySystemFacts {
     }
 
     fn tun_probe(&self, url: &str) -> Option<u16> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(HTTP_TIMEOUT)
+        // `http_status_as_error(false)` keeps ureq from turning 4xx/5xx responses
+        // into `Err`, preserving the previous behavior of reporting the status
+        // code of *any* HTTP response (the 204 probe target) and returning `None`
+        // only on a transport/timeout failure.
+        match ureq::get(url)
+            .config()
+            .http_status_as_error(false)
+            .timeout_global(Some(HTTP_TIMEOUT))
             .build()
-            .ok()?;
-        match client.get(url).send() {
+            .call()
+        {
             Ok(resp) => Some(resp.status().as_u16()),
             Err(e) => {
                 tracing::debug!(url, error = %e, "tun probe failed");

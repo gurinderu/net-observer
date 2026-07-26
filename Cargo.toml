@@ -58,7 +58,12 @@ duckdb = { version = "1", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 surge-ping = "0.8"
 socket2 = "0.5"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Pure-Rust synchronous HTTP client. Unlike `reqwest::blocking`, ureq spins up no
+# runtime of its own, so it is safe to call from the synchronous probe traits that
+# run on tokio `spawn_blocking` threads inside the `#[tokio::main]` daemon. Default
+# features give the rustls TLS backend (with webpki-roots) for HTTPS; `json` adds
+# serde_json body (de)serialization for the DoH endpoint.
+ureq = { version = "3", features = ["json"] }
 libc = "0.2"
 tempfile = "3"
 gpui = "0.2.2"

@@ -5,7 +5,7 @@
 //! (`LinkFacts`), and `collector-proxy` (`ProxyFacts`): ICMP ping (`surge-ping`), interface-bound
 //! TCP connect (`socket2` + `IP_BOUND_IF`), DHCP/ARP/Wi-Fi facts (`route` /
 //! `ipconfig` / `arp` / `networksetup`), the Clash/Mihomo RESTful API client
-//! (`reqwest`), and the `tcpdump` pcap ring with freeze-to-disk.
+//! (`ureq`), and the `tcpdump` pcap ring with freeze-to-disk.
 //!
 //! Raw ICMP and `tcpdump` require root, so the reachability paths are verified
 //! manually; the pure parsing/copy logic is unit-tested.

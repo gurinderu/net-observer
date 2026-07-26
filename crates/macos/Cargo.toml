@@ -12,7 +12,7 @@ collector-route.workspace = true
 collector-host.workspace = true
 surge-ping.workspace = true
 socket2.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
+ureq.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 tokio.workspace = true
