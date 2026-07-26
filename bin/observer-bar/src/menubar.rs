@@ -368,20 +368,22 @@ fn panel_window_options(anchor: Bounds<Pixels>) -> WindowOptions {
 ///
 /// ## Coordinate conversion
 ///
-/// gpui `Bounds` are **top-left origin** (global, y grows *down*) and gpui's macOS
-/// backend performs the Cocoa bottom-left flip itself, so we hand it top-left
-/// coordinates directly — we do NOT pre-invert (doing so double-flips the window
-/// off the bottom of the screen). AppKit reports the status window's frame in
-/// bottom-left Cocoa coords, so the only conversion we do is on that one input:
+/// gpui-0.2.2's macOS backend turns `WindowBounds::Windowed(bounds)` into the
+/// native window's bottom-left content-rect origin as (see gpui
+/// `platform/mac/window.rs`):
 ///
-/// - `x` = icon right edge minus panel width (`btn.x + btn.w - PANEL_W`),
-///   right-aligned to the icon, clamped on-screen (`x` is the same in both spaces).
-/// - `y` = panel top = menu-bar bottom = the status window's Cocoa bottom
-///   `btn.origin.y`, flipped to top-left: `display_height - btn.origin.y`
-///   (a small value just under the menu bar).
+/// ```text
+/// ns.x = screen.origin.x + bounds.origin.x
+/// ns.y = screen.origin.y + (display_height - bounds.origin.y)
+/// ```
 ///
-/// `display_height == main NSScreen.frame().size.height`; gpui opens
-/// `display_id: None` windows on the primary display (which owns the menu bar).
+/// where `ns` is the window's **bottom-left** corner in Cocoa screen coords and
+/// `display_height == main screen frame height`. So `bounds.origin.y` maps to the
+/// window's *bottom*, not its top — we must account for the panel height. We pick
+/// the desired native rect (right edge under the icon, top edge at the menu-bar
+/// bottom `btn.origin.y`, hence Cocoa bottom `btn.origin.y - PANEL_H`) and invert
+/// the mapping to get `bounds.origin`. gpui opens `display_id: None` windows on
+/// the primary display (which owns the menu bar), matching `NSScreen::mainScreen`.
 ///
 /// Captured once at startup: menu-bar status items are stable for the app's life,
 /// so the frame does not move. Assumes the status item lives on the primary
@@ -396,15 +398,13 @@ fn compute_anchor_bounds(button: &NSStatusBarButton, mtm: MainThreadMarker) -> B
     match (btn, scr) {
         (Some(btn), Some(scr)) => {
             let display_height = scr.size.height;
-            // gpui `Bounds` are TOP-LEFT origin (global, y grows down); gpui's
-            // macOS backend does the Cocoa bottom-left flip internally, so we pass
-            // top-left coords directly — no inversion here.
-            //   x  = right edge of the icon minus the panel width (right-aligned),
-            //        clamped on-screen.
-            //   y  = panel top = menu-bar bottom = the status window's Cocoa bottom
-            //        (`btn.origin.y`), converted to top-left: display_height - btn.y.
+            // Empirically, gpui-0.2.2 places the window with bounds.origin as its
+            // TOP-LEFT (x from screen left, y from screen top). Anchor the panel
+            // directly under the icon, hanging down and to the right (there is more
+            // room to the right of a near-right menu-bar item than to its left):
+            //   x = icon left edge, y = menu-bar bottom (display_height - btn.y).
             let max_x = (scr.size.width - PANEL_W).max(0.0);
-            let ox = (btn.origin.x + btn.size.width - PANEL_W).clamp(0.0, max_x);
+            let ox = (btn.origin.x - scr.origin.x).clamp(0.0, max_x);
             let oy = (display_height - btn.origin.y).max(0.0);
             Bounds {
                 origin: point(px(ox as f32), px(oy as f32)),
