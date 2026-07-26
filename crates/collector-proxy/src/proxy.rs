@@ -1,22 +1,20 @@
-use collector_core::TcpProber;
+use collector_core::PingOutcome;
 use types::{ProxySample, TcpVerdict};
-
-use crate::probes::ProxyFacts;
 
 /// Pure mapping: one [`ProxySample`] per upstream server, with the shared
 /// `tun_code`/`selector` attached to every row. Emits a single `SKIP` row when
 /// no servers are configured (absence of a signal is itself diagnostic).
+///
+/// This is a SYNC assembly step: the async `collect` awaits the probes, then
+/// hands the fetched values here. `probed` is the per-server `(ip, outcome)`
+/// pairs already gathered from the [`TcpProber`](collector_core::TcpProber).
 pub fn build_proxy_samples(
     ts_us: i64,
-    tcp: &dyn TcpProber,
-    facts: &dyn ProxyFacts,
-    tun_url: &str,
-    iface: &str,
+    tun_code: Option<u16>,
+    selector: Option<String>,
+    probed: Vec<(String, PingOutcome)>,
 ) -> Vec<ProxySample> {
-    let tun_code = facts.tun_probe(tun_url);
-    let selector = facts.selector();
-    let ips = facts.server_endpoints();
-    if ips.is_empty() {
+    if probed.is_empty() {
         return vec![ProxySample {
             ts_us,
             server_ip: "-".into(),
@@ -26,21 +24,19 @@ pub fn build_proxy_samples(
             selector,
         }];
     }
-    ips.into_iter()
-        .map(|ip| {
-            let o = tcp.connect_bound(&ip, 443, iface);
-            ProxySample {
-                ts_us,
-                server_ip: ip,
-                tcp: if o.reachable {
-                    TcpVerdict::Ok
-                } else {
-                    TcpVerdict::Fail
-                },
-                rtt_ms: o.rtt_ms,
-                tun_code,
-                selector: selector.clone(),
-            }
+    probed
+        .into_iter()
+        .map(|(ip, o)| ProxySample {
+            ts_us,
+            server_ip: ip,
+            tcp: if o.reachable {
+                TcpVerdict::Ok
+            } else {
+                TcpVerdict::Fail
+            },
+            rtt_ms: o.rtt_ms,
+            tun_code,
+            selector: selector.clone(),
         })
         .collect()
 }
@@ -48,58 +44,36 @@ pub fn build_proxy_samples(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use collector_core::{PingOutcome, Readiness};
     use types::TcpVerdict;
-    struct T(bool);
-    impl TcpProber for T {
-        fn connect_bound(&self, _: &str, _: u16, _: &str) -> PingOutcome {
-            PingOutcome {
-                reachable: self.0,
-                rtt_ms: Some(9.0),
-            }
-        }
-    }
-    struct F;
-    impl ProxyFacts for F {
-        fn server_endpoints(&self) -> Vec<String> {
-            vec!["1.1.1.1".into(), "2.2.2.2".into()]
-        }
-        fn tun_probe(&self, _: &str) -> Option<u16> {
-            Some(204)
-        }
-        fn selector(&self) -> Option<String> {
-            Some("node-a".into())
-        }
-        fn preflight(&self) -> Readiness {
-            Readiness::Ready
-        }
-    }
+
     #[test]
     fn one_row_per_server_with_tun_and_selector() {
-        let rows = build_proxy_samples(7, &T(true), &F, "http://x/204", "en0");
+        let probed = vec![
+            (
+                "1.1.1.1".to_string(),
+                PingOutcome {
+                    reachable: true,
+                    rtt_ms: Some(9.0),
+                },
+            ),
+            (
+                "2.2.2.2".to_string(),
+                PingOutcome {
+                    reachable: true,
+                    rtt_ms: Some(9.0),
+                },
+            ),
+        ];
+        let rows = build_proxy_samples(7, Some(204), Some("node-a".into()), probed);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.tcp == TcpVerdict::Ok
             && r.tun_code == Some(204)
             && r.selector.as_deref() == Some("node-a")));
     }
+
     #[test]
     fn skip_verdict_when_no_servers() {
-        struct Empty;
-        impl ProxyFacts for Empty {
-            fn server_endpoints(&self) -> Vec<String> {
-                vec![]
-            }
-            fn tun_probe(&self, _: &str) -> Option<u16> {
-                None
-            }
-            fn selector(&self) -> Option<String> {
-                None
-            }
-            fn preflight(&self) -> Readiness {
-                Readiness::Ready
-            }
-        }
-        let rows = build_proxy_samples(7, &T(false), &Empty, "http://x/204", "en0");
+        let rows = build_proxy_samples(7, None, None, Vec::new());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tcp, TcpVerdict::Skip);
     }

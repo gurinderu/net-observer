@@ -48,7 +48,7 @@ impl Collector for RouteCollector {
         Source::Event
     }
 
-    fn preflight(&self) -> Readiness {
+    async fn preflight(&self) -> Readiness {
         self.ready.clone()
     }
 
@@ -103,11 +103,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn preflight_reflects_constructed_readiness() {
-        assert!(collector(Readiness::Ready).preflight().is_ready());
+    #[tokio::test]
+    async fn preflight_reflects_constructed_readiness() {
+        assert!(collector(Readiness::Ready).preflight().await.is_ready());
         let c = collector(Readiness::Unavailable("no PF_ROUTE socket".into()));
-        assert!(!c.preflight().is_ready());
+        assert!(!c.preflight().await.is_ready());
     }
 
     #[test]

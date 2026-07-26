@@ -198,24 +198,39 @@ pub trait EventSource: Send {
 
 pub trait Collector: Send + Sync {
     fn meta(&self) -> &'static CollectorMeta;
-    fn source(&self) -> Source;             // Interval(d) or Event
-    fn preflight(&self) -> Readiness;       // deps present? perms? interface exists?
-    // Interval collectors implement collect()/skip(); event collectors leave the
-    // defaults and override into_event_source().
-    fn collect(&self, ts_us: i64) -> Vec<Sample> { Vec::new() }  // one tick (blocking pool)
-    fn skip(&self, ts_us: i64) -> Vec<Sample> { Vec::new() }     // SKIP on probe failure
+    fn source(&self) -> Source;                       // Interval(d) or Event (sync metadata)
+    async fn preflight(&self) -> Readiness;           // deps present? perms? reachable?
+    // Interval collectors implement collect()/skip(); event collectors override into_event_source().
+    async fn collect(&self, ts_us: i64) -> Vec<Sample> { Vec::new() }  // one async tick
+    fn skip(&self, ts_us: i64) -> Vec<Sample> { Vec::new() }           // SKIP on probe failure (pure)
     fn into_event_source(self: Box<Self>) -> Option<Box<dyn EventSource>> { None }
 }
 ```
 
+**Async collectors (native `async fn`, no macro).** The probe ports
+(`Pinger`/`TcpProber`/`LinkFacts`/`ProxyFacts`/`DnsFacts`/`HostFacts`) and
+`Collector::{collect, preflight}` are native `async fn`. The macOS adapters use
+async-native I/O: `surge-ping` (ICMP), `tokio::net::TcpStream` + `socket2`
+(`IP_BOUND_IF`), `reqwest` async (tun-204 / DoH / Clash), `tokio::process`
+(`ipconfig`/`arp`/`networksetup`/`tcpdump`), `getloadavg` inline. **No
+`spawn_blocking` on the interval path.** The pure sample-assembly (`build_link_sample`
+etc.) stays SYNC — `collect()` `await`s the probes, then a sync `build_*`
+composes the `Sample` from the fetched values, so mapping stays trivially
+testable while async lives only in the probe fakes (`#[tokio::test]`).
+
+Heterogeneous dispatch without `dyn`-async friction: `observerd` holds an
+`enum AnyCollector { Link(..), Proxy(..), Dns(..), Route(..), Host(..) }` and
+matches per method (native `async fn`, zero boxing, zero macros). `collector-core`
+defines the trait but cannot enumerate the concrete collectors, so the enum lives
+in the daemon.
+
 **Cadence — timer vs event.** The daemon dispatches on `source()`:
-- `Interval(d)` — the daemon drives a timer loop calling `collect(ts_us)` on the
-  blocking pool every `d` (link, proxy, and the future dns/host).
-- `Event` — the daemon takes `into_event_source()` and runs its blocking
-  `next()` loop on the blocking pool, forwarding samples as they arrive. This is
-  how `route-events` (a PF_ROUTE socket `recv` that blocks until the kernel
-  announces an interface/route change) will plug in without a poll. `collector-core`
-  stays runtime-agnostic (no tokio); the async driving lives in `observerd`.
+- `Interval(d)` — a `tokio::time::interval` loop `await`ing `collect(ts_us)` every `d`.
+- `Event` — the collector's `into_event_source()` blocking `next()` runs on a
+  dedicated OS thread bridged to the async daemon via a channel. PF_ROUTE's
+  `read(2)` is genuinely uninterruptible-blocking, so it stays on a thread
+  regardless — the only truly blocking probe. `collector-core` still declares no
+  tokio dependency it can avoid; the async driving lives in `observerd`.
 
 `pcap-ring` is not a sample-producing collector — it is continuous capture
 infrastructure (in `macos`) frozen on a trigger, not a stream of `Sample` rows.

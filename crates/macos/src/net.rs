@@ -1,28 +1,29 @@
 //! Network reachability probes: ICMP echo (`surge-ping`) and interface-bound
-//! TCP connect (`socket2` + macOS `IP_BOUND_IF`).
+//! TCP connect (`socket2` + macOS `IP_BOUND_IF` → `tokio::net::TcpStream`).
 //!
-//! Both are synchronous and blocking — call them from a `spawn_blocking`
-//! context. Raw ICMP and, on some networks, bound TCP need elevated
-//! privileges, so failures degrade to an unreachable [`PingOutcome`] rather
-//! than panicking ("absence is a signal").
+//! Both are native `async fn` and run directly on the daemon's tokio runtime —
+//! no `spawn_blocking`. Raw ICMP and, on some networks, bound TCP need elevated
+//! privileges, so failures degrade to an unreachable [`PingOutcome`] rather than
+//! panicking ("absence is a signal").
 
 use std::ffi::CString;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::os::fd::{AsRawFd, RawFd};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use collector_core::{PingOutcome, Pinger, TcpProber};
 use socket2::{Domain, Protocol, Socket, Type};
 use surge_ping::{Client, Config, ICMP, PingIdentifier, PingSequence};
+use tokio::net::TcpStream;
+use tokio::time::{Duration, timeout};
 
 /// Per-probe deadline. Kept short: a stalled probe is itself a signal.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// ICMP echo pinger backed by `surge-ping`.
 ///
-/// Builds a tiny current-thread tokio runtime per call and blocks on a single
-/// echo request, so it must be invoked from a blocking context (never from
-/// inside an async runtime worker).
+/// Sends a single echo request on the daemon's runtime and awaits the reply (or
+/// the [`PROBE_TIMEOUT`]), so it is called directly from the async interval path.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct IcmpPinger;
 
@@ -35,7 +36,7 @@ impl IcmpPinger {
 }
 
 impl Pinger for IcmpPinger {
-    fn ping_gw(&self, gw: &str) -> PingOutcome {
+    async fn ping_gw(&self, gw: &str) -> PingOutcome {
         let Ok(addr) = gw.parse::<IpAddr>() else {
             tracing::debug!(%gw, "gateway is not a parseable IP address");
             return PingOutcome {
@@ -43,7 +44,7 @@ impl Pinger for IcmpPinger {
                 rtt_ms: None,
             };
         };
-        match ping_once(addr) {
+        match ping_once(addr).await {
             Some(rtt_ms) => PingOutcome {
                 reachable: true,
                 rtt_ms: Some(rtt_ms),
@@ -57,29 +58,23 @@ impl Pinger for IcmpPinger {
 }
 
 /// Send a single ICMP echo to `addr`, returning the RTT in milliseconds.
-fn ping_once(addr: IpAddr) -> Option<f64> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()?;
-    rt.block_on(async move {
-        let config = match addr {
-            IpAddr::V4(_) => Config::default(),
-            IpAddr::V6(_) => Config::builder().kind(ICMP::V6).build(),
-        };
-        let client = Client::new(&config).ok()?;
-        let ident = PingIdentifier((std::process::id() & 0xffff) as u16);
-        let mut pinger = client.pinger(addr, ident).await;
-        pinger.timeout(PROBE_TIMEOUT);
-        let payload = [0u8; 56];
-        match pinger.ping(PingSequence(0), &payload).await {
-            Ok((_packet, rtt)) => Some(rtt.as_secs_f64() * 1000.0),
-            Err(e) => {
-                tracing::debug!(error = %e, "icmp echo failed");
-                None
-            }
+async fn ping_once(addr: IpAddr) -> Option<f64> {
+    let config = match addr {
+        IpAddr::V4(_) => Config::default(),
+        IpAddr::V6(_) => Config::builder().kind(ICMP::V6).build(),
+    };
+    let client = Client::new(&config).ok()?;
+    let ident = PingIdentifier((std::process::id() & 0xffff) as u16);
+    let mut pinger = client.pinger(addr, ident).await;
+    pinger.timeout(PROBE_TIMEOUT);
+    let payload = [0u8; 56];
+    match pinger.ping(PingSequence(0), &payload).await {
+        Ok((_packet, rtt)) => Some(rtt.as_secs_f64() * 1000.0),
+        Err(e) => {
+            tracing::debug!(error = %e, "icmp echo failed");
+            None
         }
-    })
+    }
 }
 
 /// TCP connectivity prober that pins the connect to a physical interface via
@@ -97,8 +92,8 @@ impl BoundTcpProber {
 }
 
 impl TcpProber for BoundTcpProber {
-    fn connect_bound(&self, host: &str, port: u16, iface: &str) -> PingOutcome {
-        match connect_bound_inner(host, port, iface) {
+    async fn connect_bound(&self, host: &str, port: u16, iface: &str) -> PingOutcome {
+        match connect_bound_inner(host, port, iface).await {
             Some(rtt_ms) => PingOutcome {
                 reachable: true,
                 rtt_ms: Some(rtt_ms),
@@ -111,21 +106,45 @@ impl TcpProber for BoundTcpProber {
     }
 }
 
-/// Open a TCP socket, bind it to `iface`, and connect to `host:port` with a
-/// timeout, returning the connect latency in milliseconds on success.
-fn connect_bound_inner(host: &str, port: u16, iface: &str) -> Option<f64> {
+/// Open a TCP socket, pin it to `iface` (`IP_BOUND_IF`), start a non-blocking
+/// connect to `host:port`, and await completion under [`PROBE_TIMEOUT`] via
+/// `tokio::net::TcpStream`, returning the connect latency in milliseconds on
+/// success.
+async fn connect_bound_inner(host: &str, port: u16, iface: &str) -> Option<f64> {
     let addr = (host, port).to_socket_addrs().ok()?.next()?;
     let domain = match addr {
         SocketAddr::V4(_) => Domain::IPV4,
         SocketAddr::V6(_) => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).ok()?;
+    // A non-blocking socket lets tokio drive the connect to completion.
+    socket.set_nonblocking(true).ok()?;
     if !iface.is_empty() && domain == Domain::IPV4 && !bind_to_iface_v4(socket.as_raw_fd(), iface) {
         tracing::debug!(iface, "IP_BOUND_IF failed; probing on default route");
     }
     let start = Instant::now();
-    socket.connect_timeout(&addr.into(), PROBE_TIMEOUT).ok()?;
-    Some(start.elapsed().as_secs_f64() * 1000.0)
+    // Kick off the non-blocking connect: EINPROGRESS is the expected "started"
+    // reply; anything else is an immediate failure.
+    match socket.connect(&addr.into()) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, "bound tcp connect failed to start");
+            return None;
+        }
+    }
+    let stream = TcpStream::from_std(socket.into()).ok()?;
+    // The socket becomes writable once the connect completes (success *or*
+    // failure); a bounded wait keeps a stalled connect from parking forever.
+    match timeout(PROBE_TIMEOUT, stream.writable()).await {
+        Ok(Ok(())) => {}
+        _ => return None,
+    }
+    // Distinguish a completed connect from a failed one via SO_ERROR.
+    match stream.take_error() {
+        Ok(None) => Some(start.elapsed().as_secs_f64() * 1000.0),
+        _ => None,
+    }
 }
 
 /// Pin an IPv4 socket to a physical interface with `IP_BOUND_IF`.
@@ -159,19 +178,21 @@ fn bind_to_iface_v4(fd: RawFd, iface: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn ping_gw_rejects_non_ip() {
+    #[tokio::test]
+    async fn ping_gw_rejects_non_ip() {
         let p = IcmpPinger::new();
-        let out = p.ping_gw("not-an-ip");
+        let out = p.ping_gw("not-an-ip").await;
         assert!(!out.reachable);
         assert_eq!(out.rtt_ms, None);
     }
 
-    #[test]
-    fn connect_bound_unresolvable_host_is_unreachable() {
+    #[tokio::test]
+    async fn connect_bound_unresolvable_host_is_unreachable() {
         // A host that cannot resolve must degrade to unreachable, never panic.
         let p = BoundTcpProber::new();
-        let out = p.connect_bound("this.host.does.not.exist.invalid", 443, "en0");
+        let out = p
+            .connect_bound("this.host.does.not.exist.invalid", 443, "en0")
+            .await;
         assert!(!out.reachable);
         assert_eq!(out.rtt_ms, None);
     }

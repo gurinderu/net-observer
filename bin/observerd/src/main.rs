@@ -19,7 +19,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use collector_core::{Collector, EventSource, Os, Readiness, Source};
+use collector_core::{Collector, CollectorMeta, EventSource, Os, Readiness, Source};
 use collector_dns::DnsCollector;
 use collector_host::HostCollector;
 use collector_link::{LinkCollector, LinkFacts};
@@ -68,11 +68,11 @@ const SINGBOX_CONFIG_PATH: &str = "/etc/sing-box/config.json";
 const CLASH_SELECTOR_GROUP: &str = "GLOBAL";
 
 /// Upper bound on the post-signal drain. The `route` collector's PF_ROUTE
-/// `read(2)` runs on a blocking thread that `abort()` cannot interrupt, so it
+/// `read(2)` runs on a dedicated OS thread that cannot be interrupted, so it
 /// keeps a stream sender alive and the consumer's `rx.recv()` may never observe
-/// the stream close. Bounding the drain here (and reaping the leftover blocking
-/// thread with [`tokio::runtime::Runtime::shutdown_timeout`] in [`main`]) keeps
-/// shutdown from hanging forever on an idle routing socket.
+/// the stream close. Bounding the drain here keeps shutdown from hanging forever
+/// on an idle routing socket; the detached thread is then reaped by the OS on
+/// process exit.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
@@ -88,9 +88,10 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     // Build the runtime explicitly (instead of `#[tokio::main]`) so shutdown can
-    // be *bounded*. The route collector's PF_ROUTE `read(2)` runs on a blocking
-    // pool thread that cannot be aborted; `shutdown_timeout` guarantees the
-    // process still exits even if that read is parked on an idle socket at exit.
+    // be *bounded*. The route collector's PF_ROUTE `read(2)` runs on a dedicated
+    // OS thread that cannot be aborted; the bounded consumer drain plus process
+    // exit guarantee the daemon still exits even if that read is parked on an idle
+    // socket. `shutdown_timeout` bounds any remaining runtime work too.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -155,51 +156,57 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     let (tx, rx) = mpsc::channel::<Sample>(CHANNEL_CAP);
 
-    // Resolve the physical interface once, for the pcap ring.
+    // Resolve the physical interface once, for the pcap ring. `phys_iface` is a
+    // native `async fn` (it may shell out to `route -n get default`), so it is
+    // awaited here rather than called synchronously.
     let phys_iface = SystemFacts::new(
         cfg.collectors.link.gw.clone(),
         cfg.collectors.link.phys_iface.clone(),
     )
-    .phys_iface();
+    .phys_iface()
+    .await;
 
-    // Build the enabled collectors as Box<dyn Collector>.
-    let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
+    // Build the enabled collectors as the static-dispatch `AnyCollector` enum.
+    // The `Collector` trait is native `async fn` (not `dyn`-compatible), so the
+    // daemon enumerates the concrete collectors instead of boxing them, and the
+    // adapters are passed by value (no `Arc` — each collector owns its ports).
+    let mut collectors: Vec<AnyCollector> = Vec::new();
     if cfg.collectors.link.enabled {
-        collectors.push(Box::new(LinkCollector::new(
-            Arc::new(IcmpPinger::new()),
-            Arc::new(BoundTcpProber::new()),
-            Arc::new(SystemFacts::new(
+        collectors.push(AnyCollector::Link(LinkCollector::new(
+            IcmpPinger::new(),
+            BoundTcpProber::new(),
+            SystemFacts::new(
                 cfg.collectors.link.gw.clone(),
                 cfg.collectors.link.phys_iface.clone(),
-            )),
+            ),
             cfg.collectors.link.interval,
         )));
     }
     if cfg.collectors.proxy.enabled {
-        collectors.push(Box::new(ProxyCollector::new(
-            Arc::new(BoundTcpProber::new()),
-            Arc::new(ProxySystemFacts::new(
+        collectors.push(AnyCollector::Proxy(ProxyCollector::new(
+            BoundTcpProber::new(),
+            ProxySystemFacts::new(
                 SINGBOX_CONFIG_PATH,
                 cfg.collectors.proxy.clash_api.clone(),
                 CLASH_SELECTOR_GROUP,
-            )),
+            ),
             cfg.collectors.proxy.tun_probe_url.clone(),
             phys_iface.clone().unwrap_or_default(),
             cfg.collectors.proxy.interval,
         )));
     }
     if cfg.collectors.dns.enabled {
-        collectors.push(Box::new(DnsCollector::new(
-            Arc::new(DnsResolver::new(
+        collectors.push(AnyCollector::Dns(DnsCollector::new(
+            DnsResolver::new(
                 cfg.collectors.dns.monitored_domain.clone(),
                 cfg.collectors.dns.ru_control_domain.clone(),
                 cfg.collectors.dns.doh_url.clone(),
-            )),
+            ),
             cfg.collectors.dns.interval,
         )));
     }
     if cfg.collectors.host.enabled {
-        collectors.push(Box::new(HostCollector::new(
+        collectors.push(AnyCollector::Host(HostCollector::new(
             Arc::new(HostLoad::new()),
             cfg.collectors.host.interval,
         )));
@@ -216,7 +223,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 Readiness::Unavailable(format!("PF_ROUTE socket: {e}")),
             ),
         };
-        collectors.push(Box::new(RouteCollector::new(source, ready)));
+        collectors.push(AnyCollector::Route(RouteCollector::new(source, ready)));
     }
 
     // Filter by OS meta + preflight, then spawn survivors with one uniform loop.
@@ -228,7 +235,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             tracing::warn!(collector = name, ?os, "unsupported OS; skipping");
             continue;
         }
-        let ready = c.preflight();
+        let ready = c.preflight().await;
         if !ready.is_ready() {
             if let Readiness::Unavailable(reason) = ready {
                 tracing::warn!(collector = name, %reason, "preflight failed; skipping");
@@ -271,10 +278,10 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // Signal path: stop the collectors, which closes the stream, then let the
     // consumer drain what remains and exit. The route collector's blocking
-    // PF_ROUTE `read(2)` cannot be aborted, so its task can keep a stream sender
-    // alive and `rx.recv()` may never see the stream close; bound the drain so
-    // shutdown cannot hang (the leftover blocking thread is reaped by
-    // `shutdown_timeout` in `main`).
+    // PF_ROUTE `read(2)` cannot be aborted, so its dedicated thread can keep a
+    // stream sender alive and `rx.recv()` may never see the stream close; bound
+    // the drain so shutdown cannot hang (the detached thread is reaped by the OS
+    // on process exit).
     abort_all(&handles);
     api_handle.abort();
     match tokio::time::timeout(SHUTDOWN_GRACE, &mut consumer).await {
@@ -286,6 +293,82 @@ async fn run_daemon() -> anyhow::Result<()> {
         ),
     }
     Ok(())
+}
+
+/// Static-dispatch union of every concrete collector.
+///
+/// The [`Collector`] trait uses native `async fn`, so it is not `dyn`-compatible
+/// (no vtable, no boxing, no `async-trait` macro). The daemon therefore drives a
+/// heterogeneous set of collectors through this enum: each method delegates by
+/// `match` to the concrete collector, and the async ones `await` the underlying
+/// future. Because every arm is a concrete type, the composed `collect` future is
+/// `Send` and can be spawned onto the runtime without `Box::pin`.
+pub(crate) enum AnyCollector {
+    Link(LinkCollector<IcmpPinger, BoundTcpProber, SystemFacts>),
+    Proxy(ProxyCollector<BoundTcpProber, ProxySystemFacts>),
+    Dns(DnsCollector<DnsResolver>),
+    Route(RouteCollector),
+    Host(HostCollector<HostLoad>),
+}
+
+impl AnyCollector {
+    /// Static metadata (name + supported OSes).
+    pub(crate) fn meta(&self) -> &'static CollectorMeta {
+        match self {
+            Self::Link(c) => c.meta(),
+            Self::Proxy(c) => c.meta(),
+            Self::Dns(c) => c.meta(),
+            Self::Route(c) => c.meta(),
+            Self::Host(c) => c.meta(),
+        }
+    }
+
+    /// The cadence the daemon should drive this collector on.
+    pub(crate) fn source(&self) -> Source {
+        match self {
+            Self::Link(c) => c.source(),
+            Self::Proxy(c) => c.source(),
+            Self::Dns(c) => c.source(),
+            Self::Route(c) => c.source(),
+            Self::Host(c) => c.source(),
+        }
+    }
+
+    /// Runtime capability probe (async: may shell out or open a socket).
+    pub(crate) async fn preflight(&self) -> Readiness {
+        match self {
+            Self::Link(c) => c.preflight().await,
+            Self::Proxy(c) => c.preflight().await,
+            Self::Dns(c) => c.preflight().await,
+            Self::Route(c) => c.preflight().await,
+            Self::Host(c) => c.preflight().await,
+        }
+    }
+
+    /// One interval tick: await the probes and compose the samples. Collectors
+    /// handle their own probe errors internally and return SKIP samples rather
+    /// than panicking, so the interval loop never needs to catch a failure.
+    pub(crate) async fn collect(&self, ts_us: i64) -> Vec<Sample> {
+        match self {
+            Self::Link(c) => c.collect(ts_us).await,
+            Self::Proxy(c) => c.collect(ts_us).await,
+            Self::Dns(c) => c.collect(ts_us).await,
+            Self::Route(c) => c.collect(ts_us).await,
+            Self::Host(c) => c.collect(ts_us).await,
+        }
+    }
+
+    /// For event collectors: take out the blocking source the daemon drives on a
+    /// dedicated thread. Interval collectors return `None` (the default).
+    pub(crate) fn into_event_source(self) -> Option<Box<dyn EventSource>> {
+        match self {
+            Self::Link(c) => Box::new(c).into_event_source(),
+            Self::Proxy(c) => Box::new(c).into_event_source(),
+            Self::Dns(c) => Box::new(c).into_event_source(),
+            Self::Route(c) => Box::new(c).into_event_source(),
+            Self::Host(c) => Box::new(c).into_event_source(),
+        }
+    }
 }
 
 /// A no-op [`EventSource`] used only when the PF_ROUTE socket fails to open, so

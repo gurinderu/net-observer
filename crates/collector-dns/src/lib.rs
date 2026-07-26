@@ -11,4 +11,4 @@ pub mod sample;
 
 pub use collector::{DnsCollector, META};
 pub use facts::DnsFacts;
-pub use sample::build_dns_samples;
+pub use sample::{ResolvedProbe, build_dns_samples};

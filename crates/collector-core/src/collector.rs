@@ -26,15 +26,16 @@ pub trait EventSource: Send {
 
 /// One collector subsystem. Interval collectors implement `collect()`/`skip()`;
 /// event collectors leave those defaults and override `into_event_source()`.
+#[allow(async_fn_in_trait)] // internal workspace trait, not a published API
 pub trait Collector: Send + Sync {
     /// Static metadata: name + supported OSes.
     fn meta(&self) -> &'static CollectorMeta;
     /// The cadence the daemon should drive this collector on.
     fn source(&self) -> Source;
     /// Runtime capability probe: deps present? perms? interface exists?
-    fn preflight(&self) -> Readiness;
-    /// One interval tick (runs on the blocking pool).
-    fn collect(&self, _ts_us: i64) -> Vec<Sample> {
+    async fn preflight(&self) -> Readiness;
+    /// One interval tick: `await`s the probes, then a sync `build_*` composes the samples.
+    async fn collect(&self, _ts_us: i64) -> Vec<Sample> {
         Vec::new()
     }
     /// SKIP samples emitted when a probe fails (absence of a signal is diagnostic).

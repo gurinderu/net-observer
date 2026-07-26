@@ -12,11 +12,13 @@ pub struct PingOutcome {
 }
 
 /// ICMP echo to the default gateway.
+#[allow(async_fn_in_trait)] // internal workspace port, not a published API
 pub trait Pinger: Send + Sync {
-    fn ping_gw(&self, gw: &str) -> PingOutcome;
+    async fn ping_gw(&self, gw: &str) -> PingOutcome;
 }
 
 /// TCP connect bound to a specific physical interface (`IP_BOUND_IF`).
+#[allow(async_fn_in_trait)] // internal workspace port, not a published API
 pub trait TcpProber: Send + Sync {
-    fn connect_bound(&self, host: &str, port: u16, iface: &str) -> PingOutcome;
+    async fn connect_bound(&self, host: &str, port: u16, iface: &str) -> PingOutcome;
 }

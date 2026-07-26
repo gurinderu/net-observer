@@ -6,11 +6,11 @@
 //! Every field parses defensively: a missing tool, non-zero exit, or
 //! unrecognised output yields `None`, never a panic — "absence is a signal".
 
-use std::process::Command;
 use std::time::Duration;
 
 use collector_core::Readiness;
 use collector_link::LinkFacts;
+use tokio::process::Command;
 
 use crate::wifi;
 
@@ -51,27 +51,27 @@ impl SystemFacts {
 }
 
 impl LinkFacts for SystemFacts {
-    fn default_gw(&self) -> Option<String> {
+    async fn default_gw(&self) -> Option<String> {
         if let Some(gw) = &self.gw_override {
             return Some(gw.clone());
         }
-        let out = run("route", &["-n", "get", "default"])?;
+        let out = run("route", &["-n", "get", "default"]).await?;
         parse_route_field(&out, "gateway")
     }
 
-    fn phys_iface(&self) -> Option<String> {
+    async fn phys_iface(&self) -> Option<String> {
         if let Some(iface) = &self.iface_override {
             return Some(iface.clone());
         }
-        let out = run("route", &["-n", "get", "default"])?;
+        let out = run("route", &["-n", "get", "default"]).await?;
         parse_route_field(&out, "interface")
     }
 
-    fn dhcp(&self) -> (Option<String>, Option<String>) {
-        let Some(iface) = self.phys_iface() else {
+    async fn dhcp(&self) -> (Option<String>, Option<String>) {
+        let Some(iface) = self.phys_iface().await else {
             return (None, None);
         };
-        let Some(out) = run("ipconfig", &["getpacket", &iface]) else {
+        let Some(out) = run("ipconfig", &["getpacket", &iface]).await else {
             return (None, None);
         };
         let router = ip_for_key(&out, "router");
@@ -79,22 +79,24 @@ impl LinkFacts for SystemFacts {
         (router, dns)
     }
 
-    fn gw_arp_mac(&self, gw: &str) -> Option<String> {
-        let out = run("arp", &["-n", gw])?;
+    async fn gw_arp_mac(&self, gw: &str) -> Option<String> {
+        let out = run("arp", &["-n", gw]).await?;
         parse_arp_mac(&out, gw)
     }
 
-    fn ssid(&self) -> Option<String> {
-        let iface = self.phys_iface()?;
-        wifi::current_ssid(&iface)
+    async fn ssid(&self) -> Option<String> {
+        let iface = self.phys_iface().await?;
+        wifi::current_ssid(&iface).await
     }
 
-    fn wifi_capture_present(&self) -> bool {
+    async fn wifi_capture_present(&self) -> bool {
+        // A directory scan (not a subprocess): an instant filesystem read kept
+        // synchronous inside the async fn.
         wifi::wifi_capture_present(self.capture_window)
     }
 
-    fn preflight(&self) -> Readiness {
-        if self.phys_iface().is_some() {
+    async fn preflight(&self) -> Readiness {
+        if self.phys_iface().await.is_some() {
             Readiness::Ready
         } else {
             Readiness::Unavailable("no physical interface".into())
@@ -104,8 +106,8 @@ impl LinkFacts for SystemFacts {
 
 /// Run `cmd args...` and return its stdout as a `String`, or `None` if the
 /// process could not be spawned or its output was not valid UTF-8.
-fn run(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = match Command::new(cmd).args(args).output() {
+async fn run(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = match Command::new(cmd).args(args).output().await {
         Ok(o) => o,
         Err(e) => {
             tracing::debug!(cmd, error = %e, "command failed to spawn");
@@ -218,10 +220,10 @@ mod tests {
         assert_eq!(parse_arp_mac(out, "10.20.0.1"), None);
     }
 
-    #[test]
-    fn overrides_short_circuit_command() {
+    #[tokio::test]
+    async fn overrides_short_circuit_command() {
         let facts = SystemFacts::new(Some("1.2.3.4".into()), Some("en5".into()));
-        assert_eq!(facts.default_gw().as_deref(), Some("1.2.3.4"));
-        assert_eq!(facts.phys_iface().as_deref(), Some("en5"));
+        assert_eq!(facts.default_gw().await.as_deref(), Some("1.2.3.4"));
+        assert_eq!(facts.phys_iface().await.as_deref(), Some("en5"));
     }
 }

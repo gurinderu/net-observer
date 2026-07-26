@@ -12,7 +12,7 @@
 //! The network paths (system `getaddrinfo`, DoH request) are verified manually;
 //! the pure classification/range logic is unit-tested.
 
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
 use collector_core::Readiness;
@@ -32,7 +32,7 @@ pub struct DnsResolver {
     monitored_domain: String,
     ru_control_domain: String,
     doh_url: String,
-    agent: ureq::Agent,
+    http: reqwest::Client,
 }
 
 impl DnsResolver {
@@ -40,15 +40,15 @@ impl DnsResolver {
     /// `doh_url` for the DoH path.
     #[must_use]
     pub fn new(monitored_domain: String, ru_control_domain: String, doh_url: String) -> Self {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(RESOLVE_TIMEOUT))
-            .build();
-        let agent: ureq::Agent = config.into();
+        let http = reqwest::Client::builder()
+            .timeout(RESOLVE_TIMEOUT)
+            .build()
+            .unwrap_or_default();
         Self {
             monitored_domain,
             ru_control_domain,
             doh_url,
-            agent,
+            http,
         }
     }
 
@@ -62,27 +62,30 @@ impl DnsResolver {
         }
     }
 
-    /// Resolve `domain` via the system resolver (`getaddrinfo`). `None` on error;
-    /// an empty vector means the resolver answered with no addresses.
-    fn system_lookup(domain: &str) -> Option<Vec<IpAddr>> {
-        format!("{domain}:0")
-            .to_socket_addrs()
-            .ok()
-            .map(|it| it.map(|sa| sa.ip()).collect())
+    /// Resolve `domain` via the system resolver (`getaddrinfo`, run async-native
+    /// by `tokio::net::lookup_host`), bounded by [`RESOLVE_TIMEOUT`]. `None` on
+    /// error/timeout; an empty vector means the resolver answered with no
+    /// addresses.
+    async fn system_lookup(domain: &str) -> Option<Vec<IpAddr>> {
+        let host = format!("{domain}:0");
+        match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(host)).await {
+            Ok(Ok(addrs)) => Some(addrs.map(|sa| sa.ip()).collect()),
+            _ => None,
+        }
     }
 
     /// Resolve `domain`'s A records via Cloudflare's DoH JSON API. `None` on any
     /// request/parse error.
-    fn doh_lookup(&self, domain: &str) -> Option<Vec<IpAddr>> {
-        let mut resp = self
-            .agent
+    async fn doh_lookup(&self, domain: &str) -> Option<Vec<IpAddr>> {
+        let resp = self
+            .http
             .get(&self.doh_url)
-            .query("name", domain)
-            .query("type", "A")
+            .query(&[("name", domain), ("type", "A")])
             .header("Accept", "application/dns-json")
-            .call()
+            .send()
+            .await
             .ok()?;
-        let body: serde_json::Value = resp.body_mut().read_json().ok()?;
+        let body: serde_json::Value = resp.json().await.ok()?;
         let answers = body.get("Answer")?.as_array()?;
         let ips = answers
             .iter()
@@ -96,12 +99,16 @@ impl DnsResolver {
 }
 
 impl DnsFacts for DnsResolver {
-    fn resolve(&self, probe: &str, server: &str) -> (DnsVerdict, Option<String>, Option<f64>) {
+    async fn resolve(
+        &self,
+        probe: &str,
+        server: &str,
+    ) -> (DnsVerdict, Option<String>, Option<f64>) {
         let domain = self.domain_for(probe);
         let start = Instant::now();
         let ips = match server {
-            "doh" => self.doh_lookup(&domain),
-            _ => Self::system_lookup(&domain),
+            "doh" => self.doh_lookup(&domain).await,
+            _ => Self::system_lookup(&domain).await,
         };
         #[allow(clippy::cast_precision_loss)]
         let rtt_ms = start.elapsed().as_micros() as f64 / 1000.0;
@@ -111,7 +118,7 @@ impl DnsFacts for DnsResolver {
         classify(flag_fakeip, ips.as_deref(), rtt_ms)
     }
 
-    fn probes(&self) -> Vec<(String, String)> {
+    async fn probes(&self) -> Vec<(String, String)> {
         vec![
             ("nks".into(), "sb".into()),
             (RU_CONTROL_PROBE.into(), "sb".into()),
@@ -119,7 +126,7 @@ impl DnsFacts for DnsResolver {
         ]
     }
 
-    fn preflight(&self) -> Readiness {
+    async fn preflight(&self) -> Readiness {
         if self.monitored_domain.is_empty() && self.ru_control_domain.is_empty() {
             Readiness::Unavailable("no resolver domain configured".into())
         } else {
@@ -174,8 +181,8 @@ mod tests {
         assert!(!is_fakeip_v4(Ipv4Addr::new(87, 250, 250, 242)));
     }
 
-    #[test]
-    fn control_probe_maps_to_ru_control_domain() {
+    #[tokio::test]
+    async fn control_probe_maps_to_ru_control_domain() {
         let r = DnsResolver::new(
             "nks.lab.mirari.ru".into(),
             "ya.ru".into(),
@@ -184,7 +191,7 @@ mod tests {
         assert_eq!(r.domain_for("nks"), "nks.lab.mirari.ru");
         assert_eq!(r.domain_for("ru"), "ya.ru");
         assert_eq!(r.domain_for("other"), "other");
-        assert!(r.preflight().is_ready());
+        assert!(r.preflight().await.is_ready());
     }
 
     #[test]

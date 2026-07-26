@@ -22,8 +22,10 @@ impl HostLoad {
 }
 
 impl HostFacts for HostLoad {
-    fn loadavg(&self) -> Option<(f64, f64, f64)> {
+    async fn loadavg(&self) -> Option<(f64, f64, f64)> {
         let mut avg = [0f64; 3];
+        // `getloadavg` is an instant syscall (reads a cached kernel average), so
+        // it is called inline in the async fn — no blocking, no `spawn_blocking`.
         // SAFETY: `getloadavg` writes up to `nelem` `c_double`s into the buffer;
         // we pass a 3-element buffer and request exactly 3, matching its
         // contract. It returns the number of samples written, or -1 on failure.
@@ -35,8 +37,8 @@ impl HostFacts for HostLoad {
         }
     }
 
-    fn preflight(&self) -> Readiness {
-        if self.loadavg().is_some() {
+    async fn preflight(&self) -> Readiness {
+        if self.loadavg().await.is_some() {
             Readiness::Ready
         } else {
             Readiness::Unavailable("loadavg unreadable".into())
@@ -48,18 +50,18 @@ impl HostFacts for HostLoad {
 mod tests {
     use super::*;
 
-    #[test]
-    fn loadavg_reads_three_finite_nonnegative_values() {
+    #[tokio::test]
+    async fn loadavg_reads_three_finite_nonnegative_values() {
         // `getloadavg` is available on every macOS host the daemon runs on.
-        let (l1, l5, l15) = HostLoad::new().loadavg().expect("loadavg readable");
+        let (l1, l5, l15) = HostLoad::new().loadavg().await.expect("loadavg readable");
         for v in [l1, l5, l15] {
             assert!(v.is_finite(), "load average must be finite: {v}");
             assert!(v >= 0.0, "load average must be non-negative: {v}");
         }
     }
 
-    #[test]
-    fn preflight_is_ready_when_loadavg_readable() {
-        assert!(HostLoad::new().preflight().is_ready());
+    #[tokio::test]
+    async fn preflight_is_ready_when_loadavg_readable() {
+        assert!(HostLoad::new().preflight().await.is_ready());
     }
 }

@@ -1,14 +1,13 @@
 //! Static [`META`] and the [`DnsCollector`] that wires the `dns` resolver port
 //! into the [`Collector`] abstraction the daemon drives.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use collector_core::{Collector, CollectorMeta, Os, Readiness, Source};
 use types::{DnsSample, DnsVerdict, Sample};
 
 use crate::facts::DnsFacts;
-use crate::sample::build_dns_samples;
+use crate::sample::{ResolvedProbe, build_dns_samples};
 
 /// Static metadata for the `dns` collector: macOS-only in v1.
 pub const META: CollectorMeta = CollectorMeta {
@@ -18,19 +17,23 @@ pub const META: CollectorMeta = CollectorMeta {
 
 /// The `dns` collector: resolver probes (sing-box TUN DNS, DHCP resolver, DoH,
 /// control domain), polled on a fixed interval.
-pub struct DnsCollector {
-    facts: Arc<dyn DnsFacts>,
+///
+/// Generic over its [`DnsFacts`] port for static dispatch — the async probe
+/// methods make the trait non-`dyn`-compatible, so the daemon enumerates the
+/// concrete collector types instead of boxing.
+pub struct DnsCollector<F: DnsFacts> {
+    facts: F,
     interval: Duration,
 }
 
-impl DnsCollector {
+impl<F: DnsFacts> DnsCollector<F> {
     /// Construct a `dns` collector from its resolver port and poll interval.
-    pub fn new(facts: Arc<dyn DnsFacts>, interval: Duration) -> Self {
+    pub fn new(facts: F, interval: Duration) -> Self {
         Self { facts, interval }
     }
 }
 
-impl Collector for DnsCollector {
+impl<F: DnsFacts> Collector for DnsCollector<F> {
     fn meta(&self) -> &'static CollectorMeta {
         &META
     }
@@ -39,12 +42,24 @@ impl Collector for DnsCollector {
         Source::Interval(self.interval)
     }
 
-    fn preflight(&self) -> Readiness {
-        self.facts.preflight()
+    async fn preflight(&self) -> Readiness {
+        self.facts.preflight().await
     }
 
-    fn collect(&self, ts_us: i64) -> Vec<Sample> {
-        build_dns_samples(ts_us, &*self.facts)
+    async fn collect(&self, ts_us: i64) -> Vec<Sample> {
+        let pairs = self.facts.probes().await;
+        let mut resolved = Vec::with_capacity(pairs.len());
+        for (probe, server) in pairs {
+            let (verdict, ip, rtt_ms) = self.facts.resolve(&probe, &server).await;
+            resolved.push(ResolvedProbe {
+                probe,
+                server,
+                verdict,
+                ip,
+                rtt_ms,
+            });
+        }
+        build_dns_samples(ts_us, resolved)
             .into_iter()
             .map(Sample::Dns)
             .collect()
@@ -68,32 +83,32 @@ mod tests {
 
     struct Facts(Readiness);
     impl DnsFacts for Facts {
-        fn resolve(&self, _: &str, _: &str) -> (DnsVerdict, Option<String>, Option<f64>) {
+        async fn resolve(&self, _: &str, _: &str) -> (DnsVerdict, Option<String>, Option<f64>) {
             (DnsVerdict::Ok, Some("10.0.0.1".into()), Some(2.0))
         }
-        fn probes(&self) -> Vec<(String, String)> {
+        async fn probes(&self) -> Vec<(String, String)> {
             vec![("nks".into(), "sb".into())]
         }
-        fn preflight(&self) -> Readiness {
+        async fn preflight(&self) -> Readiness {
             self.0.clone()
         }
     }
 
-    fn collector(readiness: Readiness) -> DnsCollector {
-        DnsCollector::new(Arc::new(Facts(readiness)), Duration::from_secs(15))
+    fn collector(readiness: Readiness) -> DnsCollector<Facts> {
+        DnsCollector::new(Facts(readiness), Duration::from_secs(15))
     }
 
-    #[test]
-    fn preflight_unavailable_is_not_ready() {
+    #[tokio::test]
+    async fn preflight_unavailable_is_not_ready() {
         let c = collector(Readiness::Unavailable("no resolver path configured".into()));
-        assert!(!c.preflight().is_ready());
+        assert!(!c.preflight().await.is_ready());
     }
 
-    #[test]
-    fn ready_collect_yields_dns_samples() {
+    #[tokio::test]
+    async fn ready_collect_yields_dns_samples() {
         let c = collector(Readiness::Ready);
-        assert!(c.preflight().is_ready());
-        let samples = c.collect(7);
+        assert!(c.preflight().await.is_ready());
+        let samples = c.collect(7).await;
         assert_eq!(samples.len(), 1);
         assert!(matches!(samples[0], Sample::Dns(_)));
     }

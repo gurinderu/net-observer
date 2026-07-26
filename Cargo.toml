@@ -58,12 +58,13 @@ duckdb = { version = "1", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 surge-ping = "0.8"
 socket2 = "0.5"
-# Pure-Rust synchronous HTTP client. Unlike `reqwest::blocking`, ureq spins up no
-# runtime of its own, so it is safe to call from the synchronous probe traits that
-# run on tokio `spawn_blocking` threads inside the `#[tokio::main]` daemon. Default
-# features give the rustls TLS backend (with webpki-roots) for HTTPS; `json` adds
-# serde_json body (de)serialization for the DoH endpoint.
-ureq = { version = "3", features = ["json"] }
+# Async HTTP client for the macOS adapters (Clash `now`, TUN 204 probe, DoH). The
+# collectors are native `async fn`, so the client is used from `reqwest`'s async
+# API on the daemon's tokio runtime (never `reqwest::blocking`). Kept lean:
+# `default-features = false` drops the bundled OpenSSL/`native-tls`, `rustls-tls`
+# selects the pure-Rust TLS backend, and `json` adds serde_json (de)serialization
+# for the DoH endpoint.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 libc = "0.2"
 tempfile = "3"
 gpui = "0.2.2"

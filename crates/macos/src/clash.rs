@@ -21,39 +21,37 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(1);
 pub struct ClashClient {
     /// API base URL, e.g. `http://127.0.0.1:9090`.
     pub base: String,
+    /// Shared async HTTP client with a per-request [`HTTP_TIMEOUT`].
+    http: reqwest::Client,
 }
 
 impl ClashClient {
     /// Build a client pointing at `base` (e.g. `http://127.0.0.1:9090`).
     #[must_use]
     pub fn new(base: impl Into<String>) -> Self {
-        Self { base: base.into() }
+        Self {
+            base: base.into(),
+            http: build_http_client(),
+        }
     }
 
     /// The node currently selected in the top-level `GLOBAL` group, if the API
     /// is reachable.
-    #[must_use]
-    pub fn now(&self) -> Option<String> {
-        self.selected("GLOBAL")
+    pub async fn now(&self) -> Option<String> {
+        self.selected("GLOBAL").await
     }
 
     /// The node currently selected in proxy `group`, via `GET /proxies/<group>`.
-    #[must_use]
-    pub fn selected(&self, group: &str) -> Option<String> {
+    pub async fn selected(&self, group: &str) -> Option<String> {
         let url = format!("{}/proxies/{}", self.base.trim_end_matches('/'), group);
-        let mut resp = match ureq::get(&url)
-            .config()
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .build()
-            .call()
-        {
+        let resp = match self.http.get(&url).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::debug!(url, error = %e, "clash proxies query failed");
                 return None;
             }
         };
-        let body = match resp.body_mut().read_to_string() {
+        let body = match resp.text().await {
             Ok(b) => b,
             Err(e) => {
                 tracing::debug!(url, error = %e, "clash proxies query failed");
@@ -62,6 +60,16 @@ impl ClashClient {
         };
         parse_clash_now(&body)
     }
+}
+
+/// Build the async HTTP client used for Clash/TUN requests, applying
+/// [`HTTP_TIMEOUT`] as the per-request deadline. Falls back to the default
+/// client if the builder fails (which it does not with the workspace features).
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .unwrap_or_default()
 }
 
 /// Extract the `now` (selected node) field from a Clash `/proxies/<group>`
@@ -83,6 +91,8 @@ pub struct ProxySystemFacts {
     clash: ClashClient,
     /// Proxy group whose selection identifies the active node.
     selector_group: String,
+    /// Async HTTP client for the TUN 204 probe.
+    http: reqwest::Client,
 }
 
 impl ProxySystemFacts {
@@ -102,6 +112,7 @@ impl ProxySystemFacts {
             singbox_config: singbox_config.into(),
             clash: ClashClient::new(clash_base),
             selector_group: selector_group.into(),
+            http: build_http_client(),
         }
     }
 }
@@ -109,7 +120,9 @@ impl ProxySystemFacts {
 impl ProxyFacts for ProxySystemFacts {
     /// The upstream server addresses: the `server` field of every `vless`
     /// outbound in the rendered sing-box config.
-    fn server_endpoints(&self) -> Vec<String> {
+    async fn server_endpoints(&self) -> Vec<String> {
+        // A small local config file: an instant read, kept synchronous inside
+        // the async fn (no blocking of consequence, mirroring `getloadavg`).
         let Ok(text) = std::fs::read_to_string(&self.singbox_config) else {
             tracing::debug!(path = ?self.singbox_config, "sing-box config unreadable");
             return Vec::new();
@@ -117,18 +130,11 @@ impl ProxyFacts for ProxySystemFacts {
         parse_vless_ips(&text)
     }
 
-    fn tun_probe(&self, url: &str) -> Option<u16> {
-        // `http_status_as_error(false)` keeps ureq from turning 4xx/5xx responses
-        // into `Err`, preserving the previous behavior of reporting the status
-        // code of *any* HTTP response (the 204 probe target) and returning `None`
-        // only on a transport/timeout failure.
-        match ureq::get(url)
-            .config()
-            .http_status_as_error(false)
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .build()
-            .call()
-        {
+    async fn tun_probe(&self, url: &str) -> Option<u16> {
+        // `reqwest` does not turn 4xx/5xx into `Err` (only `error_for_status`
+        // would), so this reports the status code of *any* HTTP response (the 204
+        // probe target) and returns `None` only on a transport/timeout failure.
+        match self.http.get(url).send().await {
             Ok(resp) => Some(resp.status().as_u16()),
             Err(e) => {
                 tracing::debug!(url, error = %e, "tun probe failed");
@@ -137,11 +143,11 @@ impl ProxyFacts for ProxySystemFacts {
         }
     }
 
-    fn selector(&self) -> Option<String> {
-        self.clash.selected(&self.selector_group)
+    async fn selector(&self) -> Option<String> {
+        self.clash.selected(&self.selector_group).await
     }
 
-    fn preflight(&self) -> Readiness {
+    async fn preflight(&self) -> Readiness {
         if self.singbox_config.exists() || !self.clash.base.is_empty() {
             Readiness::Ready
         } else {

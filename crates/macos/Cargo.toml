@@ -12,10 +12,12 @@ collector-route.workspace = true
 collector-host.workspace = true
 surge-ping.workspace = true
 socket2.workspace = true
-ureq.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
 libc.workspace = true
-tokio.workspace = true
+# `net` (tokio::net::TcpStream / lookup_host) is added on top of the workspace
+# feature set; `time`, `process`, and the multi-thread runtime come from there.
+tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 
 [dev-dependencies]

@@ -3,19 +3,20 @@
 //! bundle (a strong signal of a driver-level Wi-Fi wedge).
 
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, SystemTime};
+
+use tokio::process::Command;
 
 /// Directory macOS writes Wi-Fi driver capture bundles into on a fault.
 const CORECAPTURE_WIFI_DIR: &str = "/Library/Logs/CrashReporter/CoreCapture/WiFi";
 
 /// Return the SSID currently joined on `iface`, or `None` if not associated
 /// (or the query fails). Absence is a signal, so failures never panic.
-#[must_use]
-pub fn current_ssid(iface: &str) -> Option<String> {
+pub async fn current_ssid(iface: &str) -> Option<String> {
     let out = Command::new("networksetup")
         .args(["-getairportnetwork", iface])
         .output()
+        .await
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     parse_ssid(&text)

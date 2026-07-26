@@ -63,12 +63,17 @@ flowchart LR
     cli -->|"query <SQL>\n(offline, read-only)"| store
 ```
 
-- **Collectors** — one task per subsystem, each on its own cadence. `link`,
-  `proxy`, `dns`, and `host` are `Interval` collectors (timer →
-  `collect(ts_us)` on the blocking pool). `route-events` is the first **Event**
-  collector: the daemon takes its `EventSource` and drives the blocking
-  `next()` loop (a PF_ROUTE socket `recv`) on the blocking pool, forwarding
-  samples as the kernel announces interface/route changes.
+- **Collectors** — one task per subsystem, each on its own cadence. Every
+  collector is a **native `async fn`** (`Collector::collect` / `preflight` are
+  `async fn` in the trait — no `async-trait` macro, no future-boxing). `link`,
+  `proxy`, `dns`, and `host` are `Interval` collectors: the daemon `await`s
+  `collect(ts_us)` directly on the tokio runtime each tick — **never** on the
+  blocking pool (the probes do their own async I/O). `route-events` is the first
+  **Event** collector and the one true exception: its PF_ROUTE `next()` is a
+  genuinely uninterruptible blocking `read(2)`, so the daemon drives it on a
+  dedicated OS thread (`std::thread::spawn`, bridged to the async stream via
+  `blocking_send`), forwarding samples as the kernel announces interface/route
+  changes. See [Async collectors](#async-collectors) below.
 - **Consumer** (`bin/observerd/src/pipeline.rs::run`) — drains the stream,
   writes each sample to the store (a write error is *logged as a gap*, never
   silently dropped), mirrors the sample into the live `StatusSnapshot`, pushes
@@ -85,10 +90,11 @@ flowchart LR
   answering entirely from memory — no DB read on the request path, zero contention
   with the writer. See [Local socket API](#local-socket-api) below.
 - **observerd** — the root LaunchDaemon: load config → open the store → spawn the
-  socket API server → build enabled collectors as `Box<dyn Collector>` → filter
-  by `meta().supports(Os::current())` then `preflight()` → spawn survivors → run
-  the consumer → clean SIGTERM/SIGINT shutdown (the API task is aborted alongside
-  the collectors).
+  socket API server → build enabled collectors as an `AnyCollector` **enum**
+  (static dispatch — see [Async collectors](#async-collectors)) → filter by
+  `meta().supports(Os::current())` then `preflight().await` → spawn survivors →
+  run the consumer → clean SIGTERM/SIGINT shutdown (the API task is aborted
+  alongside the collectors).
 - **observer-cli** — unprivileged; `status` / `incidents` read the daemon's live
   `StatusSnapshot` over the socket (`observer_ipc::query`), so they work *while the
   daemon runs* with zero DB contention. `query <SQL>` is the only DB path: it opens
@@ -107,11 +113,40 @@ collector, whether to run it at all:
 - **Static OS metadata** — `CollectorMeta { name, supported_os }`; v1 collectors
   declare `&[Os::MacOs]`. A collector whose meta does not `supports(Os::current())`
   is skipped.
-- **Runtime preflight** — `preflight() -> Readiness` (`Ready` /
+- **Runtime preflight** — `async fn preflight() -> Readiness` (`Ready` /
   `Unavailable(String)`), delegated to the port facts: `link` is Ready iff a
   physical interface resolves; `proxy` iff the sing-box config exists or the
   Clash API is set. A failing preflight is logged (absence of a signal is itself
   diagnostic) and the collector is not spawned.
+
+### Async collectors
+
+Collectors and their probe ports are **native `async fn`** (Rust ≥ 1.75), not the
+`async-trait` macro:
+
+- `Collector::collect(&self, ts_us) -> Vec<Sample>` and `preflight()` are
+  `async fn`; the probe ports (`Pinger::ping_gw`, `TcpProber::connect_bound`, the
+  per-collector `*Facts` traits) are `async fn` too. The traits carry
+  `#[allow(async_fn_in_trait)]` — they are internal workspace ports, never a
+  published API — so there is no boxing and no macro. `source()` / `meta()` /
+  `skip()` stay sync; `EventSource::next()` stays a **sync** blocking call (it
+  only ever runs on the dedicated event thread, never on the runtime).
+- **`collect()` awaits the probes, then a sync `build_*` composes the `Sample`.**
+  All async lives in the probes; the pure mapping (`build_link_sample`,
+  `build_proxy_samples`, …) stays synchronous, so the mapping unit tests remain
+  trivial (fakes are `async fn` under `#[tokio::test]`).
+- **Enum dispatch, not `dyn`.** A native-`async fn` trait is not
+  `dyn`-compatible, so `observerd` drives its heterogeneous collector set through
+  an `enum AnyCollector { Link, Proxy, Dns, Route, Host }` whose inherent methods
+  delegate by `match` and `.await` the concrete arm. Every arm is a concrete
+  type, so the composed `collect` future is `Send` and spawns onto the runtime
+  with **no `Box::pin` and no vtable**.
+- **The interval path never touches the blocking pool.** `spawn_interval_collector`
+  is a `tokio::time::interval` loop that `await`s `collect(ts_us)` directly;
+  a probe failure is turned into `SKIP` samples inside the collector, so one
+  failing collector keeps ticking and never takes down the others. The only
+  blocking primitive is the PF_ROUTE `read(2)`, isolated on its own OS thread by
+  `spawn_event_collector`.
 
 ## Crate graph
 
@@ -184,9 +219,9 @@ graph TD
     config --> bar
 ```
 
-- `collector-core` depends on `types` only — and **not** on tokio; `Source` /
-  `EventSource` keep it runtime-agnostic. The async driving of both cadences
-  lives in `observerd`.
+- `collector-core` depends on `types` only — and **not** on tokio: native
+  `async fn` traits need no runtime crate, and `Source` / `EventSource` keep the
+  crate runtime-agnostic. The async driving of both cadences lives in `observerd`.
 - `collector-link` / `collector-proxy` / `collector-dns` / `collector-host` are
   `Interval` collectors; each depends on `types` + `collector-core` and holds its
   port trait (`LinkFacts` / `ProxyFacts` / `DnsFacts` / `HostFacts`), the pure
@@ -194,12 +229,18 @@ graph TD
   `Collector` impl.
 - `collector-route` is the first **Event**-cadence collector: it wraps a
   `Box<dyn EventSource>` (the real PF_ROUTE source lives in `macos`) and reports
-  `Source::Event`; `observerd` drives its blocking `next()` loop on the blocking
-  pool.
-- `macos` implements every port trait with the real adapters (raw ICMP,
-  `IP_BOUND_IF` TCP probes, Clash API, DHCP/ARP facts, DNS resolve, the
-  persistent PF_ROUTE `EventSource`, `getloadavg`) plus the pcap ring and the
-  per-collector `preflight()` checks.
+  `Source::Event`; `observerd` drives its blocking `next()` loop on a dedicated
+  OS thread (not the async runtime — its `read(2)` cannot be interrupted).
+- `macos` implements every port trait with the real adapters, all on
+  **async-native I/O** on the daemon's tokio runtime: `surge-ping` (raw ICMP),
+  `socket2` + `tokio::net::TcpStream` with `IP_BOUND_IF` (bound TCP probes),
+  `reqwest`'s **async** client (Clash API, TUN 204 probe, DoH), and
+  `tokio::process::Command` (DHCP/ARP + Wi-Fi subprocesses); `getloadavg` stays
+  an inline syscall inside its `async fn`. The blocking PF_ROUTE `EventSource`
+  and the pcap ring are the only non-async pieces. **`ureq` was dropped** in
+  favour of `reqwest` async — the earlier `reqwest::blocking`-inside-tokio
+  startup panic cannot recur. `macos` also carries the per-collector
+  `preflight()` checks.
 - `observer-ipc` is the shared local-socket protocol crate: the wire types
   (`Request`, `Response`, `StatusSnapshot`, `IncidentSummary`), the
   newline-delimited JSON framing (`write_frame` / `read_frame`), and a blocking
