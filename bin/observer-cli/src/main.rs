@@ -1,18 +1,36 @@
-//! `observer-cli` — an unprivileged reader for the observer DuckDB store.
+//! `observer-cli` — an unprivileged reader for the observer store.
 //!
-//! The root daemon (`observerd`) writes samples, incidents and trigger rows;
-//! this CLI only reads them. Three subcommands cover day-to-day forensics:
-//! `status` (row counts + last tick), `incidents` (open/closed list) and
-//! `query` (arbitrary read-only SQL rendered as a table).
+//! `observerd` is the **sole owner** of the DuckDB file: DuckDB takes a
+//! per-process file lock, so a second opener (even read-only) is blocked while
+//! the daemon runs. This CLI therefore splits into two access paths:
+//!
+//! - **LIVE** — `status` and `incidents` read the daemon's in-memory snapshot
+//!   over its Unix-domain socket (`observer-ipc`). No DB is opened, so there is
+//!   zero contention with the running daemon.
+//! - **OFFLINE** — `query <SQL>` opens the DuckDB file directly for ad-hoc
+//!   forensics. This only works while the daemon is stopped; if `observerd` is
+//!   running it holds the lock and the open fails with a clear message rather
+//!   than a panic.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
-use store::{DuckdbStore, QueryTable, Store};
+use config::Config;
+use observer_ipc::{IncidentSummary, Request, Response, StatusSnapshot};
+use std::process::ExitCode;
+use store::{DuckdbStore, QueryTable};
 
 #[derive(Parser)]
-#[command(name = "observer-cli", about = "Query the observer DuckDB store")]
+#[command(
+    name = "observer-cli",
+    about = "Query the observer store (live via socket, offline via SQL)"
+)]
 struct Cli {
-    /// Path to the observer DuckDB database file.
+    /// Optional path to the observer config file (TOML). Supplies the daemon
+    /// socket path for the live `status`/`incidents` commands.
+    #[arg(long)]
+    config: Option<String>,
+    /// Path to the observer DuckDB file, used only by the offline `query`
+    /// command (requires the daemon to be stopped — it holds the DB lock).
     #[arg(long, default_value = "/var/lib/observer/observer.duckdb")]
     db: String,
     #[command(subcommand)]
@@ -21,65 +39,197 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show row counts per table and the last sample timestamp.
+    /// Show the live status snapshot (latest sample per collector + incidents),
+    /// read from the running daemon over its socket.
     Status,
-    /// List incidents (open and closed), newest first.
-    Incidents,
-    /// Run an arbitrary SQL query and print the resulting rows.
+    /// List recent incidents, newest first, read live from the daemon socket.
+    Incidents {
+        /// Maximum number of incidents to fetch.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Run an arbitrary SQL query directly against the DuckDB file (offline
+    /// forensics — only works while `observerd` is stopped).
     Query {
         /// The SQL statement to run against the store.
         sql: String,
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    let store = DuckdbStore::open(&cli.db)?;
-    match cli.command {
-        Command::Status => print!("{}", format_status(&store)?),
-        Command::Incidents => print!("{}", format_incidents(&store.list_incidents()?)),
-        Command::Query { sql } => print!("{}", format_table(&store.query_table(&sql)?)),
+    match run(&cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: &Cli) -> Result<()> {
+    match &cli.command {
+        Command::Status => {
+            let cfg = load_config(cli)?;
+            let snap = fetch_status(&cfg.socket_path)?;
+            print!("{}", format_status(&snap));
+        }
+        Command::Incidents { limit } => {
+            let cfg = load_config(cli)?;
+            let incidents = fetch_incidents(&cfg.socket_path, *limit)?;
+            print!("{}", format_incidents(&incidents));
+        }
+        Command::Query { sql } => {
+            let table = run_query(&cli.db, sql)?;
+            print!("{}", format_table(&table));
+        }
     }
     Ok(())
 }
 
-/// Render `(trigger_id, opened_us, closed_us)` incident rows as a fixed-width
-/// table. An open incident (no `closed_us`) shows `open`.
-fn format_incidents(rows: &[(String, i64, Option<i64>)]) -> String {
-    let mut out = format!(
-        "{:<24} {:>18} {:>18}\n",
-        "TRIGGER", "OPENED_US", "CLOSED_US"
-    );
-    for (trigger_id, opened_us, closed_us) in rows {
-        let closed = match closed_us {
-            Some(c) => c.to_string(),
-            None => "open".to_string(),
-        };
-        out.push_str(&format!("{trigger_id:<24} {opened_us:>18} {closed:>18}\n"));
+/// Load the daemon config (defaults + optional TOML file + `OBSERVER_*` env),
+/// mapping the large `figment::Error` into a clear `anyhow` message.
+fn load_config(cli: &Cli) -> Result<Config> {
+    Config::load(cli.config.as_deref()).map_err(|e| anyhow!("failed to load observer config: {e}"))
+}
+
+/// Send one request to the daemon over the socket. An absent / refused socket
+/// (`observerd` not running) becomes a clear message, never a panic.
+fn daemon_query(socket_path: &str, req: &Request) -> Result<Response> {
+    observer_ipc::query(socket_path, req).map_err(|e| {
+        use std::io::ErrorKind::{ConnectionRefused, NotFound};
+        if matches!(e.kind(), NotFound | ConnectionRefused) {
+            anyhow!("observerd not running (socket {socket_path} unavailable)")
+        } else {
+            anyhow!("failed to query observerd over socket {socket_path}: {e}")
+        }
+    })
+}
+
+/// Fetch the live [`StatusSnapshot`] from the daemon.
+fn fetch_status(socket_path: &str) -> Result<StatusSnapshot> {
+    match daemon_query(socket_path, &Request::Status)? {
+        Response::Status(snap) => Ok(snap),
+        Response::Error(e) => Err(anyhow!("observerd returned an error: {e}")),
+        other => Err(anyhow!("unexpected daemon response to Status: {other:?}")),
     }
+}
+
+/// Fetch the newest `limit` incidents from the daemon.
+fn fetch_incidents(socket_path: &str, limit: usize) -> Result<Vec<IncidentSummary>> {
+    match daemon_query(socket_path, &Request::Incidents { limit })? {
+        Response::Incidents(list) => Ok(list),
+        Response::Error(e) => Err(anyhow!("observerd returned an error: {e}")),
+        other => Err(anyhow!(
+            "unexpected daemon response to Incidents: {other:?}"
+        )),
+    }
+}
+
+/// Open the DuckDB file directly and run one query (offline forensics). If
+/// `observerd` is running it holds the per-process DuckDB lock, so the open
+/// fails — detect that and print a clear, actionable message instead of leaking
+/// the raw driver error (and never panic).
+fn run_query(db_path: &str, sql: &str) -> Result<QueryTable> {
+    let store = DuckdbStore::open(db_path).map_err(|e| {
+        let msg = e.to_string();
+        if is_lock_error(&msg) {
+            anyhow!(
+                "observerd is running and holds the DuckDB lock; stop it for \
+                 offline SQL, or use `status`/`incidents` (live via socket)"
+            )
+        } else {
+            anyhow!("failed to open DuckDB at {db_path}: {msg}")
+        }
+    })?;
+    store
+        .query_table(sql)
+        .map_err(|e| anyhow!("query failed: {e}"))
+}
+
+/// Heuristic over a DuckDB open error: does it indicate the file is locked by
+/// another process (i.e. the daemon)? DuckDB reports this as an `IO Error`
+/// mentioning a lock, e.g. `Could not set lock on file ...: Conflicting lock is
+/// held`.
+fn is_lock_error(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("lock")
+}
+
+/// Summarise the live [`StatusSnapshot`]: the latest sample per collector plus an
+/// incident count. Pure over its input so it is unit-tested without a socket.
+fn format_status(snap: &StatusSnapshot) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("generated_us   {}\n", snap.generated_us));
+
+    match &snap.link {
+        Some(l) => out.push_str(&format!(
+            "link           gw={} direct={} ts_us={}\n",
+            l.gw, l.direct, l.ts_us
+        )),
+        None => out.push_str("link           (no data)\n"),
+    }
+
+    match &snap.proxy {
+        Some(p) => {
+            let tun = p
+                .tun_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let sel = p.selector.clone().unwrap_or_else(|| "-".to_string());
+            out.push_str(&format!(
+                "proxy          tun={tun} selector={sel} ts_us={}\n",
+                p.ts_us
+            ));
+        }
+        None => out.push_str("proxy          (no data)\n"),
+    }
+
+    match &snap.dns {
+        Some(d) => out.push_str(&format!(
+            "dns            {} {}/{} ts_us={}\n",
+            d.verdict, d.probe, d.server, d.ts_us
+        )),
+        None => out.push_str("dns            (no data)\n"),
+    }
+
+    match &snap.host {
+        Some(h) => out.push_str(&format!(
+            "host           load1={} load5={} load15={} ts_us={}\n",
+            h.load1, h.load5, h.load15, h.ts_us
+        )),
+        None => out.push_str("host           (no data)\n"),
+    }
+
+    let open = snap
+        .incidents
+        .iter()
+        .filter(|i| i.closed_us.is_none())
+        .count();
+    out.push_str(&format!(
+        "incidents      {} ({open} open)\n",
+        snap.incidents.len()
+    ));
     out
 }
 
-/// Summarise store contents: per-table row counts and the newest sample tick.
-fn format_status(store: &DuckdbStore) -> Result<String> {
-    let link = store.query_scalar_i64("SELECT count(*) FROM link_sample")?;
-    let proxy = store.query_scalar_i64("SELECT count(*) FROM proxy_sample")?;
-    let incidents = store.query_scalar_i64("SELECT count(*) FROM incident")?;
-    let open = store.query_scalar_i64("SELECT count(*) FROM incident WHERE closed_us IS NULL")?;
-    let triggers = store.query_scalar_i64("SELECT count(*) FROM trigger_fired")?;
-    let blobs = store.query_scalar_i64("SELECT count(*) FROM blob_ref")?;
-    let last_tick = store.query_scalar_i64(
-        "SELECT COALESCE(max(ts_us), 0) FROM \
-         (SELECT ts_us FROM link_sample UNION ALL SELECT ts_us FROM proxy_sample)",
-    )?;
-    let mut out = String::new();
-    out.push_str(&format!("link_sample    {link}\n"));
-    out.push_str(&format!("proxy_sample   {proxy}\n"));
-    out.push_str(&format!("incident       {incidents} ({open} open)\n"));
-    out.push_str(&format!("trigger_fired  {triggers}\n"));
-    out.push_str(&format!("blob_ref       {blobs}\n"));
-    out.push_str(&format!("last_tick_us   {last_tick}\n"));
-    Ok(out)
+/// Render [`IncidentSummary`] rows as a fixed-width table. An open incident (no
+/// `closed_us`) shows `open`. Pure over its input so it is unit-tested directly.
+fn format_incidents(rows: &[IncidentSummary]) -> String {
+    let mut out = format!(
+        "{:<20} {:<16} {:>18} {:>18}\n",
+        "ID", "TRIGGER", "OPENED_US", "CLOSED_US"
+    );
+    for i in rows {
+        let closed = match i.closed_us {
+            Some(c) => c.to_string(),
+            None => "open".to_string(),
+        };
+        out.push_str(&format!(
+            "{:<20} {:<16} {:>18} {closed:>18}\n",
+            i.id, i.trigger_id, i.opened_us
+        ));
+    }
+    out
 }
 
 /// Render a generic query result as a simple space-padded table.
@@ -115,16 +265,77 @@ fn push_row(out: &mut String, cells: &[String], widths: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use types::{GwVerdict, LinkSample, ProxySample, TcpVerdict};
+
+    fn incident(id: &str, trigger: &str, opened: i64, closed: Option<i64>) -> IncidentSummary {
+        IncidentSummary {
+            id: id.into(),
+            opened_us: opened,
+            closed_us: closed,
+            trigger_id: trigger.into(),
+            signature: "sig".into(),
+        }
+    }
+
     #[test]
     fn format_incidents_renders_rows() {
-        let out = format_incidents(&[("gw-drop".into(), 1000i64, Some(2000i64))]);
-        assert!(out.contains("gw-drop") && out.contains("1000"));
+        let out = format_incidents(&[incident("i1", "gw-drop", 1000, Some(2000))]);
+        assert!(out.contains("gw-drop") && out.contains("1000") && out.contains("2000"));
     }
 
     #[test]
     fn format_incidents_marks_open_incidents() {
-        let out = format_incidents(&[("wedge".into(), 5000i64, None)]);
+        let out = format_incidents(&[incident("i2", "wedge", 5000, None)]);
         assert!(out.contains("wedge") && out.contains("open"));
+    }
+
+    #[test]
+    fn format_status_renders_snapshot() {
+        let snap = StatusSnapshot {
+            generated_us: 100,
+            link: Some(LinkSample {
+                ts_us: 42,
+                gw: GwVerdict::Ok,
+                gw_rtt_ms: None,
+                direct: TcpVerdict::Ok,
+                direct_rtt_ms: None,
+                dhcp_router: None,
+                dhcp_dns: None,
+                gw_arp_mac: None,
+                ssid: None,
+                wifi_capture_present: false,
+            }),
+            proxy: Some(ProxySample {
+                ts_us: 43,
+                server_ip: "1.2.3.4".into(),
+                tcp: TcpVerdict::Ok,
+                rtt_ms: None,
+                tun_code: Some(204),
+                selector: Some("auto".into()),
+            }),
+            dns: None,
+            host: None,
+            incidents: vec![
+                incident("i1", "wedge", 80, None),
+                incident("i2", "gw-drop", 60, Some(70)),
+            ],
+        };
+        let out = format_status(&snap);
+        assert!(out.contains("generated_us   100"));
+        assert!(out.contains("link           gw=OK direct=OK ts_us=42"));
+        assert!(out.contains("proxy          tun=204 selector=auto ts_us=43"));
+        assert!(out.contains("dns            (no data)"));
+        assert!(out.contains("host           (no data)"));
+        // Two incidents, one still open.
+        assert!(out.contains("incidents      2 (1 open)"));
+    }
+
+    #[test]
+    fn format_status_shows_placeholders_when_empty() {
+        let out = format_status(&StatusSnapshot::default());
+        assert!(out.contains("link           (no data)"));
+        assert!(out.contains("proxy          (no data)"));
+        assert!(out.contains("incidents      0 (0 open)"));
     }
 
     #[test]
@@ -136,5 +347,23 @@ mod tests {
         let out = format_table(&table);
         assert!(out.contains("ts_us") && out.contains("gw"));
         assert!(out.contains("42") && out.contains("OK"));
+    }
+
+    #[test]
+    fn is_lock_error_detects_duckdb_lock_message() {
+        // Representative DuckDB message when the daemon holds the file lock.
+        let locked = "IO Error: Could not set lock on file \"/var/lib/observer/observer.duckdb\": \
+             Conflicting lock is held in /usr/bin/observerd (PID 4242)";
+        assert!(is_lock_error(locked));
+    }
+
+    #[test]
+    fn is_lock_error_ignores_unrelated_errors() {
+        assert!(!is_lock_error(
+            "Catalog Error: Table with name link_sample does not exist!"
+        ));
+        assert!(!is_lock_error(
+            "Parser Error: syntax error at or near \"SELCT\""
+        ));
     }
 }

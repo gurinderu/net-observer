@@ -53,7 +53,8 @@ flowchart LR
 
     snap --> apisrv{{"api::serve\nUnixListener socket"}}
     bar["observer-bar\n(unprivileged socket client)"] <-->|"Request/Response\n(observer-ipc)"| apisrv
-    cli["observer-cli\n(offline reader)"] -->|read-only SQL| store
+    cli["observer-cli\n(status/incidents: socket;\nquery <SQL>: offline DB)"] <-->|"Request/Response\n(observer-ipc)"| apisrv
+    cli -->|"query <SQL>\n(offline, read-only)"| store
 ```
 
 - **Collectors** — one task per subsystem, each on its own cadence. `link`,
@@ -82,9 +83,12 @@ flowchart LR
   by `meta().supports(Os::current())` then `preflight()` → spawn survivors → run
   the consumer → clean SIGTERM/SIGINT shutdown (the API task is aborted alongside
   the collectors).
-- **observer-cli** — unprivileged; opens the same DuckDB file read-only for
-  `status` / `incidents` / `query` (offline forensics, when no daemon holds the
-  store).
+- **observer-cli** — unprivileged; `status` / `incidents` read the daemon's live
+  `StatusSnapshot` over the socket (`observer_ipc::query`), so they work *while the
+  daemon runs* with zero DB contention. `query <SQL>` is the only DB path: it opens
+  the DuckDB file read-only for ad-hoc forensics, which succeeds only when no daemon
+  holds the store (the file lock otherwise blocks the open — reported as a clear
+  message, never a panic).
 - **observer-bar** — unprivileged **menu-bar** app and a *pure socket client*: it
   never opens the DB, fetching the live `StatusSnapshot` from the daemon over the
   socket via `observer_ipc::query`.
@@ -124,7 +128,7 @@ graph TD
     config["config\nfigment per-subsystem toggles"]
     macos["macos\nreal adapters: ICMP, IP_BOUND_IF,\nClash API, DHCP/ARP, pcap ring,\nDNS resolve, PF_ROUTE, loadavg"]
     observerd["bin/observerd\nroot LaunchDaemon"]
-    cli["bin/observer-cli\nunprivileged reader"]
+    cli["bin/observer-cli\nstatus/incidents via socket;\nquery <SQL> via offline DB"]
     bar["bin/observer-bar\ngpui menu-bar (NSStatusItem\n+ panel); socket client (no DB)"]
 
     types --> ccore
@@ -166,6 +170,8 @@ graph TD
 
     store --> cli
     types --> cli
+    ipc --> cli
+    config --> cli
 
     ipc --> bar
     types --> bar
@@ -270,11 +276,13 @@ the durable record; the socket is the live, low-latency read path.
   collectors; a bind failure is logged but never takes the daemon down (no API,
   still collecting).
 
-- **Client** (`observer_ipc::query`, used by `bin/observer-bar`) — a *blocking*
-  round-trip: connect, write one request frame, read one response frame. A
-  missing socket / connection-refused (daemon down) / protocol error all map to
-  an `Err`, which the bar renders as the "observer offline" state and retries on
-  its next ~3s tick. The bar links no async runtime for this.
+- **Client** (`observer_ipc::query`, used by `bin/observer-bar` and by
+  `observer-cli`'s `status` / `incidents`) — a *blocking* round-trip: connect, write
+  one request frame, read one response frame. A missing socket / connection-refused
+  (daemon down) / protocol error all map to an `Err`, which the bar renders as the
+  "observer offline" state and retries on its next ~3s tick, and which the CLI turns
+  into a clear "observerd not running" message with a non-zero exit. Neither client
+  links an async runtime for this.
 
 ```mermaid
 sequenceDiagram
@@ -296,9 +304,11 @@ sequenceDiagram
 store. DuckDB 1.x takes a per-process file lock, so a second opener — even
 read-only — is blocked while the daemon runs.
 
-- `observer-cli` is **unprivileged** and opens the DuckDB file `read_only` for
-  `status` / `incidents` / `query`. That open only succeeds when no `observerd`
-  holds the store (offline forensics); while the daemon runs, use the socket.
+- `observer-cli` is **unprivileged**. Its `status` / `incidents` commands read the
+  daemon's live snapshot over the socket (`observer_ipc::query`), so they work while
+  the daemon runs. Only `query <SQL>` opens the DuckDB file `read_only`, and that
+  open succeeds only when no `observerd` holds the store (offline forensics); while
+  the daemon runs it holds the lock and the open fails with a clear message.
 - `observer-bar` is **unprivileged** and does **not** open the DB at all: it is a
   pure client of the daemon's local socket (see [Local socket API](#local-socket-api)),
   so it reads *live* status while the daemon runs — the concurrent-live-access

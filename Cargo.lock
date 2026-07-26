@@ -4347,7 +4347,10 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "config",
+ "observer-ipc",
  "store",
+ "types",
 ]
 
 [[package]]

@@ -18,7 +18,7 @@ A Cargo workspace (`edition = "2024"`, toolchain pinned in `rust-toolchain.toml`
 ```
 bin/
   observerd/        # headless root LaunchDaemon: config → collectors → store + triggers
-  observer-cli/     # unprivileged reader: status / incidents / query <SQL>
+  observer-cli/     # unprivileged reader: status / incidents (live via socket), query <SQL> (offline DB)
 crates/
   types/            # Sample, verdict enums, Incident, BlobRef, TriggerFired
   store/            # Store trait + DuckDB backend, schema, QueryTable
