@@ -21,6 +21,13 @@ socket_path = "/var/lib/observer/observer.sock"
 # connect while the daemon runs as root.
 socket_mode = 0o666
 
+# Optional: chown the socket to this uid (control-path hardening). Unset by
+# default, so the socket keeps the daemon's ownership. When you enable acting
+# below, set this to the logged-in user's uid AND set socket_mode = 0o600 so only
+# that owner can send privileged commands — a world-connectable read socket must
+# not also accept actions.
+# socket_owner_uid = 501
+
 # The `link` collector probes the local network path: default gateway
 # reachability, a direct TCP connectivity check, DHCP/ARP facts and Wi-Fi SSID.
 [collectors.link]
@@ -73,3 +80,16 @@ enabled = true
 ring_mb = 8
 # BPF filter — keep it cheap: link-layer control traffic only.
 filter = "arp or icmp or udp port 67 or udp port 68 or ether broadcast"
+
+# The control (acting) path: manual recovery actions observerd runs as root
+# (currently `launchctl kickstart -k` on the sing-box service). DISABLED by
+# default — with acting off, every control request is refused WITHOUT running
+# anything, and acting NEVER happens automatically (only on an explicit request
+# from the bar's "Restart sing-box" action or the cli `kickstart` subcommand).
+#
+# Before enabling, harden the socket: set socket_mode = 0o600 and socket_owner_uid
+# above so only the owner can send privileged commands.
+# [acting]
+# enabled = false
+# launchctl service target restarted by KickstartProxy.
+# singbox_service = "system/sing-box"

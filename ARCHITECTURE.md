@@ -6,11 +6,17 @@ queryable pipeline whose north star is **incident forensics**: a rich, SQL-able
 snapshot of network/system state *around outages*, so post-incident analysis is
 a query ("что было в 17:26") instead of grepping a columnar text log.
 
-**v1 scope = observe + detect, never act.** The daemon collects telemetry and
-fires *passive* triggers (record an incident, freeze the pcap ring). No
-`launchctl kickstart`, no watchdog, no notifications in v1 — those are later
-handlers behind the same `Condition → Handler` interface. The shell
-`net-observer` remains the behavioral oracle (see `AGENTS.md`).
+**v1 scope = observe + detect; act only on an explicit, gated request.** The
+daemon collects telemetry and fires *passive* triggers (record an incident,
+freeze the pcap ring) — it **never acts automatically**. The single write/control
+path is manual and human-in-the-loop: an operator's `Request::Control` (from the
+bar's "Restart sing-box" button or the CLI `kickstart` subcommand) asks the daemon
+to `launchctl kickstart -k` the sing-box service, and the daemon runs it **only
+when `acting.enabled` is set** — off by default, so every control request is
+otherwise refused without running anything. No watchdog, no automatic recovery,
+no notifications in v1 — those remain later handlers behind the same
+`Condition → Handler` interface. The shell `net-observer` remains the behavioral
+oracle (see `AGENTS.md`).
 
 ## Pipeline
 
@@ -257,6 +263,9 @@ the durable record; the socket is the live, low-latency read path.
   newline-delimited JSON:
   - `Request::Status` → `Response::Status(StatusSnapshot)`
   - `Request::Incidents { limit }` → `Response::Incidents(Vec<IncidentSummary>)`
+  - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
+    write/control path (see [Control path](#control-path) below); the only
+    non-read request
   - a malformed request → `Response::Error(String)`
 
   `StatusSnapshot` is the latest sample per collector (`link` / `proxy` / `dns` /
@@ -266,10 +275,12 @@ the durable record; the socket is the live, low-latency read path.
   server and the blocking client share one format definition.
 
 - **Server** (`bin/observerd/src/api.rs::serve`) — a tokio `UnixListener`. On
-  start it removes any stale socket file, binds `cfg.socket_path`, and `chmod`s it
-  to `cfg.socket_mode` so the unprivileged bar can connect to the root-owned
-  socket. One task per connection: read one `Request`, answer from the shared
-  `Arc<Mutex<StatusSnapshot>>` the pipeline keeps current, write one `Response`,
+  start it removes any stale socket file, binds `cfg.socket_path`, `chmod`s it to
+  `cfg.socket_mode` so the unprivileged bar can connect to the root-owned socket,
+  and — when `cfg.socket_owner_uid` is set — `chown`s it to that uid (control-path
+  hardening; see [Control path](#control-path)). One task per connection: read one
+  `Request`, answer from the shared `Arc<Mutex<StatusSnapshot>>` the pipeline keeps
+  current (or, for a `Control`, run the gated actuator), write one `Response`,
   close. The lock is held only long enough to clone what the reply needs — never
   across an `.await`, so a slow client can never stall the collector pipeline. The
   server is spawned by the daemon and `abort()`ed on shutdown alongside the
@@ -297,6 +308,43 @@ sequenceDiagram
     Note over Bar: on connect/read error -> "observer offline"
 ```
 
+### Control path
+
+The one **write** path over the socket. A `Request::Control(ControlCmd)` asks the
+daemon to run a recovery action; the only command today is
+`ControlCmd::KickstartProxy`, which restarts the sing-box service via
+`launchctl kickstart -k <service>`. Clients (bar button, CLI `kickstart`) only
+*send the request* — they never run `launchctl` themselves; the root daemon is
+the sole actor.
+
+The gate lives in exactly one place, `api::control_response`:
+
+```
+Request::Control(cmd)  ──►  control_response(cmd, &acting)
+                              │
+                              ├─ acting.enabled == false (DEFAULT)
+                              │     └─► ControlResult { ok: false, "acting disabled" }
+                              │         (returns before touching the actuator —
+                              │          nothing is executed)
+                              │
+                              └─ acting.enabled == true
+                                    └─► acting::kickstart_proxy(&singbox_service)
+                                        (the ONLY place launchctl runs)
+                                        └─► ControlResult { ok, message }
+```
+
+**Safety invariant:** `acting.enabled` defaults to `false` (`config::ActingCfg`),
+and no code path reaches the actuator (`bin/observerd/src/acting.rs`) unless a
+`Control` request arrives **and** acting is enabled. Acting is never triggered by
+the pipeline or a passive handler — only by an explicit operator request.
+
+**Socket ownership / hardening.** Because the control path accepts privileged
+commands, an operator enabling `acting` should also lock the socket down: set
+`socket_mode = 0o600` and `socket_owner_uid = <logged-in uid>` so only that owner
+can connect and send commands. With the default `socket_mode = 0o666` the socket
+is world-connectable (fine for read-only status, unsafe once acting is on), and
+`socket_owner_uid` is `None` (the socket keeps the daemon's root ownership).
+
 ## Privilege split
 
 `observerd` is a headless **root** LaunchDaemon (needs raw ICMP, PF_ROUTE,
@@ -317,4 +365,8 @@ read-only — is blocked while the daemon runs.
 
 The menu-bar UI stays a separate unprivileged binary — never the daemon itself.
 The daemon relaxes the socket file's mode (config `socket_mode`, default `0666`)
-so the logged-in user's UI can connect to the root-owned socket.
+so the logged-in user's UI can connect to the root-owned socket. The socket is
+owned by root by default; when `socket_owner_uid` is set the daemon `chown`s it to
+that uid instead. Pair a restrictive `socket_mode = 0o600` with `socket_owner_uid`
+whenever `acting.enabled` is turned on, so the world-connectable read socket does
+not also accept privileged control commands (see [Control path](#control-path)).

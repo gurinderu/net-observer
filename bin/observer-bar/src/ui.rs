@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Rgba, SharedString, Subscription, Window, div, px, rgb};
 
-use observer_ipc::{IncidentSummary, Request, Response, StatusSnapshot};
+use observer_ipc::{ControlCmd, ControlResult, IncidentSummary, Request, Response, StatusSnapshot};
 
 use crate::status::{Health, health};
 
@@ -49,6 +49,25 @@ pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, String> {
     }
 }
 
+/// Ask `observerd` to restart the sing-box proxy over the local socket
+/// (`Control(KickstartProxy)`) and return its [`ControlResult`].
+///
+/// This is the bar's only **write/control** path — every other request is a
+/// read. The bar never runs the action itself: it just sends the request; the
+/// daemon (running as root) decides whether to act, gated by `acting.enabled`
+/// (off by default), and reports the outcome. A missing socket / connection-
+/// refused (daemon down) or a protocol error maps to `Err(String)` so the panel
+/// can surface it as a transient line instead of crashing — never a panic, and
+/// never any local `launchctl` execution.
+pub fn send_kickstart(socket_path: &str) -> Result<ControlResult, String> {
+    match observer_ipc::query(socket_path, &Request::Control(ControlCmd::KickstartProxy)) {
+        Ok(Response::Control(result)) => Ok(result),
+        Ok(Response::Error(msg)) => Err(msg),
+        Ok(_) => Err("unexpected response from observerd".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Shared, app-scoped model: the latest snapshot the UI renders.
 pub struct Glance {
     pub snapshot: StatusSnapshot,
@@ -56,6 +75,10 @@ pub struct Glance {
     pub error: Option<String>,
     /// Config socket path, so the panel's manual "Refresh" can re-query.
     pub socket_path: String,
+    /// The most recent control-action outcome (e.g. the "Restart sing-box"
+    /// result, or `"acting disabled"`), surfaced as a transient line in the
+    /// panel. `None` until the operator triggers a control action.
+    pub control_msg: Option<String>,
 }
 
 impl Glance {
@@ -64,6 +87,7 @@ impl Glance {
             snapshot,
             error,
             socket_path,
+            control_msg: None,
         }
     }
 
@@ -77,6 +101,21 @@ impl Glance {
             }
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// Send a manual "Restart sing-box" control to the daemon and record the
+    /// outcome message for the panel. Never panics: a daemon-down / refused
+    /// socket, an error response, or a refused/failed action all become a
+    /// readable `control_msg` line. The read/refresh path is untouched — this
+    /// only writes `control_msg`.
+    pub fn kickstart(&mut self) {
+        self.control_msg = Some(match send_kickstart(&self.socket_path) {
+            Ok(result) => {
+                let tag = if result.ok { "ok" } else { "failed" };
+                format!("{tag}: {}", result.message)
+            }
+            Err(e) => format!("failed: {e}"),
+        });
     }
 }
 
@@ -104,6 +143,7 @@ impl Render for PanelView {
         let glance = self.model.read(cx);
         let snapshot = glance.snapshot.clone();
         let error = glance.error.clone();
+        let control_msg = glance.control_msg.clone();
         let now_us = now_us();
 
         let (dot, dot_color) = health_dot(&snapshot);
@@ -142,6 +182,7 @@ impl Render for PanelView {
             .child(link_card(&snapshot, now_us))
             .child(proxy_card(&snapshot, now_us))
             .child(incidents_card(&snapshot.incidents, now_us))
+            .child(control_card(cx, control_msg))
             .child(footer(cx))
     }
 }
@@ -269,6 +310,50 @@ fn incident_row(i: &IncidentSummary, now_us: i64) -> impl IntoElement {
                 .text_xs()
                 .child(age_str(i.opened_us, now_us)),
         )
+}
+
+/// The write/control card: a "Restart sing-box" button that sends a
+/// `Control(KickstartProxy)` to the daemon, plus a transient line showing the
+/// last outcome. The bar never runs the action itself — the daemon does, and
+/// only when `acting.enabled` is set (off by default), otherwise it reports
+/// `"acting disabled"`. A daemon-down / refused socket degrades to a readable
+/// line here, never a panic. The read/refresh path is unaffected.
+fn control_card(cx: &mut Context<PanelView>, control_msg: Option<String>) -> impl IntoElement {
+    let button = div()
+        .id("kickstart")
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .bg(rgb(CARD))
+        .text_color(rgb(WARN))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x3a2a2a)))
+        .child("Restart sing-box")
+        .on_click(cx.listener(|this, _, _window, cx| {
+            this.model.update(cx, |g, cx| {
+                g.kickstart();
+                cx.notify();
+            });
+        }));
+
+    let mut body = div().flex().flex_col().gap_2().child(button);
+    if let Some(msg) = control_msg {
+        body = body.child(
+            div()
+                .text_color(rgb(MUTED))
+                .text_xs()
+                .child(SharedString::from(msg)),
+        );
+    }
+
+    card(WARN).child(
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section_title("control"))
+            .child(body),
+    )
 }
 
 fn footer(cx: &mut Context<PanelView>) -> impl IntoElement {
@@ -448,5 +533,37 @@ mod tests {
         let missing = dir.path().join("does-not-exist.sock");
         let res = read_fresh(missing.to_str().unwrap());
         assert!(res.is_err(), "absent socket must yield an offline Err");
+    }
+
+    /// The control path must also degrade gracefully: an absent socket (daemon
+    /// down) yields an `Err`, never a panic — and nothing local is executed (the
+    /// bar only ever sends a request; the daemon is the sole actor).
+    #[test]
+    fn send_kickstart_offline_when_socket_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sock");
+        let res = send_kickstart(missing.to_str().unwrap());
+        assert!(res.is_err(), "absent socket must yield a control Err");
+    }
+
+    /// `Glance::kickstart` on a down daemon records a readable failure line
+    /// instead of panicking, and leaves the read/refresh state untouched.
+    #[test]
+    fn glance_kickstart_records_failure_when_daemon_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sock");
+        let mut glance = Glance::new(
+            StatusSnapshot::default(),
+            None,
+            missing.to_str().unwrap().to_string(),
+        );
+        glance.kickstart();
+        let msg = glance.control_msg.expect("kickstart must record a message");
+        assert!(
+            msg.starts_with("failed:"),
+            "daemon-down must be a failure: {msg}"
+        );
+        // The read path is untouched by a control action.
+        assert!(glance.error.is_none());
     }
 }

@@ -5,6 +5,7 @@
 //! handlers (record incidents; freeze the pcap ring on any gateway change), runs
 //! the consumer loop, and shuts down cleanly on SIGTERM/SIGINT.
 
+mod acting;
 mod api;
 mod pipeline;
 
@@ -136,8 +137,17 @@ async fn run_daemon() -> anyhow::Result<()> {
         let snapshot = snapshot.clone();
         let socket_path = cfg.socket_path.clone();
         let socket_mode = cfg.socket_mode;
+        let socket_owner_uid = cfg.socket_owner_uid;
+        // Thread the acting config through so the control path is gated by
+        // `acting.enabled` (off by default) in one place: `api::control_response`.
+        let acting = api::ActingConfig {
+            enabled: cfg.acting.enabled,
+            singbox_service: cfg.acting.singbox_service.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) = api::serve(socket_path, socket_mode, snapshot).await {
+            if let Err(e) =
+                api::serve(socket_path, socket_mode, socket_owner_uid, acting, snapshot).await
+            {
                 tracing::error!(error = %e, "status socket server exited");
             }
         })

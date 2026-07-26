@@ -14,13 +14,40 @@ use std::os::unix::net::UnixStream;
 use serde::{Serialize, de::DeserializeOwned};
 use types::{DnsSample, HostSample, LinkSample, ProxySample};
 
-/// A request from a client (the bar) to the daemon.
+/// A request from a client (the bar or cli) to the daemon.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Request {
     /// Fetch the current live [`StatusSnapshot`].
     Status,
     /// Fetch the most recent incidents, newest first, capped at `limit`.
     Incidents { limit: usize },
+    /// Ask the daemon to run a write/control action (the "acting" path). The
+    /// daemon executes it as root **only** when `acting.enabled` is set (off by
+    /// default); otherwise the request is refused without running anything.
+    Control(ControlCmd),
+}
+
+/// A write/control command the client asks the daemon to execute.
+///
+/// Extensible — one conservative, human-in-the-loop action for now. The daemon
+/// (never a client) is the only process that executes these, and only when
+/// acting is explicitly enabled in its config.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum ControlCmd {
+    /// Restart the sing-box proxy service (`launchctl kickstart -k <service>`),
+    /// the same recovery net-observer's watchdog used — but triggered manually.
+    KickstartProxy,
+}
+
+/// The outcome of a [`ControlCmd`]: whether the action ran successfully plus a
+/// human-readable message the client surfaces to the operator.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ControlResult {
+    /// `true` iff the action ran and succeeded. A refusal (acting disabled) or a
+    /// failed action is `false`.
+    pub ok: bool,
+    /// A readable explanation (e.g. `"acting disabled"`, or the actuator output).
+    pub message: String,
 }
 
 /// A compact, serializable view of one incident for the live API.
@@ -59,6 +86,8 @@ pub struct StatusSnapshot {
 pub enum Response {
     Status(StatusSnapshot),
     Incidents(Vec<IncidentSummary>),
+    /// The outcome of a [`Request::Control`] command.
+    Control(ControlResult),
     Error(String),
 }
 
@@ -155,6 +184,40 @@ mod tests {
         match back {
             Request::Incidents { limit } => assert_eq!(limit, 7),
             other => panic!("unexpected request variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_round_trip_control_request() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &Request::Control(ControlCmd::KickstartProxy)).unwrap();
+        // Exactly one frame => exactly one trailing newline.
+        assert_eq!(buf.iter().filter(|&&b| b == b'\n').count(), 1);
+
+        let mut reader = std::io::BufReader::new(&buf[..]);
+        let back: Request = read_frame(&mut reader).unwrap();
+        match back {
+            Request::Control(ControlCmd::KickstartProxy) => {}
+            other => panic!("unexpected request variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_round_trip_control_response() {
+        let res = ControlResult {
+            ok: false,
+            message: "acting disabled".into(),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &Response::Control(res)).unwrap();
+        let mut reader = std::io::BufReader::new(&buf[..]);
+        let back: Response = read_frame(&mut reader).unwrap();
+        match back {
+            Response::Control(r) => {
+                assert!(!r.ok);
+                assert_eq!(r.message, "acting disabled");
+            }
+            other => panic!("unexpected response variant: {other:?}"),
         }
     }
 

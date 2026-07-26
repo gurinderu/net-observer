@@ -15,7 +15,7 @@
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use config::Config;
-use observer_ipc::{IncidentSummary, Request, Response, StatusSnapshot};
+use observer_ipc::{ControlCmd, ControlResult, IncidentSummary, Request, Response, StatusSnapshot};
 use std::process::ExitCode;
 use store::{DuckdbStore, QueryTable};
 
@@ -48,6 +48,12 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Ask the running daemon to restart the sing-box proxy service
+    /// (`launchctl kickstart`), sent as a `Control(KickstartProxy)` request over
+    /// the socket. The daemon runs it as root **only** when `acting.enabled` is
+    /// set in its config; otherwise it refuses the request without acting. Exits
+    /// non-zero if the action was refused/failed or the daemon is unreachable.
+    Kickstart,
     /// Run an arbitrary SQL query directly against the DuckDB file (offline
     /// forensics — only works while `observerd` is stopped).
     Query {
@@ -59,7 +65,7 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("{e}");
             ExitCode::FAILURE
@@ -67,7 +73,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: &Cli) -> Result<()> {
+fn run(cli: &Cli) -> Result<ExitCode> {
     match &cli.command {
         Command::Status => {
             let cfg = load_config(cli)?;
@@ -79,12 +85,22 @@ fn run(cli: &Cli) -> Result<()> {
             let incidents = fetch_incidents(&cfg.socket_path, *limit)?;
             print!("{}", format_incidents(&incidents));
         }
+        Command::Kickstart => {
+            let cfg = load_config(cli)?;
+            let result = fetch_kickstart(&cfg.socket_path)?;
+            print!("{}", format_control(&result));
+            // A refusal (acting disabled) or a failed action is a non-zero exit,
+            // even though the request itself round-tripped fine.
+            if !result.ok {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
         Command::Query { sql } => {
             let table = run_query(&cli.db, sql)?;
             print!("{}", format_table(&table));
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Load the daemon config (defaults + optional TOML file + `OBSERVER_*` env),
@@ -124,6 +140,27 @@ fn fetch_incidents(socket_path: &str, limit: usize) -> Result<Vec<IncidentSummar
             "unexpected daemon response to Incidents: {other:?}"
         )),
     }
+}
+
+/// Ask the daemon to restart the sing-box proxy over the socket
+/// (`Control(KickstartProxy)`) and return its [`ControlResult`]. A daemon-down /
+/// absent socket becomes a clear `Err` (handled by [`daemon_query`]); the daemon
+/// itself decides whether to act (gated by `acting.enabled`) and reports the
+/// outcome in the result. Never panics.
+fn fetch_kickstart(socket_path: &str) -> Result<ControlResult> {
+    match daemon_query(socket_path, &Request::Control(ControlCmd::KickstartProxy))? {
+        Response::Control(result) => Ok(result),
+        Response::Error(e) => Err(anyhow!("observerd returned an error: {e}")),
+        other => Err(anyhow!("unexpected daemon response to Control: {other:?}")),
+    }
+}
+
+/// Render a [`ControlResult`] as a single status line: `ok: <message>` when the
+/// action ran, `failed: <message>` when it was refused (acting disabled) or the
+/// action itself failed. Pure over its input so it is unit-tested directly.
+fn format_control(result: &ControlResult) -> String {
+    let tag = if result.ok { "ok" } else { "failed" };
+    format!("{tag}: {}\n", result.message)
 }
 
 /// Open the DuckDB file directly and run one query (offline forensics). If
@@ -347,6 +384,25 @@ mod tests {
         let out = format_table(&table);
         assert!(out.contains("ts_us") && out.contains("gw"));
         assert!(out.contains("42") && out.contains("OK"));
+    }
+
+    #[test]
+    fn format_control_ok_reports_success() {
+        let out = format_control(&ControlResult {
+            ok: true,
+            message: "kickstarted system/sing-box".into(),
+        });
+        assert_eq!(out, "ok: kickstarted system/sing-box\n");
+    }
+
+    #[test]
+    fn format_control_refused_reports_failure() {
+        // The daemon refuses when acting is disabled (the safe default).
+        let out = format_control(&ControlResult {
+            ok: false,
+            message: "acting disabled".into(),
+        });
+        assert_eq!(out, "failed: acting disabled\n");
     }
 
     #[test]

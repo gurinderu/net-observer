@@ -360,19 +360,37 @@ daemon runs). Every other component reads through a **local API**, never the DB.
   framing, a blocking `query()` client (for the bar) + an async serve helper.
 - **`observer-bar` is a pure socket client** — no `duckdb` dependency at all. Its
   refresh timer calls `observer_ipc::query(sock, Request::Status)` and renders;
-  daemon-down ⇒ a graceful "offline" state.
+  daemon-down ⇒ a graceful "offline" state. `observer-cli`'s `status`/`incidents`
+  also go through the socket; only its offline `query <SQL>` opens the DB directly.
+
+## Control path — manual acting (conservative first step)
+
+The Act layer starts with ONE safe, human-in-the-loop action; automatic acting
+(watchdog) stays deferred.
+
+- **`Request::Control(ControlCmd)`** with `ControlCmd::KickstartProxy` (extensible),
+  answered by `Response::Control(ControlResult { ok, message })`.
+- **`observerd` runs the action as root** — `launchctl kickstart -k <service>`
+  (service label from config), the same recovery net-observer's watchdog used,
+  but triggered manually.
+- **Gated OFF by default:** `config.acting.enabled = false` ⇒ any control request
+  is refused (`ControlResult { ok: false, "acting disabled" }`). No automatic
+  triggering — a control action happens only on an explicit user request.
+- **Socket hardening for the control path:** when the daemon has a
+  `socket_owner_uid`, it `chown`s the socket to that uid; operators set mode
+  `0600` when enabling acting so only the owner can send commands (a world-
+  connectable read socket must not also accept privileged actions).
+- **Clients:** `observer-bar` gets a "Restart sing-box" action; `observer-cli`
+  gets a `kickstart` subcommand — both send `Control(KickstartProxy)`.
 
 ## Open questions still deferred
 
-- Watchdog / acting: an `Act` handler (kickstart) behind a flag — the shell
-  watchdog stays as the recovery path meanwhile.
+- **Automatic** acting (a watchdog that kickstarts on the wedge signature without
+  a human) — the manual control action lands first; auto-acting stays deferred,
+  shell net-observer remains the automatic recovery meanwhile.
+- **kill-switch / portal** toggles (manipulate pf / routes) — riskier than a
+  proxy restart; deferred until the manual-kickstart control path is proven.
 - Notification channel(s) for a `Notify` handler.
-- **Write/control commands** on the local socket (the read/status API now
-  exists) — required before the menu-bar gains live **toggles** (portal /
-  kill-switch) and before runtime config reload. Read path is done; the control
-  path stays deferred.
-- Routing `observer-cli`'s live commands (status/incidents) through the socket
-  too, leaving direct DB access only for explicit **offline** forensics
-  (`query <SQL>` when the daemon is stopped).
+- Runtime config reload over the control socket.
 - Migrating `pcap-ring` from the `tcpdump` child to in-process capture
   (`pcap` crate / BPF).

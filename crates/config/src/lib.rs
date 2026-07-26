@@ -14,7 +14,14 @@ pub struct Config {
     /// Permission bits applied to the socket file (octal), so the unprivileged bar
     /// can connect while the daemon runs as root.
     pub socket_mode: u32,
+    /// When `Some(uid)`, the daemon `chown`s the socket to this uid (control-path
+    /// hardening: pair with a restrictive `socket_mode` such as `0o600` when
+    /// enabling acting so only the owner can send privileged commands). Default
+    /// `None` — the socket keeps the daemon's ownership.
+    pub socket_owner_uid: Option<u32>,
     pub collectors: Collectors,
+    /// The write/control ("acting") path. Disabled by default.
+    pub acting: ActingCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +85,20 @@ pub struct PcapCfg {
     pub filter: String,
 }
 
+/// The write/control ("acting") path — manual recovery actions the daemon runs
+/// as root. Disabled by default: with `enabled = false`, every control request
+/// is refused without running anything. Acting NEVER happens automatically — only
+/// on an explicit `Request::Control`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActingCfg {
+    /// Master switch for the control path. `false` (default) ⇒ refuse every
+    /// control request without executing anything.
+    pub enabled: bool,
+    /// The `launchctl` service target restarted by `ControlCmd::KickstartProxy`
+    /// (`launchctl kickstart -k <service>`).
+    pub singbox_service: String,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -85,6 +106,7 @@ impl Default for Config {
             blob_dir: "/var/lib/observer/blobs".into(),
             socket_path: "/var/lib/observer/observer.sock".into(),
             socket_mode: 0o666,
+            socket_owner_uid: None,
             collectors: Collectors {
                 link: LinkCfg {
                     enabled: true,
@@ -115,6 +137,10 @@ impl Default for Config {
                     ring_mb: 8,
                     filter: "arp or icmp or udp port 67 or udp port 68 or ether broadcast".into(),
                 },
+            },
+            acting: ActingCfg {
+                enabled: false,
+                singbox_service: "system/sing-box".into(),
             },
         }
     }
@@ -167,5 +193,30 @@ mod tests {
         std::fs::write(&p, "[collectors.link]\ninterval = \"5s\"\n").unwrap();
         let c = Config::load(Some(p.to_str().unwrap())).unwrap();
         assert_eq!(c.collectors.link.interval.as_secs(), 5);
+    }
+    #[test]
+    fn acting_disabled_by_default() {
+        // Safety invariant: acting is OFF unless explicitly enabled.
+        let c = Config::load(None).unwrap();
+        assert!(!c.acting.enabled);
+        assert_eq!(c.acting.singbox_service, "system/sing-box");
+        assert!(c.socket_owner_uid.is_none());
+    }
+    #[test]
+    fn acting_can_be_enabled_via_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        std::fs::write(
+            &p,
+            "socket_owner_uid = 501\n\
+             [acting]\n\
+             enabled = true\n\
+             singbox_service = \"system/mihomo\"\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert!(c.acting.enabled);
+        assert_eq!(c.acting.singbox_service, "system/mihomo");
+        assert_eq!(c.socket_owner_uid, Some(501));
     }
 }
