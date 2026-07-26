@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
 use serde::{Serialize, de::DeserializeOwned};
-use types::{DnsSample, HostSample, LinkSample, ProxySample};
+use types::{DnsSample, HostSample, LinkSample, ProxySample, RouteEvent};
 
 /// A request from a client (the bar or cli) to the daemon.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -25,6 +25,13 @@ pub enum Request {
     /// daemon executes it as root **only** when `acting.enabled` is set (off by
     /// default); otherwise the request is refused without running anything.
     Control(ControlCmd),
+    /// Open a live event subscription. Unlike the one-shot requests above, a
+    /// `Subscribe` connection is **not** answered by a single [`Response`]: the
+    /// daemon holds it open and streams newline-JSON [`Event`] frames (via
+    /// [`write_frame`]) until the client disconnects. `kinds` filters the stream
+    /// server-side — `None` subscribes to every [`EventKind`], `Some(list)` only
+    /// to the listed kinds. The blocking [`subscribe`] helper drives this path.
+    Subscribe { kinds: Option<Vec<EventKind>> },
 }
 
 /// A write/control command the client asks the daemon to execute.
@@ -64,6 +71,66 @@ pub struct IncidentSummary {
     pub closed_us: Option<i64>,
     pub trigger_id: String,
     pub signature: String,
+}
+
+/// The category of a live [`Event`]. Used both to tag events and, in a
+/// [`Request::Subscribe`], to filter which kinds the daemon streams.
+///
+/// `Copy` so a filter list is cheap to test against per event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EventKind {
+    Link,
+    Proxy,
+    Dns,
+    Route,
+    Host,
+    Incident,
+}
+
+/// One live event pushed over a [`Request::Subscribe`] stream: either a fresh
+/// collector [`Sample`](types::Sample) or a newly recorded incident. Each frame
+/// carries its own payload so subscribers can render it without a second lookup.
+///
+/// Sized like [`Response`]: the `Link` variant dominates, but this is the shared
+/// wire type the daemon constructs directly and boxing would add an allocation on
+/// the hot publish path, so the `large_enum_variant` lint is allowed here too.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum Event {
+    Link(LinkSample),
+    Proxy(ProxySample),
+    Dns(DnsSample),
+    Route(RouteEvent),
+    Host(HostSample),
+    Incident(IncidentSummary),
+}
+
+impl Event {
+    /// The [`EventKind`] this event belongs to — the discriminator subscribers
+    /// filter on.
+    pub fn kind(&self) -> EventKind {
+        match self {
+            Event::Link(_) => EventKind::Link,
+            Event::Proxy(_) => EventKind::Proxy,
+            Event::Dns(_) => EventKind::Dns,
+            Event::Route(_) => EventKind::Route,
+            Event::Host(_) => EventKind::Host,
+            Event::Incident(_) => EventKind::Incident,
+        }
+    }
+
+    /// The event's timestamp in epoch microseconds. Samples expose their own
+    /// `ts_us`; an incident uses its `opened_us`.
+    pub fn ts_us(&self) -> i64 {
+        match self {
+            Event::Link(l) => l.ts_us,
+            Event::Proxy(p) => p.ts_us,
+            Event::Dns(d) => d.ts_us,
+            Event::Route(r) => r.ts_us,
+            Event::Host(h) => h.ts_us,
+            Event::Incident(i) => i.opened_us,
+        }
+    }
 }
 
 /// The live, in-memory status the daemon serves. Each collector's latest sample
@@ -127,6 +194,54 @@ pub fn query(sock_path: &str, req: &Request) -> std::io::Result<Response> {
     write_frame(&mut writer, req)?;
     let mut reader = BufReader::new(&stream);
     read_frame(&mut reader)
+}
+
+/// A held-open live event stream from the daemon, returned by [`subscribe`].
+///
+/// Wraps the buffered socket and yields decoded [`Event`] frames as an iterator.
+/// The daemon pushes frames as they happen — iterating simply blocks until the
+/// next one arrives. A clean close by the daemon ends iteration (`None`); a
+/// decode/read failure surfaces as `Some(Err(..))`, letting the caller log and
+/// reconnect. No tokio: this is a plain blocking [`UnixStream`] the bar drives
+/// on its own thread.
+pub struct Subscription {
+    reader: BufReader<UnixStream>,
+}
+
+impl Iterator for Subscription {
+    type Item = std::io::Result<Event>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match read_frame(&mut self.reader) {
+            Ok(ev) => Some(Ok(ev)),
+            // The daemon closed the connection cleanly — the stream is over.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// Blocking client for a live event stream: connect, write one newline-JSON
+/// [`Request::Subscribe`], then return a [`Subscription`] that yields each pushed
+/// [`Event`] frame. Unlike [`query`], this does **not** read a single response —
+/// the connection stays open and the daemon streams events until either side
+/// disconnects. Connection-refused / no socket ⇒ `Err` (the caller renders an
+/// "offline" state and retries).
+pub fn subscribe(sock_path: &str, req: &Request) -> std::io::Result<Subscription> {
+    // The signature accepts any `Request` (the plan's shape), but only a
+    // `Subscribe` yields an `Event` stream — a one-shot request would make the
+    // first `next()` mis-decode the daemon's single `Response` frame as an
+    // `Event`. Catch that misuse in debug builds; release stays permissive.
+    debug_assert!(
+        matches!(req, Request::Subscribe { .. }),
+        "subscribe() expects a Request::Subscribe, got {req:?}"
+    );
+    let stream = UnixStream::connect(sock_path)?;
+    let mut writer = &stream;
+    write_frame(&mut writer, req)?;
+    Ok(Subscription {
+        reader: BufReader::new(stream),
+    })
 }
 
 /// Write one value as a single newline-terminated JSON frame.
@@ -278,5 +393,76 @@ mod tests {
         let mut reader = std::io::BufReader::new(empty);
         let res: std::io::Result<Request> = read_frame(&mut reader);
         assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn frame_round_trip_event_incident() {
+        let ev = Event::Incident(IncidentSummary {
+            id: "inc-9".into(),
+            opened_us: 5000,
+            closed_us: None,
+            trigger_id: "fakeip".into(),
+            signature: "sig".into(),
+        });
+
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &ev).unwrap();
+        // Exactly one frame => exactly one trailing newline.
+        assert_eq!(buf.iter().filter(|&&b| b == b'\n').count(), 1);
+
+        let mut reader = std::io::BufReader::new(&buf[..]);
+        let back: Event = read_frame(&mut reader).unwrap();
+        match back {
+            Event::Incident(inc) => {
+                assert_eq!(inc.id, "inc-9");
+                assert_eq!(inc.opened_us, 5000);
+                assert_eq!(inc.closed_us, None);
+            }
+            other => panic!("unexpected event variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_round_trip_subscribe_request() {
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &Request::Subscribe {
+                kinds: Some(vec![EventKind::Route]),
+            },
+        )
+        .unwrap();
+        // Exactly one frame => exactly one trailing newline.
+        assert_eq!(buf.iter().filter(|&&b| b == b'\n').count(), 1);
+
+        let mut reader = std::io::BufReader::new(&buf[..]);
+        let back: Request = read_frame(&mut reader).unwrap();
+        match back {
+            Request::Subscribe { kinds } => assert_eq!(kinds, Some(vec![EventKind::Route])),
+            other => panic!("unexpected request variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_kind_and_ts_us() {
+        let ev = Event::Route(RouteEvent {
+            ts_us: 314,
+            kind: "iface".into(),
+            iface: Some("en0".into()),
+            detail: "up".into(),
+        });
+        assert_eq!(ev.kind(), EventKind::Route);
+        assert_eq!(ev.ts_us(), 314);
+
+        // The Incident variant borrows its timestamp from `opened_us`.
+        let inc = Event::Incident(IncidentSummary {
+            id: "inc-1".into(),
+            opened_us: 42,
+            closed_us: None,
+            trigger_id: "t".into(),
+            signature: "s".into(),
+        });
+        assert_eq!(inc.kind(), EventKind::Incident);
+        assert_eq!(inc.ts_us(), 42);
     }
 }

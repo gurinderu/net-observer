@@ -15,7 +15,10 @@
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::Config;
-use observer_ipc::{ControlCmd, ControlResult, IncidentSummary, Request, Response, StatusSnapshot};
+use observer_ipc::{
+    ControlCmd, ControlResult, Event, EventKind, IncidentSummary, Request, Response, StatusSnapshot,
+};
+use std::io::Write;
 use std::process::ExitCode;
 use store::{DuckdbStore, QueryTable};
 
@@ -47,6 +50,20 @@ enum Command {
         /// Maximum number of incidents to fetch.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+    },
+    /// Tail the daemon's live event stream, printing each event
+    /// (`HH:MM:SS  kind  detail`) as it happens until interrupted (Ctrl-C).
+    ///
+    /// This is **pub/sub, not polling**: the CLI opens ONE `Subscribe`
+    /// connection over the socket and the daemon *pushes* every event down it
+    /// (samples as they are collected, incidents as triggers fire). With
+    /// `--kind` the daemon filters the stream server-side to that single kind;
+    /// without it, every kind is streamed. Graceful if the daemon is down or the
+    /// stream drops mid-tail; never panics.
+    Events {
+        /// Restrict the stream to a single event kind. Omit for all kinds.
+        #[arg(long)]
+        kind: Option<EventKindArg>,
     },
     /// Ask the running daemon to restart the sing-box proxy service
     /// (`launchctl kickstart`), sent as a `Control(KickstartProxy)` request over
@@ -90,6 +107,33 @@ impl ObserveState {
     }
 }
 
+/// The event kind accepted by `events --kind`. A thin CLI mirror of
+/// [`EventKind`] so `clap` renders `<link|proxy|dns|route|host|incident>` in the
+/// help without leaking the wire type into the argument surface.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EventKindArg {
+    Link,
+    Proxy,
+    Dns,
+    Route,
+    Host,
+    Incident,
+}
+
+impl EventKindArg {
+    /// Map to the wire [`EventKind`] used in `Request::Subscribe { kinds }`.
+    fn to_kind(self) -> EventKind {
+        match self {
+            EventKindArg::Link => EventKind::Link,
+            EventKindArg::Proxy => EventKind::Proxy,
+            EventKindArg::Dns => EventKind::Dns,
+            EventKindArg::Route => EventKind::Route,
+            EventKindArg::Host => EventKind::Host,
+            EventKindArg::Incident => EventKind::Incident,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
@@ -112,6 +156,13 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             let cfg = load_config(cli)?;
             let incidents = fetch_incidents(&cfg.socket_path, *limit)?;
             print!("{}", format_incidents(&incidents));
+        }
+        Command::Events { kind } => {
+            let cfg = load_config(cli)?;
+            // `None` (no `--kind`) subscribes to every kind; `Some(k)` filters
+            // server-side to that single kind.
+            let kinds = kind.map(|k| vec![k.to_kind()]);
+            stream_events(&cfg.socket_path, kinds)?;
         }
         Command::Kickstart => {
             let cfg = load_config(cli)?;
@@ -178,6 +229,112 @@ fn fetch_incidents(socket_path: &str, limit: usize) -> Result<Vec<IncidentSummar
             "unexpected daemon response to Incidents: {other:?}"
         )),
     }
+}
+
+/// Open ONE live event subscription over the socket and print each pushed event
+/// as it arrives (`HH:MM:SS  kind  detail`) until interrupted (Ctrl-C) or the
+/// daemon closes the stream. This is the pub/sub tail: the daemon *pushes* frames
+/// down a held-open connection; the CLI never polls. `kinds` filters server-side
+/// (`None` = every kind).
+///
+/// Never panics:
+/// - an absent / connection-refused socket (daemon down) becomes a clear `Err`
+///   (a non-zero exit), like the one-shot commands;
+/// - a mid-stream read/decode error (daemon restart/shutdown) prints a note and
+///   ends the tail cleanly;
+/// - a broken output pipe (e.g. `| head`) also ends the tail cleanly, rather than
+///   panicking the way `println!` would on a write failure.
+fn stream_events(socket_path: &str, kinds: Option<Vec<EventKind>>) -> Result<()> {
+    let sub = observer_ipc::subscribe(socket_path, &Request::Subscribe { kinds }).map_err(|e| {
+        use std::io::ErrorKind::{ConnectionRefused, NotFound};
+        if matches!(e.kind(), NotFound | ConnectionRefused) {
+            anyhow!("observerd not running (socket {socket_path} unavailable)")
+        } else {
+            anyhow!("failed to subscribe to observerd over socket {socket_path}: {e}")
+        }
+    })?;
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for item in sub {
+        match item {
+            Ok(ev) => {
+                // `writeln!` (not `println!`) so a broken pipe ends the tail
+                // instead of panicking; stdout is line-buffered so each line
+                // flushes on its newline, keeping the tail live.
+                if writeln!(out, "{}", format_event_line(&ev)).is_err() {
+                    break;
+                }
+            }
+            // The daemon went away mid-stream (restart / shutdown) or a frame
+            // failed to decode. Note it and stop — the tail is over.
+            Err(e) => {
+                eprintln!("event stream ended: {e}");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One printed line for a live event: `HH:MM:SS  kind  detail`. Pure over its
+/// input (the clock is derived arithmetically) so it is unit-tested directly.
+fn format_event_line(ev: &Event) -> String {
+    format!(
+        "{}  {}  {}",
+        clock(ev.ts_us()),
+        kind_label(ev.kind()),
+        event_detail(ev)
+    )
+}
+
+/// The short lowercase label for an [`EventKind`] (matches the `--kind` values).
+fn kind_label(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::Link => "link",
+        EventKind::Proxy => "proxy",
+        EventKind::Dns => "dns",
+        EventKind::Route => "route",
+        EventKind::Host => "host",
+        EventKind::Incident => "incident",
+    }
+}
+
+/// The per-variant one-line detail for an event.
+fn event_detail(ev: &Event) -> String {
+    match ev {
+        Event::Link(l) => format!("gw={} direct={}", l.gw, l.direct),
+        Event::Proxy(p) => {
+            let tun = p
+                .tun_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let sel = p.selector.clone().unwrap_or_else(|| "-".to_string());
+            format!("tun={tun} sel={sel}")
+        }
+        Event::Dns(d) => {
+            let ip = d.ip.clone().unwrap_or_else(|| "-".to_string());
+            format!("{}/{} {} {}", d.probe, d.server, d.verdict, ip)
+        }
+        Event::Route(r) => {
+            let iface = r.iface.clone().unwrap_or_else(|| "-".to_string());
+            format!("{} {} {}", r.kind, iface, r.detail)
+        }
+        Event::Host(h) => format!("load {:.2}/{:.2}/{:.2}", h.load1, h.load5, h.load15),
+        Event::Incident(i) => format!("{} {}", i.trigger_id, i.signature),
+    }
+}
+
+/// Format an epoch-microsecond timestamp as a `HH:MM:SS` wall clock in **UTC**.
+///
+/// `observer-cli` does not depend on a timezone crate (only the gpui bar does, via
+/// `jiff`), so this uses pure integer math over `ts_us` — deterministic, never
+/// panics (Euclidean division handles any `i64`, including negatives).
+fn clock(ts_us: i64) -> String {
+    let secs = ts_us.div_euclid(1_000_000);
+    let tod = secs.rem_euclid(86_400); // seconds within the UTC day
+    let (h, m, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 /// Ask the daemon to restart the sing-box proxy over the socket
@@ -357,7 +514,10 @@ fn push_row(out: &mut String, cells: &[String], widths: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{GwVerdict, LinkSample, ProxySample, TcpVerdict};
+    use types::{
+        DnsSample, DnsVerdict, GwVerdict, HostSample, LinkSample, ProxySample, RouteEvent,
+        TcpVerdict,
+    };
 
     fn incident(id: &str, trigger: &str, opened: i64, closed: Option<i64>) -> IncidentSummary {
         IncidentSummary {
@@ -484,5 +644,109 @@ mod tests {
         assert!(!is_lock_error(
             "Parser Error: syntax error at or near \"SELCT\""
         ));
+    }
+
+    #[test]
+    fn event_kind_arg_maps_to_wire_kind() {
+        assert_eq!(EventKindArg::Link.to_kind(), EventKind::Link);
+        assert_eq!(EventKindArg::Proxy.to_kind(), EventKind::Proxy);
+        assert_eq!(EventKindArg::Dns.to_kind(), EventKind::Dns);
+        assert_eq!(EventKindArg::Route.to_kind(), EventKind::Route);
+        assert_eq!(EventKindArg::Host.to_kind(), EventKind::Host);
+        assert_eq!(EventKindArg::Incident.to_kind(), EventKind::Incident);
+    }
+
+    #[test]
+    fn clock_formats_utc_hh_mm_ss() {
+        // Epoch 0 is 00:00:00 UTC; 1h1m1s later reads 01:01:01.
+        assert_eq!(clock(0), "00:00:00");
+        assert_eq!(clock(3_661_000_000), "01:01:01");
+        // A negative timestamp must not panic (Euclidean wrap into the day).
+        assert_eq!(clock(-1), "23:59:59");
+    }
+
+    #[test]
+    fn format_event_line_renders_ts_kind_detail() {
+        let link = Event::Link(LinkSample {
+            ts_us: 3_661_000_000,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Fail,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+        });
+        assert_eq!(
+            format_event_line(&link),
+            "01:01:01  link  gw=OK direct=FAIL"
+        );
+    }
+
+    #[test]
+    fn format_event_line_renders_incident() {
+        let inc = Event::Incident(IncidentSummary {
+            id: "i1".into(),
+            opened_us: 0,
+            closed_us: None,
+            trigger_id: "wedge".into(),
+            signature: "tun dead".into(),
+        });
+        assert_eq!(
+            format_event_line(&inc),
+            "00:00:00  incident  wedge tun dead"
+        );
+    }
+
+    #[test]
+    fn event_detail_covers_each_variant() {
+        let proxy = Event::Proxy(ProxySample {
+            ts_us: 0,
+            server_ip: "1.2.3.4".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: None,
+            tun_code: Some(204),
+            selector: Some("auto".into()),
+        });
+        assert_eq!(event_detail(&proxy), "tun=204 sel=auto");
+
+        // Missing tun_code / selector fall back to a placeholder dash.
+        let proxy_bare = Event::Proxy(ProxySample {
+            ts_us: 0,
+            server_ip: "1.2.3.4".into(),
+            tcp: TcpVerdict::Skip,
+            rtt_ms: None,
+            tun_code: None,
+            selector: None,
+        });
+        assert_eq!(event_detail(&proxy_bare), "tun=- sel=-");
+
+        let dns = Event::Dns(DnsSample {
+            ts_us: 0,
+            probe: "nks".into(),
+            server: "sb".into(),
+            verdict: DnsVerdict::FakeIp,
+            ip: Some("198.18.0.1".into()),
+            rtt_ms: None,
+        });
+        assert_eq!(event_detail(&dns), "nks/sb FAKEIP 198.18.0.1");
+
+        let route = Event::Route(RouteEvent {
+            ts_us: 0,
+            kind: "iface".into(),
+            iface: Some("en0".into()),
+            detail: "up".into(),
+        });
+        assert_eq!(event_detail(&route), "iface en0 up");
+
+        let host = Event::Host(HostSample {
+            ts_us: 0,
+            load1: 1.0,
+            load5: 2.0,
+            load15: 3.0,
+        });
+        assert_eq!(event_detail(&host), "load 1.00/2.00/3.00");
     }
 }

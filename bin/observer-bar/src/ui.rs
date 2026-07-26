@@ -24,7 +24,7 @@
 //! observer is collecting, grey when paused. Clicking it sends
 //! `Control(SetObserving(!observing))` to the daemon (see [`send_set_observing`])
 //! and refreshes. This is benign **self-control** — it pauses/resumes the
-//! observer's OWN collection only; it never touches sing-box or the network and is
+//! observer's OWN collection only; it never touches the proxy or the network and is
 //! not gated by `acting.enabled`. While paused the header shows a muted "paused"
 //! state and the daemon stays alive so the switch can turn collection back on.
 
@@ -42,38 +42,41 @@ use crate::status::{Health, health};
 /// A light/dark token set for the panel. Adapts to the system appearance so the
 /// menu reads as native in either mode (see [`Theme::for_appearance`]); the view
 /// never hardcodes a single palette. Colors are 24-bit RGB hex.
+///
+/// Shared crate-wide (also used by the event-log window in [`crate::events`]) so
+/// the panel and the window read as one consistent, appearance-aware surface.
 #[derive(Clone, Copy)]
-struct Theme {
+pub(crate) struct Theme {
     /// The popover surface.
-    bg: u32,
+    pub(crate) bg: u32,
     /// Primary ink (labels, app name).
-    fg: u32,
+    pub(crate) fg: u32,
     /// Secondary text and disabled/muted values.
-    muted: u32,
+    pub(crate) muted: u32,
     /// Hairline separator between sections.
-    separator: u32,
+    pub(crate) separator: u32,
     /// Semantic "good" (healthy verdicts).
-    ok: u32,
+    pub(crate) ok: u32,
     /// Semantic "bad" (failed/degraded verdicts, open incidents).
-    bad: u32,
+    pub(crate) bad: u32,
     /// Semantic "warn" (control action / offline banner).
-    warn: u32,
-    /// Accent for the neutral text action (Refresh).
-    accent: u32,
+    pub(crate) warn: u32,
+    /// Accent for the neutral text action (Refresh) and the selected chip.
+    pub(crate) accent: u32,
     /// The toggle track when observing (on) — green.
-    track_on: u32,
+    pub(crate) track_on: u32,
     /// The toggle track when paused (off) — grey.
-    track_off: u32,
-    /// The toggle knob.
-    knob: u32,
+    pub(crate) track_off: u32,
+    /// The toggle knob (also the ink on a filled/selected accent chip).
+    pub(crate) knob: u32,
     /// Hover wash under a text action.
-    hover: u32,
+    pub(crate) hover: u32,
 }
 
 impl Theme {
     /// Pick the light or dark token set from the window's system appearance.
     /// Vibrant variants collapse onto their plain light/dark counterparts.
-    fn for_appearance(appearance: WindowAppearance) -> Self {
+    pub(crate) fn for_appearance(appearance: WindowAppearance) -> Self {
         match appearance {
             WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::dark(),
             WindowAppearance::Light | WindowAppearance::VibrantLight => Self::light(),
@@ -135,32 +138,13 @@ pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, String> {
     }
 }
 
-/// Ask `observerd` to restart the sing-box proxy over the local socket
-/// (`Control(KickstartProxy)`) and return its [`ControlResult`].
-///
-/// This is the bar's **actuator-control** path (a system action) — every other
-/// request is a read or the benign self-control [`send_set_observing`]. The bar
-/// never runs the action itself: it just sends the request; the daemon (running as
-/// root) decides whether to act, gated by `acting.enabled` (off by default), and
-/// reports the outcome. A missing socket / connection-refused (daemon down) or a
-/// protocol error maps to `Err(String)` so the panel can surface it as a transient
-/// line instead of crashing — never a panic, and never any local `launchctl`
-/// execution.
-pub fn send_kickstart(socket_path: &str) -> Result<ControlResult, String> {
-    match observer_ipc::query(socket_path, &Request::Control(ControlCmd::KickstartProxy)) {
-        Ok(Response::Control(result)) => Ok(result),
-        Ok(Response::Error(msg)) => Err(msg),
-        Ok(_) => Err("unexpected response from observerd".to_string()),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
 /// Ask `observerd` to turn its OWN collection on (`true`) or off (`false`) over
 /// the local socket (`Control(SetObserving(on))`) and return its [`ControlResult`].
 ///
-/// Mirrors [`send_kickstart`] on the wire, but this is benign **self-control**:
-/// it pauses/resumes the observer's own collection only — it does NOT touch
-/// sing-box or the network, and the daemon does not gate it on `acting.enabled`.
+/// Like the other requests this maps to a `Control` command on the wire, but it is
+/// benign **self-control**: it pauses/resumes the observer's own collection only —
+/// it does NOT touch the proxy or the network, and the daemon does not gate it on
+/// `acting.enabled`.
 /// The daemon stays alive and the socket keeps serving while paused, so the switch
 /// can turn collection back on. As with every request, a missing socket /
 /// connection-refused (daemon down) or a protocol error maps to `Err(String)` so
@@ -180,13 +164,17 @@ pub struct Glance {
     pub snapshot: StatusSnapshot,
     /// The most recent fetch error, if the last refresh failed (daemon offline).
     pub error: Option<String>,
-    /// Config socket path, so the panel's manual "Refresh" can re-query.
+    /// Config socket path, so the panel's manual "Refresh" can re-query and the
+    /// event-log window can open its subscription.
     pub socket_path: String,
-    /// The most recent control-action outcome (e.g. the "Restart sing-box"
-    /// result, the observing toggle outcome, or `"acting disabled"`), surfaced as
-    /// a transient line in the panel. `None` until the operator triggers a
-    /// control action.
+    /// The most recent control-action outcome (e.g. the observing toggle outcome
+    /// or `"acting disabled"`), surfaced as a transient line in the panel. `None`
+    /// until the operator triggers a control action.
     pub control_msg: Option<String>,
+    /// The live event-log window, if one is open. Stashed here (persists across
+    /// panel re-opens) so a second "Events" click focuses the existing window
+    /// instead of opening a duplicate subscription; a stale handle re-opens.
+    pub events_window: Option<gpui::AnyWindowHandle>,
 }
 
 impl Glance {
@@ -196,6 +184,7 @@ impl Glance {
             error,
             socket_path,
             control_msg: None,
+            events_window: None,
         }
     }
 
@@ -211,25 +200,10 @@ impl Glance {
         }
     }
 
-    /// Send a manual "Restart sing-box" control to the daemon and record the
-    /// outcome message for the panel. Never panics: a daemon-down / refused
-    /// socket, an error response, or a refused/failed action all become a
-    /// readable `control_msg` line. The read/refresh path is untouched — this
-    /// only writes `control_msg`.
-    pub fn kickstart(&mut self) {
-        self.control_msg = Some(match send_kickstart(&self.socket_path) {
-            Ok(result) => {
-                let tag = if result.ok { "ok" } else { "failed" };
-                format!("{tag}: {}", result.message)
-            }
-            Err(e) => format!("failed: {e}"),
-        });
-    }
-
     /// Flip the observer's collection on/off (the header toggle switch): send
     /// `Control(SetObserving(!observing))`, record the outcome line, then refresh
     /// so the switch reflects the daemon's real state. Benign self-control — never
-    /// touches sing-box or the network. Never panics: a daemon-down / refused
+    /// touches the proxy or the network. Never panics: a daemon-down / refused
     /// socket or a failed action becomes a readable `control_msg` line and the
     /// refresh surfaces the offline state.
     pub fn toggle_observing(&mut self) {
@@ -486,9 +460,9 @@ fn incidents_section(incidents: &[IncidentSummary], now_us: i64, theme: Theme) -
     }
 }
 
-/// The footer: a muted freshness line (+ the last control-action outcome, if any)
-/// on the left, and subtle text actions on the right — "Restart sing-box"
-/// (self-standing control), "Refresh", and "Quit".
+/// The footer (pinned at the bottom of the panel): a muted freshness line (+ the
+/// last control-action outcome, if any), and subtle text actions — "Events"
+/// (opens the live event-log window), "Refresh", and "Quit".
 fn footer(
     snapshot: &StatusSnapshot,
     now_us: i64,
@@ -496,21 +470,20 @@ fn footer(
     theme: Theme,
     cx: &mut Context<PanelView>,
 ) -> impl IntoElement {
-    let restart = div()
-        .id("kickstart")
+    let events = div()
+        .id("events")
         .px_2()
         .py_1()
         .rounded_md()
         .text_size(px(12.0))
-        .text_color(rgb(theme.warn))
+        .text_color(rgb(theme.accent))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(theme.hover)))
-        .child("Restart sing-box")
+        .child("Events")
         .on_click(cx.listener(|this, _, _window, cx| {
-            this.model.update(cx, |g, cx| {
-                g.kickstart();
-                cx.notify();
-            });
+            let socket = this.model.read(cx).socket_path.clone();
+            let model = this.model.clone();
+            crate::events::open_or_focus(cx, &model, socket);
         }));
 
     let refresh = div()
@@ -546,7 +519,7 @@ fn footer(
         .flex()
         .items_center()
         .justify_between()
-        .child(restart)
+        .child(events)
         .child(
             div()
                 .flex()
@@ -717,17 +690,6 @@ mod tests {
         assert!(res.is_err(), "absent socket must yield an offline Err");
     }
 
-    /// The control path must also degrade gracefully: an absent socket (daemon
-    /// down) yields an `Err`, never a panic — and nothing local is executed (the
-    /// bar only ever sends a request; the daemon is the sole actor).
-    #[test]
-    fn send_kickstart_offline_when_socket_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does-not-exist.sock");
-        let res = send_kickstart(missing.to_str().unwrap());
-        assert!(res.is_err(), "absent socket must yield a control Err");
-    }
-
     /// The observing self-control path degrades gracefully too: an absent socket
     /// (daemon down) yields an `Err`, never a panic — and nothing is executed
     /// locally (the bar only sends a request; the daemon owns the state).
@@ -743,27 +705,6 @@ mod tests {
             send_set_observing(missing.to_str().unwrap(), true).is_err(),
             "absent socket must yield a control Err (turning on)"
         );
-    }
-
-    /// `Glance::kickstart` on a down daemon records a readable failure line
-    /// instead of panicking, and leaves the read/refresh state untouched.
-    #[test]
-    fn glance_kickstart_records_failure_when_daemon_down() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does-not-exist.sock");
-        let mut glance = Glance::new(
-            StatusSnapshot::default(),
-            None,
-            missing.to_str().unwrap().to_string(),
-        );
-        glance.kickstart();
-        let msg = glance.control_msg.expect("kickstart must record a message");
-        assert!(
-            msg.starts_with("failed:"),
-            "daemon-down must be a failure: {msg}"
-        );
-        // The read path is untouched by a control action.
-        assert!(glance.error.is_none());
     }
 
     /// `Glance::toggle_observing` on a down daemon records a readable failure line

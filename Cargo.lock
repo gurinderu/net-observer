@@ -4338,6 +4338,7 @@ version = "0.0.0"
 dependencies = [
  "config",
  "gpui",
+ "jiff",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

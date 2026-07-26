@@ -10,7 +10,7 @@ a query ("что было в 17:26") instead of grepping a columnar text log.
 daemon collects telemetry and fires *passive* triggers (record an incident,
 freeze the pcap ring) — it **never acts automatically**. The single write/control
 path is manual and human-in-the-loop: an operator's `Request::Control` (from the
-bar's "Restart sing-box" button or the CLI `kickstart` subcommand) asks the daemon
+CLI `kickstart` subcommand — no longer surfaced in the bar) asks the daemon
 to `launchctl kickstart -k` the sing-box service, and the daemon runs it **only
 when `acting.enabled` is set** — off by default, so every acting-class control
 request is otherwise refused without running anything. Distinct from acting is an
@@ -276,10 +276,11 @@ graph TD
   laid out as a clean list — a header row with the app name and an
   **observing on/off toggle switch** on the right, hairline dividers, label→value
   rows (gw / direct / tun / selector), an incidents line, and a footer of subtle
-  text actions (Restart sing-box / Refresh / Quit). The toggle is a gpui-drawn
-  pill (green track + knob-right when `snapshot.observing`, grey + knob-left when
-  paused); clicking it sends `Control(SetObserving(!observing))` over the socket
-  (`send_set_observing`, mirroring `send_kickstart`) and refreshes, and the header
+  text actions (**Events** — opens the live event-log window — / Refresh / Quit;
+  the "Restart sing-box" control has been removed from the bar). The toggle is a
+  gpui-drawn pill (green track + knob-right when `snapshot.observing`, grey +
+  knob-left when paused); clicking it sends `Control(SetObserving(!observing))`
+  over the socket (`send_set_observing`) and refreshes, and the header
   shows a muted "paused" state (grey dot) while collection is off. gpui's
   build script needs the macOS **Metal Toolchain**, so the crate is a full
   workspace member but is excluded from `default-members` — a bare `cargo build`
@@ -335,6 +336,11 @@ the durable record; the socket is the live, low-latency read path.
     non-read request. Two commands today: `ControlCmd::KickstartProxy`
     (acting-class, gated) and `ControlCmd::SetObserving(bool)` (self-control,
     ungated).
+  - `Request::Subscribe { kinds }` → a **held-open stream** of newline-JSON
+    `Event` frames (not a single `Response`) — the realtime pub/sub path (see
+    [Event bus and live subscriptions](#event-bus-and-live-subscriptions)
+    below). `kinds: None` streams every `EventKind`; `Some(list)` filters
+    server-side.
   - a malformed request → `Response::Error(String)`
 
   `StatusSnapshot` is the latest sample per collector (`link` / `proxy` / `dns` /
@@ -350,13 +356,16 @@ the durable record; the socket is the live, low-latency read path.
   `cfg.socket_mode` so the unprivileged bar can connect to the root-owned socket,
   and — when `cfg.socket_owner_uid` is set — `chown`s it to that uid (control-path
   hardening; see [Control path](#control-path)). One task per connection: read one
-  `Request`, answer from the shared `Arc<Mutex<StatusSnapshot>>` the pipeline keeps
-  current (or, for a `Control`, run the gated actuator), write one `Response`,
-  close. The lock is held only long enough to clone what the reply needs — never
-  across an `.await`, so a slow client can never stall the collector pipeline. The
-  server is spawned by the daemon and `abort()`ed on shutdown alongside the
-  collectors; a bind failure is logged but never takes the daemon down (no API,
-  still collecting).
+  `Request`, then either answer a **one-shot** request (`Status` / `Incidents` /
+  `Control`) from the shared `Arc<Mutex<StatusSnapshot>>` the pipeline keeps
+  current (or, for a `Control`, run the gated actuator), write one `Response`, and
+  close; or, for a `Subscribe`, **hold the connection open** and stream `Event`
+  frames until the client disconnects (see [Event bus and live
+  subscriptions](#event-bus-and-live-subscriptions)). The lock is held only long
+  enough to clone what a reply needs — never across an `.await`, so a slow client
+  can never stall the collector pipeline. The server is spawned by the daemon and
+  `abort()`ed on shutdown alongside the collectors; a bind failure is logged but
+  never takes the daemon down (no API, still collecting).
 
 - **Client** (`observer_ipc::query`, used by `bin/observer-bar` and by
   `observer-cli`'s `status` / `incidents`) — a *blocking* round-trip: connect, write
@@ -379,6 +388,76 @@ sequenceDiagram
     Note over Bar: on connect/read error -> "observer offline"
 ```
 
+### Event bus and live subscriptions
+
+The **realtime pub/sub** path: the daemon *pushes* events as they happen, and
+clients *subscribe* — no polling. This backs the live event-log window in the bar
+and the CLI `events` tail.
+
+- **The bus.** `observerd::main` creates one process-wide
+  `tokio::sync::broadcast::channel::<Event>(EVENT_BUS_CAP)` (1024) and threads the
+  `Sender` into both the pipeline consumer and `api::serve`. An `Event` is the
+  live sibling of a `Sample`: `Event::{Link,Proxy,Dns,Route,Host}(sample)` plus
+  `Event::Incident(IncidentSummary)`, each carrying its own `kind()` and `ts_us()`
+  (defined in `crates/observer-ipc`).
+
+- **Publishers (push).** In `pipeline::run`, every drained `Sample` is published
+  as the matching `Event` on the bus (right after it updates the in-memory
+  snapshot). Incidents are published by the trigger `SnapshotHandler`: on each fire
+  it sends an `Event::Incident` in addition to mirroring it into the snapshot ring.
+  Both sends *ignore the error* a `broadcast::Sender` returns when there are no
+  receivers — with nobody subscribed the bus buffers nothing and costs nothing, so
+  the pipeline never back-pressures on it. Because a paused daemon (`observing ==
+  false`) produces no samples, the stream naturally goes quiet while paused — no
+  extra gating on the bus.
+
+- **Subscribers (the streaming handler).** On `Request::Subscribe { kinds }`,
+  `api::stream_events` calls `events_tx.subscribe()` for a fresh per-connection
+  receiver and loops: on `Ok(ev)` it writes the frame if `kinds` passes it (`None`
+  = all, `Some(list)` = server-side filter), on `RecvError::Lagged(n)` it logs the
+  skip and continues (a slow tail may drop old events — acceptable), on
+  `RecvError::Closed` or a socket write error it stops. The connection stays open
+  for the loop's whole life — this is push, not a reply.
+
+- **Client** (`observer_ipc::subscribe`) — the blocking counterpart to `query`:
+  connect, write one `Subscribe` frame, then return a `Subscription` that
+  `impl Iterator<Item = io::Result<Event>>` by looping `read_frame::<Event>`. Like
+  `query`, it links no async runtime; a clean daemon close ends iteration.
+
+- **The event-log window** (`bin/observer-bar/src/events.rs`) — a resizable,
+  closable `WindowKind::Normal` window ("observer — events"), opened from the
+  panel footer's **Events** action. It opens **one** persistent all-kinds
+  subscription for its whole lifetime (never re-subscribes, never polls). Because
+  `observer_ipc` is blocking, a dedicated OS thread drives the `Subscription` and
+  forwards each frame down an `mpsc` channel; a gpui foreground task drains it into
+  a shared `EventLog` model (a capped `VecDeque` of the last 1000 events) that the
+  view observes and re-renders, autoscrolling to the tail. The type selector at the
+  top filters the *displayed* rows client-side by `EventKind` — changing it never
+  touches the socket. On daemon-down / stream-drop the thread shows an "offline —
+  reconnecting" note and retries after a short delay; it never panics. The window
+  handle is stashed on the shared `Glance` so a second **Events** click focuses the
+  existing window instead of spawning a duplicate subscription.
+
+- **CLI** (`observer-cli events [--kind K]`) — the pub/sub smoke test and a
+  terminal tail: one `Subscribe`, print each `Event` live until Ctrl-C; `--kind`
+  filters server-side.
+
+```mermaid
+sequenceDiagram
+    participant Pipe as pipeline::run + SnapshotHandler
+    participant Bus as broadcast::Sender<Event>
+    participant Srv as observerd stream_events
+    participant Win as event-log window / cli events
+    Pipe->>Bus: send(Event) per sample / on incident fire
+    Win->>Srv: connect + write Request::Subscribe { kinds }\n
+    Srv->>Bus: events_tx.subscribe() (per-conn receiver)
+    loop until client disconnects
+        Bus-->>Srv: recv() -> Event
+        Srv-->>Win: write Event frame\n (if kinds passes)
+    end
+    Note over Win: offline -> "reconnecting", retry (never polls)
+```
+
 ### Control path
 
 The one **write** path over the socket: a `Request::Control(ControlCmd)`. There
@@ -387,9 +466,10 @@ place, `api::control_response`:
 
 1. **Acting-class — gated by `acting.enabled`.** `ControlCmd::KickstartProxy`
    asks the daemon to restart the sing-box service via
-   `launchctl kickstart -k <service>`. Clients (bar "Restart sing-box" button,
-   CLI `kickstart`) only *send the request* — they never run `launchctl`
-   themselves; the root daemon is the sole actor, and only when acting is on.
+   `launchctl kickstart -k <service>`. The client only *sends the request* — it
+   never runs `launchctl` itself; the root daemon is the sole actor, and only when
+   acting is on. This capability lives in the CLI (`observer-cli kickstart`); it is
+   **not** surfaced in the bar (the bar has no "Restart sing-box" control).
 
 2. **Self-control — NOT gated by `acting.enabled`.** `ControlCmd::SetObserving(b)`
    turns the observer's OWN collection on/off. It stores `b` into the shared

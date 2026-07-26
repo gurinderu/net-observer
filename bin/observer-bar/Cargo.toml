@@ -12,6 +12,9 @@ config.workspace = true
 # absent socket degrades to a graceful "observer offline" state. No DB, `store`,
 # or `anyhow` dependency here — the wire types come from `observer-ipc`.
 observer-ipc.workspace = true
+# Local `HH:MM:SS` wall-clock formatting for event-log rows (the daemon reports
+# epoch-microsecond timestamps). Same crate the daemon/types layer already uses.
+jiff.workspace = true
 
 # macOS menu-bar UI. The rich panel is drawn with gpui (Zed's GPU-accelerated
 # Rust UI framework); the system status-bar item (`NSStatusItem`) plus the

@@ -25,8 +25,9 @@ use std::sync::{Arc, Mutex};
 use collector_core::Source;
 
 use crate::AnyCollector;
-use observer_ipc::{IncidentSummary, StatusSnapshot};
+use observer_ipc::{Event, IncidentSummary, StatusSnapshot};
 use store::{DuckdbStore, Store};
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
@@ -42,17 +43,24 @@ const WINDOW_CAP: usize = 64;
 /// keeping the live [`StatusSnapshot`] current.
 ///
 /// For every [`Sample`]: write it to the store, update the shared `snapshot`
-/// (the latest sample for that variant, plus `generated_us`), push it into the
-/// recent window, then evaluate all triggers at the sample's own timestamp. A
-/// store write failure is logged and the loop continues (a DB outage must not
-/// silently drop the live detection stream — the gap is recorded, per the spec);
-/// the in-memory snapshot is updated regardless, so the socket API stays live
-/// even through a DB hiccup.
+/// (the latest sample for that variant, plus `generated_us`), publish the matching
+/// [`Event`] on the realtime bus, push it into the recent window, then evaluate
+/// all triggers at the sample's own timestamp. A store write failure is logged and
+/// the loop continues (a DB outage must not silently drop the live detection
+/// stream — the gap is recorded, per the spec); the in-memory snapshot is updated
+/// regardless, so the socket API stays live even through a DB hiccup.
+///
+/// Publishing is push, not poll: each sample becomes an [`Event`] on `events_tx`
+/// so held-open `Subscribe` connections receive it immediately. A `send` error
+/// just means there are no subscribers right now (the initial receiver is
+/// dropped), so it is ignored — the pipeline never back-pressures on the bus.
+/// Incidents are published separately by the trigger [`SnapshotHandler`] on fire.
 pub async fn run(
     store: Arc<DuckdbStore>,
     mut engine: TriggerEngine,
     mut rx: mpsc::Receiver<Sample>,
     snapshot: Arc<Mutex<StatusSnapshot>>,
+    events_tx: broadcast::Sender<Event>,
 ) {
     let mut window = RecentWindow::new(WINDOW_CAP);
     while let Some(sample) = rx.recv().await {
@@ -74,6 +82,16 @@ pub async fn run(
                 Sample::Route(_) => {}
             }
         }
+        // Publish the sample as a live `Event` (push, not poll). Ignore the send
+        // error: it only means no client is subscribed right now.
+        let event = match &sample {
+            Sample::Link(l) => Event::Link(l.clone()),
+            Sample::Proxy(p) => Event::Proxy(p.clone()),
+            Sample::Dns(d) => Event::Dns(d.clone()),
+            Sample::Host(h) => Event::Host(h.clone()),
+            Sample::Route(r) => Event::Route(r.clone()),
+        };
+        let _ = events_tx.send(event);
         window.push(sample);
         engine.on_sample(&window, now_us);
     }
@@ -244,18 +262,29 @@ impl<S: Store + Send + Sync> Handler for FreezePcapHandler<S> {
 
 /// A passive [`Handler`] that mirrors each firing into the live
 /// [`StatusSnapshot`]'s bounded incident ring, so the socket API can serve recent
-/// incidents from memory without a DB read. Newest first; the ring is truncated
-/// to `cap`. DuckDB (via [`RecordHandler`]) remains the durable record — this
-/// ring is only the live view.
+/// incidents from memory without a DB read, and publishes an [`Event::Incident`]
+/// on the realtime bus so held-open `Subscribe` connections see it immediately.
+/// Newest first; the ring is truncated to `cap`. DuckDB (via [`RecordHandler`])
+/// remains the durable record — this ring is only the live view.
 pub struct SnapshotHandler {
     snapshot: Arc<Mutex<StatusSnapshot>>,
     cap: usize,
+    events_tx: broadcast::Sender<Event>,
 }
 
 impl SnapshotHandler {
-    /// Build a handler that pushes onto `snapshot`'s incident ring, capped to `cap`.
-    pub fn new(snapshot: Arc<Mutex<StatusSnapshot>>, cap: usize) -> Self {
-        Self { snapshot, cap }
+    /// Build a handler that pushes onto `snapshot`'s incident ring, capped to
+    /// `cap`, and publishes each firing as an [`Event::Incident`] on `events_tx`.
+    pub fn new(
+        snapshot: Arc<Mutex<StatusSnapshot>>,
+        cap: usize,
+        events_tx: broadcast::Sender<Event>,
+    ) -> Self {
+        Self {
+            snapshot,
+            cap,
+            events_tx,
+        }
     }
 }
 
@@ -275,6 +304,9 @@ impl Handler for SnapshotHandler {
             trigger_id,
             signature: detail.to_string(),
         };
+        // Publish the incident on the realtime bus (push, not poll). Ignore the
+        // send error: it only means no client is subscribed right now.
+        let _ = self.events_tx.send(Event::Incident(summary.clone()));
         let mut snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
         snap.incidents.insert(0, summary);
         snap.incidents.truncate(self.cap);
@@ -290,7 +322,7 @@ mod tests {
     use triggers::conditions::{GwChange, GwDrop};
     use triggers::engine::Trigger;
     use triggers::handlers::RecordHandler;
-    use types::{GwVerdict, LinkSample, ProxySample, TcpVerdict};
+    use types::{GwVerdict, HostSample, LinkSample, ProxySample, TcpVerdict};
 
     fn link(ts_us: i64, gw: GwVerdict) -> Sample {
         Sample::Link(LinkSample {
@@ -313,8 +345,9 @@ mod tests {
         let rec = Arc::new(RecordHandler::new(store.clone()));
         let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 0)]);
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
         let (tx, rx) = mpsc::channel(16);
-        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot));
+        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot, events_tx));
         tx.send(Sample::Link(LinkSample {
             ts_us: 1,
             gw: GwVerdict::Fail,
@@ -368,8 +401,9 @@ mod tests {
         let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwChange), handlers, 0)]);
 
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
         let (tx, rx) = mpsc::channel(16);
-        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot));
+        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot, events_tx));
         // Ok -> Fail is a gateway-verdict change: gw-change must fire.
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
         tx.send(link(2, GwVerdict::Fail)).await.unwrap();
@@ -462,8 +496,9 @@ mod tests {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let eng = TriggerEngine::new(vec![]);
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
         let (tx, rx) = mpsc::channel(16);
-        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot.clone()));
+        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot.clone(), events_tx));
 
         // A link sample then a proxy sample: each populates its own snapshot field,
         // and `generated_us` tracks the most recent sample.
@@ -495,7 +530,8 @@ mod tests {
     #[test]
     fn snapshot_handler_caps_incident_ring() {
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
-        let handler = SnapshotHandler::new(snapshot.clone(), 3);
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let handler = SnapshotHandler::new(snapshot.clone(), 3, events_tx);
 
         // Five firings into a cap-3 ring: only the three newest survive, newest first.
         for i in 0..5 {
@@ -510,5 +546,62 @@ mod tests {
         assert_eq!(snap.incidents[0].signature, "sig");
         assert_eq!(snap.incidents[1].id, "gw-drop-3");
         assert_eq!(snap.incidents[2].id, "gw-drop-2");
+    }
+
+    /// Push, not poll: the consumer publishes one `Event` per sample on the
+    /// broadcast bus, in order, matching the sample variant. A receiver created
+    /// before `run` starts captures every published frame.
+    #[tokio::test]
+    async fn run_publishes_event_per_sample() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let eng = TriggerEngine::new(vec![]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, mut events_rx) = broadcast::channel(16);
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot, events_tx));
+
+        tx.send(link(1, GwVerdict::Ok)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 2,
+            load1: 1.0,
+            load5: 2.0,
+            load15: 3.0,
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        // Each sample was published as the matching Event, in arrival order.
+        match events_rx.recv().await.unwrap() {
+            Event::Link(l) => assert_eq!(l.ts_us, 1),
+            other => panic!("expected Link event, got {other:?}"),
+        }
+        match events_rx.recv().await.unwrap() {
+            Event::Host(hh) => assert_eq!(hh.ts_us, 2),
+            other => panic!("expected Host event, got {other:?}"),
+        }
+    }
+
+    /// On fire the `SnapshotHandler` publishes an `Event::Incident` on the bus (in
+    /// addition to mirroring it into the snapshot ring), so held-open subscribers
+    /// see the incident live.
+    #[test]
+    fn snapshot_handler_publishes_incident_event() {
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, mut events_rx) = broadcast::channel(16);
+        let handler = SnapshotHandler::new(snapshot, 8, events_tx);
+
+        handler.on_fire("gw-drop-42", 42, "sig");
+
+        match events_rx.try_recv().unwrap() {
+            Event::Incident(inc) => {
+                assert_eq!(inc.id, "gw-drop-42");
+                assert_eq!(inc.opened_us, 42);
+                assert_eq!(inc.trigger_id, "gw-drop");
+                assert_eq!(inc.signature, "sig");
+            }
+            other => panic!("expected Incident event, got {other:?}"),
+        }
     }
 }

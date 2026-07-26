@@ -31,7 +31,7 @@ use macos::{
     BoundTcpProber, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource, ProxySystemFacts,
     SystemFacts,
 };
-use observer_ipc::StatusSnapshot;
+use observer_ipc::{Event, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{FakeIp, GwChange, GwDrop, Starvation, Wedge};
 use triggers::engine::{Trigger, TriggerEngine};
@@ -53,6 +53,13 @@ const CHANNEL_CAP: usize = 256;
 /// How many recent incidents the live snapshot keeps for the socket API. DuckDB
 /// remains the durable record; this ring is just the in-memory live view.
 const INCIDENT_RING_CAP: usize = 20;
+
+/// Depth of the realtime event broadcast bus. The pipeline publishes one `Event`
+/// per sample (plus an `Event::Incident` on each trigger fire) onto this bus;
+/// each held-open `Subscribe` connection gets its own receiver. A subscriber that
+/// falls this far behind sees a `Lagged` skip rather than back-pressuring the
+/// pipeline — a live tail may drop old events, which is acceptable.
+const EVENT_BUS_CAP: usize = 1024;
 
 /// Wedge signal: tun dead while the direct path is healthy, for this many ticks.
 const WEDGE_CONSECUTIVE: usize = 3;
@@ -142,12 +149,22 @@ async fn run_daemon() -> anyhow::Result<()> {
     // `observing: true`; the control handler mirrors every change into it.
     let observing = Arc::new(AtomicBool::new(true));
 
+    // The realtime event bus (push, not poll): the pipeline consumer publishes an
+    // `Event` per sample and the trigger `SnapshotHandler` publishes an
+    // `Event::Incident` on each fire; the socket API's `Subscribe` handler holds a
+    // connection open and streams filtered frames from a per-connection receiver.
+    // The initial receiver is dropped — with no subscribers a `send` simply
+    // returns an ignored error (nothing is buffered against an absent audience),
+    // so the bus adds no cost while nobody is watching.
+    let (events_tx, _) = tokio::sync::broadcast::channel::<Event>(EVENT_BUS_CAP);
+
     // Serve the read-only status socket for the unprivileged bar. Best-effort: a
     // bind failure is logged but never takes the daemon down (no API, still
     // collecting). Aborted on shutdown alongside the collectors.
     let api_handle = {
         let snapshot = snapshot.clone();
         let observing = observing.clone();
+        let events_tx = events_tx.clone();
         let socket_path = cfg.socket_path.clone();
         let socket_mode = cfg.socket_mode;
         let socket_owner_uid = cfg.socket_owner_uid;
@@ -167,6 +184,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 acting,
                 observing,
                 snapshot,
+                events_tx,
             )
             .await
             {
@@ -280,11 +298,20 @@ async fn run_daemon() -> anyhow::Result<()> {
     // gw-change trigger still records the incident, just without a pcap freeze.
     let freezer = maybe_start_pcap_ring(&cfg, phys_iface.as_deref());
 
-    // Build the trigger engine with the starter rule set + passive handlers.
-    let engine = build_engine(store.clone(), &cfg, freezer, snapshot.clone());
+    // Build the trigger engine with the starter rule set + passive handlers. The
+    // event bus is threaded in so the `SnapshotHandler` publishes an
+    // `Event::Incident` on each fire.
+    let engine = build_engine(
+        store.clone(),
+        &cfg,
+        freezer,
+        snapshot.clone(),
+        events_tx.clone(),
+    );
 
-    // Run the consumer loop until a shutdown signal (or the stream closing).
-    let mut consumer = tokio::spawn(run(store.clone(), engine, rx, snapshot.clone()));
+    // Run the consumer loop until a shutdown signal (or the stream closing). The
+    // consumer publishes an `Event` per sample onto the bus (push, not poll).
+    let mut consumer = tokio::spawn(run(store.clone(), engine, rx, snapshot.clone(), events_tx));
 
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     tokio::select! {
@@ -448,12 +475,15 @@ fn build_engine(
     cfg: &Config,
     freezer: Option<Arc<dyn PcapFreezer>>,
     snapshot: Arc<Mutex<StatusSnapshot>>,
+    events_tx: tokio::sync::broadcast::Sender<Event>,
 ) -> TriggerEngine {
     let record: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
     // Passive handler that pushes each firing onto the live snapshot's incident
-    // ring so the socket API serves recent incidents from memory. Added to every
-    // trigger alongside `record`.
-    let snap: Arc<dyn Handler> = Arc::new(SnapshotHandler::new(snapshot, INCIDENT_RING_CAP));
+    // ring so the socket API serves recent incidents from memory, and publishes an
+    // `Event::Incident` on the realtime bus for held-open subscribers. Added to
+    // every trigger alongside `record`.
+    let snap: Arc<dyn Handler> =
+        Arc::new(SnapshotHandler::new(snapshot, INCIDENT_RING_CAP, events_tx));
 
     let mut gw_change_handlers: Vec<Arc<dyn Handler>> = vec![record.clone(), snap.clone()];
     if let Some(freezer) = freezer {

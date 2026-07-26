@@ -15,9 +15,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use observer_ipc::{ControlCmd, ControlResult, Request, Response, StatusSnapshot};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use observer_ipc::{
+    ControlCmd, ControlResult, Event, EventKind, Request, Response, StatusSnapshot,
+};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast;
 
 use crate::acting;
 
@@ -48,6 +51,12 @@ pub struct ActingConfig {
 /// and is *not* gated by `acting`: it flips the shared `observing` flag the
 /// collectors check and mirrors the new state into the live snapshot.
 ///
+/// `events_tx` is the realtime event bus. A one-shot request (`Status`,
+/// `Incidents`, `Control`) is answered with a single [`Response`] then the
+/// connection closes; a [`Request::Subscribe`] instead holds the connection open
+/// and streams filtered newline-JSON [`Event`] frames from a per-connection
+/// broadcast receiver until the client disconnects (see [`stream_events`]).
+///
 /// Runs forever; the daemon spawns it and `abort()`s it on shutdown. A stale
 /// socket file left by a previous run is removed before binding (otherwise
 /// `bind` fails with `EADDRINUSE`).
@@ -58,6 +67,7 @@ pub async fn serve(
     acting: ActingConfig,
     observing: Arc<AtomicBool>,
     snapshot: Arc<Mutex<StatusSnapshot>>,
+    events_tx: broadcast::Sender<Event>,
 ) -> std::io::Result<()> {
     // A leftover socket file from a previous run makes bind() fail; clear it.
     let _ = std::fs::remove_file(&socket_path);
@@ -89,9 +99,13 @@ pub async fn serve(
                 let snapshot = Arc::clone(&snapshot);
                 let observing = Arc::clone(&observing);
                 let acting = acting.clone();
-                // One task per connection: read one request, reply, close.
+                let events_tx = events_tx.clone();
+                // One task per connection. One-shot requests reply and close; a
+                // `Subscribe` holds the connection open and streams `Event` frames.
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, &snapshot, &observing, &acting).await {
+                    if let Err(e) =
+                        handle_conn(stream, &snapshot, &observing, &acting, &events_tx).await
+                    {
                         tracing::debug!(error = %e, "status socket connection error");
                     }
                 });
@@ -101,15 +115,20 @@ pub async fn serve(
     }
 }
 
-/// Handle one client: read a single newline-JSON [`Request`], answer from the
-/// in-memory snapshot with a newline-JSON [`Response`], then close. The snapshot
-/// lock is held only long enough to clone what the response needs — never across
-/// an `.await`.
+/// Handle one client: read a single newline-JSON [`Request`], then dispatch.
+///
+/// One-shot requests (`Status`, `Incidents`, `Control`) are answered from the
+/// in-memory snapshot with a single newline-JSON [`Response`], then the connection
+/// closes. A [`Request::Subscribe`] instead holds the connection open and streams
+/// filtered [`Event`] frames via [`stream_events`] until the client disconnects.
+/// The snapshot lock is held only long enough to clone what a response needs —
+/// never across an `.await`.
 async fn handle_conn(
     stream: UnixStream,
     snapshot: &Mutex<StatusSnapshot>,
     observing: &AtomicBool,
     acting: &ActingConfig,
+    events_tx: &broadcast::Sender<Event>,
 ) -> std::io::Result<()> {
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
@@ -119,6 +138,12 @@ async fn handle_conn(
     }
 
     let response = match serde_json::from_str::<Request>(&line) {
+        // Streaming path: hold the connection open and push filtered `Event`
+        // frames from a per-connection broadcast receiver until the client goes
+        // away. It never produces a single `Response`, so it returns directly.
+        Ok(Request::Subscribe { kinds }) => {
+            return stream_events(&mut wr, kinds, events_tx).await;
+        }
         Ok(Request::Status) => Response::Status(snapshot_clone(snapshot)),
         Ok(Request::Incidents { limit }) => {
             let incidents = snapshot
@@ -141,6 +166,55 @@ async fn handle_conn(
     buf.push(b'\n');
     wr.write_all(&buf).await?;
     wr.flush().await
+}
+
+/// Stream live [`Event`] frames to a held-open [`Request::Subscribe`] connection.
+///
+/// Subscribes a fresh receiver on the realtime bus and loops, writing each event
+/// as a newline-JSON frame to `wr`, filtered by `kinds` (`None` = every kind).
+/// The connection stays open for the loop's whole duration — this is push, not
+/// poll: the client subscribes once and the daemon pushes frames as they happen.
+///
+/// Termination:
+/// - [`broadcast::error::RecvError::Lagged`] — the subscriber fell behind the bus;
+///   log the count and continue (a live tail may drop old events).
+/// - [`broadcast::error::RecvError::Closed`] — the bus is gone; stop.
+/// - a write/flush error — the client disconnected; stop.
+async fn stream_events<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    kinds: Option<Vec<EventKind>>,
+    events_tx: &broadcast::Sender<Event>,
+) -> std::io::Result<()> {
+    let mut rx = events_tx.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                // Filter server-side: `None` passes every kind, `Some(list)` only
+                // the listed kinds.
+                let deliver = match &kinds {
+                    Some(ks) => ks.contains(&ev.kind()),
+                    None => true,
+                };
+                if !deliver {
+                    continue;
+                }
+                let mut buf = serde_json::to_vec(&ev)?;
+                buf.push(b'\n');
+                // A write/flush error means the client is gone — stop streaming.
+                if wr.write_all(&buf).await.is_err() || wr.flush().await.is_err() {
+                    break;
+                }
+            }
+            // Slow subscriber: it missed `n` events. Acceptable for a live tail —
+            // log and keep going rather than tearing the connection down.
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "event subscriber lagged; dropped old events");
+            }
+            // The broadcast sender was dropped (daemon shutting down): end the stream.
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    Ok(())
 }
 
 /// Map a [`ControlCmd`] to its [`ControlResult`].
@@ -201,7 +275,7 @@ fn snapshot_clone(snapshot: &Mutex<StatusSnapshot>) -> StatusSnapshot {
 mod tests {
     use super::*;
     use observer_ipc::IncidentSummary;
-    use types::{GwVerdict, LinkSample, TcpVerdict};
+    use types::{GwVerdict, HostSample, LinkSample, RouteEvent, TcpVerdict};
 
     /// End-to-end round-trip over a real `UnixListener` bound to a temp path,
     /// answered with the blocking `observer_ipc::query` client the bar uses.
@@ -251,6 +325,7 @@ mod tests {
             singbox_service: "system/sing-box".into(),
         };
         let observing = Arc::new(AtomicBool::new(true));
+        let (events_tx, _) = broadcast::channel(16);
         let handle = tokio::spawn(serve(
             sock_str.clone(),
             0o666,
@@ -258,6 +333,7 @@ mod tests {
             acting,
             observing,
             snapshot.clone(),
+            events_tx,
         ));
 
         // Wait for the socket file to appear (bind + chmod complete).
@@ -361,5 +437,108 @@ mod tests {
         assert_eq!(on.message, "observing on");
         assert!(observing.load(Ordering::Acquire));
         assert!(snapshot.lock().unwrap().observing);
+    }
+
+    /// End-to-end streaming subscription over a real `UnixListener`: a `Subscribe`
+    /// connection is held open and streamed filtered `Event` frames pushed on the
+    /// bus (push, not poll). The client subscribes once filtered to `Route`; a
+    /// `Host` event is dropped server-side by the filter while a `Route` event is
+    /// delivered on the same held-open connection.
+    #[tokio::test]
+    async fn serve_streams_filtered_subscription_events() {
+        let dir = std::env::temp_dir().join(format!("observerd-sub-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let acting = ActingConfig {
+            enabled: false,
+            singbox_service: "system/sing-box".into(),
+        };
+        let observing = Arc::new(AtomicBool::new(true));
+        let (events_tx, _) = broadcast::channel(16);
+        let handle = tokio::spawn(serve(
+            sock_str.clone(),
+            0o666,
+            None,
+            acting,
+            observing,
+            snapshot.clone(),
+            events_tx.clone(),
+        ));
+
+        // Wait for the socket file to appear (bind + chmod complete).
+        for _ in 0..200 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(sock.exists(), "socket was never created");
+
+        // Open a live subscription filtered to Route only, on a blocking thread
+        // (the client is deliberately tokio-free).
+        let sp = sock_str.clone();
+        let sub = tokio::task::spawn_blocking(move || {
+            observer_ipc::subscribe(
+                &sp,
+                &Request::Subscribe {
+                    kinds: Some(vec![EventKind::Route]),
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Wait until the server has created its broadcast receiver; a `send` before
+        // that would reach no one (broadcast only delivers to receivers that exist
+        // at send time).
+        for _ in 0..200 {
+            if events_tx.receiver_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            events_tx.receiver_count() >= 1,
+            "server never subscribed to the bus"
+        );
+
+        // A Host event is filtered out server-side; a Route event passes.
+        events_tx
+            .send(Event::Host(HostSample {
+                ts_us: 1,
+                load1: 0.0,
+                load5: 0.0,
+                load15: 0.0,
+            }))
+            .unwrap();
+        events_tx
+            .send(Event::Route(RouteEvent {
+                ts_us: 7,
+                kind: "iface".into(),
+                iface: Some("en0".into()),
+                detail: "up".into(),
+            }))
+            .unwrap();
+
+        // The first frame the client receives is the Route event (Host filtered).
+        let ev = tokio::task::spawn_blocking(move || {
+            let mut sub = sub;
+            sub.next()
+        })
+        .await
+        .unwrap()
+        .expect("subscription should yield a frame")
+        .expect("frame should decode");
+        match ev {
+            Event::Route(r) => assert_eq!(r.ts_us, 7),
+            other => panic!("expected Route event, got {other:?}"),
+        }
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

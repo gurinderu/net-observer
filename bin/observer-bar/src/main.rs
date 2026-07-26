@@ -29,10 +29,15 @@
 //!   blocking socket fetch that maps daemon-down to an "offline" `Err`.
 //! - [`menubar`] — the dockless (`.accessory`) `NSStatusItem` shell (AppKit
 //!   interop via `objc2`) that hosts the gpui panel and drives the refresh timer.
+//! - [`events`] — the realtime **event-log window** (a resizable, closable
+//!   `WindowKind::Normal`): opened from the panel footer, fed by one held-open
+//!   `Subscribe` stream over the socket (pub/sub, push not poll), with a type
+//!   selector over a live autoscrolling list.
 //!
 //! The GUI cannot run headlessly, so it is verified by compiling + clippy; the
 //! tested surface stays the data/render layer.
 
+mod events;
 mod menubar;
 mod status;
 mod ui;
