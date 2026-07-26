@@ -246,12 +246,11 @@ impl Render for PanelView {
 
         let glance = self.model.read(cx);
         let snapshot = glance.snapshot.clone();
-        let error = glance.error.clone();
         let control_msg = glance.control_msg.clone();
         let now_us = now_us();
         // Offline (daemon down / socket absent) ⇒ we cannot be observing, so the
         // switch reads OFF and is non-interactive regardless of the stale snapshot.
-        let online = error.is_none();
+        let online = glance.error.is_none();
 
         div()
             .flex()
@@ -265,7 +264,6 @@ impl Render for PanelView {
             .overflow_hidden()
             .child(header_row(&snapshot, online, theme, cx))
             .child(separator(theme))
-            .children(error.map(|e| offline_row(e, theme)))
             .child(status_rows(&snapshot, theme))
             .child(separator(theme))
             .child(incidents_section(&snapshot.incidents, now_us, theme))
@@ -296,11 +294,9 @@ fn header_row(
                 .font_weight(gpui::FontWeight::BOLD)
                 .child("observer"),
         );
-    // Show "offline" when the daemon is unreachable, else "paused" when the
-    // daemon is up but collection is off.
-    let sub = if !online {
-        Some("offline")
-    } else if !snapshot.observing {
+    // Only a muted "paused" label when the daemon is up but collection is off.
+    // Offline is conveyed by a warning glyph next to the (disabled) toggle — no text.
+    let sub = if online && !snapshot.observing {
         Some("paused")
     } else {
         None
@@ -321,6 +317,8 @@ fn header_row(
         .py_2p5()
         .child(left)
         .child(div().flex_1())
+        // Offline: a warning glyph with a tooltip, next to the (disabled) toggle.
+        .children((!online).then(|| warn_offline(theme)))
         // ON only if actually observing AND connected; interactive only online.
         .child(toggle_switch(
             snapshot.observing && online,
@@ -328,6 +326,42 @@ fn header_row(
             theme,
             cx,
         ))
+}
+
+/// A warning glyph shown in the header when the daemon is unreachable. Hovering it
+/// explains why the observing toggle is disabled — instead of a loud offline
+/// banner. Replaces the old yellow offline row.
+fn warn_offline(theme: Theme) -> impl IntoElement {
+    div()
+        .id("offline-warn")
+        .text_size(px(13.0))
+        .text_color(rgb(theme.warn))
+        .child("\u{26A0}") // ⚠
+        .tooltip(|_window, cx| {
+            cx.new(|_| {
+                WarnTooltip(
+                    "observer offline — can't toggle collection (daemon not reachable)".into(),
+                )
+            })
+            .into()
+        })
+}
+
+/// A minimal tooltip view: a small dark chip with a message. gpui 0.2.2 has no
+/// built-in tooltip element, so `.tooltip(..)` builds this `AnyView`.
+struct WarnTooltip(SharedString);
+
+impl Render for WarnTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .bg(rgb(0x1f1f22))
+            .text_color(rgb(0xe8e8ec))
+            .text_size(px(12.0))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .child(self.0.clone())
+    }
 }
 
 /// The header health dot glyph + color. When paused, a grey dot regardless of the
@@ -390,30 +424,6 @@ fn toggle_switch(
         track.justify_start()
     };
     track
-}
-
-/// The offline banner shown when the last fetch failed (daemon down / socket
-/// absent): a warn-colored title + the error, rather than showing stale data as
-/// if it were live.
-fn offline_row(msg: String, theme: Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .px_3()
-        .py_2()
-        .child(
-            div()
-                .text_color(rgb(theme.warn))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child("observer offline"),
-        )
-        .child(
-            div()
-                .text_size(px(11.0))
-                .text_color(rgb(theme.warn))
-                .child(SharedString::from(msg)),
-        )
 }
 
 /// The label→value list: the latest link tick (gw, direct) and proxy tick (tun,
