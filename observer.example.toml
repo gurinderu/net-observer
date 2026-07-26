@@ -13,6 +13,14 @@ db_path = "/var/lib/observer/observer.duckdb"
 # Directory for captured blobs (pcap ring files, log dumps).
 blob_dir = "/var/lib/observer/blobs"
 
+# Unix-domain socket the daemon binds to serve live status. The bar (and any
+# other client) connects here instead of opening the DB directly.
+socket_path = "/var/lib/observer/observer.sock"
+
+# Permission bits (octal) applied to the socket file so the unprivileged bar can
+# connect while the daemon runs as root.
+socket_mode = 0o666
+
 # The `link` collector probes the local network path: default gateway
 # reachability, a direct TCP connectivity check, DHCP/ARP facts and Wi-Fi SSID.
 [collectors.link]

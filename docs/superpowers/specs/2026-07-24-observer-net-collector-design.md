@@ -338,17 +338,41 @@ Plan: `docs/superpowers/plans/2026-07-25-next-collectors-and-bar.md`.
 - `dns`, `route-events`, `host-metrics` collectors (own crates), activating the
   `FakeIp` and `Starvation` trigger conditions with real data. `route-events` is
   the first **Event**-cadence collector (PF_ROUTE via `EventSource`).
-- **gpui menu-bar** (`bin/observer-bar`) — first cut is a **read-only glance**:
-  `NSStatusItem` (via `objc2`) + a gpui panel that reads the DuckDB file
-  (last tick per collector + recent incidents). No toggles yet.
+- **gpui menu-bar** (`bin/observer-bar`) — `NSStatusItem` (via `objc2`) + a gpui
+  panel showing the last tick per collector + recent incidents. No toggles yet.
+
+## Local API (the daemon is the sole DB owner)
+
+`observerd` is the **only** process that touches the DuckDB store (DuckDB takes a
+per-process file lock — a second opener, even read-only, is blocked while the
+daemon runs). Every other component reads through a **local API**, never the DB.
+
+- **`observerd` exposes a Unix-domain socket** (`/var/lib/observer/observer.sock`,
+  path + mode configurable; the root daemon `chmod`s it so the logged-in user's
+  UI can connect). Served async via `tokio::net::UnixListener`.
+- The daemon keeps an **in-memory live snapshot** (`tokio::sync::watch`) updated
+  by the pipeline consumer on every sample, plus a small ring of recent
+  incidents pushed when a trigger fires. The socket answers **from memory** — no
+  DB read on the request path, zero contention with the writer, always live.
+- **`crates/observer-ipc`** holds the shared protocol: `Request { Status,
+  Incidents { limit } }`, `StatusSnapshot { link/proxy/dns/host: Option<*Sample>,
+  incidents: Vec<IncidentSummary>, generated_us }` (reuses `types`), newline-JSON
+  framing, a blocking `query()` client (for the bar) + an async serve helper.
+- **`observer-bar` is a pure socket client** — no `duckdb` dependency at all. Its
+  refresh timer calls `observer_ipc::query(sock, Request::Status)` and renders;
+  daemon-down ⇒ a graceful "offline" state.
 
 ## Open questions still deferred
 
 - Watchdog / acting: an `Act` handler (kickstart) behind a flag — the shell
   watchdog stays as the recovery path meanwhile.
 - Notification channel(s) for a `Notify` handler.
-- Runtime config mechanism (reload / **control socket** / CLI) — required before
-  the menu-bar gains live **toggles** (portal / kill-switch); the read-only bar
-  does not need it.
+- **Write/control commands** on the local socket (the read/status API now
+  exists) — required before the menu-bar gains live **toggles** (portal /
+  kill-switch) and before runtime config reload. Read path is done; the control
+  path stays deferred.
+- Routing `observer-cli`'s live commands (status/incidents) through the socket
+  too, leaving direct DB access only for explicit **offline** forensics
+  (`query <SQL>` when the daemon is stopped).
 - Migrating `pcap-ring` from the `tcpdump` child to in-process capture
   (`pcap` crate / BPF).

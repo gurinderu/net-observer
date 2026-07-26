@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/types",
     "crates/config",
+    "crates/observer-ipc",
     "crates/store",
     "crates/collector-core",
     "crates/collector-link",
@@ -25,6 +26,7 @@ members = [
 default-members = [
     "crates/types",
     "crates/config",
+    "crates/observer-ipc",
     "crates/store",
     "crates/collector-core",
     "crates/collector-link",
@@ -64,6 +66,7 @@ objc2 = "0.6.4"
 # local crates
 types = { path = "crates/types" }
 config = { path = "crates/config" }
+observer-ipc = { path = "crates/observer-ipc" }
 store = { path = "crates/store" }
 collector-core = { path = "crates/collector-core" }
 collector-link = { path = "crates/collector-link" }

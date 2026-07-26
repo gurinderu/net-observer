@@ -5,10 +5,11 @@
 //! handlers (record incidents; freeze the pcap ring on any gateway change), runs
 //! the consumer loop, and shuts down cleanly on SIGTERM/SIGINT.
 
+mod api;
 mod pipeline;
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -28,6 +29,7 @@ use macos::{
     BoundTcpProber, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource, ProxySystemFacts,
     SystemFacts,
 };
+use observer_ipc::StatusSnapshot;
 use store::DuckdbStore;
 use triggers::conditions::{FakeIp, GwChange, GwDrop, Starvation, Wedge};
 use triggers::engine::{Trigger, TriggerEngine};
@@ -35,7 +37,8 @@ use triggers::handlers::{Handler, RecordHandler};
 use types::Sample;
 
 use pipeline::{
-    FreezePcapHandler, PcapFreezer, run, spawn_event_collector, spawn_interval_collector,
+    FreezePcapHandler, PcapFreezer, SnapshotHandler, run, spawn_event_collector,
+    spawn_interval_collector,
 };
 
 /// Minimum interval between fires for one trigger (5 minutes, in microseconds),
@@ -44,6 +47,10 @@ const BACKOFF_US: i64 = 300_000_000;
 
 /// Depth of the sample stream between the collectors and the consumer.
 const CHANNEL_CAP: usize = 256;
+
+/// How many recent incidents the live snapshot keeps for the socket API. DuckDB
+/// remains the durable record; this ring is just the in-memory live view.
+const INCIDENT_RING_CAP: usize = 20;
 
 /// Wedge signal: tun dead while the direct path is healthy, for this many ticks.
 const WEDGE_CONSECUTIVE: usize = 3;
@@ -115,6 +122,26 @@ async fn run_daemon() -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(&cfg.blob_dir);
 
     let store = Arc::new(DuckdbStore::open(&cfg.db_path).context("opening store")?);
+
+    // The live, in-memory snapshot the socket API serves. The pipeline consumer
+    // keeps it current (latest sample per variant); the SnapshotHandler mirrors
+    // fired incidents into its bounded ring. The daemon stays the sole DuckDB
+    // owner — the socket answers from this snapshot, never the DB.
+    let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+
+    // Serve the read-only status socket for the unprivileged bar. Best-effort: a
+    // bind failure is logged but never takes the daemon down (no API, still
+    // collecting). Aborted on shutdown alongside the collectors.
+    let api_handle = {
+        let snapshot = snapshot.clone();
+        let socket_path = cfg.socket_path.clone();
+        let socket_mode = cfg.socket_mode;
+        tokio::spawn(async move {
+            if let Err(e) = api::serve(socket_path, socket_mode, snapshot).await {
+                tracing::error!(error = %e, "status socket server exited");
+            }
+        })
+    };
 
     let (tx, rx) = mpsc::channel::<Sample>(CHANNEL_CAP);
 
@@ -212,10 +239,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     let freezer = maybe_start_pcap_ring(&cfg, phys_iface.as_deref());
 
     // Build the trigger engine with the starter rule set + passive handlers.
-    let engine = build_engine(store.clone(), &cfg, freezer);
+    let engine = build_engine(store.clone(), &cfg, freezer, snapshot.clone());
 
     // Run the consumer loop until a shutdown signal (or the stream closing).
-    let mut consumer = tokio::spawn(run(store.clone(), engine, rx));
+    let mut consumer = tokio::spawn(run(store.clone(), engine, rx, snapshot.clone()));
 
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     tokio::select! {
@@ -227,6 +254,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 Err(e) => tracing::error!(error = %e, "consumer task failed"),
             }
             abort_all(&handles);
+            api_handle.abort();
             return Ok(());
         }
     }
@@ -238,6 +266,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     // shutdown cannot hang (the leftover blocking thread is reaped by
     // `shutdown_timeout` in `main`).
     abort_all(&handles);
+    api_handle.abort();
     match tokio::time::timeout(SHUTDOWN_GRACE, &mut consumer).await {
         Ok(Ok(())) => tracing::info!("observerd shut down cleanly"),
         Ok(Err(e)) => tracing::error!(error = %e, "consumer join failed during shutdown"),
@@ -293,16 +322,22 @@ fn maybe_start_pcap_ring(cfg: &Config, phys_iface: Option<&str>) -> Option<Arc<d
 }
 
 /// Assemble the [`TriggerEngine`] with the starter rules (wedge, gw-drop,
-/// gw-change, fakeip, starvation). Every rule records an incident; gw-change
-/// additionally freezes the pcap ring when one is available.
+/// gw-change, fakeip, starvation). Every rule records an incident (durable, in
+/// DuckDB) and mirrors it into the live snapshot's ring for the socket API;
+/// gw-change additionally freezes the pcap ring when one is available.
 fn build_engine(
     store: Arc<DuckdbStore>,
     cfg: &Config,
     freezer: Option<Arc<dyn PcapFreezer>>,
+    snapshot: Arc<Mutex<StatusSnapshot>>,
 ) -> TriggerEngine {
     let record: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+    // Passive handler that pushes each firing onto the live snapshot's incident
+    // ring so the socket API serves recent incidents from memory. Added to every
+    // trigger alongside `record`.
+    let snap: Arc<dyn Handler> = Arc::new(SnapshotHandler::new(snapshot, INCIDENT_RING_CAP));
 
-    let mut gw_change_handlers: Vec<Arc<dyn Handler>> = vec![record.clone()];
+    let mut gw_change_handlers: Vec<Arc<dyn Handler>> = vec![record.clone(), snap.clone()];
     if let Some(freezer) = freezer {
         let freeze: Arc<dyn Handler> = Arc::new(FreezePcapHandler::new(
             freezer,
@@ -317,17 +352,25 @@ fn build_engine(
             Box::new(Wedge {
                 consecutive: WEDGE_CONSECUTIVE,
             }),
-            vec![record.clone()],
+            vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
-        Trigger::new(Box::new(GwDrop), vec![record.clone()], BACKOFF_US),
+        Trigger::new(
+            Box::new(GwDrop),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
         Trigger::new(Box::new(GwChange), gw_change_handlers, BACKOFF_US),
-        Trigger::new(Box::new(FakeIp), vec![record.clone()], BACKOFF_US),
+        Trigger::new(
+            Box::new(FakeIp),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
         Trigger::new(
             Box::new(Starvation {
                 load_threshold: STARVATION_LOAD,
             }),
-            vec![record],
+            vec![record, snap],
             BACKOFF_US,
         ),
     ];

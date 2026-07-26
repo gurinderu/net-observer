@@ -9,6 +9,11 @@ use std::time::Duration;
 pub struct Config {
     pub db_path: String,
     pub blob_dir: String,
+    /// Unix-domain socket the daemon binds and the bar connects to for live status.
+    pub socket_path: String,
+    /// Permission bits applied to the socket file (octal), so the unprivileged bar
+    /// can connect while the daemon runs as root.
+    pub socket_mode: u32,
     pub collectors: Collectors,
 }
 
@@ -78,6 +83,8 @@ impl Default for Config {
         Config {
             db_path: "/var/lib/observer/observer.duckdb".into(),
             blob_dir: "/var/lib/observer/blobs".into(),
+            socket_path: "/var/lib/observer/observer.sock".into(),
+            socket_mode: 0o666,
             collectors: Collectors {
                 link: LinkCfg {
                     enabled: true,
@@ -134,6 +141,12 @@ mod tests {
         let c = Config::load(None).unwrap();
         assert!(c.collectors.link.enabled);
         assert_eq!(c.collectors.link.interval.as_secs(), 15);
+    }
+    #[test]
+    fn socket_defaults_apply() {
+        let c = Config::load(None).unwrap();
+        assert_eq!(c.socket_path, "/var/lib/observer/observer.sock");
+        assert_eq!(c.socket_mode, 0o666);
     }
     #[test]
     fn dns_route_host_defaults_apply() {

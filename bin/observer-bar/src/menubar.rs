@@ -18,8 +18,10 @@
 //! flips an `AtomicBool`. A gpui foreground task polls that flag and opens (or
 //! re-focuses) the panel window — keeping all gpui/window work on gpui's own
 //! executor rather than reentering it from an AppKit callback. A second
-//! foreground task re-reads the store every ~3s and updates both the shared
-//! model (so an open panel re-renders) and the status-item glyph + tooltip.
+//! foreground task re-queries the daemon over the local socket every ~3s and
+//! updates both the shared model (so an open panel re-renders) and the
+//! status-item glyph + tooltip. When the daemon is down the query fails and the
+//! shell renders a grey "offline" glyph instead of crashing.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,9 +41,10 @@ use objc2_app_kit::{
 };
 use objc2_foundation::NSString;
 
-use crate::status::{Status, render_status, status_glyph};
+use crate::status::{render_status, status_glyph};
 use crate::ui::{Glance, PanelView, read_fresh};
 use config::Config;
+use observer_ipc::StatusSnapshot;
 
 /// How often the glance re-reads the store and refreshes the glyph + panel.
 const REFRESH: Duration = Duration::from_secs(3);
@@ -82,13 +85,13 @@ impl ClickTarget {
 
 /// Run the menu-bar app. Blocks (drives the AppKit run loop) until the user
 /// quits. GUI code cannot run headlessly, so this is verified by compiling +
-/// clippy; the tested surface is the data layer ([`crate::status`], [`crate::db`]).
+/// clippy; the tested surface is the data layer ([`crate::status`], [`crate::ui`]).
 pub fn run() {
     // Config is best-effort here: the GUI must not fail to launch just because a
-    // config file is malformed — fall back to defaults and surface DB problems in
-    // the panel instead.
+    // config file is malformed — fall back to defaults and surface a down daemon
+    // in the panel as an "offline" state instead.
     let cfg = Config::load(None).unwrap_or_default();
-    let db_path = cfg.db_path.clone();
+    let socket_path = cfg.socket_path.clone();
 
     Application::new().run(move |cx: &mut App| {
         let mtm = MainThreadMarker::new()
@@ -100,11 +103,11 @@ pub fn run() {
         let _ = ns_app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
         // 2. Initial snapshot (best-effort) and the shared model the panel reads.
-        let (initial, initial_err) = match read_fresh(&db_path) {
+        let (initial, initial_err) = match read_fresh(&socket_path) {
             Ok(s) => (s, None),
-            Err(e) => (Status::default(), Some(e.to_string())),
+            Err(e) => (StatusSnapshot::default(), Some(e)),
         };
-        let model = cx.new(|_| Glance::new(initial.clone(), initial_err, db_path.clone()));
+        let model = cx.new(|_| Glance::new(initial.clone(), initial_err, socket_path.clone()));
 
         // 3. The status-item + its button. Keep the item retained for the whole
         //    app lifetime (see the refresh task, which owns it).
@@ -138,21 +141,21 @@ pub fn run() {
         //    objects) so they stay alive for the app's lifetime.
         cx.spawn({
             let model = model.clone();
-            let db_path = db_path.clone();
+            let socket_path = socket_path.clone();
             async move |acx: &mut AsyncApp| {
                 // Keep the status item alive alongside the button.
                 let _item = item;
                 loop {
                     Timer::after(REFRESH).await;
-                    let fresh = read_fresh(&db_path);
+                    let fresh = read_fresh(&socket_path);
                     let updated = acx.update(|app| {
                         model.update(app, |g, cx| {
                             match fresh {
                                 Ok(s) => {
-                                    g.status = s;
+                                    g.snapshot = s;
                                     g.error = None;
                                 }
-                                Err(e) => g.error = Some(e.to_string()),
+                                Err(e) => g.error = Some(e),
                             }
                             cx.notify();
                         });
@@ -191,16 +194,20 @@ pub fn run() {
 
 /// Set the status-item button's title (compact glyph) and tooltip (the full
 /// multi-line [`render_status`] text, shown on hover).
+///
+/// When the last fetch failed (daemon down / socket absent) the glance carries
+/// an `error`: the title becomes a grey "offline" glyph and the tooltip explains
+/// why, rather than showing stale health as if it were live.
 fn apply_glyph(button: &NSStatusBarButton, glance: &Glance) {
     let title = match &glance.error {
-        Some(_) => "\u{26A0} observer".to_string(), // ⚠ observer
-        None => status_glyph(&glance.status),
+        Some(_) => "\u{26AB} offline".to_string(), // ⚫ offline (daemon down)
+        None => status_glyph(&glance.snapshot),
     };
     button.setTitle(&NSString::from_str(&title));
 
     let tooltip = match &glance.error {
-        Some(e) => format!("observer\nstore unavailable: {e}"),
-        None => render_status(&glance.status),
+        Some(e) => format!("observer offline\n{e}"),
+        None => render_status(&glance.snapshot),
     };
     button.setToolTip(Some(&NSString::from_str(&tooltip)));
 }

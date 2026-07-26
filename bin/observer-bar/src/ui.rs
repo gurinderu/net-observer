@@ -1,21 +1,25 @@
 //! The gpui panel view for the menu-bar app.
 //!
-//! [`Glance`] is a shared entity holding the most recent [`Status`] snapshot
-//! (plus the last read error and the db path used to refresh). The menu-bar
-//! refresh timer writes into it (see [`crate::menubar`]); [`PanelView`] observes
-//! it and re-renders whenever it changes, so an open panel updates live on the
-//! same ~3s cadence as the status-item glyph.
+//! [`Glance`] is a shared entity holding the most recent
+//! [`StatusSnapshot`](observer_ipc::StatusSnapshot) fetched from `observerd` over
+//! the local socket (plus the last fetch error and the socket path used to
+//! refresh). The menu-bar refresh timer writes into it (see [`crate::menubar`]);
+//! [`PanelView`] observes it and re-renders whenever it changes, so an open panel
+//! updates live on the same ~3s cadence as the status-item glyph.
+//!
+//! The bar is a pure socket client — it never opens the DuckDB store (the daemon
+//! is the sole DB owner). When the daemon is down / the socket is absent,
+//! [`read_fresh`] returns `Err` and the panel renders a graceful "observer
+//! offline" state instead of crashing.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Rgba, SharedString, Subscription, Window, div, px, rgb};
 
-use crate::db::ReadOnlyDb;
-use crate::status::{Health, IncidentGlance, Status, health, read_status};
+use observer_ipc::{IncidentSummary, Request, Response, StatusSnapshot};
 
-/// How many recent incidents the panel shows.
-pub const INCIDENT_LIMIT: usize = 10;
+use crate::status::{Health, health};
 
 // Dark palette for the panel.
 const BG: u32 = 0x1e1e2e;
@@ -27,45 +31,51 @@ const BAD: u32 = 0xf05a5a;
 const WARN: u32 = 0xe6b450;
 const ACCENT: u32 = 0x7aa2f7;
 
-/// Open a fresh read-only connection and snapshot the store. Re-opening each
-/// tick (rather than holding a long-lived read-only handle) means the glance
-/// recovers on its own once the DB becomes readable again — and it fails
-/// gracefully when it is not: a missing file, or a live `observerd` holding the
-/// store open read-write (DuckDB's per-process file lock blocks even read-only
-/// opens; see [`crate::db`]). Any such error is surfaced in the panel as "store
-/// unavailable" and retried on the next tick instead of crashing.
-pub fn read_fresh(db_path: &str) -> anyhow::Result<Status> {
-    let db = ReadOnlyDb::open(db_path)?;
-    Ok(read_status(&db, INCIDENT_LIMIT)?)
+/// Fetch the live [`StatusSnapshot`] from `observerd` over the local socket.
+///
+/// The bar owns no DB — the daemon does — so every refresh is a blocking
+/// [`observer_ipc::query`] round-trip. Re-querying each tick means the glance
+/// recovers on its own once the daemon comes back, and fails gracefully when it
+/// is not there: a missing socket, connection-refused (daemon down), or a
+/// protocol error all map to `Err(String)`, which the panel surfaces as
+/// "observer offline" and the status item as a grey glyph — retried on the next
+/// tick instead of crashing.
+pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, String> {
+    match observer_ipc::query(socket_path, &Request::Status) {
+        Ok(Response::Status(snap)) => Ok(snap),
+        Ok(Response::Error(msg)) => Err(msg),
+        Ok(_) => Err("unexpected response from observerd".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Shared, app-scoped model: the latest snapshot the UI renders.
 pub struct Glance {
-    pub status: Status,
-    /// The most recent read error, if the last refresh failed.
+    pub snapshot: StatusSnapshot,
+    /// The most recent fetch error, if the last refresh failed (daemon offline).
     pub error: Option<String>,
-    /// Config db path, so the panel's manual "Refresh" can re-read.
-    pub db_path: String,
+    /// Config socket path, so the panel's manual "Refresh" can re-query.
+    pub socket_path: String,
 }
 
 impl Glance {
-    pub fn new(status: Status, error: Option<String>, db_path: String) -> Self {
+    pub fn new(snapshot: StatusSnapshot, error: Option<String>, socket_path: String) -> Self {
         Self {
-            status,
+            snapshot,
             error,
-            db_path,
+            socket_path,
         }
     }
 
-    /// Re-read the store into this model. Used by the manual refresh button; the
+    /// Re-query the daemon into this model. Used by the manual refresh button; the
     /// timer path in [`crate::menubar`] mutates the same fields directly.
     pub fn refresh(&mut self) {
-        match read_fresh(&self.db_path) {
+        match read_fresh(&self.socket_path) {
             Ok(s) => {
-                self.status = s;
+                self.snapshot = s;
                 self.error = None;
             }
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => self.error = Some(e),
         }
     }
 }
@@ -92,11 +102,11 @@ impl PanelView {
 impl Render for PanelView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let glance = self.model.read(cx);
-        let status = glance.status.clone();
+        let snapshot = glance.snapshot.clone();
         let error = glance.error.clone();
         let now_us = now_us();
 
-        let (dot, dot_color) = health_dot(&status);
+        let (dot, dot_color) = health_dot(&snapshot);
 
         div()
             .flex()
@@ -125,13 +135,13 @@ impl Render for PanelView {
                         div()
                             .text_color(rgb(MUTED))
                             .text_xs()
-                            .child(freshness_line(&status, now_us)),
+                            .child(freshness_line(&snapshot, now_us)),
                     ),
             )
             .children(error.map(error_banner))
-            .child(link_card(&status, now_us))
-            .child(proxy_card(&status, now_us))
-            .child(incidents_card(&status.incidents, now_us))
+            .child(link_card(&snapshot, now_us))
+            .child(proxy_card(&snapshot, now_us))
+            .child(incidents_card(&snapshot.incidents, now_us))
             .child(footer(cx))
     }
 }
@@ -139,8 +149,8 @@ impl Render for PanelView {
 /// The colored health dot + its color for the panel header. The color follows
 /// the shared [`health`] classifier, so the panel dot and the menu-bar
 /// [`status_glyph`](crate::status::status_glyph) can never disagree.
-fn health_dot(status: &Status) -> (&'static str, Rgba) {
-    let color = match health(status) {
+fn health_dot(snapshot: &StatusSnapshot) -> (&'static str, Rgba) {
+    let color = match health(snapshot) {
         Health::NoData => rgb(MUTED),
         Health::Ok => rgb(OK),
         Health::Bad => rgb(BAD),
@@ -154,20 +164,24 @@ fn error_banner(msg: String) -> impl IntoElement {
             .flex()
             .flex_col()
             .gap_1()
-            .child(section_title("store unavailable"))
+            .child(section_title("observer offline"))
             .child(div().text_color(rgb(WARN)).child(SharedString::from(msg))),
     )
 }
 
-fn link_card(status: &Status, now_us: i64) -> impl IntoElement {
-    let body = match &status.link {
-        Some(l) => div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(kv("gw", &l.gw, verdict_color(&l.gw)))
-            .child(kv("direct", &l.direct, verdict_color(&l.direct)))
-            .child(kv("age", &age_str(l.ts_us, now_us), rgb(MUTED))),
+fn link_card(snapshot: &StatusSnapshot, now_us: i64) -> impl IntoElement {
+    let body = match &snapshot.link {
+        Some(l) => {
+            let gw = l.gw.to_string();
+            let direct = l.direct.to_string();
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(kv("gw", &gw, verdict_color(&gw)))
+                .child(kv("direct", &direct, verdict_color(&direct)))
+                .child(kv("age", &age_str(l.ts_us, now_us), rgb(MUTED)))
+        }
         None => div().child(no_data()),
     };
     card(CARD).child(
@@ -180,8 +194,8 @@ fn link_card(status: &Status, now_us: i64) -> impl IntoElement {
     )
 }
 
-fn proxy_card(status: &Status, now_us: i64) -> impl IntoElement {
-    let body = match &status.proxy {
+fn proxy_card(snapshot: &StatusSnapshot, now_us: i64) -> impl IntoElement {
+    let body = match &snapshot.proxy {
         Some(p) => {
             let tun = p
                 .tun_code
@@ -213,7 +227,7 @@ fn proxy_card(status: &Status, now_us: i64) -> impl IntoElement {
     )
 }
 
-fn incidents_card(incidents: &[IncidentGlance], now_us: i64) -> impl IntoElement {
+fn incidents_card(incidents: &[IncidentSummary], now_us: i64) -> impl IntoElement {
     let body = if incidents.is_empty() {
         div().child(div().text_color(rgb(MUTED)).child("no recent incidents"))
     } else {
@@ -233,7 +247,7 @@ fn incidents_card(incidents: &[IncidentGlance], now_us: i64) -> impl IntoElement
     )
 }
 
-fn incident_row(i: &IncidentGlance, now_us: i64) -> impl IntoElement {
+fn incident_row(i: &IncidentSummary, now_us: i64) -> impl IntoElement {
     let (state, state_color) = match i.closed_us {
         Some(_) => ("closed", rgb(MUTED)),
         None => ("open", rgb(BAD)),
@@ -370,10 +384,10 @@ fn age_str(ts_us: i64, now_us: i64) -> String {
     }
 }
 
-fn freshness_line(status: &Status, now_us: i64) -> String {
+fn freshness_line(snapshot: &StatusSnapshot, now_us: i64) -> String {
     let newest = [
-        status.link.as_ref().map(|l| l.ts_us),
-        status.proxy.as_ref().map(|p| p.ts_us),
+        snapshot.link.as_ref().map(|l| l.ts_us),
+        snapshot.proxy.as_ref().map(|p| p.ts_us),
     ]
     .into_iter()
     .flatten()
@@ -400,19 +414,39 @@ mod tests {
 
     #[test]
     fn freshness_prefers_newest_tick() {
-        let mut s = Status::default();
+        let mut s = StatusSnapshot::default();
         assert_eq!(freshness_line(&s, 10_000_000), "no data");
-        s.link = Some(crate::status::LinkGlance {
+        s.link = Some(types::LinkSample {
             ts_us: 1_000_000,
-            gw: "OK".into(),
-            direct: "OK".into(),
+            gw: types::GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: types::TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
         });
-        s.proxy = Some(crate::status::ProxyGlance {
+        s.proxy = Some(types::ProxySample {
             ts_us: 4_000_000,
+            server_ip: "1.2.3.4".into(),
+            tcp: types::TcpVerdict::Ok,
+            rtt_ms: None,
             tun_code: Some(204),
             selector: None,
         });
         // newest is the proxy tick at 4s -> 6s ago at now=10s.
         assert_eq!(freshness_line(&s, 10_000_000), "updated 6s ago");
+    }
+
+    /// Daemon down / socket absent must map to a graceful `Err`, never a panic —
+    /// this is the "observer offline" path the panel renders.
+    #[test]
+    fn read_fresh_offline_when_socket_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sock");
+        let res = read_fresh(missing.to_str().unwrap());
+        assert!(res.is_err(), "absent socket must yield an offline Err");
     }
 }

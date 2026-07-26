@@ -1,0 +1,8 @@
+[package]
+name = "observer-ipc"
+edition.workspace = true
+
+[dependencies]
+types.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -18,9 +18,10 @@
 //! the pcap ring *before* slow forensic work and records a [`BlobRef`] per file.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use collector_core::{Collector, Source};
+use observer_ipc::{IncidentSummary, StatusSnapshot};
 use store::{DuckdbStore, Store};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -33,22 +34,41 @@ use types::{BlobRef, Sample};
 /// Capacity of the recent-sample window handed to the trigger engine.
 const WINDOW_CAP: usize = 64;
 
-/// Drain `rx` until the stream closes, persisting and evaluating each sample.
+/// Drain `rx` until the stream closes, persisting and evaluating each sample and
+/// keeping the live [`StatusSnapshot`] current.
 ///
-/// For every [`Sample`]: write it to the store, push it into the recent window,
-/// then evaluate all triggers at the sample's own timestamp. A store write
-/// failure is logged and the loop continues (a DB outage must not silently drop
-/// the live detection stream — the gap is recorded, per the spec).
+/// For every [`Sample`]: write it to the store, update the shared `snapshot`
+/// (the latest sample for that variant, plus `generated_us`), push it into the
+/// recent window, then evaluate all triggers at the sample's own timestamp. A
+/// store write failure is logged and the loop continues (a DB outage must not
+/// silently drop the live detection stream — the gap is recorded, per the spec);
+/// the in-memory snapshot is updated regardless, so the socket API stays live
+/// even through a DB hiccup.
 pub async fn run(
     store: Arc<DuckdbStore>,
     mut engine: TriggerEngine,
     mut rx: mpsc::Receiver<Sample>,
+    snapshot: Arc<Mutex<StatusSnapshot>>,
 ) {
     let mut window = RecentWindow::new(WINDOW_CAP);
     while let Some(sample) = rx.recv().await {
         let now_us = sample.ts_us();
         if let Err(e) = store.write_sample(&sample) {
             tracing::warn!(error = %e, "store write failed; sample dropped from DB (gap logged)");
+        }
+        // Mirror the latest sample into the in-memory snapshot the socket serves.
+        {
+            let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+            snap.generated_us = now_us;
+            match &sample {
+                Sample::Link(l) => snap.link = Some(l.clone()),
+                Sample::Proxy(p) => snap.proxy = Some(p.clone()),
+                Sample::Dns(d) => snap.dns = Some(d.clone()),
+                Sample::Host(h) => snap.host = Some(h.clone()),
+                // Route events are a stream, not a "latest sample" field of the
+                // snapshot; they still bump `generated_us` above.
+                Sample::Route(_) => {}
+            }
         }
         window.push(sample);
         engine.on_sample(&window, now_us);
@@ -185,6 +205,45 @@ impl<S: Store + Send + Sync> Handler for FreezePcapHandler<S> {
     }
 }
 
+/// A passive [`Handler`] that mirrors each firing into the live
+/// [`StatusSnapshot`]'s bounded incident ring, so the socket API can serve recent
+/// incidents from memory without a DB read. Newest first; the ring is truncated
+/// to `cap`. DuckDB (via [`RecordHandler`]) remains the durable record — this
+/// ring is only the live view.
+pub struct SnapshotHandler {
+    snapshot: Arc<Mutex<StatusSnapshot>>,
+    cap: usize,
+}
+
+impl SnapshotHandler {
+    /// Build a handler that pushes onto `snapshot`'s incident ring, capped to `cap`.
+    pub fn new(snapshot: Arc<Mutex<StatusSnapshot>>, cap: usize) -> Self {
+        Self { snapshot, cap }
+    }
+}
+
+impl Handler for SnapshotHandler {
+    fn on_fire(&self, incident_id: &str, ts_us: i64, detail: &str) {
+        // `incident_id` is `"{trigger_id}-{now_us}"`; recover the trigger id from
+        // the prefix before the final `-` (matching `RecordHandler`).
+        let trigger_id = incident_id
+            .rsplit_once('-')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(incident_id)
+            .to_string();
+        let summary = IncidentSummary {
+            id: incident_id.to_string(),
+            opened_us: ts_us,
+            closed_us: None,
+            trigger_id,
+            signature: detail.to_string(),
+        };
+        let mut snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        snap.incidents.insert(0, summary);
+        snap.incidents.truncate(self.cap);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,8 +274,9 @@ mod tests {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let rec = Arc::new(RecordHandler::new(store.clone()));
         let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 0)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let (tx, rx) = mpsc::channel(16);
-        let h = tokio::spawn(run(store.clone(), eng, rx));
+        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot));
         tx.send(Sample::Link(LinkSample {
             ts_us: 1,
             gw: GwVerdict::Fail,
@@ -269,8 +329,9 @@ mod tests {
         let handlers: Vec<Arc<dyn Handler>> = vec![rec, freeze];
         let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwChange), handlers, 0)]);
 
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let (tx, rx) = mpsc::channel(16);
-        let h = tokio::spawn(run(store.clone(), eng, rx));
+        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot));
         // Ok -> Fail is a gateway-verdict change: gw-change must fire.
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
         tx.send(link(2, GwVerdict::Fail)).await.unwrap();
@@ -343,5 +404,60 @@ mod tests {
         assert!(matches!(second, Sample::Proxy(_)));
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_updates_snapshot_fields() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let eng = TriggerEngine::new(vec![]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot.clone()));
+
+        // A link sample then a proxy sample: each populates its own snapshot field,
+        // and `generated_us` tracks the most recent sample.
+        tx.send(link(5, GwVerdict::Ok)).await.unwrap();
+        tx.send(Sample::Proxy(ProxySample {
+            ts_us: 9,
+            server_ip: "1.2.3.4".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: Some(2.0),
+            tun_code: Some(204),
+            selector: None,
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        let snap = snapshot.lock().unwrap();
+        assert_eq!(snap.link.as_ref().unwrap().ts_us, 5);
+        assert_eq!(snap.link.as_ref().unwrap().gw, GwVerdict::Ok);
+        assert_eq!(snap.proxy.as_ref().unwrap().ts_us, 9);
+        assert_eq!(snap.proxy.as_ref().unwrap().server_ip, "1.2.3.4");
+        assert!(snap.dns.is_none());
+        assert!(snap.host.is_none());
+        // Last sample processed was the proxy at ts=9.
+        assert_eq!(snap.generated_us, 9);
+    }
+
+    #[test]
+    fn snapshot_handler_caps_incident_ring() {
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let handler = SnapshotHandler::new(snapshot.clone(), 3);
+
+        // Five firings into a cap-3 ring: only the three newest survive, newest first.
+        for i in 0..5 {
+            handler.on_fire(&format!("gw-drop-{i}"), i, "sig");
+        }
+
+        let snap = snapshot.lock().unwrap();
+        assert_eq!(snap.incidents.len(), 3);
+        assert_eq!(snap.incidents[0].id, "gw-drop-4");
+        assert_eq!(snap.incidents[0].opened_us, 4);
+        assert_eq!(snap.incidents[0].trigger_id, "gw-drop");
+        assert_eq!(snap.incidents[0].signature, "sig");
+        assert_eq!(snap.incidents[1].id, "gw-drop-3");
+        assert_eq!(snap.incidents[2].id, "gw-drop-2");
     }
 }

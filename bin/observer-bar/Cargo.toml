@@ -3,20 +3,15 @@ name = "observer-bar"
 edition.workspace = true
 
 [dependencies]
-store.workspace = true
 types.workspace = true
 config.workspace = true
-anyhow.workspace = true
-# `observer-bar` is a read-only glance at the observer DuckDB store, so it opens
-# the file directly with `access_mode=read_only` (see `src/db.rs`) rather than
-# through `store::DuckdbStore::open`, which runs `CREATE TABLE IF NOT EXISTS` on a
-# read-write connection. Opening read-only skips that DDL and never takes DuckDB's
-# write slot. It does NOT make the glance safe alongside a live `observerd`:
-# DuckDB's per-process file lock blocks even read-only opens while the daemon
-# holds the store, so the bar reads it only when observerd is not (offline
-# forensics), degrading gracefully otherwise. That needs the `duckdb` crate
-# directly.
-duckdb.workspace = true
+# `observer-bar` is a pure socket client: `observerd` owns the DuckDB store (its
+# per-process file lock blocks any second opener while the daemon runs), so the
+# bar never touches the DB. It fetches a live `StatusSnapshot` over the daemon's
+# Unix-domain socket via `observer_ipc::query` and renders it; a down daemon /
+# absent socket degrades to a graceful "observer offline" state. No DB, `store`,
+# or `anyhow` dependency here — the wire types come from `observer-ipc`.
+observer-ipc.workspace = true
 
 # macOS menu-bar UI. The rich panel is drawn with gpui (Zed's GPU-accelerated
 # Rust UI framework); the system status-bar item (`NSStatusItem`) plus the
