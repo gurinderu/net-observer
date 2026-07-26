@@ -98,11 +98,12 @@ impl ClickTarget {
 /// Run the menu-bar app. Blocks (drives the AppKit run loop) until the user
 /// quits. GUI code cannot run headlessly, so this is verified by compiling +
 /// clippy; the tested surface is the data layer ([`crate::status`], [`crate::ui`]).
-pub fn run() {
+pub fn run(config: Option<String>, open: bool) {
     // Config is best-effort here: the GUI must not fail to launch just because a
     // config file is malformed — fall back to defaults and surface a down daemon
-    // in the panel as an "offline" state instead.
-    let cfg = Config::load(None).unwrap_or_default();
+    // in the panel as an "offline" state instead. `config` is the `--config` path
+    // (its `socket_path` is the daemon socket the bar talks to).
+    let cfg = Config::load(config.as_deref()).unwrap_or_default();
     let socket_path = cfg.socket_path.clone();
 
     Application::new().run(move |cx: &mut App| {
@@ -141,7 +142,8 @@ pub fn run() {
         let dismissed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
         // 4. Wire the click: button -> ClickTarget.handleClick: -> flip the flag.
-        let click_flag = Arc::new(AtomicBool::new(false));
+        //    Seed it with `open` so `--open` pops the panel on the first poll.
+        let click_flag = Arc::new(AtomicBool::new(open));
         let target = ClickTarget::new(click_flag.clone());
         // SAFETY: `setTarget:`/`setAction:` are the standard AppKit control
         // wiring. `target_ref` points at a live `ClickTarget` (an `NSObject`

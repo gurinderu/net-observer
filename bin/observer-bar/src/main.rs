@@ -43,5 +43,25 @@ mod status;
 mod ui;
 
 fn main() {
-    menubar::run();
+    // Minimal arg parsing (no clap dep): `--config <path>` picks the daemon
+    // socket (defaults to the built-in config path when omitted); `--open` opens
+    // the panel immediately on launch instead of waiting for a status-item click.
+    let args: Vec<String> = std::env::args().collect();
+    let mut config: Option<String> = None;
+    let mut open = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                config = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--open" => {
+                open = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    menubar::run(config, open);
 }
