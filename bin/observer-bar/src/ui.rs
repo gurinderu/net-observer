@@ -249,6 +249,9 @@ impl Render for PanelView {
         let error = glance.error.clone();
         let control_msg = glance.control_msg.clone();
         let now_us = now_us();
+        // Offline (daemon down / socket absent) ⇒ we cannot be observing, so the
+        // switch reads OFF and is non-interactive regardless of the stale snapshot.
+        let online = error.is_none();
 
         div()
             .flex()
@@ -260,7 +263,7 @@ impl Render for PanelView {
             .text_size(px(13.0))
             .rounded_lg()
             .overflow_hidden()
-            .child(header_row(&snapshot, theme, cx))
+            .child(header_row(&snapshot, online, theme, cx))
             .child(separator(theme))
             .children(error.map(|e| offline_row(e, theme)))
             .child(status_rows(&snapshot, theme))
@@ -276,10 +279,11 @@ impl Render for PanelView {
 /// and the dot is grey.
 fn header_row(
     snapshot: &StatusSnapshot,
+    online: bool,
     theme: Theme,
     cx: &mut Context<PanelView>,
 ) -> impl IntoElement {
-    let (dot, dot_color) = header_dot(snapshot, theme);
+    let (dot, dot_color) = header_dot(snapshot, online, theme);
 
     let mut left = div()
         .flex()
@@ -292,12 +296,21 @@ fn header_row(
                 .font_weight(gpui::FontWeight::BOLD)
                 .child("observer"),
         );
-    if !snapshot.observing {
+    // Show "offline" when the daemon is unreachable, else "paused" when the
+    // daemon is up but collection is off.
+    let sub = if !online {
+        Some("offline")
+    } else if !snapshot.observing {
+        Some("paused")
+    } else {
+        None
+    };
+    if let Some(label) = sub {
         left = left.child(
             div()
                 .text_size(px(11.0))
                 .text_color(rgb(theme.muted))
-                .child("paused"),
+                .child(label),
         );
     }
 
@@ -308,15 +321,22 @@ fn header_row(
         .py_2p5()
         .child(left)
         .child(div().flex_1())
-        .child(toggle_switch(snapshot.observing, theme, cx))
+        // ON only if actually observing AND connected; interactive only online.
+        .child(toggle_switch(
+            snapshot.observing && online,
+            online,
+            theme,
+            cx,
+        ))
 }
 
 /// The header health dot glyph + color. When paused, a grey dot regardless of the
 /// underlying health (collection is off, so there is nothing live to judge);
 /// otherwise it follows the shared [`health`] classifier so the panel dot and the
 /// menu-bar dot can never disagree.
-fn header_dot(snapshot: &StatusSnapshot, theme: Theme) -> (&'static str, Rgba) {
-    if !snapshot.observing {
+fn header_dot(snapshot: &StatusSnapshot, online: bool, theme: Theme) -> (&'static str, Rgba) {
+    if !online || !snapshot.observing {
+        // Offline or paused: nothing live to judge — a muted dot.
         return ("\u{25CF}", rgb(theme.muted));
     }
     let color = match health(snapshot) {
@@ -331,12 +351,13 @@ fn header_dot(snapshot: &StatusSnapshot, theme: Theme) -> (&'static str, Rgba) {
 /// (`rounded_full`) with a circular knob that sits left (off) or right (on). Green
 /// track when observing, grey when paused. Clicking it flips the observer's
 /// collection via [`Glance::toggle_observing`] and re-renders.
-fn toggle_switch(observing: bool, theme: Theme, cx: &mut Context<PanelView>) -> impl IntoElement {
-    let track_color = if observing {
-        theme.track_on
-    } else {
-        theme.track_off
-    };
+fn toggle_switch(
+    on: bool,
+    interactive: bool,
+    theme: Theme,
+    cx: &mut Context<PanelView>,
+) -> impl IntoElement {
+    let track_color = if on { theme.track_on } else { theme.track_off };
 
     let mut track = div()
         .id("observing-toggle")
@@ -347,17 +368,23 @@ fn toggle_switch(observing: bool, theme: Theme, cx: &mut Context<PanelView>) -> 
         .p_0p5()
         .rounded_full()
         .bg(rgb(track_color))
-        .cursor_pointer()
-        .child(div().size(px(20.0)).rounded_full().bg(rgb(theme.knob)))
-        .on_click(cx.listener(|this, _, _window, cx| {
-            this.model.update(cx, |g, cx| {
-                g.toggle_observing();
-                cx.notify();
-            });
-        }));
+        .child(div().size(px(20.0)).rounded_full().bg(rgb(theme.knob)));
+
+    // Only clickable while the daemon is reachable — you cannot toggle collection
+    // on a daemon that is not there. Offline renders OFF and inert.
+    if interactive {
+        track = track
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _window, cx| {
+                this.model.update(cx, |g, cx| {
+                    g.toggle_observing();
+                    cx.notify();
+                });
+            }));
+    }
 
     // Knob left when off, right when on.
-    track = if observing {
+    track = if on {
         track.justify_end()
     } else {
         track.justify_start()
