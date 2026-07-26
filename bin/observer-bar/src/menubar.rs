@@ -130,10 +130,12 @@ pub fn run() {
             .expect("a freshly created NSStatusItem always has a button");
         apply_glyph(&button, model.read(cx));
 
-        // Capture the anchored-dropdown position once, now, while we still own
-        // `button` (the refresh task moves it in below). Menu-bar items don't move
-        // for the app's lifetime, so a startup capture stays valid.
-        let anchor = compute_anchor_bounds(&button, mtm);
+        // A retained handle to the status-item button for the click task, so it
+        // can compute the dropdown anchor *at open time*. The button is NOT laid
+        // out yet during this startup closure — its frame is zero, which would put
+        // the panel off-screen — so we must read the frame on the first click.
+        // `Retained::clone` just bumps the refcount (same underlying button).
+        let button_for_click = button.clone();
         // Shared latch stamped by the click-away dismiss, so the same click that
         // dismissed the panel doesn't immediately reopen it (see `toggle_panel`).
         let dismissed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
@@ -197,12 +199,15 @@ pub fn run() {
             async move |acx: &mut AsyncApp| {
                 // Keep the target alive: NSControl holds its target weakly.
                 let _target = target;
+                // The status-item button; the anchor is computed from its frame at
+                // open time (see `open_panel`), when it is actually laid out.
+                let button = button_for_click;
                 let mut panel: Option<WindowHandle<PanelView>> = None;
                 loop {
                     Timer::after(CLICK_POLL).await;
                     if click_flag.swap(false, Ordering::AcqRel) {
                         let alive = acx.update(|app| {
-                            toggle_panel(app, &mut panel, &model, anchor, &dismissed_at)
+                            toggle_panel(app, &mut panel, &model, &button, &dismissed_at)
                         });
                         if alive.is_err() {
                             break;
@@ -255,7 +260,7 @@ fn toggle_panel(
     cx: &mut App,
     panel: &mut Option<WindowHandle<PanelView>>,
     model: &Entity<Glance>,
-    anchor: Bounds<Pixels>,
+    button: &NSStatusBarButton,
     dismissed_at: &Arc<Mutex<Option<Instant>>>,
 ) {
     if let Some(handle) = panel.take() {
@@ -274,7 +279,7 @@ fn toggle_panel(
         }
         // Dismissed a while ago: fall through and reopen.
     }
-    open_panel(cx, panel, model, anchor, dismissed_at);
+    open_panel(cx, panel, model, button, dismissed_at);
 }
 
 /// True if the panel was dismissed by click-away within [`REOPEN_GUARD`].
@@ -293,11 +298,16 @@ fn open_panel(
     cx: &mut App,
     panel: &mut Option<WindowHandle<PanelView>>,
     model: &Entity<Glance>,
-    anchor: Bounds<Pixels>,
+    button: &NSStatusBarButton,
     dismissed_at: &Arc<Mutex<Option<Instant>>>,
 ) {
     let model = model.clone();
     let dismissed_at = dismissed_at.clone();
+    // Compute the anchor now, at open time: the button is laid out by now, so its
+    // frame is real (a startup capture sees a zero frame and lands off-screen).
+    let mtm =
+        MainThreadMarker::new().expect("open_panel runs on the main thread (gpui App update)");
+    let anchor = compute_anchor_bounds(button, mtm);
     let options = panel_window_options(anchor);
     let opened = cx.open_window(options, move |window, cx| {
         cx.new(move |cx| {
@@ -358,29 +368,20 @@ fn panel_window_options(anchor: Bounds<Pixels>) -> WindowOptions {
 ///
 /// ## Coordinate conversion
 ///
-/// AppKit screen geometry is **bottom-left origin** (Cocoa: y grows *up*); gpui's
-/// global window coordinates are **top-left origin** (y grows *down*). We bridge
-/// the two by inverting the exact mapping gpui's macOS backend applies when it
-/// turns a `WindowBounds::Windowed(bounds)` into the native window's bottom-left
-/// `NSRect` origin (gpui `platform/mac/window.rs`):
+/// gpui `Bounds` are **top-left origin** (global, y grows *down*) and gpui's macOS
+/// backend performs the Cocoa bottom-left flip itself, so we hand it top-left
+/// coordinates directly — we do NOT pre-invert (doing so double-flips the window
+/// off the bottom of the screen). AppKit reports the status window's frame in
+/// bottom-left Cocoa coords, so the only conversion we do is on that one input:
 ///
-/// ```text
-/// ns_bottom_left.x = screen.origin.x + bounds.origin.x
-/// ns_bottom_left.y = screen.origin.y + (display_height - bounds.origin.y)
-/// ```
+/// - `x` = icon right edge minus panel width (`btn.x + btn.w - PANEL_W`),
+///   right-aligned to the icon, clamped on-screen (`x` is the same in both spaces).
+/// - `y` = panel top = menu-bar bottom = the status window's Cocoa bottom
+///   `btn.origin.y`, flipped to top-left: `display_height - btn.origin.y`
+///   (a small value just under the menu bar).
 ///
-/// where `display_height == screen.frame().size.height`. gpui opens
-/// `display_id: None` windows on the primary display (which owns the menu bar), so
-/// we read the main `NSScreen` frame — the same coordinate space `button.window()`
-/// reports its frame in.
-///
-/// We want the panel's Cocoa rect to be:
-///
-/// - right edge = icon right edge = `btn.x + btn.w`  (right-aligned to the icon)
-/// - top edge   = menu-bar bottom = `btn.y`          (the status window's bottom)
-///
-/// i.e. bottom-left corner `(btn.x + btn.w - PANEL_W, btn.y - PANEL_H)`. Solving
-/// the mapping above for `bounds.origin` yields the expressions below.
+/// `display_height == main NSScreen.frame().size.height`; gpui opens
+/// `display_id: None` windows on the primary display (which owns the menu bar).
 ///
 /// Captured once at startup: menu-bar status items are stable for the app's life,
 /// so the frame does not move. Assumes the status item lives on the primary
@@ -395,12 +396,16 @@ fn compute_anchor_bounds(button: &NSStatusBarButton, mtm: MainThreadMarker) -> B
     match (btn, scr) {
         (Some(btn), Some(scr)) => {
             let display_height = scr.size.height;
-            // Desired panel rect in Cocoa (bottom-left origin).
-            let left = btn.origin.x + btn.size.width - PANEL_W;
-            let bottom = btn.origin.y - PANEL_H;
-            // Invert gpui's open() mapping into gpui top-left `bounds.origin`.
-            let ox = left - scr.origin.x;
-            let oy = display_height - (bottom - scr.origin.y);
+            // gpui `Bounds` are TOP-LEFT origin (global, y grows down); gpui's
+            // macOS backend does the Cocoa bottom-left flip internally, so we pass
+            // top-left coords directly — no inversion here.
+            //   x  = right edge of the icon minus the panel width (right-aligned),
+            //        clamped on-screen.
+            //   y  = panel top = menu-bar bottom = the status window's Cocoa bottom
+            //        (`btn.origin.y`), converted to top-left: display_height - btn.y.
+            let max_x = (scr.size.width - PANEL_W).max(0.0);
+            let ox = (btn.origin.x + btn.size.width - PANEL_W).clamp(0.0, max_x);
+            let oy = (display_height - btn.origin.y).max(0.0);
             Bounds {
                 origin: point(px(ox as f32), px(oy as f32)),
                 size: panel_size,
