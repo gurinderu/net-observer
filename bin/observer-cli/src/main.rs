@@ -13,7 +13,7 @@
 //!   than a panic.
 
 use anyhow::{Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use config::Config;
 use observer_ipc::{ControlCmd, ControlResult, IncidentSummary, Request, Response, StatusSnapshot};
 use std::process::ExitCode;
@@ -54,12 +54,40 @@ enum Command {
     /// set in its config; otherwise it refuses the request without acting. Exits
     /// non-zero if the action was refused/failed or the daemon is unreachable.
     Kickstart,
+    /// Turn the observer's own collection on or off (pause/resume), sent as a
+    /// `Control(SetObserving)` request over the socket. This controls the
+    /// daemon's OWN observation only — it does **not** touch sing-box or the
+    /// network, and is **not** gated by `acting.enabled` (benign self-control).
+    /// The daemon stays alive and the socket keeps serving while paused, so the
+    /// switch can be turned back on. Exits non-zero if the request failed or the
+    /// daemon is unreachable.
+    Observe {
+        /// `on` resumes collection; `off` pauses it.
+        #[arg(value_enum)]
+        state: ObserveState,
+    },
     /// Run an arbitrary SQL query directly against the DuckDB file (offline
     /// forensics — only works while `observerd` is stopped).
     Query {
         /// The SQL statement to run against the store.
         sql: String,
     },
+}
+
+/// The desired observation state for the `observe` subcommand.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ObserveState {
+    /// Resume collection (`observing = true`).
+    On,
+    /// Pause collection (`observing = false`).
+    Off,
+}
+
+impl ObserveState {
+    /// The boolean carried in `ControlCmd::SetObserving`.
+    fn as_bool(self) -> bool {
+        matches!(self, ObserveState::On)
+    }
 }
 
 fn main() -> ExitCode {
@@ -91,6 +119,16 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             print!("{}", format_control(&result));
             // A refusal (acting disabled) or a failed action is a non-zero exit,
             // even though the request itself round-tripped fine.
+            if !result.ok {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Observe { state } => {
+            let cfg = load_config(cli)?;
+            let result = fetch_set_observing(&cfg.socket_path, state.as_bool())?;
+            print!("{}", format_control(&result));
+            // The request round-trips fine; a non-`ok` result means the daemon
+            // declined or failed, which is a non-zero exit.
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
@@ -149,6 +187,23 @@ fn fetch_incidents(socket_path: &str, limit: usize) -> Result<Vec<IncidentSummar
 /// outcome in the result. Never panics.
 fn fetch_kickstart(socket_path: &str) -> Result<ControlResult> {
     match daemon_query(socket_path, &Request::Control(ControlCmd::KickstartProxy))? {
+        Response::Control(result) => Ok(result),
+        Response::Error(e) => Err(anyhow!("observerd returned an error: {e}")),
+        other => Err(anyhow!("unexpected daemon response to Control: {other:?}")),
+    }
+}
+
+/// Ask the daemon to turn its own observation on/off over the socket
+/// (`Control(SetObserving)`) and return its [`ControlResult`]. This is benign
+/// self-control (pause/resume the daemon's OWN collection) — it does not touch
+/// sing-box or the network and is not gated by `acting.enabled`. A daemon-down /
+/// absent socket becomes a clear `Err` (handled by [`daemon_query`]). Never
+/// panics.
+fn fetch_set_observing(socket_path: &str, observing: bool) -> Result<ControlResult> {
+    match daemon_query(
+        socket_path,
+        &Request::Control(ControlCmd::SetObserving(observing)),
+    )? {
         Response::Control(result) => Ok(result),
         Response::Error(e) => Err(anyhow!("observerd returned an error: {e}")),
         other => Err(anyhow!("unexpected daemon response to Control: {other:?}")),
@@ -356,6 +411,7 @@ mod tests {
                 incident("i1", "wedge", 80, None),
                 incident("i2", "gw-drop", 60, Some(70)),
             ],
+            observing: true,
         };
         let out = format_status(&snap);
         assert!(out.contains("generated_us   100"));
@@ -403,6 +459,13 @@ mod tests {
             message: "acting disabled".into(),
         });
         assert_eq!(out, "failed: acting disabled\n");
+    }
+
+    #[test]
+    fn observe_state_maps_to_control_bool() {
+        // `on` resumes collection, `off` pauses it.
+        assert!(ObserveState::On.as_bool());
+        assert!(!ObserveState::Off.as_bool());
     }
 
     #[test]

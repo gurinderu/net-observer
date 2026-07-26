@@ -11,25 +11,111 @@
 //! is the sole DB owner). When the daemon is down / the socket is absent,
 //! [`read_fresh`] returns `Err` and the panel renders a graceful "observer
 //! offline" state instead of crashing.
+//!
+//! ## Look — a Tailscale-style menu
+//!
+//! The panel is drawn as a clean, system-native dropdown (not bordered cards): a
+//! rounded surface, a header row with the app name and a toggle switch, hairline
+//! separators, and label→value list rows. It **adapts to the system appearance**
+//! ([`Theme::for_appearance`] reads gpui's [`gpui::WindowAppearance`]) — a
+//! near-white light theme or a dark-grey dark theme — rather than hardcoding one.
+//!
+//! The header **toggle switch** is bound to `snapshot.observing`: green when the
+//! observer is collecting, grey when paused. Clicking it sends
+//! `Control(SetObserving(!observing))` to the daemon (see [`send_set_observing`])
+//! and refreshes. This is benign **self-control** — it pauses/resumes the
+//! observer's OWN collection only; it never touches sing-box or the network and is
+//! not gated by `acting.enabled`. While paused the header shows a muted "paused"
+//! state and the daemon stays alive so the switch can turn collection back on.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Rgba, SharedString, Subscription, Window, div, px, rgb};
+use gpui::{
+    App, Context, Entity, Rgba, SharedString, Subscription, Window, WindowAppearance, div, px, rgb,
+};
 
 use observer_ipc::{ControlCmd, ControlResult, IncidentSummary, Request, Response, StatusSnapshot};
 
 use crate::status::{Health, health};
 
-// Dark palette for the panel.
-const BG: u32 = 0x1e1e2e;
-const CARD: u32 = 0x2a2a3c;
-const FG: u32 = 0xe6e6f0;
-const MUTED: u32 = 0x9a9ab0;
-const OK: u32 = 0x66d17d;
-const BAD: u32 = 0xf05a5a;
-const WARN: u32 = 0xe6b450;
-const ACCENT: u32 = 0x7aa2f7;
+/// A light/dark token set for the panel. Adapts to the system appearance so the
+/// menu reads as native in either mode (see [`Theme::for_appearance`]); the view
+/// never hardcodes a single palette. Colors are 24-bit RGB hex.
+#[derive(Clone, Copy)]
+struct Theme {
+    /// The popover surface.
+    bg: u32,
+    /// Primary ink (labels, app name).
+    fg: u32,
+    /// Secondary text and disabled/muted values.
+    muted: u32,
+    /// Hairline separator between sections.
+    separator: u32,
+    /// Semantic "good" (healthy verdicts).
+    ok: u32,
+    /// Semantic "bad" (failed/degraded verdicts, open incidents).
+    bad: u32,
+    /// Semantic "warn" (control action / offline banner).
+    warn: u32,
+    /// Accent for the neutral text action (Refresh).
+    accent: u32,
+    /// The toggle track when observing (on) — green.
+    track_on: u32,
+    /// The toggle track when paused (off) — grey.
+    track_off: u32,
+    /// The toggle knob.
+    knob: u32,
+    /// Hover wash under a text action.
+    hover: u32,
+}
+
+impl Theme {
+    /// Pick the light or dark token set from the window's system appearance.
+    /// Vibrant variants collapse onto their plain light/dark counterparts.
+    fn for_appearance(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::dark(),
+            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::light(),
+        }
+    }
+
+    /// Near-white surface, dark ink, hairline separators — the macOS light menu.
+    fn light() -> Self {
+        Self {
+            bg: 0xf6f6f7,
+            fg: 0x1d1d1f,
+            muted: 0x86868b,
+            separator: 0xe4e4e7,
+            ok: 0x1f9d4d,
+            bad: 0xd93a3a,
+            warn: 0xb26a00,
+            accent: 0x0a6cff,
+            track_on: 0x34c759,
+            track_off: 0xcfcfd4,
+            knob: 0xffffff,
+            hover: 0xececef,
+        }
+    }
+
+    /// Dark-grey surface, light ink — the macOS dark menu.
+    fn dark() -> Self {
+        Self {
+            bg: 0x1f1f22,
+            fg: 0xe8e8ec,
+            muted: 0x9a9aa2,
+            separator: 0x38383d,
+            ok: 0x4fce6e,
+            bad: 0xff5c5c,
+            warn: 0xe6b450,
+            accent: 0x6ea8fe,
+            track_on: 0x34c759,
+            track_off: 0x4a4a50,
+            knob: 0xffffff,
+            hover: 0x2c2c31,
+        }
+    }
+}
 
 /// Fetch the live [`StatusSnapshot`] from `observerd` over the local socket.
 ///
@@ -52,15 +138,36 @@ pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, String> {
 /// Ask `observerd` to restart the sing-box proxy over the local socket
 /// (`Control(KickstartProxy)`) and return its [`ControlResult`].
 ///
-/// This is the bar's only **write/control** path — every other request is a
-/// read. The bar never runs the action itself: it just sends the request; the
-/// daemon (running as root) decides whether to act, gated by `acting.enabled`
-/// (off by default), and reports the outcome. A missing socket / connection-
-/// refused (daemon down) or a protocol error maps to `Err(String)` so the panel
-/// can surface it as a transient line instead of crashing — never a panic, and
-/// never any local `launchctl` execution.
+/// This is the bar's **actuator-control** path (a system action) — every other
+/// request is a read or the benign self-control [`send_set_observing`]. The bar
+/// never runs the action itself: it just sends the request; the daemon (running as
+/// root) decides whether to act, gated by `acting.enabled` (off by default), and
+/// reports the outcome. A missing socket / connection-refused (daemon down) or a
+/// protocol error maps to `Err(String)` so the panel can surface it as a transient
+/// line instead of crashing — never a panic, and never any local `launchctl`
+/// execution.
 pub fn send_kickstart(socket_path: &str) -> Result<ControlResult, String> {
     match observer_ipc::query(socket_path, &Request::Control(ControlCmd::KickstartProxy)) {
+        Ok(Response::Control(result)) => Ok(result),
+        Ok(Response::Error(msg)) => Err(msg),
+        Ok(_) => Err("unexpected response from observerd".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Ask `observerd` to turn its OWN collection on (`true`) or off (`false`) over
+/// the local socket (`Control(SetObserving(on))`) and return its [`ControlResult`].
+///
+/// Mirrors [`send_kickstart`] on the wire, but this is benign **self-control**:
+/// it pauses/resumes the observer's own collection only — it does NOT touch
+/// sing-box or the network, and the daemon does not gate it on `acting.enabled`.
+/// The daemon stays alive and the socket keeps serving while paused, so the switch
+/// can turn collection back on. As with every request, a missing socket /
+/// connection-refused (daemon down) or a protocol error maps to `Err(String)` so
+/// the panel can surface it as a transient line instead of crashing — never a
+/// panic.
+pub fn send_set_observing(socket_path: &str, on: bool) -> Result<ControlResult, String> {
+    match observer_ipc::query(socket_path, &Request::Control(ControlCmd::SetObserving(on))) {
         Ok(Response::Control(result)) => Ok(result),
         Ok(Response::Error(msg)) => Err(msg),
         Ok(_) => Err("unexpected response from observerd".to_string()),
@@ -76,8 +183,9 @@ pub struct Glance {
     /// Config socket path, so the panel's manual "Refresh" can re-query.
     pub socket_path: String,
     /// The most recent control-action outcome (e.g. the "Restart sing-box"
-    /// result, or `"acting disabled"`), surfaced as a transient line in the
-    /// panel. `None` until the operator triggers a control action.
+    /// result, the observing toggle outcome, or `"acting disabled"`), surfaced as
+    /// a transient line in the panel. `None` until the operator triggers a
+    /// control action.
     pub control_msg: Option<String>,
 }
 
@@ -117,6 +225,25 @@ impl Glance {
             Err(e) => format!("failed: {e}"),
         });
     }
+
+    /// Flip the observer's collection on/off (the header toggle switch): send
+    /// `Control(SetObserving(!observing))`, record the outcome line, then refresh
+    /// so the switch reflects the daemon's real state. Benign self-control — never
+    /// touches sing-box or the network. Never panics: a daemon-down / refused
+    /// socket or a failed action becomes a readable `control_msg` line and the
+    /// refresh surfaces the offline state.
+    pub fn toggle_observing(&mut self) {
+        let target = !self.snapshot.observing;
+        self.control_msg = Some(match send_set_observing(&self.socket_path, target) {
+            Ok(result) => {
+                let tag = if result.ok { "ok" } else { "failed" };
+                format!("{tag}: {}", result.message)
+            }
+            Err(e) => format!("failed: {e}"),
+        });
+        // Reflect the daemon's real observing state after the toggle.
+        self.refresh();
+    }
 }
 
 /// The root view of the panel window. Holds a handle to the shared [`Glance`]
@@ -139,195 +266,245 @@ impl PanelView {
 }
 
 impl Render for PanelView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Adapt to the system appearance instead of hardcoding a palette.
+        let theme = Theme::for_appearance(window.appearance());
+
         let glance = self.model.read(cx);
         let snapshot = glance.snapshot.clone();
         let error = glance.error.clone();
         let control_msg = glance.control_msg.clone();
         let now_us = now_us();
 
-        let (dot, dot_color) = health_dot(&snapshot);
-
         div()
             .flex()
             .flex_col()
             .size_full()
-            .gap_3()
-            .p_4()
-            .bg(rgb(BG))
-            .text_color(rgb(FG))
-            .text_sm()
-            // Header: health dot + title + last-updated age.
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_color(dot_color).text_xl().child(dot))
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("observer"),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_color(rgb(MUTED))
-                            .text_xs()
-                            .child(freshness_line(&snapshot, now_us)),
-                    ),
-            )
-            .children(error.map(error_banner))
-            .child(link_card(&snapshot, now_us))
-            .child(proxy_card(&snapshot, now_us))
-            .child(incidents_card(&snapshot.incidents, now_us))
-            .child(control_card(cx, control_msg))
-            .child(footer(cx))
+            .bg(rgb(theme.bg))
+            .text_color(rgb(theme.fg))
+            .font_family(".SystemUIFont")
+            .text_size(px(13.0))
+            .rounded_lg()
+            .overflow_hidden()
+            .child(header_row(&snapshot, theme, cx))
+            .child(separator(theme))
+            .children(error.map(|e| offline_row(e, theme)))
+            .child(status_rows(&snapshot, theme))
+            .child(separator(theme))
+            .child(incidents_section(&snapshot.incidents, now_us, theme))
+            .child(separator(theme))
+            .child(footer(&snapshot, now_us, control_msg, theme, cx))
     }
 }
 
-/// The colored health dot + its color for the panel header. The color follows
-/// the shared [`health`] classifier, so the panel dot and the menu-bar
-/// [`status_dot`](crate::status::status_dot) can never disagree.
-fn health_dot(snapshot: &StatusSnapshot) -> (&'static str, Rgba) {
+/// The header row: a health dot + the app name on the left, the observing toggle
+/// switch on the right. When paused, a muted "paused" label sits after the name
+/// and the dot is grey.
+fn header_row(
+    snapshot: &StatusSnapshot,
+    theme: Theme,
+    cx: &mut Context<PanelView>,
+) -> impl IntoElement {
+    let (dot, dot_color) = header_dot(snapshot, theme);
+
+    let mut left = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(div().text_color(dot_color).text_size(px(10.0)).child(dot))
+        .child(
+            div()
+                .text_size(px(15.0))
+                .font_weight(gpui::FontWeight::BOLD)
+                .child("observer"),
+        );
+    if !snapshot.observing {
+        left = left.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(theme.muted))
+                .child("paused"),
+        );
+    }
+
+    div()
+        .flex()
+        .items_center()
+        .px_3()
+        .py_2p5()
+        .child(left)
+        .child(div().flex_1())
+        .child(toggle_switch(snapshot.observing, theme, cx))
+}
+
+/// The header health dot glyph + color. When paused, a grey dot regardless of the
+/// underlying health (collection is off, so there is nothing live to judge);
+/// otherwise it follows the shared [`health`] classifier so the panel dot and the
+/// menu-bar dot can never disagree.
+fn header_dot(snapshot: &StatusSnapshot, theme: Theme) -> (&'static str, Rgba) {
+    if !snapshot.observing {
+        return ("\u{25CF}", rgb(theme.muted));
+    }
     let color = match health(snapshot) {
-        Health::NoData => rgb(MUTED),
-        Health::Ok => rgb(OK),
-        Health::Bad => rgb(BAD),
+        Health::NoData => rgb(theme.muted),
+        Health::Ok => rgb(theme.ok),
+        Health::Bad => rgb(theme.bad),
     };
     ("\u{25CF}", color)
 }
 
-fn error_banner(msg: String) -> impl IntoElement {
-    card(WARN).child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(section_title("observer offline"))
-            .child(div().text_color(rgb(WARN)).child(SharedString::from(msg))),
-    )
+/// A Tailscale-style toggle switch bound to `observing`: a pill track
+/// (`rounded_full`) with a circular knob that sits left (off) or right (on). Green
+/// track when observing, grey when paused. Clicking it flips the observer's
+/// collection via [`Glance::toggle_observing`] and re-renders.
+fn toggle_switch(observing: bool, theme: Theme, cx: &mut Context<PanelView>) -> impl IntoElement {
+    let track_color = if observing {
+        theme.track_on
+    } else {
+        theme.track_off
+    };
+
+    let mut track = div()
+        .id("observing-toggle")
+        .flex()
+        .items_center()
+        .w(px(40.0))
+        .h(px(24.0))
+        .p_0p5()
+        .rounded_full()
+        .bg(rgb(track_color))
+        .cursor_pointer()
+        .child(div().size(px(20.0)).rounded_full().bg(rgb(theme.knob)))
+        .on_click(cx.listener(|this, _, _window, cx| {
+            this.model.update(cx, |g, cx| {
+                g.toggle_observing();
+                cx.notify();
+            });
+        }));
+
+    // Knob left when off, right when on.
+    track = if observing {
+        track.justify_end()
+    } else {
+        track.justify_start()
+    };
+    track
 }
 
-fn link_card(snapshot: &StatusSnapshot, now_us: i64) -> impl IntoElement {
-    let body = match &snapshot.link {
+/// The offline banner shown when the last fetch failed (daemon down / socket
+/// absent): a warn-colored title + the error, rather than showing stale data as
+/// if it were live.
+fn offline_row(msg: String, theme: Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .px_3()
+        .py_2()
+        .child(
+            div()
+                .text_color(rgb(theme.warn))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child("observer offline"),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(theme.warn))
+                .child(SharedString::from(msg)),
+        )
+}
+
+/// The label→value list: the latest link tick (gw, direct) and proxy tick (tun,
+/// selector). Missing collectors render a muted "-". Values carry semantic color;
+/// labels are muted.
+fn status_rows(snapshot: &StatusSnapshot, theme: Theme) -> impl IntoElement {
+    let (gw, gw_color, direct, direct_color) = match &snapshot.link {
         Some(l) => {
             let gw = l.gw.to_string();
             let direct = l.direct.to_string();
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(kv("gw", &gw, verdict_color(&gw)))
-                .child(kv("direct", &direct, verdict_color(&direct)))
-                .child(kv("age", &age_str(l.ts_us, now_us), rgb(MUTED)))
+            let gw_color = verdict_color(&gw, theme);
+            let direct_color = verdict_color(&direct, theme);
+            (gw, gw_color, direct, direct_color)
         }
-        None => div().child(no_data()),
+        None => (
+            "-".to_string(),
+            rgb(theme.muted),
+            "-".to_string(),
+            rgb(theme.muted),
+        ),
     };
-    card(CARD).child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(section_title("link (latest tick)"))
-            .child(body),
-    )
-}
 
-fn proxy_card(snapshot: &StatusSnapshot, now_us: i64) -> impl IntoElement {
-    let body = match &snapshot.proxy {
+    let (tun, tun_color, sel) = match &snapshot.proxy {
         Some(p) => {
             let tun = p
                 .tun_code
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "-".to_string());
             let tun_color = match p.tun_code {
-                Some(204) => rgb(OK),
-                Some(_) => rgb(BAD),
-                None => rgb(MUTED),
+                Some(204) => rgb(theme.ok),
+                Some(_) => rgb(theme.bad),
+                None => rgb(theme.muted),
             };
             let sel = p.selector.clone().unwrap_or_else(|| "-".to_string());
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(kv("tun", &tun, tun_color))
-                .child(kv("selector", &sel, rgb(FG)))
-                .child(kv("age", &age_str(p.ts_us, now_us), rgb(MUTED)))
+            (tun, tun_color, sel)
         }
-        None => div().child(no_data()),
+        None => ("-".to_string(), rgb(theme.muted), "-".to_string()),
     };
-    card(CARD).child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(section_title("proxy (latest tick)"))
-            .child(body),
-    )
-}
 
-fn incidents_card(incidents: &[IncidentSummary], now_us: i64) -> impl IntoElement {
-    let body = if incidents.is_empty() {
-        div().child(div().text_color(rgb(MUTED)).child("no recent incidents"))
-    } else {
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .children(incidents.iter().map(|i| incident_row(i, now_us)))
-    };
-    card(CARD).child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(section_title("recent incidents"))
-            .child(body),
-    )
-}
-
-fn incident_row(i: &IncidentSummary, now_us: i64) -> impl IntoElement {
-    let (state, state_color) = match i.closed_us {
-        Some(_) => ("closed", rgb(MUTED)),
-        None => ("open", rgb(BAD)),
-    };
     div()
         .flex()
-        .items_center()
-        .gap_2()
-        .child(div().text_color(state_color).w(px(48.0)).child(state))
-        .child(
-            div()
-                .flex_1()
-                .text_color(rgb(FG))
-                .child(SharedString::from(i.trigger_id.clone())),
-        )
-        .child(
-            div()
-                .text_color(rgb(MUTED))
-                .text_xs()
-                .child(age_str(i.opened_us, now_us)),
-        )
-}
-
-/// The write/control card: a "Restart sing-box" button that sends a
-/// `Control(KickstartProxy)` to the daemon, plus a transient line showing the
-/// last outcome. The bar never runs the action itself — the daemon does, and
-/// only when `acting.enabled` is set (off by default), otherwise it reports
-/// `"acting disabled"`. A daemon-down / refused socket degrades to a readable
-/// line here, never a panic. The read/refresh path is unaffected.
-fn control_card(cx: &mut Context<PanelView>, control_msg: Option<String>) -> impl IntoElement {
-    let button = div()
-        .id("kickstart")
+        .flex_col()
         .px_3()
         .py_1()
+        .child(row("gw", &gw, gw_color, theme))
+        .child(row("direct", &direct, direct_color, theme))
+        .child(row("tun", &tun, tun_color, theme))
+        .child(row("selector", &sel, rgb(theme.fg), theme))
+}
+
+/// The incidents section: a compact list of `trigger_id → state · age` rows, or a
+/// single muted "no recent incidents" line when there are none.
+fn incidents_section(incidents: &[IncidentSummary], now_us: i64, theme: Theme) -> impl IntoElement {
+    let base = div().flex().flex_col().px_3().py_1();
+    if incidents.is_empty() {
+        base.child(
+            div()
+                .py_1()
+                .text_color(rgb(theme.muted))
+                .child("no recent incidents"),
+        )
+    } else {
+        base.children(incidents.iter().map(move |i| {
+            let (state, color) = match i.closed_us {
+                Some(_) => ("closed", theme.muted),
+                None => ("open", theme.bad),
+            };
+            let value = format!("{state} \u{00b7} {}", age_str(i.opened_us, now_us));
+            row(&i.trigger_id, &value, rgb(color), theme)
+        }))
+    }
+}
+
+/// The footer: a muted freshness line (+ the last control-action outcome, if any)
+/// on the left, and subtle text actions on the right — "Restart sing-box"
+/// (self-standing control), "Refresh", and "Quit".
+fn footer(
+    snapshot: &StatusSnapshot,
+    now_us: i64,
+    control_msg: Option<String>,
+    theme: Theme,
+    cx: &mut Context<PanelView>,
+) -> impl IntoElement {
+    let restart = div()
+        .id("kickstart")
+        .px_2()
+        .py_1()
         .rounded_md()
-        .bg(rgb(CARD))
-        .text_color(rgb(WARN))
+        .text_size(px(12.0))
+        .text_color(rgb(theme.warn))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(0x3a2a2a)))
+        .hover(|s| s.bg(rgb(theme.hover)))
         .child("Restart sing-box")
         .on_click(cx.listener(|this, _, _window, cx| {
             this.model.update(cx, |g, cx| {
@@ -336,92 +513,99 @@ fn control_card(cx: &mut Context<PanelView>, control_msg: Option<String>) -> imp
             });
         }));
 
-    let mut body = div().flex().flex_col().gap_2().child(button);
-    if let Some(msg) = control_msg {
-        body = body.child(
+    let refresh = div()
+        .id("refresh")
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        .text_color(rgb(theme.accent))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme.hover)))
+        .child("Refresh")
+        .on_click(cx.listener(|this, _, _window, cx| {
+            this.model.update(cx, |g, cx| {
+                g.refresh();
+                cx.notify();
+            });
+        }));
+
+    let quit = div()
+        .id("quit")
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        .text_color(rgb(theme.bad))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme.hover)))
+        .child("Quit")
+        .on_click(|_, _window, cx: &mut App| cx.quit());
+
+    let actions = div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(restart)
+        .child(
             div()
-                .text_color(rgb(MUTED))
-                .text_xs()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(refresh)
+                .child(quit),
+        );
+
+    let mut meta = div().flex().flex_col().gap_0p5().child(
+        div()
+            .text_size(px(11.0))
+            .text_color(rgb(theme.muted))
+            .child(freshness_line(snapshot, now_us)),
+    );
+    if let Some(msg) = control_msg {
+        meta = meta.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(theme.muted))
                 .child(SharedString::from(msg)),
         );
     }
 
-    card(WARN).child(
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(section_title("control"))
-            .child(body),
-    )
-}
-
-fn footer(cx: &mut Context<PanelView>) -> impl IntoElement {
     div()
         .flex()
-        .items_center()
-        .gap_2()
-        .child(div().flex_1())
-        .child(
-            div()
-                .id("refresh")
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .bg(rgb(CARD))
-                .text_color(rgb(ACCENT))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(0x33334a)))
-                .child("Refresh")
-                .on_click(cx.listener(|this, _, _window, cx| {
-                    this.model.update(cx, |g, cx| {
-                        g.refresh();
-                        cx.notify();
-                    });
-                })),
-        )
-        .child(
-            div()
-                .id("quit")
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .bg(rgb(CARD))
-                .text_color(rgb(BAD))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(0x3a2a2a)))
-                .child("Quit")
-                .on_click(|_, _window, cx: &mut App| cx.quit()),
-        )
+        .flex_col()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .child(actions)
+        .child(meta)
 }
 
 // ---- small element helpers -------------------------------------------------
 
-fn card(border: u32) -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .p_3()
-        .rounded_md()
-        .bg(rgb(CARD))
-        .border_l_2()
-        .border_color(rgb(border))
+/// A hairline separator between sections — a 1px full-width rule, no borders.
+fn separator(theme: Theme) -> impl IntoElement {
+    div().h(px(1.0)).w_full().bg(rgb(theme.separator))
 }
 
-fn section_title(text: &'static str) -> impl IntoElement {
-    div()
-        .text_xs()
-        .text_color(rgb(MUTED))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .child(text)
-}
-
-fn kv(key: &'static str, value: &str, value_color: Rgba) -> impl IntoElement {
+/// One label→value list row: a muted label on the left, a colored value on the
+/// right (the Tailscale-style clean list, not a bordered card).
+///
+/// `+ use<>` opts the returned element out of capturing the `&str` argument
+/// lifetimes (Rust 2024's default): the row copies both into owned
+/// [`SharedString`]s, so it borrows neither — letting callers build rows from
+/// short-lived locals (e.g. a formatted incident line).
+fn row(key: &str, value: &str, value_color: Rgba, theme: Theme) -> impl IntoElement + use<> {
     div()
         .flex()
         .items_center()
-        .gap_2()
-        .child(div().w(px(72.0)).text_color(rgb(MUTED)).child(key))
+        .justify_between()
+        .py_1()
+        .child(
+            div()
+                .text_color(rgb(theme.muted))
+                .child(SharedString::from(key.to_string())),
+        )
         .child(
             div()
                 .text_color(value_color)
@@ -429,15 +613,13 @@ fn kv(key: &'static str, value: &str, value_color: Rgba) -> impl IntoElement {
         )
 }
 
-fn no_data() -> impl IntoElement {
-    div().text_color(rgb(MUTED)).child("(no data)")
-}
-
-fn verdict_color(verdict: &str) -> Rgba {
+/// Semantic color for a verdict string: `OK` → good, empty → muted, anything else
+/// → bad.
+fn verdict_color(verdict: &str, theme: Theme) -> Rgba {
     match verdict {
-        "OK" => rgb(OK),
-        "" => rgb(MUTED),
-        _ => rgb(BAD),
+        "OK" => rgb(theme.ok),
+        "" => rgb(theme.muted),
+        _ => rgb(theme.bad),
     }
 }
 
@@ -546,6 +728,23 @@ mod tests {
         assert!(res.is_err(), "absent socket must yield a control Err");
     }
 
+    /// The observing self-control path degrades gracefully too: an absent socket
+    /// (daemon down) yields an `Err`, never a panic — and nothing is executed
+    /// locally (the bar only sends a request; the daemon owns the state).
+    #[test]
+    fn send_set_observing_offline_when_socket_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sock");
+        assert!(
+            send_set_observing(missing.to_str().unwrap(), false).is_err(),
+            "absent socket must yield a control Err (turning off)"
+        );
+        assert!(
+            send_set_observing(missing.to_str().unwrap(), true).is_err(),
+            "absent socket must yield a control Err (turning on)"
+        );
+    }
+
     /// `Glance::kickstart` on a down daemon records a readable failure line
     /// instead of panicking, and leaves the read/refresh state untouched.
     #[test]
@@ -565,5 +764,35 @@ mod tests {
         );
         // The read path is untouched by a control action.
         assert!(glance.error.is_none());
+    }
+
+    /// `Glance::toggle_observing` on a down daemon records a readable failure line
+    /// instead of panicking, and its trailing refresh surfaces the offline state
+    /// (the switch reflects the daemon's real, unreachable state — never a
+    /// silently-flipped local bool).
+    #[test]
+    fn glance_toggle_observing_records_failure_when_daemon_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sock");
+        let mut glance = Glance::new(
+            StatusSnapshot::default(),
+            None,
+            missing.to_str().unwrap().to_string(),
+        );
+        // A fresh snapshot reads as observing; the daemon is down.
+        assert!(glance.snapshot.observing);
+        glance.toggle_observing();
+        let msg = glance
+            .control_msg
+            .clone()
+            .expect("toggle must record a message");
+        assert!(
+            msg.starts_with("failed:"),
+            "daemon-down must be a failure: {msg}"
+        );
+        // The trailing refresh failed against the absent socket -> offline error,
+        // and the (unreached) snapshot state is left as-is rather than flipped.
+        assert!(glance.error.is_some(), "refresh must surface offline");
+        assert!(glance.snapshot.observing, "state not flipped locally");
     }
 }

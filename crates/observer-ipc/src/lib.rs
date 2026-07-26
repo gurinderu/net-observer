@@ -37,6 +37,12 @@ pub enum ControlCmd {
     /// Restart the sing-box proxy service (`launchctl kickstart -k <service>`),
     /// the same recovery net-observer's watchdog used — but triggered manually.
     KickstartProxy,
+    /// Turn the observer's OWN collection on (`true`) or off (`false`) —
+    /// pause/resume. This is benign **self-control**: it does NOT touch sing-box
+    /// or the network, and is NOT gated by `acting.enabled`. While paused the
+    /// daemon stays alive and the socket keeps serving so the switch can turn
+    /// collection back on.
+    SetObserving(bool),
 }
 
 /// The outcome of a [`ControlCmd`]: whether the action ran successfully plus a
@@ -62,7 +68,7 @@ pub struct IncidentSummary {
 
 /// The live, in-memory status the daemon serves. Each collector's latest sample
 /// plus a bounded ring of recent incidents.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StatusSnapshot {
     pub generated_us: i64,
     pub link: Option<LinkSample>,
@@ -70,6 +76,27 @@ pub struct StatusSnapshot {
     pub dns: Option<DnsSample>,
     pub host: Option<HostSample>,
     pub incidents: Vec<IncidentSummary>,
+    /// Whether the daemon is actively collecting. `true` (the default) = collectors
+    /// run and samples flow; `false` = collection is paused (the daemon stays alive
+    /// and the socket keeps serving, the last snapshot retained but marked paused).
+    pub observing: bool,
+}
+
+/// Hand-written so a fresh snapshot reads `observing: true` — deriving `Default`
+/// would give `false` for the `bool`, which would misreport a healthy daemon as
+/// paused.
+impl Default for StatusSnapshot {
+    fn default() -> Self {
+        Self {
+            generated_us: 0,
+            link: None,
+            proxy: None,
+            dns: None,
+            host: None,
+            incidents: Vec::new(),
+            observing: true,
+        }
+    }
 }
 
 /// A response from the daemon to a client.
@@ -158,6 +185,7 @@ mod tests {
                 trigger_id: "fakeip".into(),
                 signature: "sig".into(),
             }],
+            observing: false,
         };
 
         let mut buf = Vec::new();
@@ -173,6 +201,14 @@ mod tests {
         assert_eq!(back.incidents.len(), 1);
         assert_eq!(back.incidents[0].id, "inc-1");
         assert_eq!(back.incidents[0].closed_us, Some(2000));
+        assert!(!back.observing);
+    }
+
+    #[test]
+    fn status_snapshot_default_is_observing() {
+        // A fresh snapshot must read as observing (true), not paused — the
+        // hand-written `Default` guards against `derive(Default)`'s `false`.
+        assert!(StatusSnapshot::default().observing);
     }
 
     #[test]
@@ -198,6 +234,21 @@ mod tests {
         let back: Request = read_frame(&mut reader).unwrap();
         match back {
             Request::Control(ControlCmd::KickstartProxy) => {}
+            other => panic!("unexpected request variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_round_trip_set_observing_request() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &Request::Control(ControlCmd::SetObserving(true))).unwrap();
+        // Exactly one frame => exactly one trailing newline.
+        assert_eq!(buf.iter().filter(|&&b| b == b'\n').count(), 1);
+
+        let mut reader = std::io::BufReader::new(&buf[..]);
+        let back: Request = read_frame(&mut reader).unwrap();
+        match back {
+            Request::Control(ControlCmd::SetObserving(on)) => assert!(on),
             other => panic!("unexpected request variant: {other:?}"),
         }
     }

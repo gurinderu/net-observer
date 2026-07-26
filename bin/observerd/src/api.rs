@@ -12,6 +12,7 @@
 //! [`Response`] out, then the connection closes.
 
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use observer_ipc::{ControlCmd, ControlResult, Request, Response, StatusSnapshot};
@@ -40,9 +41,12 @@ pub struct ActingConfig {
 /// `chown` it to `socket_owner_uid`, and serve [`Request`]s from the shared
 /// `snapshot` until the task is aborted.
 ///
-/// `acting` gates the write/control path: control requests are refused unless
-/// `acting.enabled` is set (see [`control_response`]). Only this daemon runs the
-/// actuator, and only on an explicit request — never automatically.
+/// `acting` gates the write/control path: acting-class control requests (e.g.
+/// `KickstartProxy`) are refused unless `acting.enabled` is set (see
+/// [`control_response`]). Only this daemon runs the actuator, and only on an
+/// explicit request — never automatically. `SetObserving` is benign self-control
+/// and is *not* gated by `acting`: it flips the shared `observing` flag the
+/// collectors check and mirrors the new state into the live snapshot.
 ///
 /// Runs forever; the daemon spawns it and `abort()`s it on shutdown. A stale
 /// socket file left by a previous run is removed before binding (otherwise
@@ -52,6 +56,7 @@ pub async fn serve(
     socket_mode: u32,
     socket_owner_uid: Option<u32>,
     acting: ActingConfig,
+    observing: Arc<AtomicBool>,
     snapshot: Arc<Mutex<StatusSnapshot>>,
 ) -> std::io::Result<()> {
     // A leftover socket file from a previous run makes bind() fail; clear it.
@@ -82,10 +87,11 @@ pub async fn serve(
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let snapshot = Arc::clone(&snapshot);
+                let observing = Arc::clone(&observing);
                 let acting = acting.clone();
                 // One task per connection: read one request, reply, close.
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, &snapshot, &acting).await {
+                    if let Err(e) = handle_conn(stream, &snapshot, &observing, &acting).await {
                         tracing::debug!(error = %e, "status socket connection error");
                     }
                 });
@@ -102,6 +108,7 @@ pub async fn serve(
 async fn handle_conn(
     stream: UnixStream,
     snapshot: &Mutex<StatusSnapshot>,
+    observing: &AtomicBool,
     acting: &ActingConfig,
 ) -> std::io::Result<()> {
     let (rd, mut wr) = stream.into_split();
@@ -124,7 +131,9 @@ async fn handle_conn(
                 .collect();
             Response::Incidents(incidents)
         }
-        Ok(Request::Control(cmd)) => Response::Control(control_response(cmd, acting)),
+        Ok(Request::Control(cmd)) => {
+            Response::Control(control_response(cmd, observing, snapshot, acting))
+        }
         Err(e) => Response::Error(format!("bad request: {e}")),
     };
 
@@ -134,25 +143,52 @@ async fn handle_conn(
     wr.flush().await
 }
 
-/// Map a [`ControlCmd`] to its [`ControlResult`], honoring the acting gate.
+/// Map a [`ControlCmd`] to its [`ControlResult`].
 ///
-/// Safety invariant: when acting is disabled the command is refused *without
-/// running anything* — this returns early before touching the actuator, so no
-/// `launchctl` (or any other action) is ever invoked. Only when acting is
-/// explicitly enabled does `observerd` run the actuator, and only for this
-/// explicit request (never automatically).
-fn control_response(cmd: ControlCmd, acting: &ActingConfig) -> ControlResult {
-    if !acting.enabled {
-        return ControlResult {
-            ok: false,
-            message: "acting disabled".into(),
-        };
-    }
+/// Two classes of command with different gating:
+///
+/// - **`SetObserving(b)` — benign self-control, NOT gated by `acting.enabled`.**
+///   It flips the observer's OWN collection on/off: it stores `b` into the shared
+///   `observing` flag the collectors check and mirrors it into the live snapshot
+///   (`snapshot.observing`) so the switch shows the real state. It never touches
+///   sing-box or the network, so the acting gate does not apply — a client can
+///   pause/resume collection even with acting disabled. The daemon stays alive
+///   and the socket keeps serving throughout, so the switch can turn it back on.
+///
+/// - **Acting-class commands (e.g. `KickstartProxy`) — gated by
+///   `acting.enabled`.** Safety invariant: when acting is disabled the command is
+///   refused *without running anything* — no `launchctl` (or any other actuator)
+///   is ever invoked. Only when acting is explicitly enabled does `observerd` run
+///   the actuator, and only for this explicit request (never automatically).
+fn control_response(
+    cmd: ControlCmd,
+    observing: &AtomicBool,
+    snapshot: &Mutex<StatusSnapshot>,
+    acting: &ActingConfig,
+) -> ControlResult {
     match cmd {
-        ControlCmd::KickstartProxy => match acting::kickstart_proxy(&acting.singbox_service) {
-            Ok(message) => ControlResult { ok: true, message },
-            Err(message) => ControlResult { ok: false, message },
-        },
+        // Self-control: not gated by acting. Set the flag + mirror into snapshot.
+        ControlCmd::SetObserving(b) => {
+            observing.store(b, Ordering::Release);
+            snapshot.lock().unwrap_or_else(|e| e.into_inner()).observing = b;
+            ControlResult {
+                ok: true,
+                message: format!("observing {}", if b { "on" } else { "off" }),
+            }
+        }
+        // Acting-class: refused unless acting is explicitly enabled.
+        ControlCmd::KickstartProxy => {
+            if !acting.enabled {
+                return ControlResult {
+                    ok: false,
+                    message: "acting disabled".into(),
+                };
+            }
+            match acting::kickstart_proxy(&acting.singbox_service) {
+                Ok(message) => ControlResult { ok: true, message },
+                Err(message) => ControlResult { ok: false, message },
+            }
+        }
     }
 }
 
@@ -214,11 +250,13 @@ mod tests {
             enabled: false,
             singbox_service: "system/sing-box".into(),
         };
+        let observing = Arc::new(AtomicBool::new(true));
         let handle = tokio::spawn(serve(
             sock_str.clone(),
             0o666,
             None,
             acting,
+            observing,
             snapshot.clone(),
         ));
 
@@ -268,21 +306,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Safety invariant: with acting disabled, a control request is refused
-    /// without running anything. This exercises the gate directly (no socket, no
-    /// `launchctl`) so the "never act when disabled" branch is asserted in
-    /// isolation. The actuator itself is intentionally never invoked here.
+    /// Safety invariant: with acting disabled, an acting-class control request is
+    /// refused without running anything. This exercises the gate directly (no
+    /// socket, no `launchctl`) so the "never act when disabled" branch is asserted
+    /// in isolation. The actuator itself is intentionally never invoked here.
     #[test]
     fn control_refused_when_acting_disabled() {
         let acting = ActingConfig {
             enabled: false,
             singbox_service: "system/sing-box".into(),
         };
-        let result = control_response(ControlCmd::KickstartProxy, &acting);
+        let observing = AtomicBool::new(true);
+        let snapshot = Mutex::new(StatusSnapshot::default());
+        let result = control_response(ControlCmd::KickstartProxy, &observing, &snapshot, &acting);
         assert!(
             !result.ok,
             "control must be refused when acting is disabled"
         );
         assert_eq!(result.message, "acting disabled");
+    }
+
+    /// `SetObserving` is benign self-control: it must succeed even with acting
+    /// disabled (it is NOT gated by `acting.enabled`), flip the shared flag, and
+    /// mirror the new state into the live snapshot so the switch shows reality.
+    #[test]
+    fn set_observing_not_gated_by_acting_and_updates_snapshot() {
+        let acting = ActingConfig {
+            enabled: false,
+            singbox_service: "system/sing-box".into(),
+        };
+        let observing = AtomicBool::new(true);
+        let snapshot = Mutex::new(StatusSnapshot::default());
+
+        // Pause: succeeds despite acting being disabled; flag + snapshot go false.
+        let off = control_response(
+            ControlCmd::SetObserving(false),
+            &observing,
+            &snapshot,
+            &acting,
+        );
+        assert!(off.ok, "SetObserving must not be gated by acting");
+        assert_eq!(off.message, "observing off");
+        assert!(!observing.load(Ordering::Acquire));
+        assert!(!snapshot.lock().unwrap().observing);
+
+        // Resume: flag + snapshot go true again.
+        let on = control_response(
+            ControlCmd::SetObserving(true),
+            &observing,
+            &snapshot,
+            &acting,
+        );
+        assert!(on.ok);
+        assert_eq!(on.message, "observing on");
+        assert!(observing.load(Ordering::Acquire));
+        assert!(snapshot.lock().unwrap().observing);
     }
 }

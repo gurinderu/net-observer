@@ -12,9 +12,14 @@ freeze the pcap ring) — it **never acts automatically**. The single write/cont
 path is manual and human-in-the-loop: an operator's `Request::Control` (from the
 bar's "Restart sing-box" button or the CLI `kickstart` subcommand) asks the daemon
 to `launchctl kickstart -k` the sing-box service, and the daemon runs it **only
-when `acting.enabled` is set** — off by default, so every control request is
-otherwise refused without running anything. No watchdog, no automatic recovery,
-no notifications in v1 — those remain later handlers behind the same
+when `acting.enabled` is set** — off by default, so every acting-class control
+request is otherwise refused without running anything. Distinct from acting is an
+**observing on/off switch** (`ControlCmd::SetObserving`): benign *self-control*
+that pauses/resumes the daemon's OWN collection (the collectors stop producing
+samples; the daemon stays alive and the socket keeps serving). It touches neither
+sing-box nor the network, so it is **not** gated by `acting.enabled` — see
+[Control path](#control-path). No watchdog, no automatic recovery, no
+notifications in v1 — those remain later handlers behind the same
 `Condition → Handler` interface. The shell `net-observer` remains the behavioral
 oracle (see `AGENTS.md`).
 
@@ -147,6 +152,15 @@ Collectors and their probe ports are **native `async fn`** (Rust ≥ 1.75), not 
   failing collector keeps ticking and never takes down the others. The only
   blocking primitive is the PF_ROUTE `read(2)`, isolated on its own OS thread by
   `spawn_event_collector`.
+- **A shared `observing` flag pauses collection.** Both spawners take an
+  `Arc<AtomicBool>` (`observing`, default `true`) that the operator flips via the
+  `SetObserving` control command. Each cycle checks it with `Ordering::Acquire`:
+  the interval loop `continue`s **before** `collect()` (skips the probe entirely,
+  so a paused collector produces no samples), and the event thread keeps draining
+  the source with `next()` (so the PF_ROUTE socket never backs up) but `continue`s
+  **before** forwarding the batch. The loops keep running while paused, so
+  `SetObserving(true)` resumes probing/forwarding on the very next tick — this is
+  the pause/resume the menu-bar switch drives. See [Control path](#control-path).
 
 ## Crate graph
 
@@ -256,7 +270,17 @@ graph TD
   Tailscale-style dropdown — `WindowKind::PopUp`, anchored under the icon,
   dismissed on click-away) rendering the full `StatusSnapshot`
   (latest link/proxy tick + recent incidents), re-queried on a ~3s timer; a down
-  daemon / absent socket degrades to a graceful "observer offline" state. gpui's
+  daemon / absent socket degrades to a graceful "observer offline" state. The
+  popup is a **Tailscale-style** panel: it reads the window's
+  `WindowAppearance` and picks a LIGHT or DARK token set (never hardcoded dark),
+  laid out as a clean list — a header row with the app name and an
+  **observing on/off toggle switch** on the right, hairline dividers, label→value
+  rows (gw / direct / tun / selector), an incidents line, and a footer of subtle
+  text actions (Restart sing-box / Refresh / Quit). The toggle is a gpui-drawn
+  pill (green track + knob-right when `snapshot.observing`, grey + knob-left when
+  paused); clicking it sends `Control(SetObserving(!observing))` over the socket
+  (`send_set_observing`, mirroring `send_kickstart`) and refreshes, and the header
+  shows a muted "paused" state (grey dot) while collection is off. gpui's
   build script needs the macOS **Metal Toolchain**, so the crate is a full
   workspace member but is excluded from `default-members` — a bare `cargo build`
   needs no GUI toolchain; build the bar with `--workspace` / `-p observer-bar` on
@@ -308,12 +332,16 @@ the durable record; the socket is the live, low-latency read path.
   - `Request::Incidents { limit }` → `Response::Incidents(Vec<IncidentSummary>)`
   - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
     write/control path (see [Control path](#control-path) below); the only
-    non-read request
+    non-read request. Two commands today: `ControlCmd::KickstartProxy`
+    (acting-class, gated) and `ControlCmd::SetObserving(bool)` (self-control,
+    ungated).
   - a malformed request → `Response::Error(String)`
 
   `StatusSnapshot` is the latest sample per collector (`link` / `proxy` / `dns` /
-  `host`), a `generated_us` stamp, and a bounded, newest-first ring of recent
-  `IncidentSummary`s. `write_frame` / `read_frame` pin the exact framing
+  `host`), a `generated_us` stamp, an `observing: bool` (whether collection is
+  live or paused — hand-written `Default` so a fresh snapshot reads `true`, never
+  misreporting a healthy daemon as paused), and a bounded, newest-first ring of
+  recent `IncidentSummary`s. `write_frame` / `read_frame` pin the exact framing
   (`serde_json` + `'\n'`); the crate is runtime-agnostic (no tokio) so the async
   server and the blocking client share one format definition.
 
@@ -353,33 +381,54 @@ sequenceDiagram
 
 ### Control path
 
-The one **write** path over the socket. A `Request::Control(ControlCmd)` asks the
-daemon to run a recovery action; the only command today is
-`ControlCmd::KickstartProxy`, which restarts the sing-box service via
-`launchctl kickstart -k <service>`. Clients (bar button, CLI `kickstart`) only
-*send the request* — they never run `launchctl` themselves; the root daemon is
-the sole actor.
+The one **write** path over the socket: a `Request::Control(ControlCmd)`. There
+are two classes of command, gated differently and dispatched in exactly one
+place, `api::control_response`:
 
-The gate lives in exactly one place, `api::control_response`:
+1. **Acting-class — gated by `acting.enabled`.** `ControlCmd::KickstartProxy`
+   asks the daemon to restart the sing-box service via
+   `launchctl kickstart -k <service>`. Clients (bar "Restart sing-box" button,
+   CLI `kickstart`) only *send the request* — they never run `launchctl`
+   themselves; the root daemon is the sole actor, and only when acting is on.
+
+2. **Self-control — NOT gated by `acting.enabled`.** `ControlCmd::SetObserving(b)`
+   turns the observer's OWN collection on/off. It stores `b` into the shared
+   `observing` `AtomicBool` the collectors check each cycle and mirrors it into
+   the live snapshot (`snapshot.observing`) so the switch shows the real state. It
+   touches neither sing-box nor the network — a purely benign, reversible pause of
+   the daemon's own probing — so the acting gate deliberately does not apply: a
+   client can pause/resume collection even with `acting.enabled == false`. The
+   daemon stays alive and the socket keeps serving throughout, so the same switch
+   can turn collection back on. Clients: the bar's toggle switch and the CLI
+   `observe on|off` subcommand.
 
 ```
-Request::Control(cmd)  ──►  control_response(cmd, &acting)
+Request::Control(cmd)  ──►  control_response(cmd, &observing, &snapshot, &acting)
                               │
-                              ├─ acting.enabled == false (DEFAULT)
-                              │     └─► ControlResult { ok: false, "acting disabled" }
-                              │         (returns before touching the actuator —
-                              │          nothing is executed)
+                              ├─ SetObserving(b)  — self-control, UNGATED
+                              │     └─► observing.store(b)  +  snapshot.observing = b
+                              │         └─► ControlResult { ok: true, "observing on|off" }
+                              │             (never touches sing-box or the network)
                               │
-                              └─ acting.enabled == true
-                                    └─► acting::kickstart_proxy(&singbox_service)
-                                        (the ONLY place launchctl runs)
-                                        └─► ControlResult { ok, message }
+                              └─ KickstartProxy   — acting-class, GATED
+                                    ├─ acting.enabled == false (DEFAULT)
+                                    │     └─► ControlResult { ok: false, "acting disabled" }
+                                    │         (returns before touching the actuator —
+                                    │          nothing is executed)
+                                    │
+                                    └─ acting.enabled == true
+                                          └─► acting::kickstart_proxy(&singbox_service)
+                                              (the ONLY place launchctl runs)
+                                              └─► ControlResult { ok, message }
 ```
 
 **Safety invariant:** `acting.enabled` defaults to `false` (`config::ActingCfg`),
 and no code path reaches the actuator (`bin/observerd/src/acting.rs`) unless a
-`Control` request arrives **and** acting is enabled. Acting is never triggered by
-the pipeline or a passive handler — only by an explicit operator request.
+`KickstartProxy` request arrives **and** acting is enabled. Acting is never
+triggered by the pipeline or a passive handler — only by an explicit operator
+request. `SetObserving` is exempt from this gate by design (self-control, no
+external effect), but it is still a `Control` request over the same socket, so
+the socket-ownership hardening below applies to it unchanged.
 
 **Socket ownership / hardening.** Because the control path accepts privileged
 commands, an operator enabling `acting` should also lock the socket down: set

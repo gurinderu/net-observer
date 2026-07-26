@@ -19,6 +19,7 @@
 //! the pcap ring *before* slow forensic work and records a [`BlobRef`] per file.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use collector_core::Source;
@@ -91,9 +92,15 @@ pub async fn run(
 ///   samples, so a failed probe is recorded as absence rather than crashing the
 ///   task — the loop keeps ticking regardless;
 /// - the task exits cleanly only once the receiver is gone (channel closed).
+///
+/// While `observing` is `false` the loop keeps ticking but **skips the probe
+/// entirely** (`continue` before `collect()`), so paused collection produces no
+/// new samples. The daemon and its socket stay alive throughout, so
+/// `SetObserving(true)` resumes probing on the next tick.
 pub(crate) fn spawn_interval_collector(
     c: AnyCollector,
     tx: mpsc::Sender<Sample>,
+    observing: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     let Source::Interval(interval) = c.source() else {
         unreachable!("interval spawner")
@@ -104,6 +111,10 @@ pub(crate) fn spawn_interval_collector(
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // Paused: skip the probe entirely for this tick (no sample produced).
+            if !observing.load(Ordering::Acquire) {
+                continue;
+            }
             let ts_us = types::now_us();
             let samples = c.collect(ts_us).await;
             for s in samples {
@@ -127,7 +138,17 @@ pub(crate) fn spawn_interval_collector(
 /// therefore bounds its shutdown drain (see `observerd::main`) and the OS reaps
 /// the detached thread on process exit, rather than relying on this task to
 /// release the sender.
-pub(crate) fn spawn_event_collector(c: AnyCollector, tx: mpsc::Sender<Sample>) -> JoinHandle<()> {
+///
+/// While `observing` is `false` each batch is **dropped** (`continue` before
+/// forwarding): the source is still drained (`next()` keeps being called so the
+/// PF_ROUTE socket does not back up), but no events reach the consumer while
+/// paused. The daemon stays alive throughout; `SetObserving(true)` resumes
+/// forwarding on the next batch.
+pub(crate) fn spawn_event_collector(
+    c: AnyCollector,
+    tx: mpsc::Sender<Sample>,
+    observing: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     let name = c.meta().name;
     let Some(mut src) = c.into_event_source() else {
         tracing::error!(
@@ -143,6 +164,10 @@ pub(crate) fn spawn_event_collector(c: AnyCollector, tx: mpsc::Sender<Sample>) -
     // `next()` ends or the consumer is gone, and the OS reaps it on process exit.
     std::thread::spawn(move || {
         while let Some(samples) = src.next() {
+            // Paused: drop this batch (still drained from the source above).
+            if !observing.load(Ordering::Acquire) {
+                continue;
+            }
             for s in samples {
                 if tx.blocking_send(s).is_err() {
                     return; // consumer gone
@@ -378,7 +403,8 @@ mod tests {
             Duration::from_millis(5),
         ));
         let (tx, mut rx) = mpsc::channel(4);
-        let handle = spawn_interval_collector(c, tx);
+        let observing = Arc::new(AtomicBool::new(true));
+        let handle = spawn_interval_collector(c, tx, observing);
 
         // First tick forwards a Host sample (bounded so a stuck loop fails fast).
         let first = time::timeout(Duration::from_secs(5), rx.recv())
@@ -388,6 +414,42 @@ mod tests {
         assert!(matches!(first, Sample::Host(_)));
 
         // Dropping the receiver makes the next `send` fail, so the task exits.
+        drop(rx);
+        time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("collector task should exit after the receiver is dropped")
+            .expect("collector task should not panic");
+    }
+
+    /// While `observing` is `false` the interval collector keeps ticking but
+    /// skips its probe entirely, so no samples flow. Flipping the flag back to
+    /// `true` resumes probing on the next tick — the daemon (and this task) stay
+    /// alive throughout, exactly the pause/resume the switch relies on.
+    #[tokio::test]
+    async fn interval_collector_skips_probe_while_paused() {
+        let c = AnyCollector::Host(HostCollector::new(
+            Arc::new(HostLoad::new()),
+            Duration::from_millis(5),
+        ));
+        let (tx, mut rx) = mpsc::channel(4);
+        let observing = Arc::new(AtomicBool::new(false));
+        let handle = spawn_interval_collector(c, tx, observing.clone());
+
+        // Paused: several tick intervals must elapse with no sample forwarded.
+        let paused = time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            paused.is_err(),
+            "paused collector must not forward any sample"
+        );
+
+        // Resume: the very next tick produces a Host sample again.
+        observing.store(true, Ordering::Release);
+        let resumed = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("resumed collector should forward a sample within 5s")
+            .expect("channel should stay open while the collector runs");
+        assert!(matches!(resumed, Sample::Host(_)));
+
         drop(rx);
         time::timeout(Duration::from_secs(5), handle)
             .await

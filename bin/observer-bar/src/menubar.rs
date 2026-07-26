@@ -226,18 +226,27 @@ pub fn run() {
 /// The menu-bar title is just the [`status_dot`] — a single colored dot, no text
 /// (Tailscale-style). The verbose detail still lives in the hover tooltip.
 ///
-/// When the last fetch failed (daemon down / socket absent) the glance carries an
-/// `error`: the title becomes a grey "offline" dot (`⚫`) and the tooltip explains
-/// why, rather than showing stale health as if it were live.
+/// Three shells wrap the pure [`status_dot`]/[`render_status`] renderers (which
+/// describe a live snapshot only, so they stay untouched):
+/// - **offline** (last fetch failed, daemon down / socket absent): a grey `⚫`
+///   dot and a tooltip explaining why, rather than stale health shown as live.
+/// - **paused** (collection turned off via the panel switch): a `⏸` glyph and a
+///   "paused" tooltip prefix — the daemon is alive but not collecting, so the
+///   live health dot would be misleading.
+/// - **observing**: the live [`status_dot`] + [`render_status`].
 fn apply_glyph(button: &NSStatusBarButton, glance: &Glance) {
     let title: &str = match &glance.error {
         Some(_) => "\u{26AB}", // ⚫ offline (daemon down) — dot only, no text
+        None if !glance.snapshot.observing => "\u{23F8}", // ⏸ paused (collection off)
         None => status_dot(&glance.snapshot),
     };
     button.setTitle(&NSString::from_str(title));
 
     let tooltip = match &glance.error {
         Some(e) => format!("observer offline\n{e}"),
+        None if !glance.snapshot.observing => {
+            format!("paused\n{}", render_status(&glance.snapshot))
+        }
         None => render_status(&glance.snapshot),
     };
     button.setToolTip(Some(&NSString::from_str(&tooltip)));

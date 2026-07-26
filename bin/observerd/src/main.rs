@@ -10,6 +10,7 @@ mod api;
 mod pipeline;
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -131,23 +132,43 @@ async fn run_daemon() -> anyhow::Result<()> {
     // owner — the socket answers from this snapshot, never the DB.
     let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
 
+    // The observer's OWN collection on/off flag (self-control). `true` (default)
+    // = collecting; `false` = paused. The interval + event collectors check it
+    // each cycle (skip the probe / drop the batch while paused); the
+    // `SetObserving` control command flips it. Benign self-control — NOT gated by
+    // `acting.enabled` and it never touches sing-box or the network. While paused
+    // the daemon stays alive and the socket keeps serving, so the switch can turn
+    // collection back on. `StatusSnapshot::default()` already reports
+    // `observing: true`; the control handler mirrors every change into it.
+    let observing = Arc::new(AtomicBool::new(true));
+
     // Serve the read-only status socket for the unprivileged bar. Best-effort: a
     // bind failure is logged but never takes the daemon down (no API, still
     // collecting). Aborted on shutdown alongside the collectors.
     let api_handle = {
         let snapshot = snapshot.clone();
+        let observing = observing.clone();
         let socket_path = cfg.socket_path.clone();
         let socket_mode = cfg.socket_mode;
         let socket_owner_uid = cfg.socket_owner_uid;
         // Thread the acting config through so the control path is gated by
         // `acting.enabled` (off by default) in one place: `api::control_response`.
+        // The `observing` flag is threaded separately: `SetObserving` is benign
+        // self-control and must NOT be gated by that switch.
         let acting = api::ActingConfig {
             enabled: cfg.acting.enabled,
             singbox_service: cfg.acting.singbox_service.clone(),
         };
         tokio::spawn(async move {
-            if let Err(e) =
-                api::serve(socket_path, socket_mode, socket_owner_uid, acting, snapshot).await
+            if let Err(e) = api::serve(
+                socket_path,
+                socket_mode,
+                socket_owner_uid,
+                acting,
+                observing,
+                snapshot,
+            )
+            .await
             {
                 tracing::error!(error = %e, "status socket server exited");
             }
@@ -242,10 +263,14 @@ async fn run_daemon() -> anyhow::Result<()> {
             }
             continue;
         }
-        // Dispatch on cadence — timer vs event stream.
+        // Dispatch on cadence — timer vs event stream. Both spawners take the
+        // shared `observing` flag: the interval loop skips its probe while paused,
+        // the event thread drops batches while paused.
         match c.source() {
-            Source::Interval(_) => handles.push(spawn_interval_collector(c, tx.clone())),
-            Source::Event => handles.push(spawn_event_collector(c, tx.clone())),
+            Source::Interval(_) => {
+                handles.push(spawn_interval_collector(c, tx.clone(), observing.clone()))
+            }
+            Source::Event => handles.push(spawn_event_collector(c, tx.clone(), observing.clone())),
         }
     }
     // Drop our own sender so the consumer stops once every collector is gone.
