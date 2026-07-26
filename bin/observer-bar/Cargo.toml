@@ -33,6 +33,11 @@ objc2-app-kit = { version = "0.3", features = [
     "NSStatusBar",
     "NSStatusItem",
     "NSStatusBarButton",
+    # Anchoring the popup under the status item: `NSView::window()` +
+    # `NSWindow::frame()` give the icon's on-screen rect, and `NSScreen::frame()`
+    # the display bounds we convert into gpui's top-left window coordinates.
+    "NSWindow",
+    "NSScreen",
     # CGFloat-typed APIs: `statusItemWithLength:` + `NSVariableStatusItemLength`.
     "objc2-core-foundation",
 ] }

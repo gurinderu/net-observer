@@ -251,8 +251,10 @@ graph TD
   reads `store` read-only, while `bin/observer-bar` reads live status over the
   socket via `observer-ipc` and **never touches the DB**. `bin/observer-bar` is a
   macOS **menu-bar app**: a dockless (`.accessory`) `NSStatusItem` (AppKit interop
-  via `objc2` / `objc2-app-kit`) whose glyph shows the latest link/proxy health
-  and whose click opens a **gpui** panel rendering the full `StatusSnapshot`
+  via `objc2` / `objc2-app-kit`) whose icon-only health dot shows the latest
+  link/proxy health and whose click toggles an anchored **gpui** popup (a
+  Tailscale-style dropdown — `WindowKind::PopUp`, anchored under the icon,
+  dismissed on click-away) rendering the full `StatusSnapshot`
   (latest link/proxy tick + recent incidents), re-queried on a ~3s timer; a down
   daemon / absent socket degrades to a graceful "observer offline" state. gpui's
   build script needs the macOS **Metal Toolchain**, so the crate is a full
@@ -402,7 +404,7 @@ read-only — is blocked while the daemon runs.
   pure client of the daemon's local socket (see [Local socket API](#local-socket-api)),
   so it reads *live* status while the daemon runs — the concurrent-live-access
   case the read-only open could never cover. A down daemon degrades to a graceful
-  "observer offline" glyph, retried each tick.
+  "observer offline" dot, retried each tick.
 
 The menu-bar UI stays a separate unprivileged binary — never the daemon itself.
 The daemon relaxes the socket file's mode (config `socket_mode`, default `0666`)

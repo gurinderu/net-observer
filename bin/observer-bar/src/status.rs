@@ -1,6 +1,7 @@
 //! Pure render layer for `observer-bar`: turn an [`observer_ipc::StatusSnapshot`]
-//! (fetched live from `observerd` over the local socket) into the compact glyph,
-//! the health classification, and the multi-line tooltip/panel text.
+//! (fetched live from `observerd` over the local socket) into the menu-bar health
+//! dot (and the retained compact glyph), the health classification, and the
+//! multi-line tooltip/panel text.
 //!
 //! This is the load-bearing, unit-tested part of the menu-bar app. It is pure
 //! over its input — no DB, no socket, no GUI — so every renderer is tested here
@@ -60,7 +61,7 @@ pub fn render_status(snap: &StatusSnapshot) -> String {
 
 /// The three-state health of a [`StatusSnapshot`], derived from the gateway
 /// verdict and the tun probe code. The single source of truth for both the
-/// menu-bar glyph ([`status_glyph`]) and the panel's header dot
+/// menu-bar dot ([`status_dot`]) and the panel's header dot
 /// (`ui::health_dot`), so the two can never drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
@@ -92,24 +93,40 @@ pub fn health(snap: &StatusSnapshot) -> Health {
     }
 }
 
-/// A compact, single-line health glyph for the menu-bar status item, derived
-/// from a [`StatusSnapshot`]: a colored dot plus `gw:<verdict> tun:<code>`. Pure
-/// over its input so it can be unit-tested without a socket or a GUI.
+/// The bare health *dot* for the menu-bar status item — no text — derived from a
+/// [`StatusSnapshot`] via the shared [`health`] classifier:
 ///
 /// - green (`🟢`) when the gateway verdict is `OK` and the tun probe returned
-///   HTTP 204 (the healthy reachability code),
-/// - white (`⚪`) when there is no data at all yet,
-/// - red (`🔴`) otherwise (gw or tun is bad / degraded).
+///   HTTP 204 (the healthy reachability code, [`Health::Ok`]),
+/// - red (`🔴`) when gw or tun is bad / degraded ([`Health::Bad`]),
+/// - white (`⚪`) when there is no data at all yet ([`Health::NoData`]).
+///
+/// This is what the menu-bar title shows (icon-only, Tailscale-style). Pure over
+/// its input, so it is unit-tested without a socket or a GUI. The daemon-down
+/// "offline" state is rendered separately by the shell (see [`crate::menubar`]);
+/// this dot describes a live snapshot only.
+pub fn status_dot(snap: &StatusSnapshot) -> &'static str {
+    match health(snap) {
+        Health::NoData => "⚪",
+        Health::Ok => "🟢",
+        Health::Bad => "🔴",
+    }
+}
+
+/// A compact, single-line health glyph derived from a [`StatusSnapshot`]: the
+/// [`status_dot`] plus `gw:<verdict> tun:<code>`. Pure over its input so it can
+/// be unit-tested without a socket or a GUI.
 ///
 /// The dot follows [`health`], the shared classifier the panel header dot uses.
 /// The daemon-down "offline" state is rendered separately by the shell (see
 /// [`crate::menubar`]); this glyph describes a live snapshot only.
+///
+/// Retained as a tested pure renderer of the verbose form; the menu-bar title now
+/// shows the icon-only [`status_dot`], so nothing outside the tests calls this in
+/// a release build (hence the conditional `allow(dead_code)`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn status_glyph(snap: &StatusSnapshot) -> String {
-    let dot = match health(snap) {
-        Health::NoData => "⚪",
-        Health::Ok => "🟢",
-        Health::Bad => "🔴",
-    };
+    let dot = status_dot(snap);
 
     let gw = snap
         .link
@@ -220,6 +237,28 @@ mod tests {
             ..ok
         };
         assert_eq!(health(&gw_down), Health::Bad);
+    }
+
+    #[test]
+    fn status_dot_maps_each_health_to_its_dot() {
+        // NoData -> white.
+        assert_eq!(status_dot(&StatusSnapshot::default()), "⚪");
+
+        // gw OK + tun 204 -> green (Health::Ok).
+        let ok = StatusSnapshot {
+            link: Some(link(GwVerdict::Ok)),
+            proxy: Some(proxy(Some(204), None)),
+            ..Default::default()
+        };
+        assert_eq!(status_dot(&ok), "🟢");
+
+        // gw FAIL (or tun wedged) -> red (Health::Bad).
+        let bad = StatusSnapshot {
+            link: Some(link(GwVerdict::Fail)),
+            proxy: Some(proxy(Some(204), None)),
+            ..Default::default()
+        };
+        assert_eq!(status_dot(&bad), "🔴");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! the local socket (plus the last fetch error and the socket path used to
 //! refresh). The menu-bar refresh timer writes into it (see [`crate::menubar`]);
 //! [`PanelView`] observes it and re-renders whenever it changes, so an open panel
-//! updates live on the same ~3s cadence as the status-item glyph.
+//! updates live on the same ~3s cadence as the status-item dot.
 //!
 //! The bar is a pure socket client — it never opens the DuckDB store (the daemon
 //! is the sole DB owner). When the daemon is down / the socket is absent,
@@ -38,7 +38,7 @@ const ACCENT: u32 = 0x7aa2f7;
 /// recovers on its own once the daemon comes back, and fails gracefully when it
 /// is not there: a missing socket, connection-refused (daemon down), or a
 /// protocol error all map to `Err(String)`, which the panel surfaces as
-/// "observer offline" and the status item as a grey glyph — retried on the next
+/// "observer offline" and the status item as a grey dot — retried on the next
 /// tick instead of crashing.
 pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, String> {
     match observer_ipc::query(socket_path, &Request::Status) {
@@ -189,7 +189,7 @@ impl Render for PanelView {
 
 /// The colored health dot + its color for the panel header. The color follows
 /// the shared [`health`] classifier, so the panel dot and the menu-bar
-/// [`status_glyph`](crate::status::status_glyph) can never disagree.
+/// [`status_dot`](crate::status::status_dot) can never disagree.
 fn health_dot(snapshot: &StatusSnapshot) -> (&'static str, Rgba) {
     let color = match health(snapshot) {
         Health::NoData => rgb(MUTED),

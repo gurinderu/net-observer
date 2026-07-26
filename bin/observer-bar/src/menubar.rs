@@ -1,9 +1,10 @@
 //! The macOS menu-bar shell: a dockless (`.accessory`) app whose `NSStatusItem`
-//! shows a compact health glyph, and whose click opens a gpui panel rendering
-//! the full [`Status`](crate::status::Status).
+//! shows an icon-only health dot, and whose click toggles an anchored gpui popup
+//! rendering the full [`Status`](crate::status::Status).
 //!
 //! Fallback rung **(a)** of the design's ladder: a real `NSStatusItem` (AppKit
-//! interop via `objc2` / `objc2-app-kit`) whose click opens a gpui panel/window.
+//! interop via `objc2` / `objc2-app-kit`) whose click toggles an anchored gpui
+//! popup (a Tailscale-style dropdown, dismissed on click-away).
 //!
 //! ## How the pieces fit
 //!
@@ -15,42 +16,53 @@
 //!
 //! The status-item button carries a target/action pair. AppKit delivers the
 //! click on the main thread to our [`ClickTarget`] Objective-C class, which just
-//! flips an `AtomicBool`. A gpui foreground task polls that flag and opens (or
-//! re-focuses) the panel window — keeping all gpui/window work on gpui's own
-//! executor rather than reentering it from an AppKit callback. A second
-//! foreground task re-queries the daemon over the local socket every ~3s and
-//! updates both the shared model (so an open panel re-renders) and the
-//! status-item glyph + tooltip. When the daemon is down the query fails and the
-//! shell renders a grey "offline" glyph instead of crashing.
+//! flips an `AtomicBool`. A gpui foreground task polls that flag and *toggles* the
+//! panel — a Tailscale-style dropdown anchored under the icon (a borderless
+//! `WindowKind::PopUp`, no titlebar): a click opens it, a click while it is open
+//! closes it, and it also dismisses itself when it loses key focus (click-away).
+//! Keeping all gpui/window work on gpui's own executor avoids reentering it from
+//! an AppKit callback. A second foreground task re-queries the daemon over the
+//! local socket every ~3s and updates both the shared model (so an open panel
+//! re-renders) and the status-item dot + tooltip. When the daemon is down the
+//! query fails and the shell renders a grey "offline" dot instead of crashing.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext, Application, AsyncApp, Bounds, Entity, Timer, TitlebarOptions, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, px, size,
+    App, AppContext, Application, AsyncApp, Bounds, Entity, Pixels, Timer, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions, point, px, size,
 };
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSStatusBar, NSStatusBarButton,
+    NSApplication, NSApplicationActivationPolicy, NSScreen, NSStatusBar, NSStatusBarButton,
     NSVariableStatusItemLength,
 };
 use objc2_foundation::NSString;
 
-use crate::status::{render_status, status_glyph};
+use crate::status::{render_status, status_dot};
 use crate::ui::{Glance, PanelView, read_fresh};
 use config::Config;
 use observer_ipc::StatusSnapshot;
 
-/// How often the glance re-reads the store and refreshes the glyph + panel.
+/// How often the glance re-reads the store and refreshes the status dot + panel.
 const REFRESH: Duration = Duration::from_secs(3);
 /// How often the click task polls the status-item click flag. Small enough to
 /// feel instant, cheap enough to leave the CPU idle (one atomic load per tick).
 const CLICK_POLL: Duration = Duration::from_millis(100);
+/// Fixed size of the anchored panel (a compact dropdown, not a resizable
+/// workspace). Width/height in gpui logical pixels.
+const PANEL_W: f64 = 320.0;
+const PANEL_H: f64 = 460.0;
+/// After a click-away dismissal, a status-item click that arrives within this
+/// window is treated as the gesture that *caused* the dismissal (so the panel
+/// stays closed) rather than a request to reopen it. It must comfortably cover
+/// the resign-key -> click-action ordering plus one [`CLICK_POLL`] interval.
+const REOPEN_GUARD: Duration = Duration::from_millis(400);
 
 define_class!(
     /// A tiny Objective-C object used purely as the status-item button's
@@ -118,6 +130,14 @@ pub fn run() {
             .expect("a freshly created NSStatusItem always has a button");
         apply_glyph(&button, model.read(cx));
 
+        // Capture the anchored-dropdown position once, now, while we still own
+        // `button` (the refresh task moves it in below). Menu-bar items don't move
+        // for the app's lifetime, so a startup capture stays valid.
+        let anchor = compute_anchor_bounds(&button, mtm);
+        // Shared latch stamped by the click-away dismiss, so the same click that
+        // dismissed the panel doesn't immediately reopen it (see `toggle_panel`).
+        let dismissed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+
         // 4. Wire the click: button -> ClickTarget.handleClick: -> flip the flag.
         let click_flag = Arc::new(AtomicBool::new(false));
         let target = ClickTarget::new(click_flag.clone());
@@ -170,9 +190,10 @@ pub fn run() {
         })
         .detach();
 
-        // 6. Click task: poll the flag; on a click, open or re-focus the panel.
+        // 6. Click task: poll the flag; on a click, toggle the anchored panel.
         cx.spawn({
             let model = model.clone();
+            let dismissed_at = dismissed_at.clone();
             async move |acx: &mut AsyncApp| {
                 // Keep the target alive: NSControl holds its target weakly.
                 let _target = target;
@@ -180,7 +201,9 @@ pub fn run() {
                 loop {
                     Timer::after(CLICK_POLL).await;
                     if click_flag.swap(false, Ordering::AcqRel) {
-                        let alive = acx.update(|app| toggle_panel(app, &mut panel, &model));
+                        let alive = acx.update(|app| {
+                            toggle_panel(app, &mut panel, &model, anchor, &dismissed_at)
+                        });
                         if alive.is_err() {
                             break;
                         }
@@ -192,18 +215,21 @@ pub fn run() {
     });
 }
 
-/// Set the status-item button's title (compact glyph) and tooltip (the full
-/// multi-line [`render_status`] text, shown on hover).
+/// Set the status-item button's title (icon-only health dot) and tooltip (the
+/// full multi-line [`render_status`] text, shown on hover).
 ///
-/// When the last fetch failed (daemon down / socket absent) the glance carries
-/// an `error`: the title becomes a grey "offline" glyph and the tooltip explains
+/// The menu-bar title is just the [`status_dot`] — a single colored dot, no text
+/// (Tailscale-style). The verbose detail still lives in the hover tooltip.
+///
+/// When the last fetch failed (daemon down / socket absent) the glance carries an
+/// `error`: the title becomes a grey "offline" dot (`⚫`) and the tooltip explains
 /// why, rather than showing stale health as if it were live.
 fn apply_glyph(button: &NSStatusBarButton, glance: &Glance) {
-    let title = match &glance.error {
-        Some(_) => "\u{26AB} offline".to_string(), // ⚫ offline (daemon down)
-        None => status_glyph(&glance.snapshot),
+    let title: &str = match &glance.error {
+        Some(_) => "\u{26AB}", // ⚫ offline (daemon down) — dot only, no text
+        None => status_dot(&glance.snapshot),
     };
-    button.setTitle(&NSString::from_str(&title));
+    button.setTitle(&NSString::from_str(title));
 
     let tooltip = match &glance.error {
         Some(e) => format!("observer offline\n{e}"),
@@ -212,50 +238,184 @@ fn apply_glyph(button: &NSStatusBarButton, glance: &Glance) {
     button.setToolTip(Some(&NSString::from_str(&tooltip)));
 }
 
-/// Open the panel window, or re-focus it if it is already open.
-fn toggle_panel(cx: &mut App, panel: &mut Option<WindowHandle<PanelView>>, model: &Entity<Glance>) {
-    if let Some(handle) = *panel {
-        // If the window is still open, bring it to the front instead of stacking
-        // a second one. `update` fails once the window has been closed.
+/// Toggle the anchored panel: open it if closed, close it if open.
+///
+/// This is the *click* path. It cooperates with the click-away dismiss (which
+/// closes the window when it loses key focus and stamps `dismissed_at`) to give a
+/// single predictable rule — a click flips the panel's visibility — despite the
+/// two racing on macOS (clicking the status item resigns the popup's key status):
+///
+/// - If we still hold a live window, the click landed before any resign-key
+///   dismissal: close it in place.
+/// - If the window is already gone, the click-away handler closed it. When that
+///   happened *just now* (within [`REOPEN_GUARD`]), this very click is what
+///   dismissed it, so we leave it closed; otherwise it was dismissed earlier and
+///   the click means "open again".
+fn toggle_panel(
+    cx: &mut App,
+    panel: &mut Option<WindowHandle<PanelView>>,
+    model: &Entity<Glance>,
+    anchor: Bounds<Pixels>,
+    dismissed_at: &Arc<Mutex<Option<Instant>>>,
+) {
+    if let Some(handle) = panel.take() {
+        // `update` succeeds only while the window is still open.
         if handle
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |_, window, _| window.remove_window())
             .is_ok()
         {
-            cx.activate(true);
+            // Closed by this click; leave `panel` cleared.
             return;
         }
+        // Already dismissed by click-away. If that just happened, this click is
+        // the dismissing gesture — stay closed.
+        if recently_dismissed(dismissed_at) {
+            return;
+        }
+        // Dismissed a while ago: fall through and reopen.
     }
+    open_panel(cx, panel, model, anchor, dismissed_at);
+}
 
+/// True if the panel was dismissed by click-away within [`REOPEN_GUARD`].
+fn recently_dismissed(dismissed_at: &Arc<Mutex<Option<Instant>>>) -> bool {
+    dismissed_at
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .is_some_and(|at| at.elapsed() < REOPEN_GUARD)
+}
+
+/// Open the anchored panel and store its handle. Wires the click-away dismiss:
+/// once the popup has been key and then loses it, it stamps `dismissed_at` and
+/// closes itself. Never panics — a failed open is logged, not fatal.
+fn open_panel(
+    cx: &mut App,
+    panel: &mut Option<WindowHandle<PanelView>>,
+    model: &Entity<Glance>,
+    anchor: Bounds<Pixels>,
+    dismissed_at: &Arc<Mutex<Option<Instant>>>,
+) {
     let model = model.clone();
-    let options = panel_window_options(cx);
-    match cx.open_window(options, move |_window, cx| {
-        cx.new(|cx| PanelView::new(model, cx))
-    }) {
+    let dismissed_at = dismissed_at.clone();
+    let options = panel_window_options(anchor);
+    let opened = cx.open_window(options, move |window, cx| {
+        cx.new(move |cx| {
+            let view = PanelView::new(model, cx);
+            // Dismiss-on-click-away via gpui's window-activation observation:
+            // close the popup once it has been active and then resigns key. The
+            // `was_active` latch skips the opening activation (and any spurious
+            // deactivate before the panel is ever shown). `detach` keeps the
+            // subscription alive for the window's lifetime — it is dropped with
+            // the window — so we needn't store it, and `PanelView` (ui.rs) stays
+            // untouched.
+            let mut was_active = false;
+            cx.observe_window_activation(window, move |_view, window, _cx| {
+                if window.is_window_active() {
+                    was_active = true;
+                } else if was_active {
+                    if let Ok(mut guard) = dismissed_at.lock() {
+                        *guard = Some(Instant::now());
+                    }
+                    window.remove_window();
+                }
+            })
+            .detach();
+            view
+        })
+    });
+    match opened {
         Ok(handle) => {
             *panel = Some(handle);
             // Accessory apps don't get key focus for free; activate so the panel
-            // comes to the front and is interactive.
+            // comes to the front, is interactive, and can register losing key
+            // focus (the click-away dismiss).
             cx.activate(true);
         }
         Err(e) => eprintln!("observer-bar: failed to open panel window: {e}"),
     }
 }
 
-fn panel_window_options(cx: &mut App) -> WindowOptions {
-    // Panel size is fixed; a compact glance, not a resizable workspace.
-    let bounds = Bounds::centered(None, size(px(360.0), px(480.0)), cx);
+/// Window options for the anchored dropdown: a borderless, fixed-size
+/// [`WindowKind::PopUp`] (no titlebar; not resizable / minimizable / movable),
+/// positioned at `anchor` (see [`compute_anchor_bounds`]).
+fn panel_window_options(anchor: Bounds<Pixels>) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: Some(TitlebarOptions {
-            title: Some("observer".into()),
-            appears_transparent: false,
-            traffic_light_position: None,
-        }),
-        kind: WindowKind::Normal,
+        window_bounds: Some(WindowBounds::Windowed(anchor)),
+        titlebar: None,
+        kind: WindowKind::PopUp,
         is_resizable: false,
         is_minimizable: false,
+        is_movable: false,
         focus: true,
         show: true,
         ..Default::default()
+    }
+}
+
+/// Compute the gpui window bounds that anchor the panel directly under the
+/// status-item icon, right-aligned to it — the Tailscale-style dropdown.
+///
+/// ## Coordinate conversion
+///
+/// AppKit screen geometry is **bottom-left origin** (Cocoa: y grows *up*); gpui's
+/// global window coordinates are **top-left origin** (y grows *down*). We bridge
+/// the two by inverting the exact mapping gpui's macOS backend applies when it
+/// turns a `WindowBounds::Windowed(bounds)` into the native window's bottom-left
+/// `NSRect` origin (gpui `platform/mac/window.rs`):
+///
+/// ```text
+/// ns_bottom_left.x = screen.origin.x + bounds.origin.x
+/// ns_bottom_left.y = screen.origin.y + (display_height - bounds.origin.y)
+/// ```
+///
+/// where `display_height == screen.frame().size.height`. gpui opens
+/// `display_id: None` windows on the primary display (which owns the menu bar), so
+/// we read the main `NSScreen` frame — the same coordinate space `button.window()`
+/// reports its frame in.
+///
+/// We want the panel's Cocoa rect to be:
+///
+/// - right edge = icon right edge = `btn.x + btn.w`  (right-aligned to the icon)
+/// - top edge   = menu-bar bottom = `btn.y`          (the status window's bottom)
+///
+/// i.e. bottom-left corner `(btn.x + btn.w - PANEL_W, btn.y - PANEL_H)`. Solving
+/// the mapping above for `bounds.origin` yields the expressions below.
+///
+/// Captured once at startup: menu-bar status items are stable for the app's life,
+/// so the frame does not move. Assumes the status item lives on the primary
+/// display (the usual case); a graceful fallback covers the rare cases where the
+/// status window or main screen isn't available yet.
+fn compute_anchor_bounds(button: &NSStatusBarButton, mtm: MainThreadMarker) -> Bounds<Pixels> {
+    let panel_size = size(px(PANEL_W as f32), px(PANEL_H as f32));
+
+    let btn = button.window().map(|w| w.frame());
+    let scr = NSScreen::mainScreen(mtm).map(|s| s.frame());
+
+    match (btn, scr) {
+        (Some(btn), Some(scr)) => {
+            let display_height = scr.size.height;
+            // Desired panel rect in Cocoa (bottom-left origin).
+            let left = btn.origin.x + btn.size.width - PANEL_W;
+            let bottom = btn.origin.y - PANEL_H;
+            // Invert gpui's open() mapping into gpui top-left `bounds.origin`.
+            let ox = left - scr.origin.x;
+            let oy = display_height - (bottom - scr.origin.y);
+            Bounds {
+                origin: point(px(ox as f32), px(oy as f32)),
+                size: panel_size,
+            }
+        }
+        // No status window yet but we know the screen: anchor to its top-right,
+        // just under a nominal menu bar.
+        (None, Some(scr)) => Bounds {
+            origin: point(px((scr.size.width - PANEL_W) as f32), px(24.0)),
+            size: panel_size,
+        },
+        // Nothing to go on: top-left. Never panics; the human will notice.
+        _ => Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: panel_size,
+        },
     }
 }
