@@ -19,13 +19,13 @@
 //! the pcap ring *before* slow forensic work and records a [`BlobRef`] per file.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use collector_core::Source;
 
 use crate::AnyCollector;
-use observer_ipc::{Event, IncidentSummary, StatusSnapshot};
+use observer_ipc::{EncodedFrame, Event, IncidentSummary, StatusSnapshot, StreamFrame};
 use store::{DuckdbStore, Store};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -50,19 +50,36 @@ const WINDOW_CAP: usize = 64;
 /// stream — the gap is recorded, per the spec); the in-memory snapshot is updated
 /// regardless, so the socket API stays live even through a DB hiccup.
 ///
-/// Publishing is push, not poll: each sample becomes an [`Event`] on `events_tx`
-/// so held-open `Subscribe` connections receive it immediately. A `send` error
-/// just means there are no subscribers right now (the initial receiver is
-/// dropped), so it is ignored — the pipeline never back-pressures on the bus.
-/// Incidents are published separately by the trigger [`SnapshotHandler`] on fire.
+/// Publishing is push, not poll: each sample becomes a [`StreamFrame::Event`] on
+/// `events_tx` so held-open `Subscribe` connections receive it immediately. The
+/// frame is serialised exactly ONCE here, into an [`EncodedFrame`], so N
+/// subscribers cost one `serde_json` pass and an `Arc` refcount bump each. With
+/// no subscribers the [`Event`] is not even built (the clone is skipped), so the
+/// bus costs nothing while nobody is watching; a `send` error is likewise
+/// ignored — the pipeline never back-pressures on the bus. Neither the store
+/// write nor the snapshot mirror depends on the bus: both run whether or not
+/// anyone subscribes. Incidents are published separately by the trigger
+/// [`SnapshotHandler`] on fire.
+///
+/// On a RESUME edge — signalled by `resume_at_us` moving — the recent-sample
+/// window is dropped before the next sample is pushed, so the count-based
+/// conditions (`Wedge`, `GwChange`) can never span an observation gap: two bad
+/// pre-pause ticks plus one post-resume tick must not read as "tun dead 3
+/// ticks". The trigger engine's re-arm/latch state is deliberately untouched — a
+/// trigger not re-firing across a pause is intended dedup, not a bug.
 pub async fn run(
     store: Arc<DuckdbStore>,
     mut engine: TriggerEngine,
     mut rx: mpsc::Receiver<Sample>,
     snapshot: Arc<Mutex<StatusSnapshot>>,
-    events_tx: broadcast::Sender<Event>,
+    events_tx: broadcast::Sender<EncodedFrame>,
+    // `ts_us` of the most recent RESUME edge, published by the control socket.
+    // `0` = the daemon has never resumed.
+    resume_at_us: Arc<AtomicI64>,
 ) {
     let mut window = RecentWindow::new(WINDOW_CAP);
+    // The resume edge this consumer has already applied.
+    let mut applied_resume_us: i64 = 0;
     while let Some(sample) = rx.recv().await {
         let now_us = sample.ts_us();
         if let Err(e) = store.write_sample(&sample) {
@@ -82,16 +99,47 @@ pub async fn run(
                 Sample::Route(_) => {}
             }
         }
-        // Publish the sample as a live `Event` (push, not poll). Ignore the send
-        // error: it only means no client is subscribed right now.
-        let event = match &sample {
-            Sample::Link(l) => Event::Link(l.clone()),
-            Sample::Proxy(p) => Event::Proxy(p.clone()),
-            Sample::Dns(d) => Event::Dns(d.clone()),
-            Sample::Host(h) => Event::Host(h.clone()),
-            Sample::Route(r) => Event::Route(r.clone()),
-        };
-        let _ = events_tx.send(event);
+        // Publish the sample as a live `Event` (push, not poll), but only build it
+        // when someone is actually subscribed — the bus must add no cost while
+        // nobody is watching. The check/subscribe race is benign: a receiver that
+        // subscribes after the check would not have received this frame anyway
+        // (broadcast delivers only frames sent after `subscribe`).
+        if events_tx.receiver_count() > 0 {
+            let event = match &sample {
+                Sample::Link(l) => Event::Link(l.clone()),
+                Sample::Proxy(p) => Event::Proxy(p.clone()),
+                Sample::Dns(d) => Event::Dns(d.clone()),
+                Sample::Host(h) => Event::Host(h.clone()),
+                Sample::Route(r) => Event::Route(r.clone()),
+            };
+            // Serialise ONCE here; every subscriber then clones an Arc, not a
+            // second `serde_json` pass.
+            match EncodedFrame::encode(&StreamFrame::Event(event)) {
+                Ok(frame) => {
+                    // Ignore the send error: the last receiver may have gone.
+                    let _ = events_tx.send(frame);
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to encode event frame; not published"),
+            }
+        }
+
+        let resume_us = resume_at_us.load(Ordering::Acquire);
+        if resume_us != applied_resume_us {
+            window.clear();
+            applied_resume_us = resume_us;
+            tracing::info!(
+                resume_us,
+                "collection resumed; recent-sample window cleared"
+            );
+        }
+        // A sample produced before the resume is on the far side of the
+        // observation gap: still persisted and still published above (it is a
+        // real observation), but never seeded into the fresh window, so one
+        // stale in-flight sample cannot reinstate the very continuity the clear
+        // just removed.
+        if now_us < applied_resume_us {
+            continue;
+        }
         window.push(sample);
         engine.on_sample(&window, now_us);
     }
@@ -113,8 +161,12 @@ pub async fn run(
 ///
 /// While `observing` is `false` the loop keeps ticking but **skips the probe
 /// entirely** (`continue` before `collect()`), so paused collection produces no
-/// new samples. The daemon and its socket stay alive throughout, so
-/// `SetObserving(true)` resumes probing on the next tick.
+/// new samples. The flag is checked twice per tick — once before the probe and
+/// again before forwarding — because `collect()` (ICMP ping + bound TCP probe)
+/// runs for seconds: a toggle-off landing mid-probe drops the in-flight result
+/// instead of letting it advance `generated_us` after the control socket has
+/// already acked `observing: false`. The daemon and its socket stay alive
+/// throughout, so `SetObserving(true)` resumes probing on the next tick.
 pub(crate) fn spawn_interval_collector(
     c: AnyCollector,
     tx: mpsc::Sender<Sample>,
@@ -135,6 +187,11 @@ pub(crate) fn spawn_interval_collector(
             }
             let ts_us = types::now_us();
             let samples = c.collect(ts_us).await;
+            // Re-check after the probe: a pause that landed while `collect()` was
+            // in flight is already acked, so this result must not be forwarded.
+            if !observing.load(Ordering::Acquire) {
+                continue;
+            }
             for s in samples {
                 if tx.send(s).await.is_err() {
                     tracing::info!(collector = name, "receiver dropped; collector exiting");
@@ -162,6 +219,12 @@ pub(crate) fn spawn_interval_collector(
 /// PF_ROUTE socket does not back up), but no events reach the consumer while
 /// paused. The daemon stays alive throughout; `SetObserving(true)` resumes
 /// forwarding on the next batch.
+///
+/// Dropping is not silent, but it is rate-limited so a long pause cannot flood
+/// the log: the first drop after a pause edge logs at `debug`, the rest only
+/// accumulate into a counter, and the resume edge logs the total at `info`. That
+/// keeps "paused" distinguishable from "the PF_ROUTE source wedged" without a
+/// line per batch.
 pub(crate) fn spawn_event_collector(
     c: AnyCollector,
     tx: mpsc::Sender<Sample>,
@@ -181,10 +244,30 @@ pub(crate) fn spawn_event_collector(
     // runtime context). The thread is detached — it holds a stream sender until
     // `next()` ends or the consumer is gone, and the OS reaps it on process exit.
     std::thread::spawn(move || {
+        // Batches dropped since the current pause began; the pause edge is derived
+        // from the flag itself, so no extra shared state is needed.
+        let mut dropped_while_paused: u64 = 0;
         while let Some(samples) = src.next() {
             // Paused: drop this batch (still drained from the source above).
             if !observing.load(Ordering::Acquire) {
+                if dropped_while_paused == 0 {
+                    tracing::debug!(
+                        collector = name,
+                        dropped = samples.len(),
+                        "paused: dropping route batch"
+                    );
+                }
+                dropped_while_paused += 1;
                 continue;
+            }
+            // Resume edge: report what the pause cost, once, then re-arm.
+            if dropped_while_paused > 0 {
+                tracing::info!(
+                    collector = name,
+                    dropped = dropped_while_paused,
+                    "resumed: route batches dropped while paused"
+                );
+                dropped_while_paused = 0;
             }
             for s in samples {
                 if tx.blocking_send(s).is_err() {
@@ -269,7 +352,7 @@ impl<S: Store + Send + Sync> Handler for FreezePcapHandler<S> {
 pub struct SnapshotHandler {
     snapshot: Arc<Mutex<StatusSnapshot>>,
     cap: usize,
-    events_tx: broadcast::Sender<Event>,
+    events_tx: broadcast::Sender<EncodedFrame>,
 }
 
 impl SnapshotHandler {
@@ -278,7 +361,7 @@ impl SnapshotHandler {
     pub fn new(
         snapshot: Arc<Mutex<StatusSnapshot>>,
         cap: usize,
-        events_tx: broadcast::Sender<Event>,
+        events_tx: broadcast::Sender<EncodedFrame>,
     ) -> Self {
         Self {
             snapshot,
@@ -304,9 +387,15 @@ impl Handler for SnapshotHandler {
             trigger_id,
             signature: detail.to_string(),
         };
-        // Publish the incident on the realtime bus (push, not poll). Ignore the
-        // send error: it only means no client is subscribed right now.
-        let _ = self.events_tx.send(Event::Incident(summary.clone()));
+        // Publish the incident on the realtime bus (push, not poll), serialised
+        // once for every subscriber. Ignore the send error: it only means no
+        // client is subscribed right now.
+        match EncodedFrame::encode(&StreamFrame::Event(Event::Incident(summary.clone()))) {
+            Ok(frame) => {
+                let _ = self.events_tx.send(frame);
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to encode event frame; not published"),
+        }
         let mut snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
         snap.incidents.insert(0, summary);
         snap.incidents.truncate(self.cap);
@@ -319,10 +408,24 @@ mod tests {
     use collector_host::HostCollector;
     use macos::HostLoad;
     use std::time::Duration;
-    use triggers::conditions::{GwChange, GwDrop};
+    use triggers::conditions::{GwChange, GwDrop, Wedge};
     use triggers::engine::Trigger;
     use triggers::handlers::RecordHandler;
     use types::{GwVerdict, HostSample, LinkSample, ProxySample, TcpVerdict};
+
+    /// Decode a bus payload back into the frame it was built from. The bus
+    /// carries bytes on purpose (one encode for N subscribers), so the tests
+    /// decode them here rather than the wire type growing a method that exists
+    /// only for tests.
+    fn decode(f: &EncodedFrame) -> StreamFrame {
+        serde_json::from_slice(f.bytes()).expect("bus payload must decode as a StreamFrame")
+    }
+
+    /// A never-resumed epoch: the value the daemon starts with and keeps until
+    /// the first `SetObserving(true)` edge.
+    fn no_resume() -> Arc<AtomicI64> {
+        Arc::new(AtomicI64::new(0))
+    }
 
     fn link(ts_us: i64, gw: GwVerdict) -> Sample {
         Sample::Link(LinkSample {
@@ -347,7 +450,14 @@ mod tests {
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let (events_tx, _events_rx) = broadcast::channel(16);
         let (tx, rx) = mpsc::channel(16);
-        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot, events_tx));
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot,
+            events_tx,
+            no_resume(),
+        ));
         tx.send(Sample::Link(LinkSample {
             ts_us: 1,
             gw: GwVerdict::Fail,
@@ -403,7 +513,14 @@ mod tests {
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let (events_tx, _events_rx) = broadcast::channel(16);
         let (tx, rx) = mpsc::channel(16);
-        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot, events_tx));
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot,
+            events_tx,
+            no_resume(),
+        ));
         // Ok -> Fail is a gateway-verdict change: gw-change must fire.
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
         tx.send(link(2, GwVerdict::Fail)).await.unwrap();
@@ -491,6 +608,45 @@ mod tests {
             .expect("collector task should not panic");
     }
 
+    /// A pause that lands *after* a tick has begun must not produce a sample: the
+    /// spawner re-checks `observing` between `collect()` and the forward, so an
+    /// in-flight probe is discarded rather than advancing `generated_us` after the
+    /// control socket already acked `observing: false`. The tick interval is long
+    /// relative to `getloadavg` so the flag flips inside a tick, not between them.
+    #[tokio::test]
+    async fn interval_collector_drops_in_flight_probe_on_pause() {
+        let c = AnyCollector::Host(HostCollector::new(
+            Arc::new(HostLoad::new()),
+            Duration::from_millis(100),
+        ));
+        let (tx, mut rx) = mpsc::channel(4);
+        let observing = Arc::new(AtomicBool::new(true));
+        let handle = spawn_interval_collector(c, tx, observing.clone());
+
+        // Observing: the first tick forwards a sample.
+        let first = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("observing collector should forward a sample within 5s")
+            .expect("channel should stay open while the collector runs");
+        assert!(matches!(first, Sample::Host(_)));
+
+        // Toggle off mid-tick: nothing more may reach the consumer, across several
+        // tick intervals.
+        observing.store(false, Ordering::Release);
+        let paused = time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            paused.is_err(),
+            "no sample may be forwarded once observing is false"
+        );
+
+        drop(rx);
+        observing.store(true, Ordering::Release);
+        time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("collector task should exit after the receiver is dropped")
+            .expect("collector task should not panic");
+    }
+
     #[tokio::test]
     async fn run_updates_snapshot_fields() {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
@@ -498,7 +654,14 @@ mod tests {
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let (events_tx, _events_rx) = broadcast::channel(16);
         let (tx, rx) = mpsc::channel(16);
-        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot.clone(), events_tx));
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            no_resume(),
+        ));
 
         // A link sample then a proxy sample: each populates its own snapshot field,
         // and `generated_us` tracks the most recent sample.
@@ -558,7 +721,14 @@ mod tests {
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let (events_tx, mut events_rx) = broadcast::channel(16);
         let (tx, rx) = mpsc::channel(16);
-        let h = tokio::spawn(run(store.clone(), eng, rx, snapshot, events_tx));
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot,
+            events_tx,
+            no_resume(),
+        ));
 
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
         tx.send(Sample::Host(HostSample {
@@ -573,14 +743,97 @@ mod tests {
         h.await.unwrap();
 
         // Each sample was published as the matching Event, in arrival order.
-        match events_rx.recv().await.unwrap() {
-            Event::Link(l) => assert_eq!(l.ts_us, 1),
-            other => panic!("expected Link event, got {other:?}"),
+        match decode(&events_rx.recv().await.unwrap()) {
+            StreamFrame::Event(Event::Link(l)) => assert_eq!(l.ts_us, 1),
+            other => panic!("expected a Link event frame, got {other:?}"),
         }
-        match events_rx.recv().await.unwrap() {
-            Event::Host(hh) => assert_eq!(hh.ts_us, 2),
-            other => panic!("expected Host event, got {other:?}"),
+        match decode(&events_rx.recv().await.unwrap()) {
+            StreamFrame::Event(Event::Host(hh)) => assert_eq!(hh.ts_us, 2),
+            other => panic!("expected a Host event frame, got {other:?}"),
         }
+    }
+
+    /// What actually travels on the bus is an already-serialised frame, not an
+    /// `Event`: the payload must decode as a `StreamFrame::Event` carrying the
+    /// sample verbatim, so the daemon's one encode is byte-compatible with what
+    /// a subscriber reads off the socket.
+    #[tokio::test]
+    async fn run_publishes_an_encoded_event_frame_per_sample() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let eng = TriggerEngine::new(vec![]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, mut events_rx) = broadcast::channel(16);
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot,
+            events_tx,
+            no_resume(),
+        ));
+
+        tx.send(link(11, GwVerdict::Ok)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        let frame = events_rx.recv().await.unwrap();
+        // The routing metadata rides along with the bytes, so the server loop
+        // never has to re-inspect the payload to filter it.
+        assert_eq!(frame.kind(), Some(observer_ipc::EventKind::Link));
+        match decode(&frame) {
+            StreamFrame::Event(Event::Link(l)) => {
+                assert_eq!(l.ts_us, 11);
+                assert_eq!(l.gw, GwVerdict::Ok);
+            }
+            other => panic!("expected a Link event frame, got {other:?}"),
+        }
+    }
+
+    /// With zero subscribers the consumer skips building the `Event` entirely, but
+    /// that guard must not short-circuit anything else: the store write and the
+    /// snapshot mirror still happen on every sample.
+    #[tokio::test]
+    async fn run_persists_and_mirrors_with_no_subscribers() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let eng = TriggerEngine::new(vec![]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, events_rx) = broadcast::channel(16);
+        // Nobody is watching the bus.
+        drop(events_rx);
+        assert_eq!(events_tx.receiver_count(), 0);
+
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            no_resume(),
+        ));
+        tx.send(link(7, GwVerdict::Ok)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 8,
+            load1: 1.0,
+            load5: 2.0,
+            load15: 3.0,
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM link_sample")
+                .unwrap(),
+            1
+        );
+        let snap = snapshot.lock().unwrap();
+        assert_eq!(snap.link.as_ref().unwrap().ts_us, 7);
+        assert_eq!(snap.host.as_ref().unwrap().ts_us, 8);
+        assert_eq!(snap.generated_us, 8);
     }
 
     /// On fire the `SnapshotHandler` publishes an `Event::Incident` on the bus (in
@@ -594,14 +847,171 @@ mod tests {
 
         handler.on_fire("gw-drop-42", 42, "sig");
 
-        match events_rx.try_recv().unwrap() {
-            Event::Incident(inc) => {
+        match decode(&events_rx.try_recv().unwrap()) {
+            StreamFrame::Event(Event::Incident(inc)) => {
                 assert_eq!(inc.id, "gw-drop-42");
                 assert_eq!(inc.opened_us, 42);
                 assert_eq!(inc.trigger_id, "gw-drop");
                 assert_eq!(inc.signature, "sig");
             }
-            other => panic!("expected Incident event, got {other:?}"),
+            other => panic!("expected an Incident event frame, got {other:?}"),
         }
+    }
+
+    /// A wedge-shaped proxy tick: the tun is dead (`tun_code == 0`) while the
+    /// direct path stays healthy, which is what [`link`] already builds.
+    fn dead_proxy(ts_us: i64) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us,
+            server_ip: "1.2.3.4".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: None,
+            tun_code: Some(0),
+            selector: None,
+        })
+    }
+
+    /// Block until the consumer has mirrored a sample at or past `want_us` into
+    /// the snapshot. The mirror happens before the resume check in the loop body,
+    /// so observing it proves every earlier sample has already been pushed into
+    /// the window — which is what lets the resume epoch be published at a
+    /// deterministic point in the stream.
+    async fn wait_for_generated(snapshot: &Arc<Mutex<StatusSnapshot>>, want_us: i64) {
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                let seen = snapshot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .generated_us;
+                if seen >= want_us {
+                    return;
+                }
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("consumer should reach the expected sample within 5s");
+    }
+
+    /// D5: a resume edge drops the pre-pause samples, so the count-based `Wedge`
+    /// condition cannot span the observation gap. Two wedge-shaped ticks before
+    /// the pause plus one after it are three bad ticks in wall-clock terms but
+    /// only one *observed* run — asserting "tun dead 3 ticks" across a gap the
+    /// daemon deliberately created would be a fabricated continuity.
+    #[tokio::test]
+    async fn run_clears_the_window_on_a_resume_edge() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(
+            Box::new(Wedge { consecutive: 3 }),
+            vec![rec],
+            0,
+        )]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+        ));
+
+        // Two wedge-shaped tick pairs before the pause.
+        tx.send(link(1, GwVerdict::Ok)).await.unwrap();
+        tx.send(dead_proxy(2)).await.unwrap();
+        tx.send(link(3, GwVerdict::Ok)).await.unwrap();
+        tx.send(dead_proxy(4)).await.unwrap();
+        // A sentinel past the last pair: once it is mirrored, both pairs are in
+        // the window, so the resume epoch below lands on a known stream position.
+        tx.send(Sample::Host(HostSample {
+            ts_us: 5,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 5).await;
+
+        // The pause/resume boundary: later than everything observed so far,
+        // earlier than the post-resume pair.
+        resume_at_us.store(10, Ordering::Release);
+
+        // One wedge-shaped pair after the resume.
+        tx.send(link(11, GwVerdict::Ok)).await.unwrap();
+        tx.send(dead_proxy(12)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        // Every sample is still persisted — the clear forgets the *window*, not
+        // the record.
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM link_sample")
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            0,
+            "wedge must not fire across an observation gap"
+        );
+    }
+
+    /// The other half of the D5 pair: the exact same three tick pairs with no
+    /// resume edge DO fire the wedge. Without this control the test above would
+    /// also pass against a window that is simply never populated.
+    #[tokio::test]
+    async fn run_fires_without_a_resume_edge() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(
+            Box::new(Wedge { consecutive: 3 }),
+            vec![rec],
+            0,
+        )]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            no_resume(),
+        ));
+
+        tx.send(link(1, GwVerdict::Ok)).await.unwrap();
+        tx.send(dead_proxy(2)).await.unwrap();
+        tx.send(link(3, GwVerdict::Ok)).await.unwrap();
+        tx.send(dead_proxy(4)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 5,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 5).await;
+        tx.send(link(11, GwVerdict::Ok)).await.unwrap();
+        tx.send(dead_proxy(12)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            1,
+            "three uninterrupted wedge ticks must fire"
+        );
     }
 }

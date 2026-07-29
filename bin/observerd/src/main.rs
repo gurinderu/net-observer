@@ -10,7 +10,7 @@ mod api;
 mod pipeline;
 
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ use macos::{
     BoundTcpProber, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource, ProxySystemFacts,
     SystemFacts,
 };
-use observer_ipc::{Event, StatusSnapshot};
+use observer_ipc::{EncodedFrame, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{FakeIp, GwChange, GwDrop, Starvation, Wedge};
 use triggers::engine::{Trigger, TriggerEngine};
@@ -54,8 +54,9 @@ const CHANNEL_CAP: usize = 256;
 /// remains the durable record; this ring is just the in-memory live view.
 const INCIDENT_RING_CAP: usize = 20;
 
-/// Depth of the realtime event broadcast bus. The pipeline publishes one `Event`
-/// per sample (plus an `Event::Incident` on each trigger fire) onto this bus;
+/// Depth of the realtime event broadcast bus. The pipeline publishes one
+/// already-encoded frame per sample (plus an `Event::Incident` on each trigger
+/// fire, and a `StreamFrame::Observing` on each pause/resume edge) onto this bus;
 /// each held-open `Subscribe` connection gets its own receiver. A subscriber that
 /// falls this far behind sees a `Lagged` skip rather than back-pressuring the
 /// pipeline — a live tail may drop old events, which is acceptable.
@@ -147,16 +148,40 @@ async fn run_daemon() -> anyhow::Result<()> {
     // the daemon stays alive and the socket keeps serving, so the switch can turn
     // collection back on. `StatusSnapshot::default()` already reports
     // `observing: true`; the control handler mirrors every change into it.
+    //
+    // It always starts `true`, and is deliberately never loaded from disk (see
+    // the startup log below for why).
     let observing = Arc::new(AtomicBool::new(true));
 
-    // The realtime event bus (push, not poll): the pipeline consumer publishes an
-    // `Event` per sample and the trigger `SnapshotHandler` publishes an
-    // `Event::Incident` on each fire; the socket API's `Subscribe` handler holds a
-    // connection open and streams filtered frames from a per-connection receiver.
-    // The initial receiver is dropped — with no subscribers a `send` simply
-    // returns an ignored error (nothing is buffered against an absent audience),
-    // so the bus adds no cost while nobody is watching.
-    let (events_tx, _) = tokio::sync::broadcast::channel::<Event>(EVENT_BUS_CAP);
+    // The observing state is process-scoped and deliberately NEVER persisted: a
+    // root forensics collector silently staying blind across a restart nobody
+    // noticed is the dangerous failure mode, whereas restart-resumes fails safe.
+    // Logged so the choice is explicit at every boot rather than accidental.
+    tracing::info!(
+        observing = true,
+        "collection enabled at startup; the observing state is process-scoped and \
+         deliberately never persisted — a restart always resumes collecting"
+    );
+
+    // `ts_us` of the most recent RESUME edge. The control socket publishes it on
+    // every `SetObserving(true)` transition; the pipeline consumer watches it and
+    // drops its recent-sample window so a count-based condition cannot span the
+    // observation gap the pause opened. `0` = the daemon has never resumed.
+    let resume_at_us = Arc::new(AtomicI64::new(0));
+
+    // The realtime event bus (push, not poll): the pipeline consumer publishes a
+    // `StreamFrame::Event` per sample, the trigger `SnapshotHandler` publishes an
+    // `Event::Incident` on each fire, and the control path publishes a
+    // `StreamFrame::Observing` on each pause/resume edge; the socket API's
+    // `Subscribe` handler holds a connection open and streams filtered frames
+    // from a per-connection receiver. Frames travel already serialised
+    // (`EncodedFrame`), so N subscribers cost one `serde_json` pass, not N. The
+    // initial receiver is dropped — the sample publisher checks
+    // `receiver_count()` and skips the publish path entirely while nobody is
+    // subscribed, so the bus costs nothing until someone watches. With
+    // subscribers it still never back-pressures: a `send` error just means nobody
+    // is listening, and is ignored.
+    let (events_tx, _) = tokio::sync::broadcast::channel::<EncodedFrame>(EVENT_BUS_CAP);
 
     // Serve the read-only status socket for the unprivileged bar. Best-effort: a
     // bind failure is logged but never takes the daemon down (no API, still
@@ -176,18 +201,26 @@ async fn run_daemon() -> anyhow::Result<()> {
             enabled: cfg.acting.enabled,
             singbox_service: cfg.acting.singbox_service.clone(),
         };
+        let server = api::ApiServer {
+            socket_path,
+            socket_mode,
+            socket_owner_uid,
+            max_subscribers: api::MAX_SUBSCRIBERS,
+            acting,
+            // Who may send a `Request::Control` at all — orthogonal to
+            // `acting.enabled`, which only gates the acting *class* of commands.
+            policy: api::ControlPolicy::from_config(cfg.socket_owner_uid, cfg.control_uids.clone()),
+            observing,
+            resume_at_us: resume_at_us.clone(),
+            snapshot,
+            // The durable sink for `observing_edge` boundary rows: the daemon
+            // stays the sole DuckDB owner, so the control path writes through the
+            // same handle the pipeline does.
+            store: store.clone() as Arc<dyn store::Store + Send + Sync>,
+            events_tx,
+        };
         tokio::spawn(async move {
-            if let Err(e) = api::serve(
-                socket_path,
-                socket_mode,
-                socket_owner_uid,
-                acting,
-                observing,
-                snapshot,
-                events_tx,
-            )
-            .await
-            {
+            if let Err(e) = server.serve().await {
                 tracing::error!(error = %e, "status socket server exited");
             }
         })
@@ -310,8 +343,16 @@ async fn run_daemon() -> anyhow::Result<()> {
     );
 
     // Run the consumer loop until a shutdown signal (or the stream closing). The
-    // consumer publishes an `Event` per sample onto the bus (push, not poll).
-    let mut consumer = tokio::spawn(run(store.clone(), engine, rx, snapshot.clone(), events_tx));
+    // consumer publishes a frame per sample onto the bus (push, not poll) and
+    // watches `resume_at_us` so its recent-sample window never spans a pause.
+    let mut consumer = tokio::spawn(run(
+        store.clone(),
+        engine,
+        rx,
+        snapshot.clone(),
+        events_tx,
+        resume_at_us,
+    ));
 
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     tokio::select! {
@@ -475,7 +516,7 @@ fn build_engine(
     cfg: &Config,
     freezer: Option<Arc<dyn PcapFreezer>>,
     snapshot: Arc<Mutex<StatusSnapshot>>,
-    events_tx: tokio::sync::broadcast::Sender<Event>,
+    events_tx: tokio::sync::broadcast::Sender<EncodedFrame>,
 ) -> TriggerEngine {
     let record: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
     // Passive handler that pushes each firing onto the live snapshot's incident

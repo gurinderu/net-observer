@@ -9,8 +9,11 @@
 //!
 //! The bar is a pure socket client — it never opens the DuckDB store (the daemon
 //! is the sole DB owner). When the daemon is down / the socket is absent,
-//! [`read_fresh`] returns `Err` and the panel renders a graceful "observer
-//! offline" state instead of crashing.
+//! [`read_fresh`] returns [`GlanceError::Unreachable`] and the panel renders a
+//! graceful "observer offline" state instead of crashing. A daemon that *does*
+//! answer but whose answer we cannot use ([`GlanceError::Protocol`]) is a
+//! different state: the panel stays online and shows the message rather than
+//! claiming the daemon is not there.
 //!
 //! ## Look — a Tailscale-style menu
 //!
@@ -21,18 +24,22 @@
 //! near-white light theme or a dark-grey dark theme — rather than hardcoding one.
 //!
 //! The header **toggle switch** is bound to `snapshot.observing`: green when the
-//! observer is collecting, grey when paused. Clicking it sends
-//! `Control(SetObserving(!observing))` to the daemon (see [`send_set_observing`])
-//! and refreshes. This is benign **self-control** — it pauses/resumes the
-//! observer's OWN collection only; it never touches the proxy or the network and is
-//! not gated by `acting.enabled`. While paused the header shows a muted "paused"
-//! state and the daemon stays alive so the switch can turn collection back on.
+//! observer is collecting, grey when paused. Clicking it runs [`toggle_round_trip`]
+//! — read the live state, send `Control(SetObserving(!live))` (see
+//! [`send_set_observing`]), read it back — **on a background thread**, then applies
+//! the outcome with [`Glance::apply_toggle_result`]. The socket round-trips never
+//! run on the gpui main thread, so a daemon that accepts but does not answer cannot
+//! park the bar. This is benign **self-control** — it pauses/resumes the observer's
+//! OWN collection only; it never touches the proxy or the network and is not gated
+//! by `acting.enabled`. While paused the header shows a muted "paused" state and the
+//! daemon stays alive so the switch can turn collection back on.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, Rgba, SharedString, Subscription, Window, WindowAppearance, div, px, rgb,
+    App, AsyncApp, Context, Entity, Rgba, SharedString, Subscription, Window, WindowAppearance,
+    div, px, rgb,
 };
 
 use observer_ipc::{ControlCmd, ControlResult, IncidentSummary, Request, Response, StatusSnapshot};
@@ -120,21 +127,71 @@ impl Theme {
     }
 }
 
+/// Why a fetch failed — the distinction the panel must not blur.
+///
+/// "Daemon not reachable" is an assertion about the world, so it may only be made
+/// when nothing answered. A daemon that accepts the connection and replies, but
+/// whose reply we cannot use (an `Error` frame, an unexpected variant, or a decode
+/// failure — e.g. a new bar against an older daemon), is *up*: reporting it as
+/// offline would be a false statement, and the real message would be nowhere to be
+/// seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlanceError {
+    /// Nothing answered: the socket is absent, the connection was refused, or the
+    /// connect/round-trip timed out. The daemon is down — the panel goes offline.
+    Unreachable(String),
+    /// The daemon answered but the exchange failed. It is reachable, so the panel
+    /// stays online and surfaces the message.
+    Protocol(String),
+}
+
+impl GlanceError {
+    /// The underlying message, without the reachable/unreachable framing.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Unreachable(m) | Self::Protocol(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for GlanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+/// Classify a transport failure from [`observer_ipc::query`]. Only the kinds that
+/// mean "nobody was there" are [`GlanceError::Unreachable`]; everything else
+/// (`InvalidData` from a frame we cannot decode, a broken pipe mid-exchange, …)
+/// happened *with* a daemon on the other end.
+fn classify_io(e: std::io::Error) -> GlanceError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::TimedOut => GlanceError::Unreachable(e.to_string()),
+        _ => GlanceError::Protocol(e.to_string()),
+    }
+}
+
 /// Fetch the live [`StatusSnapshot`] from `observerd` over the local socket.
 ///
 /// The bar owns no DB — the daemon does — so every refresh is a blocking
 /// [`observer_ipc::query`] round-trip. Re-querying each tick means the glance
 /// recovers on its own once the daemon comes back, and fails gracefully when it
-/// is not there: a missing socket, connection-refused (daemon down), or a
-/// protocol error all map to `Err(String)`, which the panel surfaces as
-/// "observer offline" and the status item as a grey dot — retried on the next
+/// is not there: a missing socket, connection-refused or a timeout map to
+/// [`GlanceError::Unreachable`], which the panel surfaces as "observer offline"
+/// and the status item as a grey dot. An `Error` frame, an unexpected variant or a
+/// decode failure map to [`GlanceError::Protocol`] — the daemon is up, so the
+/// panel stays online and shows the message. Either way it is retried on the next
 /// tick instead of crashing.
-pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, String> {
+pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, GlanceError> {
     match observer_ipc::query(socket_path, &Request::Status) {
         Ok(Response::Status(snap)) => Ok(snap),
-        Ok(Response::Error(msg)) => Err(msg),
-        Ok(_) => Err("unexpected response from observerd".to_string()),
-        Err(e) => Err(e.to_string()),
+        Ok(Response::Error(msg)) => Err(GlanceError::Protocol(msg)),
+        Ok(_) => Err(GlanceError::Protocol(
+            "unexpected response from observerd".to_string(),
+        )),
+        Err(e) => Err(classify_io(e)),
     }
 }
 
@@ -162,8 +219,9 @@ pub fn send_set_observing(socket_path: &str, on: bool) -> Result<ControlResult, 
 /// Shared, app-scoped model: the latest snapshot the UI renders.
 pub struct Glance {
     pub snapshot: StatusSnapshot,
-    /// The most recent fetch error, if the last refresh failed (daemon offline).
-    pub error: Option<String>,
+    /// The most recent fetch error, if the last refresh failed — classified into
+    /// "nothing answered" vs "the daemon answered badly" (see [`GlanceError`]).
+    pub error: Option<GlanceError>,
     /// Config socket path, so the panel's manual "Refresh" can re-query and the
     /// event-log window can open its subscription.
     pub socket_path: String,
@@ -178,7 +236,7 @@ pub struct Glance {
 }
 
 impl Glance {
-    pub fn new(snapshot: StatusSnapshot, error: Option<String>, socket_path: String) -> Self {
+    pub fn new(snapshot: StatusSnapshot, error: Option<GlanceError>, socket_path: String) -> Self {
         Self {
             snapshot,
             error,
@@ -200,24 +258,72 @@ impl Glance {
         }
     }
 
-    /// Flip the observer's collection on/off (the header toggle switch): send
-    /// `Control(SetObserving(!observing))`, record the outcome line, then refresh
-    /// so the switch reflects the daemon's real state. Benign self-control — never
-    /// touches the proxy or the network. Never panics: a daemon-down / refused
-    /// socket or a failed action becomes a readable `control_msg` line and the
-    /// refresh surfaces the offline state.
-    pub fn toggle_observing(&mut self) {
-        let target = !self.snapshot.observing;
-        self.control_msg = Some(match send_set_observing(&self.socket_path, target) {
+    /// Whether the daemon is reachable. Only [`GlanceError::Unreachable`] means
+    /// "not there": a protocol failure came *from* a live daemon, so the panel
+    /// stays online (the toggle keeps working, the message is shown instead).
+    pub fn online(&self) -> bool {
+        !matches!(self.error, Some(GlanceError::Unreachable(_)))
+    }
+
+    /// Apply the outcome of a toggle round-trip (see [`toggle_round_trip`]) to this
+    /// model. Pure state application — it performs no I/O, so it is safe to run on
+    /// the gpui main thread and is directly testable.
+    ///
+    /// `control` becomes the transient `control_msg` line; `fresh` is applied
+    /// exactly the way [`Glance::refresh`] applies its own read, so the switch
+    /// reflects the daemon's real state (or goes offline) rather than a
+    /// silently-flipped local bool.
+    pub fn apply_toggle_result(
+        &mut self,
+        control: Result<ControlResult, String>,
+        fresh: Result<StatusSnapshot, GlanceError>,
+    ) {
+        self.control_msg = Some(match control {
             Ok(result) => {
                 let tag = if result.ok { "ok" } else { "failed" };
                 format!("{tag}: {}", result.message)
             }
             Err(e) => format!("failed: {e}"),
         });
-        // Reflect the daemon's real observing state after the toggle.
-        self.refresh();
+        match fresh {
+            Ok(s) => {
+                self.snapshot = s;
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e),
+        }
     }
+}
+
+/// The blocking half of the header toggle: read the live state, flip it, read it
+/// back. Returns the control outcome and the post-toggle snapshot for
+/// [`Glance::apply_toggle_result`].
+///
+/// **Never call this on the gpui main thread** — it is three blocking socket
+/// round-trips (see the click wiring in `toggle_switch`, which runs it on the
+/// background executor).
+///
+/// The *leading* read is the point: `SetObserving(bool)` is absolute on the wire
+/// and a second controller genuinely exists (`observer-cli observe on|off`), so a
+/// cached snapshot up to one refresh tick old is not a safe premise — a state
+/// change inside that window would be silently overwritten. The target is derived
+/// from the freshly-read state instead. If that read fails there is no premise, so
+/// no command is sent and the error is reported on both channels (as its message
+/// on the control half, as the classified [`GlanceError`] on the read half). Never
+/// panics — every failure is a readable `Err`.
+pub fn toggle_round_trip(
+    socket_path: &str,
+) -> (
+    Result<ControlResult, String>,
+    Result<StatusSnapshot, GlanceError>,
+) {
+    let before = match read_fresh(socket_path) {
+        Ok(s) => s,
+        Err(e) => return (Err(e.to_string()), Err(e)),
+    };
+    let control = send_set_observing(socket_path, !before.observing);
+    // Reflect the daemon's real observing state after the toggle.
+    (control, read_fresh(socket_path))
 }
 
 /// The root view of the panel window. Holds a handle to the shared [`Glance`]
@@ -250,7 +356,14 @@ impl Render for PanelView {
         let now_us = now_us();
         // Offline (daemon down / socket absent) ⇒ we cannot be observing, so the
         // switch reads OFF and is non-interactive regardless of the stale snapshot.
-        let online = glance.error.is_none();
+        // A protocol failure is NOT offline: the daemon answered, so the toggle
+        // stays live and the message goes to the footer instead.
+        let online = glance.online();
+        let (offline_msg, protocol_msg) = match &glance.error {
+            Some(GlanceError::Unreachable(m)) => (Some(m.clone()), None),
+            Some(GlanceError::Protocol(m)) => (None, Some(m.clone())),
+            None => (None, None),
+        };
 
         div()
             .flex()
@@ -262,22 +375,35 @@ impl Render for PanelView {
             .text_size(px(13.0))
             .rounded_lg()
             .overflow_hidden()
-            .child(header_row(&snapshot, online, theme, cx))
+            .child(header_row(&snapshot, online, offline_msg, theme, cx))
             .child(separator(theme))
-            .child(status_rows(&snapshot, theme))
+            .child(status_rows(&snapshot, now_us, theme))
             .child(separator(theme))
             .child(incidents_section(&snapshot.incidents, now_us, theme))
             .child(separator(theme))
-            .child(footer(&snapshot, now_us, control_msg, theme, cx))
+            .child(footer(
+                &snapshot,
+                now_us,
+                control_msg,
+                protocol_msg,
+                theme,
+                cx,
+            ))
     }
 }
 
 /// The header row: a health dot + the app name on the left, the observing toggle
 /// switch on the right. When paused, a muted "paused" label sits after the name
 /// and the dot is grey.
+///
+/// `online` is [`Glance::online`] — false only when the daemon is unreachable, in
+/// which case `offline` carries the reason for the warning glyph's tooltip. A
+/// protocol failure is not offline (see [`GlanceError`]): the header stays live and
+/// the footer states it.
 fn header_row(
     snapshot: &StatusSnapshot,
     online: bool,
+    offline: Option<String>,
     theme: Theme,
     cx: &mut Context<PanelView>,
 ) -> impl IntoElement {
@@ -318,7 +444,7 @@ fn header_row(
         .child(left)
         .child(div().flex_1())
         // Offline: a warning glyph with a tooltip, next to the (disabled) toggle.
-        .children((!online).then(|| warn_offline(theme)))
+        .children(offline.map(|reason| warn_offline(reason, theme)))
         // ON only if actually observing AND connected; interactive only online.
         .child(toggle_switch(
             snapshot.observing && online,
@@ -331,19 +457,22 @@ fn header_row(
 /// A warning glyph shown in the header when the daemon is unreachable. Hovering it
 /// explains why the observing toggle is disabled — instead of a loud offline
 /// banner. Replaces the old yellow offline row.
-fn warn_offline(theme: Theme) -> impl IntoElement {
+///
+/// `reason` is the real transport error (the panel deleted the row that used to
+/// print it), so the tooltip says *why* nothing answered rather than asserting a
+/// canned diagnosis.
+fn warn_offline(reason: String, theme: Theme) -> impl IntoElement {
+    let tip = SharedString::from(format!(
+        "observer offline — can't toggle collection ({reason})"
+    ));
     div()
         .id("offline-warn")
         .text_size(px(13.0))
         .text_color(rgb(theme.warn))
         .child("\u{26A0}") // ⚠
-        .tooltip(|_window, cx| {
-            cx.new(|_| {
-                WarnTooltip(
-                    "observer offline — can't toggle collection (daemon not reachable)".into(),
-                )
-            })
-            .into()
+        .tooltip(move |_window, cx| {
+            let tip = tip.clone();
+            cx.new(|_| WarnTooltip(tip)).into()
         })
 }
 
@@ -384,7 +513,8 @@ fn header_dot(snapshot: &StatusSnapshot, online: bool, theme: Theme) -> (&'stati
 /// A Tailscale-style toggle switch bound to `observing`: a pill track
 /// (`rounded_full`) with a circular knob that sits left (off) or right (on). Green
 /// track when observing, grey when paused. Clicking it flips the observer's
-/// collection via [`Glance::toggle_observing`] and re-renders.
+/// collection via [`toggle_round_trip`] on the background executor and re-renders
+/// when the result lands (see [`Glance::apply_toggle_result`]).
 fn toggle_switch(
     on: bool,
     interactive: bool,
@@ -410,10 +540,25 @@ fn toggle_switch(
         track = track
             .cursor_pointer()
             .on_click(cx.listener(|this, _, _window, cx| {
-                this.model.update(cx, |g, cx| {
-                    g.toggle_observing();
-                    cx.notify();
-                });
+                let model = this.model.downgrade();
+                let socket = this.model.read(cx).socket_path.clone();
+                // The three socket round-trips run on the background executor: a
+                // daemon that accepts the connection but never answers must not
+                // park the bar (status item, panel, event window). The result is
+                // written back on the foreground, through a weak handle so a
+                // shut-down app just drops it.
+                cx.spawn(async move |_view, acx: &mut AsyncApp| {
+                    let (control, fresh) = acx
+                        .background_spawn(async move { toggle_round_trip(&socket) })
+                        .await;
+                    model
+                        .update(acx, |g, cx| {
+                            g.apply_toggle_result(control, fresh);
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .detach();
             }));
     }
 
@@ -427,23 +572,33 @@ fn toggle_switch(
 }
 
 /// The label→value list: the latest link tick (gw, direct) and proxy tick (tun,
-/// selector). Missing collectors render a muted "-". Values carry semantic color;
-/// labels are muted.
-fn status_rows(snapshot: &StatusSnapshot, theme: Theme) -> impl IntoElement {
+/// selector), each pair followed by a muted age row for the collector that
+/// produced it. Missing collectors render a muted "-". Values carry semantic
+/// color; labels are muted.
+///
+/// The per-collector age rows matter because the collectors are independent: their
+/// intervals are separately configurable and one stalling while the others keep
+/// ticking is an expected state (the isolation rule). The footer's single
+/// freshness line is a `max` over both, so on its own it would date a stalled
+/// collector's stale verdicts by its neighbour's tick.
+fn status_rows(snapshot: &StatusSnapshot, now_us: i64, theme: Theme) -> impl IntoElement {
     let (gw, gw_color, direct, direct_color) = match &snapshot.link {
-        Some(l) => {
-            let gw = l.gw.to_string();
-            let direct = l.direct.to_string();
-            let gw_color = verdict_color(&gw, theme);
-            let direct_color = verdict_color(&direct, theme);
-            (gw, gw_color, direct, direct_color)
-        }
+        Some(l) => (
+            l.gw.to_string(),
+            gw_verdict_color(l.gw, theme),
+            l.direct.to_string(),
+            tcp_verdict_color(l.direct, theme),
+        ),
         None => (
             "-".to_string(),
             rgb(theme.muted),
             "-".to_string(),
             rgb(theme.muted),
         ),
+    };
+    let link_age = match &snapshot.link {
+        Some(l) => age_str(l.ts_us, now_us),
+        None => "-".to_string(),
     };
 
     let (tun, tun_color, sel) = match &snapshot.proxy {
@@ -462,16 +617,22 @@ fn status_rows(snapshot: &StatusSnapshot, theme: Theme) -> impl IntoElement {
         }
         None => ("-".to_string(), rgb(theme.muted), "-".to_string()),
     };
+    let proxy_age = match &snapshot.proxy {
+        Some(p) => age_str(p.ts_us, now_us),
+        None => "-".to_string(),
+    };
 
     div()
         .flex()
         .flex_col()
         .px_3()
         .py_1()
-        .child(row("gw", &gw, gw_color, theme))
-        .child(row("direct", &direct, direct_color, theme))
-        .child(row("tun", &tun, tun_color, theme))
-        .child(row("selector", &sel, rgb(theme.fg), theme))
+        .child(row("gw", gw, gw_color, theme))
+        .child(row("direct", direct, direct_color, theme))
+        .child(row("link", link_age, rgb(theme.muted), theme))
+        .child(row("tun", tun, tun_color, theme))
+        .child(row("selector", sel, rgb(theme.fg), theme))
+        .child(row("proxy", proxy_age, rgb(theme.muted), theme))
 }
 
 /// The incidents section: a compact list of `trigger_id → state · age` rows, or a
@@ -492,18 +653,24 @@ fn incidents_section(incidents: &[IncidentSummary], now_us: i64, theme: Theme) -
                 None => ("open", theme.bad),
             };
             let value = format!("{state} \u{00b7} {}", age_str(i.opened_us, now_us));
-            row(&i.trigger_id, &value, rgb(color), theme)
+            row(i.trigger_id.clone(), value, rgb(color), theme)
         }))
     }
 }
 
 /// The footer (pinned at the bottom of the panel): a muted freshness line (+ the
-/// last control-action outcome, if any), and subtle text actions — "Events"
-/// (opens the live event-log window), "Refresh", and "Quit".
+/// last control-action outcome and any protocol error, if present), and subtle
+/// text actions — "Events" (opens the live event-log window), "Refresh", and
+/// "Quit".
+///
+/// `protocol_msg` is a [`GlanceError::Protocol`] message: the daemon answered, so
+/// the header stays online and this warn-colored line is where the failure is
+/// stated — otherwise it would be visible nowhere in the panel.
 fn footer(
     snapshot: &StatusSnapshot,
     now_us: i64,
     control_msg: Option<String>,
+    protocol_msg: Option<String>,
     theme: Theme,
     cx: &mut Context<PanelView>,
 ) -> impl IntoElement {
@@ -580,6 +747,14 @@ fn footer(
                 .child(SharedString::from(msg)),
         );
     }
+    if let Some(msg) = protocol_msg {
+        meta = meta.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(theme.warn))
+                .child(SharedString::from(format!("protocol error: {msg}"))),
+        );
+    }
 
     div()
         .flex()
@@ -601,35 +776,44 @@ fn separator(theme: Theme) -> impl IntoElement {
 /// One label→value list row: a muted label on the left, a colored value on the
 /// right (the Tailscale-style clean list, not a bordered card).
 ///
-/// `+ use<>` opts the returned element out of capturing the `&str` argument
-/// lifetimes (Rust 2024's default): the row copies both into owned
-/// [`SharedString`]s, so it borrows neither — letting callers build rows from
-/// short-lived locals (e.g. a formatted incident line).
-fn row(key: &str, value: &str, value_color: Rgba, theme: Theme) -> impl IntoElement + use<> {
+/// Both sides take anything convertible into a [`SharedString`], so a `&'static
+/// str` label costs no allocation at all and an owned `String` local is *moved*
+/// in rather than copied — a render runs this once per row, every tick.
+fn row<K: Into<SharedString>, V: Into<SharedString>>(
+    key: K,
+    value: V,
+    value_color: Rgba,
+    theme: Theme,
+) -> impl IntoElement {
+    let key: SharedString = key.into();
+    let value: SharedString = value.into();
     div()
         .flex()
         .items_center()
         .justify_between()
         .py_1()
-        .child(
-            div()
-                .text_color(rgb(theme.muted))
-                .child(SharedString::from(key.to_string())),
-        )
-        .child(
-            div()
-                .text_color(value_color)
-                .child(SharedString::from(value.to_string())),
-        )
+        .child(div().text_color(rgb(theme.muted)).child(key))
+        .child(div().text_color(value_color).child(value))
 }
 
-/// Semantic color for a verdict string: `OK` → good, empty → muted, anything else
-/// → bad.
-fn verdict_color(verdict: &str, theme: Theme) -> Rgba {
-    match verdict {
-        "OK" => rgb(theme.ok),
-        "" => rgb(theme.muted),
-        _ => rgb(theme.bad),
+/// Semantic color for a [`types::TcpVerdict`]. Exhaustive over the typed verdict —
+/// no wildcard arm — so a probe that could not run (`SKIP`) reads as muted rather
+/// than as a failure, and a new token added to the enum fails to compile *here*
+/// instead of silently painting itself red.
+fn tcp_verdict_color(v: types::TcpVerdict, theme: Theme) -> Rgba {
+    match v {
+        types::TcpVerdict::Ok => rgb(theme.ok),
+        types::TcpVerdict::Skip => rgb(theme.muted),
+        types::TcpVerdict::Fail => rgb(theme.bad),
+    }
+}
+
+/// Semantic color for a [`types::GwVerdict`]. Exhaustive for the same reason as
+/// [`tcp_verdict_color`]; this enum has no skip token today.
+fn gw_verdict_color(v: types::GwVerdict, theme: Theme) -> Rgba {
+    match v {
+        types::GwVerdict::Ok => rgb(theme.ok),
+        types::GwVerdict::Fail | types::GwVerdict::NoGw => rgb(theme.bad),
     }
 }
 
@@ -718,13 +902,72 @@ mod tests {
     }
 
     /// Daemon down / socket absent must map to a graceful `Err`, never a panic —
-    /// this is the "observer offline" path the panel renders.
+    /// this is the "observer offline" path the panel renders. It is specifically
+    /// `Unreachable`: nothing answered, so "daemon not reachable" is true.
     #[test]
     fn read_fresh_offline_when_socket_absent() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist.sock");
-        let res = read_fresh(missing.to_str().unwrap());
-        assert!(res.is_err(), "absent socket must yield an offline Err");
+        let err = read_fresh(missing.to_str().unwrap())
+            .expect_err("absent socket must yield an offline Err");
+        assert!(
+            matches!(err, GlanceError::Unreachable(_)),
+            "absent socket is unreachable, not a protocol failure: {err:?}"
+        );
+    }
+
+    /// Only the kinds that mean "nobody was there" are unreachable; a decode
+    /// failure (a new bar against an older daemon) happened *with* a live daemon on
+    /// the other end.
+    #[test]
+    fn classify_io_separates_unreachable_from_protocol() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                matches!(
+                    classify_io(Error::new(kind, "nope")),
+                    GlanceError::Unreachable(_)
+                ),
+                "{kind:?} means nothing answered"
+            );
+        }
+        assert!(
+            matches!(
+                classify_io(Error::new(ErrorKind::InvalidData, "bad frame")),
+                GlanceError::Protocol(_)
+            ),
+            "an undecodable answer still came from a live daemon"
+        );
+    }
+
+    /// A protocol failure must NOT read as offline: the daemon answered, so the
+    /// panel stays online (toggle live) and the message goes to the footer.
+    #[test]
+    fn protocol_error_keeps_the_panel_online() {
+        let mut glance = Glance::new(
+            StatusSnapshot::default(),
+            None,
+            "/nonexistent.sock".to_string(),
+        );
+        assert!(glance.online(), "no error is online");
+
+        glance.error = Some(GlanceError::Protocol("missing field `observing`".into()));
+        assert!(
+            glance.online(),
+            "a daemon that answered badly is still reachable"
+        );
+        assert_eq!(
+            glance.error.as_ref().map(GlanceError::message),
+            Some("missing field `observing`"),
+            "the real message must survive for the footer line"
+        );
+
+        glance.error = Some(GlanceError::Unreachable("No such file".into()));
+        assert!(!glance.online(), "nothing answered -> offline");
     }
 
     /// The observing self-control path degrades gracefully too: an absent socket
@@ -744,22 +987,55 @@ mod tests {
         );
     }
 
-    /// `Glance::toggle_observing` on a down daemon records a readable failure line
-    /// instead of panicking, and its trailing refresh surfaces the offline state
-    /// (the switch reflects the daemon's real, unreachable state — never a
+    /// "SKIP, never silence": a probe that could not run is not a failure, so it
+    /// must not be painted with the failure color. Both mappings are exhaustive
+    /// over the typed verdicts, so a new token cannot quietly land in "bad".
+    #[test]
+    fn skip_verdict_is_muted_not_bad() {
+        for theme in [Theme::light(), Theme::dark()] {
+            assert_eq!(
+                tcp_verdict_color(types::TcpVerdict::Skip, theme),
+                rgb(theme.muted),
+                "SKIP is 'could not run', not 'failed'"
+            );
+            assert_ne!(
+                tcp_verdict_color(types::TcpVerdict::Skip, theme),
+                rgb(theme.bad)
+            );
+            assert_eq!(
+                tcp_verdict_color(types::TcpVerdict::Ok, theme),
+                rgb(theme.ok)
+            );
+            assert_eq!(
+                tcp_verdict_color(types::TcpVerdict::Fail, theme),
+                rgb(theme.bad)
+            );
+            assert_eq!(gw_verdict_color(types::GwVerdict::Ok, theme), rgb(theme.ok));
+            assert_eq!(
+                gw_verdict_color(types::GwVerdict::NoGw, theme),
+                rgb(theme.bad)
+            );
+            assert_eq!(
+                gw_verdict_color(types::GwVerdict::Fail, theme),
+                rgb(theme.bad)
+            );
+        }
+    }
+
+    /// Applying a toggle outcome from a down daemon records a readable failure line
+    /// instead of panicking, and the failed read surfaces the offline state (the
+    /// switch reflects the daemon's real, unreachable state — never a
     /// silently-flipped local bool).
     #[test]
     fn glance_toggle_observing_records_failure_when_daemon_down() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist.sock");
-        let mut glance = Glance::new(
-            StatusSnapshot::default(),
-            None,
-            missing.to_str().unwrap().to_string(),
-        );
+        let socket = missing.to_str().unwrap();
+        let mut glance = Glance::new(StatusSnapshot::default(), None, socket.to_string());
         // A fresh snapshot reads as observing; the daemon is down.
         assert!(glance.snapshot.observing);
-        glance.toggle_observing();
+        // The real errors the background round-trip would hand back.
+        glance.apply_toggle_result(send_set_observing(socket, false), read_fresh(socket));
         let msg = glance
             .control_msg
             .clone()
@@ -768,9 +1044,83 @@ mod tests {
             msg.starts_with("failed:"),
             "daemon-down must be a failure: {msg}"
         );
-        // The trailing refresh failed against the absent socket -> offline error,
-        // and the (unreached) snapshot state is left as-is rather than flipped.
-        assert!(glance.error.is_some(), "refresh must surface offline");
+        // The read failed against the absent socket -> offline (unreachable, since
+        // nothing answered), and the (unreached) snapshot state is left as-is
+        // rather than flipped.
+        assert!(
+            matches!(glance.error, Some(GlanceError::Unreachable(_))),
+            "refresh must surface offline: {:?}",
+            glance.error
+        );
+        assert!(!glance.online(), "the panel reads as offline");
         assert!(glance.snapshot.observing, "state not flipped locally");
+    }
+
+    /// A successful toggle applies the daemon's post-toggle snapshot and clears a
+    /// previous offline error — the switch follows the daemon, not a local guess.
+    #[test]
+    fn apply_toggle_result_adopts_fresh_snapshot_and_clears_error() {
+        let mut glance = Glance::new(
+            StatusSnapshot::default(),
+            Some(GlanceError::Unreachable("was offline".to_string())),
+            "/nonexistent.sock".to_string(),
+        );
+        let paused = StatusSnapshot {
+            observing: false,
+            ..StatusSnapshot::default()
+        };
+        glance.apply_toggle_result(
+            Ok(ControlResult {
+                ok: true,
+                message: "observing off".to_string(),
+            }),
+            Ok(paused),
+        );
+        assert_eq!(glance.control_msg.as_deref(), Some("ok: observing off"));
+        assert!(!glance.snapshot.observing, "switch follows the daemon");
+        assert!(glance.error.is_none(), "a good read clears offline");
+    }
+
+    /// A refusal (`ok: false`) reads as a failure line even though the round-trip
+    /// itself succeeded.
+    #[test]
+    fn apply_toggle_result_marks_refusal_as_failed() {
+        let mut glance = Glance::new(
+            StatusSnapshot::default(),
+            None,
+            "/nonexistent.sock".to_string(),
+        );
+        glance.apply_toggle_result(
+            Ok(ControlResult {
+                ok: false,
+                message: "refused".to_string(),
+            }),
+            Err(GlanceError::Unreachable("offline".to_string())),
+        );
+        assert_eq!(glance.control_msg.as_deref(), Some("failed: refused"));
+        assert_eq!(
+            glance.error,
+            Some(GlanceError::Unreachable("offline".to_string()))
+        );
+    }
+
+    /// The leading read is the toggle's premise: when it fails there is nothing to
+    /// flip, so no `SetObserving` is sent and both halves report the error.
+    #[test]
+    fn toggle_round_trip_skips_control_when_leading_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sock");
+        let (control, fresh) = toggle_round_trip(missing.to_str().unwrap());
+        let err = control.expect_err("no premise -> no command, just the error");
+        let fresh = fresh.expect_err("the leading read failed");
+        assert!(
+            matches!(fresh, GlanceError::Unreachable(_)),
+            "an absent socket is unreachable: {fresh:?}"
+        );
+        assert_eq!(
+            err,
+            fresh.to_string(),
+            "both halves report the same offline error"
+        );
     }
 }

@@ -5,6 +5,11 @@ edition.workspace = true
 [dependencies]
 types.workspace = true
 config.workspace = true
+# Same CLI surface as the sibling binaries (`observerd`, `observer-cli`): a
+# derive parser that accepts `--config=<path>` and hard-errors on a missing
+# value / unknown flag, instead of silently dropping them onto the default
+# socket (which renders as an unexplained "offline").
+clap.workspace = true
 # `observer-bar` is a pure socket client: `observerd` owns the DuckDB store (its
 # per-process file lock blocks any second opener while the daemon runs), so the
 # bar never touches the DB. It fetches a live `StatusSnapshot` over the daemon's

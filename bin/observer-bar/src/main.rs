@@ -42,26 +42,30 @@ mod menubar;
 mod status;
 mod ui;
 
+use clap::Parser;
+
+// The same `clap` surface as the sibling binaries (`observerd`, `observer-cli`):
+// `--config=<path>` works, a `--config` without a value is a hard error rather
+// than a silently ignored flag, and an unknown argument exits non-zero instead of
+// being swallowed. A dropped `--config` would fall back to the default socket and
+// render as "offline" with nothing said about why.
+#[derive(Parser)]
+#[command(
+    name = "observer-bar",
+    about = "macOS menu-bar glance at the live observer status"
+)]
+struct Cli {
+    /// Optional path to the observer config file (TOML). Supplies the daemon
+    /// socket path the bar reads its snapshots from.
+    #[arg(long)]
+    config: Option<String>,
+    /// Open the panel immediately on launch instead of waiting for a
+    /// status-item click.
+    #[arg(long)]
+    open: bool,
+}
+
 fn main() {
-    // Minimal arg parsing (no clap dep): `--config <path>` picks the daemon
-    // socket (defaults to the built-in config path when omitted); `--open` opens
-    // the panel immediately on launch instead of waiting for a status-item click.
-    let args: Vec<String> = std::env::args().collect();
-    let mut config: Option<String> = None;
-    let mut open = false;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" => {
-                config = args.get(i + 1).cloned();
-                i += 2;
-            }
-            "--open" => {
-                open = true;
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    menubar::run(config, open);
+    let cli = Cli::parse();
+    menubar::run(cli.config, cli.open);
 }

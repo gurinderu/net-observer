@@ -1,4 +1,4 @@
-//! The local read-only API server (plan Task 2 / spec "Local API").
+//! The local API server (plan Task 2 / spec "Local API").
 //!
 //! `observerd` is the sole DuckDB owner (DuckDB takes a per-process file lock, so
 //! a second opener — even read-only — is blocked while the daemon runs). Every
@@ -7,110 +7,323 @@
 //! [`StatusSnapshot`] the pipeline keeps current — no DB read on the request
 //! path, zero contention with the writer, always live.
 //!
-//! The wire format matches `observer_ipc::{write_frame, read_frame}`: one
+//! The wire format is `observer_ipc`'s: frames are encoded with
+//! `observer_ipc::encode_frame` (the same bytes `write_frame` produces) — one
 //! newline-terminated JSON [`Request`] in, one newline-terminated JSON
-//! [`Response`] out, then the connection closes.
+//! [`Response`] out, then the connection closes. The one exception is
+//! [`Request::Subscribe`], which is answered by a stream of
+//! [`StreamFrame`]s instead of a single [`Response`].
+//!
+//! Reads are open to anyone who can connect (the default `socket_mode` is
+//! deliberately permissive so the unprivileged menu-bar app can poll a root
+//! daemon); *control* is not. Every `Request::Control` first passes the
+//! peer-credential gate in [`control_request`] — see [`ControlPolicy`].
 
 use std::os::unix::fs::PermissionsExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use observer_ipc::{
-    ControlCmd, ControlResult, Event, EventKind, Request, Response, StatusSnapshot,
+    ControlCmd, ControlResult, EncodedFrame, EventKind, Gap, Ready, Request, Response,
+    StatusSnapshot, StreamError, StreamErrorCode, StreamFrame,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use store::Store;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
+use types::ObservingEdge;
 
 use crate::acting;
 
-/// The acting (write/control) configuration handed to the socket server. Kept
-/// small and cloneable so each connection task gets its own copy.
+/// The uid `root` runs as. Always authorised for control: root can already stop
+/// and reconfigure the daemon, so refusing it would be theatre.
+const ROOT_UID: u32 = 0;
+
+/// Hard cap on concurrently held-open `Subscribe` streams. A generous backstop,
+/// not a tuning knob: each subscriber costs a task, an fd and a broadcast
+/// receiver, and the socket is world-connectable by default (`socket_mode`
+/// 0o666), so an unprivileged process must not be able to exhaust the daemon by
+/// opening subscriptions in a loop. Beyond it the daemon refuses with a
+/// decodable `StreamFrame::Error` rather than a bare close.
+pub(crate) const MAX_SUBSCRIBERS: usize = 256;
+
+/// Largest request frame the daemon will buffer before giving up on finding a
+/// newline. The socket is world-connectable by default, so no client may grow
+/// server memory by never terminating its request; an over-long frame is
+/// truncated, fails to parse, and is answered `Response::Error`.
+const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+
+/// Who may send a `Request::Control`. Built once at start-up from the config.
+///
+/// Peer credentials are checked on `Request::Control` **only** — `Status`,
+/// `Incidents` and `Subscribe` stay open, because the permissive default
+/// `socket_mode` exists precisely for unprivileged readers and a read carries no
+/// authority.
+#[derive(Debug, Clone)]
+pub struct ControlPolicy {
+    /// The daemon's own effective uid. A process running as the same user can
+    /// already signal this one, so it gains no new authority — and this is the
+    /// clause that keeps an unprivileged `cargo test` (server and client in one
+    /// process) working with no root, no console and no special-casing.
+    pub daemon_uid: u32,
+    /// `config.socket_owner_uid`: the operator's explicit statement about who
+    /// owns the control endpoint (the daemon already `chown`s the socket to it).
+    pub socket_owner_uid: Option<u32>,
+    /// `config.control_uids`: extra authorised uids, for headless/multi-admin
+    /// hosts with no console session.
+    pub control_uids: Vec<u32>,
+}
+
+impl ControlPolicy {
+    /// Build from config, resolving the daemon's own effective uid once.
+    pub fn from_config(socket_owner_uid: Option<u32>, control_uids: Vec<u32>) -> Self {
+        // SAFETY: `geteuid` takes no arguments, dereferences nothing and cannot
+        // fail (POSIX: "always successful").
+        let daemon_uid = unsafe { libc::geteuid() };
+        Self {
+            daemon_uid,
+            socket_owner_uid,
+            control_uids,
+        }
+    }
+}
+
+/// THE control predicate: may `peer_uid` send control commands, given the
+/// current console owner `console_uid` (`None` when there is none / it cannot be
+/// read)?
+///
+/// **Pure** — no syscalls, no clock, no filesystem — so the whole policy is unit
+/// tested without root, without a socket and without a console session. Allowed:
+/// - `root` (uid 0): it can already kill and reconfigure the daemon;
+/// - the daemon's own uid: it can already signal this process;
+/// - `socket_owner_uid`, when the operator set it;
+/// - the **console user** — the logged-in GUI user running `observer-bar`, which
+///   is the out-of-the-box case for the menu-bar toggle against a root daemon;
+/// - any uid explicitly listed in `control_uids`.
+///
+/// Everything else — an unrelated local uid on the mode-0666 socket — is
+/// refused. An unidentifiable peer is refused by [`authorize_control`]: an
+/// authority decision fails closed.
+fn control_authorized(policy: &ControlPolicy, peer_uid: u32, console_uid: Option<u32>) -> bool {
+    peer_uid == ROOT_UID
+        || peer_uid == policy.daemon_uid
+        || policy.socket_owner_uid == Some(peer_uid)
+        || console_uid == Some(peer_uid)
+        || policy.control_uids.contains(&peer_uid)
+}
+
+/// The uid of the user logged in at this Mac's console — the one running the
+/// menu-bar app.
+///
+/// macOS's `loginwindow` keeps `/dev/console` owned by the console-session user
+/// (the same fact `stat -f %Su /dev/console` reports), so its owner *is* that
+/// user. Plain `std`: no SystemConfiguration binding, no framework link, no new
+/// dependency.
+///
+/// Resolved fresh on every control request, never cached: the daemon is a
+/// LaunchDaemon that starts at boot before anyone has logged in, and fast user
+/// switching / logout must take effect immediately. `None` when nobody is logged
+/// in (root-owned) or the path cannot be read (SSH-only host, CI, container) —
+/// which fails closed: a console that is not there authorises nobody.
+fn console_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/dev/console").ok()?.uid();
+    (uid != ROOT_UID).then_some(uid)
+}
+
+/// Proof that the connected peer passed [`control_authorized`], carrying that
+/// peer's uid.
+///
+/// Its field is private and it is constructed ONLY by [`authorize_control`];
+/// [`control_response`] requires one by value. No dispatch path can therefore
+/// reach a control command without the peer check — the gate is a type, not a
+/// convention a future third command could forget.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PeerAuthorized(u32);
+
+impl PeerAuthorized {
+    /// The authorised peer's uid — recorded on the `observing_edge` boundary row
+    /// so a pause is attributable to a *who*.
+    fn uid(self) -> u32 {
+        self.0
+    }
+}
+
+/// Decide whether the peer may send control commands. `peer_uid` is `None` when
+/// `getpeereid` failed; a control request whose origin cannot be established is
+/// never authorised.
+fn authorize_control(
+    policy: &ControlPolicy,
+    peer_uid: Option<u32>,
+) -> Result<PeerAuthorized, ControlResult> {
+    match peer_uid {
+        Some(uid) if control_authorized(policy, uid, console_uid()) => Ok(PeerAuthorized(uid)),
+        Some(uid) => Err(ControlResult {
+            ok: false,
+            message: format!("control refused: uid {uid} is not authorised to control observerd"),
+        }),
+        None => Err(ControlResult {
+            ok: false,
+            message: "control refused: peer credentials unavailable".to_string(),
+        }),
+    }
+}
+
+/// The authority class a [`ControlCmd`] requires — the ONE place a command's
+/// gating class is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlAuthority {
+    /// Benign self-control: an authorised peer, and nothing else. No external
+    /// effect, so `acting.enabled` does not apply.
+    SelfControl,
+    /// Runs an external actuator as root: an authorised peer AND
+    /// `acting.enabled`.
+    Acting,
+}
+
+impl ControlAuthority {
+    /// The class of `cmd`.
+    ///
+    /// **Exhaustive on purpose.** `ControlCmd` is deliberately not
+    /// `#[non_exhaustive]`, so adding a third command fails to compile here
+    /// until someone decides its class — no command can inherit the weaker gate
+    /// by omission. Orthogonal to peer authorisation, which every control
+    /// request passes before this function is ever reached.
+    pub(crate) fn of(cmd: &ControlCmd) -> Self {
+        match cmd {
+            ControlCmd::SetObserving(_) => Self::SelfControl,
+            ControlCmd::KickstartProxy => Self::Acting,
+        }
+    }
+}
+
+/// The acting (write/control) configuration handed to the socket server.
 ///
 /// Safety invariant: `enabled` is off by default; with `enabled = false` every
-/// control request is refused *without running anything*. Only `observerd`
-/// executes actions, and never automatically — only on an explicit request that
-/// passes this gate.
+/// *acting-class* control request (`ControlCmd::KickstartProxy`) is refused
+/// *without running anything*. Benign self-control (`ControlCmd::SetObserving`)
+/// is deliberately not gated by this switch — but it, like every control
+/// request, must still pass the peer-credential gate ([`ControlPolicy`]). The
+/// two are orthogonal: peer credentials answer "may this uid command the daemon
+/// at all", `acting.enabled` answers "may the daemon touch the outside world".
 #[derive(Debug, Clone)]
 pub struct ActingConfig {
-    /// Master switch for the control path (`config.acting.enabled`).
+    /// Master switch for the acting class of the control path
+    /// (`config.acting.enabled`).
     pub enabled: bool,
     /// The `launchctl` service target for `ControlCmd::KickstartProxy`.
     pub singbox_service: String,
 }
 
-/// Bind the Unix-domain socket at `socket_path`, `chmod` it to `socket_mode` so an
-/// unprivileged client (the bar; the daemon runs as root) can connect, optionally
-/// `chown` it to `socket_owner_uid`, and serve [`Request`]s from the shared
-/// `snapshot` until the task is aborted.
+/// Everything the socket server needs, assembled once by the daemon.
 ///
-/// `acting` gates the write/control path: acting-class control requests (e.g.
-/// `KickstartProxy`) are refused unless `acting.enabled` is set (see
-/// [`control_response`]). Only this daemon runs the actuator, and only on an
-/// explicit request — never automatically. `SetObserving` is benign self-control
-/// and is *not* gated by `acting`: it flips the shared `observing` flag the
-/// collectors check and mirrors the new state into the live snapshot.
-///
-/// `events_tx` is the realtime event bus. A one-shot request (`Status`,
-/// `Incidents`, `Control`) is answered with a single [`Response`] then the
-/// connection closes; a [`Request::Subscribe`] instead holds the connection open
-/// and streams filtered newline-JSON [`Event`] frames from a per-connection
-/// broadcast receiver until the client disconnects (see [`stream_events`]).
-///
-/// Runs forever; the daemon spawns it and `abort()`s it on shutdown. A stale
-/// socket file left by a previous run is removed before binding (otherwise
-/// `bind` fails with `EADDRINUSE`).
-pub async fn serve(
-    socket_path: String,
-    socket_mode: u32,
-    socket_owner_uid: Option<u32>,
-    acting: ActingConfig,
-    observing: Arc<AtomicBool>,
-    snapshot: Arc<Mutex<StatusSnapshot>>,
-    events_tx: broadcast::Sender<Event>,
-) -> std::io::Result<()> {
-    // A leftover socket file from a previous run makes bind() fail; clear it.
-    let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path)?;
-    // The root daemon must relax the mode so the logged-in user's UI can connect.
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(socket_mode))?;
-    // Socket hardening for the control path: when an owner uid is configured,
-    // chown the socket to it (operators pair this with mode 0600 when enabling
-    // acting so only the owner can send privileged commands). Best-effort: a
-    // chown failure is logged but never takes the daemon down.
-    if let Some(uid) = socket_owner_uid {
-        match std::os::unix::fs::chown(&socket_path, Some(uid), None) {
-            Ok(()) => tracing::info!(uid, path = %socket_path, "status socket chowned"),
-            Err(e) => {
-                tracing::warn!(error = %e, uid, path = %socket_path, "failed to chown status socket")
+/// Bundled rather than passed as eleven positional arguments (which would trip
+/// `clippy::too_many_arguments` under `-D warnings`), and cheaper: the accept
+/// loop clones one `Arc` per connection instead of six handles.
+pub struct ApiServer {
+    pub socket_path: String,
+    pub socket_mode: u32,
+    pub socket_owner_uid: Option<u32>,
+    /// Concurrent held-open `Subscribe` cap. Production passes
+    /// [`MAX_SUBSCRIBERS`]; tests pass a small value so the refusal path is one
+    /// extra connection rather than 257.
+    pub max_subscribers: usize,
+    pub acting: ActingConfig,
+    /// Who may send a `Request::Control`.
+    pub policy: ControlPolicy,
+    /// The collectors' pause flag; `SetObserving` is its only writer.
+    pub observing: Arc<AtomicBool>,
+    /// `ts_us` of the most recent RESUME edge, published here and consumed by
+    /// `pipeline::run` to drop its pre-pause trigger window. `0` = never
+    /// resumed.
+    pub resume_at_us: Arc<AtomicI64>,
+    pub snapshot: Arc<Mutex<StatusSnapshot>>,
+    /// Durable sink for pause/resume boundary records.
+    pub store: Arc<dyn Store + Send + Sync>,
+    /// The realtime bus, carrying frames already serialised once.
+    pub events_tx: broadcast::Sender<EncodedFrame>,
+}
+
+impl ApiServer {
+    /// Bind the Unix-domain socket at `socket_path`, `chmod` it to `socket_mode`
+    /// so an unprivileged client (the bar; the daemon runs as root) can connect,
+    /// optionally `chown` it to `socket_owner_uid`, and serve [`Request`]s from
+    /// the shared snapshot until the task is aborted.
+    ///
+    /// `acting` gates the *acting class* of the control path (e.g.
+    /// `KickstartProxy`); the peer-credential [`ControlPolicy`] gates the whole
+    /// of it. Only this daemon runs the actuator, and only on an explicit
+    /// request — never automatically.
+    ///
+    /// A one-shot request (`Status`, `Incidents`, `Control`) is answered with a
+    /// single [`Response`] then the connection closes; a [`Request::Subscribe`]
+    /// instead holds the connection open and streams newline-JSON
+    /// [`StreamFrame`]s from a per-connection broadcast receiver until the client
+    /// disconnects (see [`stream_events`]).
+    ///
+    /// Runs forever; the daemon spawns it and `abort()`s it on shutdown. Every
+    /// connection task is *owned* by the accept loop (a [`tokio::task::JoinSet`],
+    /// not a detached `spawn`), so aborting or dropping this future tears down
+    /// the in-flight connections with it — which is also what releases their
+    /// subscriber slots. A stale socket file left by a previous run is removed
+    /// before binding (otherwise `bind` fails with `EADDRINUSE`).
+    pub async fn serve(self) -> std::io::Result<()> {
+        // A leftover socket file from a previous run makes bind() fail; clear it.
+        let _ = std::fs::remove_file(&self.socket_path);
+        let listener = UnixListener::bind(&self.socket_path)?;
+        // The root daemon must relax the mode so the logged-in user's UI can connect.
+        std::fs::set_permissions(
+            &self.socket_path,
+            std::fs::Permissions::from_mode(self.socket_mode),
+        )?;
+        // Socket hardening for the control path: when an owner uid is configured,
+        // chown the socket to it (operators pair this with mode 0600 when enabling
+        // acting so only the owner can send privileged commands). Best-effort: a
+        // chown failure is logged but never takes the daemon down. Note this is
+        // belt-and-braces only — authorisation itself is the peer-credential
+        // check in `control_request`, not the socket mode.
+        if let Some(uid) = self.socket_owner_uid {
+            match std::os::unix::fs::chown(&self.socket_path, Some(uid), None) {
+                Ok(()) => tracing::info!(uid, path = %self.socket_path, "status socket chowned"),
+                Err(e) => {
+                    tracing::warn!(error = %e, uid, path = %self.socket_path, "failed to chown status socket")
+                }
             }
         }
-    }
-    tracing::info!(
-        path = %socket_path,
-        mode = format!("{socket_mode:o}"),
-        acting = acting.enabled,
-        "status socket listening"
-    );
+        tracing::info!(
+            path = %self.socket_path,
+            mode = format!("{:o}", self.socket_mode),
+            acting = self.acting.enabled,
+            max_subscribers = self.max_subscribers,
+            "status socket listening"
+        );
 
-    loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let snapshot = Arc::clone(&snapshot);
-                let observing = Arc::clone(&observing);
-                let acting = acting.clone();
-                let events_tx = events_tx.clone();
-                // One task per connection. One-shot requests reply and close; a
-                // `Subscribe` holds the connection open and streams `Event` frames.
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_conn(stream, &snapshot, &observing, &acting, &events_tx).await
-                    {
-                        tracing::debug!(error = %e, "status socket connection error");
-                    }
-                });
+        let srv = Arc::new(self);
+        // One counter shared by every connection task: the daemon's live
+        // subscriber tally, guarding `max_subscribers`.
+        let subscribers = Arc::new(AtomicUsize::new(0));
+
+        // Connection tasks live in a set owned by this loop rather than detached, so
+        // dropping/aborting `serve` aborts them too.
+        let mut conns = tokio::task::JoinSet::new();
+        loop {
+            let accepted = listener.accept().await;
+            // Reap finished connection tasks so the set cannot grow without bound.
+            while conns.try_join_next().is_some() {}
+            match accepted {
+                Ok((stream, _addr)) => {
+                    let srv = Arc::clone(&srv);
+                    let subscribers = Arc::clone(&subscribers);
+                    // One task per connection. One-shot requests reply and close; a
+                    // `Subscribe` holds the connection open and streams frames.
+                    conns.spawn(async move {
+                        if let Err(e) = handle_conn(stream, &srv, &subscribers).await {
+                            tracing::debug!(error = %e, "status socket connection error");
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!(error = %e, "status socket accept failed"),
             }
-            Err(e) => tracing::warn!(error = %e, "status socket accept failed"),
         }
     }
 }
@@ -120,33 +333,55 @@ pub async fn serve(
 /// One-shot requests (`Status`, `Incidents`, `Control`) are answered from the
 /// in-memory snapshot with a single newline-JSON [`Response`], then the connection
 /// closes. A [`Request::Subscribe`] instead holds the connection open and streams
-/// filtered [`Event`] frames via [`stream_events`] until the client disconnects.
-/// The snapshot lock is held only long enough to clone what a response needs —
-/// never across an `.await`.
+/// [`StreamFrame`]s via [`stream_events`] until the client disconnects. The
+/// snapshot lock is held only long enough to clone what a response needs — never
+/// across an `.await`.
 async fn handle_conn(
     stream: UnixStream,
-    snapshot: &Mutex<StatusSnapshot>,
-    observing: &AtomicBool,
-    acting: &ActingConfig,
-    events_tx: &broadcast::Sender<Event>,
+    srv: &ApiServer,
+    subscribers: &Arc<AtomicUsize>,
 ) -> std::io::Result<()> {
+    // Peer credentials for the control gate, read from the WHOLE stream before
+    // the split (only a `UnixStream` exposes them; on macOS tokio implements
+    // this with `getpeereid(2)`). They describe the peer at connect(2) time.
+    // Read paths never consult it: the permissive default socket mode exists for
+    // unprivileged readers, and a read carries no authority.
+    let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
     let mut line = String::new();
-    if reader.read_line(&mut line).await? == 0 {
+    // Bounded: an unterminated request must not grow server memory on a
+    // world-connectable socket. Over-long frames fail to parse and are answered
+    // `Response::Error` below.
+    if (&mut reader)
+        .take(MAX_REQUEST_BYTES)
+        .read_line(&mut line)
+        .await?
+        == 0
+    {
         return Ok(()); // client closed without sending a request
     }
 
     let response = match serde_json::from_str::<Request>(&line) {
-        // Streaming path: hold the connection open and push filtered `Event`
-        // frames from a per-connection broadcast receiver until the client goes
-        // away. It never produces a single `Response`, so it returns directly.
+        // Streaming path: hold the connection open and push frames from a
+        // per-connection broadcast receiver until the client goes away. It never
+        // produces a single `Response`, so it returns directly.
         Ok(Request::Subscribe { kinds }) => {
-            return stream_events(&mut wr, kinds, events_tx).await;
+            return stream_events(
+                &mut reader,
+                &mut wr,
+                kinds,
+                &srv.events_tx,
+                &srv.observing,
+                subscribers,
+                srv.max_subscribers,
+            )
+            .await;
         }
-        Ok(Request::Status) => Response::Status(snapshot_clone(snapshot)),
+        Ok(Request::Status) => Response::Status(snapshot_clone(&srv.snapshot)),
         Ok(Request::Incidents { limit }) => {
-            let incidents = snapshot
+            let incidents = srv
+                .snapshot
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .incidents
@@ -157,58 +392,182 @@ async fn handle_conn(
             Response::Incidents(incidents)
         }
         Ok(Request::Control(cmd)) => {
-            Response::Control(control_response(cmd, observing, snapshot, acting))
+            let cx = ControlCtx {
+                policy: &srv.policy,
+                acting: &srv.acting,
+                observing: &srv.observing,
+                resume_at_us: &srv.resume_at_us,
+                snapshot: &srv.snapshot,
+                store: srv.store.as_ref(),
+                events_tx: &srv.events_tx,
+            };
+            Response::Control(control_request(cmd, peer_uid, &cx))
         }
         Err(e) => Response::Error(format!("bad request: {e}")),
     };
 
-    let mut buf = serde_json::to_vec(&response)?;
-    buf.push(b'\n');
+    let buf = observer_ipc::encode_frame(&response)?;
     wr.write_all(&buf).await?;
     wr.flush().await
 }
 
-/// Stream live [`Event`] frames to a held-open [`Request::Subscribe`] connection.
+/// One of the daemon's `max_subscribers` streaming slots, released on drop — so
+/// every exit path (client gone, write error, bus closed, task aborted at
+/// shutdown) frees it.
+struct SubscriberSlot(Arc<AtomicUsize>);
+
+impl SubscriberSlot {
+    /// Claim a slot, or `None` when the cap is reached. `fetch_update` rather
+    /// than check-then-increment: two connections racing at the boundary must
+    /// not both see `< max`.
+    fn claim(count: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()?;
+        Some(Self(Arc::clone(count)))
+    }
+}
+
+impl Drop for SubscriberSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Write one PER-CONNECTION frame (ack, gap, error). Bus frames are never
+/// written this way — they arrive already encoded once for everyone (see
+/// [`observer_ipc::EncodedFrame`]).
+async fn write_stream_frame<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    frame: &StreamFrame,
+) -> std::io::Result<()> {
+    let buf = observer_ipc::encode_frame(frame)?;
+    wr.write_all(&buf).await?;
+    wr.flush().await
+}
+
+/// Stream live [`StreamFrame`]s to a held-open [`Request::Subscribe`] connection.
 ///
-/// Subscribes a fresh receiver on the realtime bus and loops, writing each event
-/// as a newline-JSON frame to `wr`, filtered by `kinds` (`None` = every kind).
-/// The connection stays open for the loop's whole duration — this is push, not
-/// poll: the client subscribes once and the daemon pushes frames as they happen.
+/// Order is load-bearing:
+/// 1. reserve one of `max_subscribers` slots — over the cap the daemon writes a
+///    single decodable [`StreamFrame::Error`] and closes, rather than a bare
+///    close a client cannot tell from a crash;
+/// 2. create the broadcast receiver;
+/// 3. only then write the mandatory [`StreamFrame::Ready`] ack. The ack is the
+///    client's proof that the receiver exists, so nothing published after
+///    `observer_ipc::subscribe` returns can vanish into a
+///    publish-before-subscribe window.
+///
+/// Then loop, writing each bus frame's already-encoded bytes to `wr`, filtered by
+/// `kinds` (`None` = every kind). The filter applies to events only — the
+/// delivery rule lives in [`EncodedFrame::passes`], not here.
 ///
 /// Termination:
-/// - [`broadcast::error::RecvError::Lagged`] — the subscriber fell behind the bus;
-///   log the count and continue (a live tail may drop old events).
+/// - the client half-closed or vanished — the probe read on `rd` completes (EOF,
+///   an unexpected byte, or a read error); stop. Watching the read half is what
+///   makes a dead subscriber detectable while the stream is *quiet*: with
+///   collection paused, or a filter no event matches, no write ever happens, so
+///   the write error below would never fire and the task would leak its receiver
+///   and fd.
+/// - [`broadcast::error::RecvError::Lagged`] — the subscriber fell behind; a
+///   [`StreamFrame::Gap`] is written in band (always, filter or not) and the
+///   stream continues.
 /// - [`broadcast::error::RecvError::Closed`] — the bus is gone; stop.
-/// - a write/flush error — the client disconnected; stop.
-async fn stream_events<W: AsyncWrite + Unpin>(
+/// - a write/flush error — the client disconnected; log and stop.
+///
+/// Cancellation: `broadcast::Receiver::recv` is cancel-safe, so a `recv` dropped
+/// because the read branch won loses no event; `AsyncReadExt::read` is cancel-safe
+/// too, so a lost race the other way reads nothing.
+async fn stream_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    rd: &mut R,
     wr: &mut W,
     kinds: Option<Vec<EventKind>>,
-    events_tx: &broadcast::Sender<Event>,
+    events_tx: &broadcast::Sender<EncodedFrame>,
+    observing: &AtomicBool,
+    subscribers: &Arc<AtomicUsize>,
+    max_subscribers: usize,
 ) -> std::io::Result<()> {
+    // 1. Reserve a slot. Refused ⇒ ONE decodable error frame, then close.
+    let Some(_slot) = SubscriberSlot::claim(subscribers, max_subscribers) else {
+        tracing::warn!(
+            max = max_subscribers,
+            "subscriber cap reached; refusing subscription"
+        );
+        return write_stream_frame(
+            wr,
+            &StreamFrame::Error(StreamError {
+                ts_us: types::now_us(),
+                code: StreamErrorCode::TooManySubscribers,
+                message: format!("subscriber limit reached ({max_subscribers} concurrent)"),
+            }),
+        )
+        .await;
+    };
+
+    // 2. Receiver BEFORE the ack: the ack is the client's proof that this
+    //    receiver exists, so nothing published after `subscribe()` returns can
+    //    vanish into the old publish-before-subscribe window.
     let mut rx = events_tx.subscribe();
+
+    // 3. The mandatory ack, carrying the CURRENT collection state so a fresh
+    //    subscriber learns it immediately instead of inferring it from silence.
+    //    `observing` is read AFTER subscribing, deliberately: an edge landing in
+    //    between is then delivered twice (ack + bus frame) rather than lost, and
+    //    duplication is free because the frame carries an absolute state.
+    write_stream_frame(
+        wr,
+        &StreamFrame::Ready(Ready {
+            ts_us: types::now_us(),
+            kinds: kinds.clone(),
+            observing: observing.load(Ordering::Acquire),
+        }),
+    )
+    .await?;
+
+    // A fixed one-byte probe. The read half exists only to notice a subscriber
+    // that went away while the stream is quiet, and its content is never
+    // inspected — so nothing a client sends can grow the daemon's memory.
+    // `read_line` APPENDS, so any growable buffer here (however scoped) is an
+    // unbounded-memory hole on a world-connectable socket. `AsyncReadExt::read`
+    // is cancel-safe, so a lost race with `recv` reads nothing.
+    let mut probe = [0u8; 1];
     loop {
-        match rx.recv().await {
-            Ok(ev) => {
-                // Filter server-side: `None` passes every kind, `Some(list)` only
-                // the listed kinds.
-                let deliver = match &kinds {
-                    Some(ks) => ks.contains(&ev.kind()),
-                    None => true,
-                };
-                if !deliver {
+        let recv = tokio::select! {
+            recv = rx.recv() => recv,
+            // Any completion — Ok(0) EOF, Ok(1) protocol violation, or Err —
+            // means this subscriber is done. A `Subscribe` client sends nothing.
+            _ = rd.read(&mut probe) => break,
+        };
+        match recv {
+            Ok(frame) => {
+                // The delivery rule lives in `observer-ipc`, not here: stream
+                // frames that are not events are always delivered.
+                if !frame.passes(kinds.as_deref()) {
                     continue;
                 }
-                let mut buf = serde_json::to_vec(&ev)?;
-                buf.push(b'\n');
-                // A write/flush error means the client is gone — stop streaming.
-                if wr.write_all(&buf).await.is_err() || wr.flush().await.is_err() {
+                // A write/flush error means the client is gone — log which and stop.
+                if let Err(e) = wr.write_all(frame.bytes()).await {
+                    tracing::debug!(error = %e, "subscriber write failed; ending stream");
+                    break;
+                }
+                if let Err(e) = wr.flush().await {
+                    tracing::debug!(error = %e, "subscriber flush failed; ending stream");
                     break;
                 }
             }
-            // Slow subscriber: it missed `n` events. Acceptable for a live tail —
-            // log and keep going rather than tearing the connection down.
+            // The subscriber fell behind: tell it, in band, ALWAYS — a filtered
+            // subscriber has more need to know its stream has a hole, not less.
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(skipped = n, "event subscriber lagged; dropped old events");
+                let gap = StreamFrame::Gap(Gap {
+                    ts_us: types::now_us(),
+                    skipped: n,
+                });
+                if write_stream_frame(wr, &gap).await.is_err() {
+                    break;
+                }
             }
             // The broadcast sender was dropped (daemon shutting down): end the stream.
             Err(broadcast::error::RecvError::Closed) => break,
@@ -217,52 +576,159 @@ async fn stream_events<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Map a [`ControlCmd`] to its [`ControlResult`].
+/// The pieces [`control_request`] reads and mutates. Borrowed, so the focused
+/// unit tests build one on the stack — no socket, no runtime, no DB file.
+pub(crate) struct ControlCtx<'a> {
+    pub policy: &'a ControlPolicy,
+    pub acting: &'a ActingConfig,
+    pub observing: &'a AtomicBool,
+    pub resume_at_us: &'a AtomicI64,
+    pub snapshot: &'a Mutex<StatusSnapshot>,
+    pub store: &'a (dyn Store + Send + Sync),
+    pub events_tx: &'a broadcast::Sender<EncodedFrame>,
+}
+
+/// The single entry point for `Request::Control`: authorise the peer FIRST, then
+/// dispatch. Both `ControlCmd` arms are reachable only through here.
+pub(crate) fn control_request(
+    cmd: ControlCmd,
+    peer_uid: Option<u32>,
+    cx: &ControlCtx<'_>,
+) -> ControlResult {
+    match authorize_control(cx.policy, peer_uid) {
+        Ok(authorized) => control_response(cmd, authorized, cx),
+        Err(refusal) => {
+            tracing::warn!(
+                ?peer_uid,
+                ?cmd,
+                "control request refused: peer not authorised"
+            );
+            refusal
+        }
+    }
+}
+
+/// Dispatch an ALREADY-AUTHORISED command. Private, and requires a
+/// [`PeerAuthorized`], so "dispatch without a peer check" is unrepresentable.
 ///
-/// Two classes of command with different gating:
+/// Two classes of command with different gating, decided once by
+/// [`ControlAuthority::of`]:
 ///
 /// - **`SetObserving(b)` — benign self-control, NOT gated by `acting.enabled`.**
-///   It flips the observer's OWN collection on/off: it stores `b` into the shared
-///   `observing` flag the collectors check and mirrors it into the live snapshot
-///   (`snapshot.observing`) so the switch shows the real state. It never touches
+///   It flips the observer's OWN collection on/off and, on a real edge, records
+///   the boundary in both sinks (durable row + realtime frame). It never touches
 ///   sing-box or the network, so the acting gate does not apply — a client can
-///   pause/resume collection even with acting disabled. The daemon stays alive
-///   and the socket keeps serving throughout, so the switch can turn it back on.
+///   pause/resume collection even with acting disabled.
 ///
 /// - **Acting-class commands (e.g. `KickstartProxy`) — gated by
 ///   `acting.enabled`.** Safety invariant: when acting is disabled the command is
 ///   refused *without running anything* — no `launchctl` (or any other actuator)
-///   is ever invoked. Only when acting is explicitly enabled does `observerd` run
-///   the actuator, and only for this explicit request (never automatically).
+///   is ever invoked.
 fn control_response(
     cmd: ControlCmd,
-    observing: &AtomicBool,
-    snapshot: &Mutex<StatusSnapshot>,
-    acting: &ActingConfig,
+    authorized: PeerAuthorized,
+    cx: &ControlCtx<'_>,
 ) -> ControlResult {
+    // The acting gate is derived from ONE exhaustive classification of the
+    // command set, not from a per-arm decision, so a third command cannot pick a
+    // weaker gate. Peer authorisation already happened in `control_request`.
+    if ControlAuthority::of(&cmd) == ControlAuthority::Acting && !cx.acting.enabled {
+        return ControlResult {
+            ok: false,
+            message: "acting disabled".into(),
+        };
+    }
     match cmd {
-        // Self-control: not gated by acting. Set the flag + mirror into snapshot.
         ControlCmd::SetObserving(b) => {
-            observing.store(b, Ordering::Release);
-            snapshot.lock().unwrap_or_else(|e| e.into_inner()).observing = b;
+            // Flag + snapshot mirror under one lock: the snapshot mutex is the
+            // only thing serialising concurrent control connections and this is
+            // the sole writer of both, so no interleaving can leave them
+            // disagreeing. The resume epoch is published BEFORE the flag, so a
+            // collector that sees `observing == true` has already synchronised
+            // with it and no post-resume sample can reach the consumer while it
+            // still reads the old epoch. No `.await` inside — the guard must not
+            // be held across one, and no store write happens under it.
+            //
+            // `now_us()` and the bus publish are BOTH inside the guard, and must
+            // stay there. Sampling the clock outside it lets two opposite-direction
+            // toggles stamp in one order and take the mutex in the other, so the
+            // rows read back (`ORDER BY ts_us`) claim the daemon is collecting
+            // while it is in fact paused — with the gap invisible, which is the
+            // one offline guarantee this boundary record exists to provide.
+            // Publishing outside it lets a subscriber latch the opposite state for
+            // the same reason. `send` is synchronous, so neither costs an `.await`.
+            let transition = {
+                let mut snap = cx.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                let was = cx.observing.load(Ordering::Acquire);
+                if was == b {
+                    None
+                } else {
+                    let ts_us = types::now_us();
+                    if b {
+                        cx.resume_at_us.store(ts_us, Ordering::Release);
+                    }
+                    cx.observing.store(b, Ordering::Release);
+                    snap.observing = b;
+
+                    // ONE value, TWO sinks — built once so the DB row and the wire
+                    // frame cannot drift, and stamped with one `ts_us`.
+                    let edge = ObservingEdge {
+                        ts_us,
+                        observing: b,
+                        peer_uid: Some(authorized.uid()),
+                    };
+
+                    // Sink 2, realtime: the same value on the bus for held-open
+                    // subscribers. Unconditional — the `receiver_count()` guard the
+                    // sample path uses buys nothing for an operator-paced toggle.
+                    match EncodedFrame::encode(&StreamFrame::Observing(edge)) {
+                        Ok(frame) => {
+                            let _ = cx.events_tx.send(frame);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "failed to encode observing frame"),
+                    }
+                    Some(edge)
+                }
+            };
+            let label = if b { "on" } else { "off" };
+            let Some(edge) = transition else {
+                // Not a transition: no boundary row, no bus frame. A no-op click
+                // must not manufacture a gap in the record.
+                tracing::info!(observing = b, changed = false, "observing state unchanged");
+                return ControlResult {
+                    ok: true,
+                    message: format!("observing {label}"),
+                };
+            };
+            let ts_us = edge.ts_us;
+
+            // Sink 1, durable: the boundary that makes an operator pause
+            // attributable offline. A store failure is logged as a gap (never
+            // silently dropped) and reported in the message, but never fails the
+            // control: the pause really did take effect, and reporting
+            // `ok: false` would be a false statement about the daemon's state.
+            let mut note = String::new();
+            if let Err(e) = cx.store.write_observing_edge(&edge) {
+                tracing::error!(error = %e, observing = b,
+                    "store write failed; observing edge not recorded (gap logged)");
+                note = format!(" (boundary record failed: {e})");
+            }
+
+            tracing::info!(
+                observing = b,
+                ts_us,
+                peer_uid = authorized.uid(),
+                "observing state changed via control socket"
+            );
             ControlResult {
                 ok: true,
-                message: format!("observing {}", if b { "on" } else { "off" }),
+                message: format!("observing {label}{note}"),
             }
         }
-        // Acting-class: refused unless acting is explicitly enabled.
-        ControlCmd::KickstartProxy => {
-            if !acting.enabled {
-                return ControlResult {
-                    ok: false,
-                    message: "acting disabled".into(),
-                };
-            }
-            match acting::kickstart_proxy(&acting.singbox_service) {
-                Ok(message) => ControlResult { ok: true, message },
-                Err(message) => ControlResult { ok: false, message },
-            }
-        }
+        ControlCmd::KickstartProxy => match acting::kickstart_proxy(&cx.acting.singbox_service) {
+            Ok(message) => ControlResult { ok: true, message },
+            Err(message) => ControlResult { ok: false, message },
+        },
     }
 }
 
@@ -274,19 +740,90 @@ fn snapshot_clone(snapshot: &Mutex<StatusSnapshot>) -> StatusSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use observer_ipc::IncidentSummary;
+    use observer_ipc::{Event, IncidentSummary};
     use types::{GwVerdict, HostSample, LinkSample, RouteEvent, TcpVerdict};
+
+    /// The uid the tests' policies claim as the daemon's own — an arbitrary value
+    /// no real account on a dev machine or CI runner holds, so an authorised test
+    /// peer is authorised by the `daemon_uid` clause and nothing else.
+    const TEST_DAEMON_UID: u32 = 4242;
+
+    fn test_acting(enabled: bool) -> ActingConfig {
+        ActingConfig {
+            enabled,
+            singbox_service: "system/sing-box".into(),
+        }
+    }
+
+    /// A server wired for tests: an in-memory DuckDB, a small bus, fresh atomics,
+    /// and a [`ControlPolicy`] with an EXPLICIT `daemon_uid` — never
+    /// [`ControlPolicy::from_config`], so no syscall runs and no test depends on
+    /// the uid it happens to be running as. The fields are public, so a test
+    /// reads `events_tx` / `snapshot` / `observing` / `store` back off the value.
+    fn test_server(socket_path: &str, acting: ActingConfig, daemon_uid: u32) -> ApiServer {
+        // The extra receiver is dropped immediately: the subscription tests
+        // assert on `receiver_count()`, which must count only the server's own.
+        let (events_tx, _rx) = broadcast::channel(16);
+        ApiServer {
+            socket_path: socket_path.to_string(),
+            socket_mode: 0o666,
+            socket_owner_uid: None,
+            max_subscribers: MAX_SUBSCRIBERS,
+            acting,
+            policy: ControlPolicy {
+                daemon_uid,
+                socket_owner_uid: None,
+                control_uids: Vec::new(),
+            },
+            observing: Arc::new(AtomicBool::new(true)),
+            resume_at_us: Arc::new(AtomicI64::new(0)),
+            snapshot: Arc::new(Mutex::new(StatusSnapshot::default())),
+            store: Arc::new(store::DuckdbStore::in_memory().unwrap()),
+            events_tx,
+        }
+    }
+
+    /// Borrow a [`ControlCtx`] out of a test server, so the control tests exercise
+    /// exactly the context `handle_conn` builds.
+    fn test_ctx(srv: &ApiServer) -> ControlCtx<'_> {
+        ControlCtx {
+            policy: &srv.policy,
+            acting: &srv.acting,
+            observing: &srv.observing,
+            resume_at_us: &srv.resume_at_us,
+            snapshot: &srv.snapshot,
+            store: srv.store.as_ref(),
+            events_tx: &srv.events_tx,
+        }
+    }
+
+    /// A scratch directory for a socket-bound test.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("observerd-{tag}-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn wait_for_socket(sock: &std::path::Path) {
+        for _ in 0..200 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(sock.exists(), "socket was never created");
+    }
 
     /// End-to-end round-trip over a real `UnixListener` bound to a temp path,
     /// answered with the blocking `observer_ipc::query` client the bar uses.
     #[tokio::test]
     async fn serve_answers_status_and_incidents() {
-        let dir = std::env::temp_dir().join(format!("observerd-api-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("api");
         let sock = dir.join("observer.sock");
         let sock_str = sock.to_str().unwrap().to_string();
 
-        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        let snapshot = Arc::clone(&srv.snapshot);
         {
             let mut s = snapshot.lock().unwrap();
             s.generated_us = 42;
@@ -320,30 +857,8 @@ mod tests {
             ];
         }
 
-        let acting = ActingConfig {
-            enabled: false,
-            singbox_service: "system/sing-box".into(),
-        };
-        let observing = Arc::new(AtomicBool::new(true));
-        let (events_tx, _) = broadcast::channel(16);
-        let handle = tokio::spawn(serve(
-            sock_str.clone(),
-            0o666,
-            None,
-            acting,
-            observing,
-            snapshot.clone(),
-            events_tx,
-        ));
-
-        // Wait for the socket file to appear (bind + chmod complete).
-        for _ in 0..200 {
-            if sock.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(sock.exists(), "socket was never created");
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
 
         // Status: the whole snapshot, cloned from memory.
         let sp = sock_str.clone();
@@ -382,19 +897,122 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// D2, the pure core of the policy: every allow rule and the refusal, with no
+    /// syscall, no socket, no root and no console session involved.
+    #[test]
+    fn control_authorized_covers_every_rule() {
+        let base = ControlPolicy {
+            daemon_uid: 501,
+            socket_owner_uid: None,
+            control_uids: Vec::new(),
+        };
+
+        // root is always allowed; so is the daemon's own uid.
+        assert!(control_authorized(&base, 0, None));
+        assert!(control_authorized(&base, 501, None));
+        // The logged-in console user — the out-of-the-box menu-bar case.
+        assert!(control_authorized(&base, 600, Some(600)));
+        // An unrelated local uid on the mode-0666 socket is refused.
+        assert!(!control_authorized(&base, 502, None));
+        assert!(!control_authorized(&base, 502, Some(600)));
+
+        // The operator's explicit socket owner is allowed.
+        let owned = ControlPolicy {
+            socket_owner_uid: Some(502),
+            ..base.clone()
+        };
+        assert!(control_authorized(&owned, 502, None));
+
+        // The headless escape hatch: an explicitly listed uid.
+        let listed = ControlPolicy {
+            control_uids: vec![777],
+            ..base.clone()
+        };
+        assert!(control_authorized(&listed, 777, None));
+        assert!(!control_authorized(&base, 777, None));
+
+        // With no console session (SSH-only host, CI, container) the console rule
+        // authorises nobody: only root and the daemon's own uid remain.
+        for uid in [502u32, 600, 777] {
+            assert!(
+                !control_authorized(&base, uid, None),
+                "uid {uid} must be refused with no console session"
+            );
+        }
+        assert!(control_authorized(&base, 0, None));
+        assert!(control_authorized(&base, 501, None));
+    }
+
+    /// An authority decision fails closed: a peer whose credentials could not be
+    /// read (`getpeereid` failed) is refused, and nothing is mutated.
+    #[test]
+    fn control_refused_when_peer_credentials_unavailable() {
+        let srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
+        let result = control_request(ControlCmd::SetObserving(false), None, &cx);
+        assert!(!result.ok, "an unidentifiable peer must be refused");
+        assert!(
+            result.message.starts_with("control refused"),
+            "unexpected message: {}",
+            result.message
+        );
+        assert!(
+            srv.observing.load(Ordering::Acquire),
+            "a refused control must not touch the observing flag"
+        );
+    }
+
+    /// D2: EVERY control command is peer-gated, not just the acting-class one.
+    /// The `match` inside the loop is exhaustive on purpose — a third `ControlCmd`
+    /// variant fails to compile until it is added here and thus asserted.
+    #[test]
+    fn every_control_cmd_is_refused_for_an_unauthorised_peer() {
+        // No real account holds `u32::MAX - 1`, so the per-request `/dev/console`
+        // stat cannot accidentally authorise it on any host.
+        let stranger = Some(u32::MAX - 1);
+
+        for cmd in [ControlCmd::SetObserving(false), ControlCmd::KickstartProxy] {
+            // Exhaustive on purpose — a new variant breaks this arm list.
+            match cmd {
+                ControlCmd::SetObserving(_) | ControlCmd::KickstartProxy => {}
+            }
+            // Acting is ENABLED, so a refusal here can only come from the peer
+            // gate, never from the acting switch.
+            let srv = test_server("/nonexistent.sock", test_acting(true), 1);
+            let cx = test_ctx(&srv);
+            let result = control_request(cmd.clone(), stranger, &cx);
+            assert!(
+                !result.ok,
+                "{cmd:?} must be refused for an unauthorised peer"
+            );
+            assert!(
+                result.message.starts_with("control refused"),
+                "{cmd:?}: unexpected message {}",
+                result.message
+            );
+            assert!(
+                srv.observing.load(Ordering::Acquire),
+                "{cmd:?}: a refused control must not touch the observing flag"
+            );
+            assert_eq!(
+                srv.store
+                    .query_scalar_i64("SELECT count(*) FROM observing_edge")
+                    .unwrap(),
+                0,
+                "{cmd:?}: a refused pause must leave no boundary row behind"
+            );
+        }
+    }
+
     /// Safety invariant: with acting disabled, an acting-class control request is
-    /// refused without running anything. This exercises the gate directly (no
-    /// socket, no `launchctl`) so the "never act when disabled" branch is asserted
-    /// in isolation. The actuator itself is intentionally never invoked here.
+    /// refused without running anything — exercised through the real entry point
+    /// with an AUTHORISED peer, so the acting dimension is tested in isolation
+    /// from the peer gate. The actuator itself is intentionally never invoked.
     #[test]
     fn control_refused_when_acting_disabled() {
-        let acting = ActingConfig {
-            enabled: false,
-            singbox_service: "system/sing-box".into(),
-        };
-        let observing = AtomicBool::new(true);
-        let snapshot = Mutex::new(StatusSnapshot::default());
-        let result = control_response(ControlCmd::KickstartProxy, &observing, &snapshot, &acting);
+        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
+        let result = control_request(ControlCmd::KickstartProxy, Some(TEST_DAEMON_UID), &cx);
         assert!(
             !result.ok,
             "control must be refused when acting is disabled"
@@ -407,125 +1025,362 @@ mod tests {
     /// mirror the new state into the live snapshot so the switch shows reality.
     #[test]
     fn set_observing_not_gated_by_acting_and_updates_snapshot() {
-        let acting = ActingConfig {
-            enabled: false,
-            singbox_service: "system/sing-box".into(),
-        };
-        let observing = AtomicBool::new(true);
-        let snapshot = Mutex::new(StatusSnapshot::default());
+        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
 
         // Pause: succeeds despite acting being disabled; flag + snapshot go false.
-        let off = control_response(
-            ControlCmd::SetObserving(false),
-            &observing,
-            &snapshot,
-            &acting,
-        );
+        let off = control_request(ControlCmd::SetObserving(false), Some(TEST_DAEMON_UID), &cx);
         assert!(off.ok, "SetObserving must not be gated by acting");
         assert_eq!(off.message, "observing off");
-        assert!(!observing.load(Ordering::Acquire));
-        assert!(!snapshot.lock().unwrap().observing);
+        assert!(!srv.observing.load(Ordering::Acquire));
+        assert!(!srv.snapshot.lock().unwrap().observing);
 
         // Resume: flag + snapshot go true again.
-        let on = control_response(
-            ControlCmd::SetObserving(true),
-            &observing,
-            &snapshot,
-            &acting,
-        );
+        let on = control_request(ControlCmd::SetObserving(true), Some(TEST_DAEMON_UID), &cx);
         assert!(on.ok);
         assert_eq!(on.message, "observing on");
-        assert!(observing.load(Ordering::Acquire));
-        assert!(snapshot.lock().unwrap().observing);
+        assert!(srv.observing.load(Ordering::Acquire));
+        assert!(srv.snapshot.lock().unwrap().observing);
+    }
+
+    /// Every [`ControlCmd`] variant must declare its gating class explicitly, so a
+    /// future third variant cannot silently default to ungated: the `match` in
+    /// [`ControlAuthority::of`] is exhaustive, so adding a variant fails to
+    /// compile until someone decides its class.
+    #[test]
+    fn every_control_cmd_variant_declares_its_gating_class() {
+        for cmd in [ControlCmd::SetObserving(false), ControlCmd::KickstartProxy] {
+            // Exhaustive on purpose — a new variant breaks this arm list.
+            let expected = match cmd {
+                ControlCmd::SetObserving(_) => ControlAuthority::SelfControl,
+                ControlCmd::KickstartProxy => ControlAuthority::Acting,
+            };
+            assert_eq!(
+                ControlAuthority::of(&cmd),
+                expected,
+                "{cmd:?} declares the wrong authority class"
+            );
+        }
+    }
+
+    /// The D1↔D3 anti-drift test: one real edge produces exactly ONE durable
+    /// boundary row and exactly ONE realtime frame, and the two describe the same
+    /// transition (same `ts_us`, same state, same peer).
+    #[test]
+    fn set_observing_edge_writes_one_row_and_publishes_one_frame() {
+        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let mut rx = srv.events_tx.subscribe();
+        let cx = test_ctx(&srv);
+
+        let res = control_request(ControlCmd::SetObserving(false), Some(TEST_DAEMON_UID), &cx);
+        assert!(res.ok);
+        assert_eq!(res.message, "observing off");
+
+        // Sink 1: exactly one durable row, attributable to the authorised peer.
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM observing_edge")
+                .unwrap(),
+            1
+        );
+        let row_ts = srv
+            .store
+            .query_scalar_i64("SELECT ts_us FROM observing_edge")
+            .unwrap();
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT peer_uid FROM observing_edge")
+                .unwrap(),
+            i64::from(TEST_DAEMON_UID)
+        );
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM observing_edge WHERE observing = false")
+                .unwrap(),
+            1
+        );
+
+        // Sink 2: exactly one frame on the bus, describing the same transition.
+        let frame = rx.try_recv().expect("an edge must publish one frame");
+        let decoded: StreamFrame = serde_json::from_slice(frame.bytes()).unwrap();
+        match decoded {
+            StreamFrame::Observing(edge) => {
+                assert_eq!(
+                    edge.ts_us, row_ts,
+                    "row and frame disagree on the timestamp"
+                );
+                assert!(!edge.observing);
+                assert_eq!(edge.peer_uid, Some(TEST_DAEMON_UID));
+            }
+            other => panic!("expected an Observing frame, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "one edge must publish exactly one frame"
+        );
+    }
+
+    /// A `SetObserving` that does not change the state is not an edge: no row, no
+    /// frame — a no-op click must not manufacture a gap in the record. It still
+    /// reports success, because the requested state does hold.
+    #[test]
+    fn repeat_set_observing_writes_nothing_and_publishes_nothing() {
+        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let mut rx = srv.events_tx.subscribe();
+        let cx = test_ctx(&srv);
+
+        let first = control_request(ControlCmd::SetObserving(false), Some(TEST_DAEMON_UID), &cx);
+        assert!(first.ok);
+        let _ = rx.try_recv().expect("the first call is a real edge");
+
+        let second = control_request(ControlCmd::SetObserving(false), Some(TEST_DAEMON_UID), &cx);
+        assert!(second.ok, "a no-op still reports the requested state");
+        assert_eq!(second.message, "observing off");
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM observing_edge")
+                .unwrap(),
+            1,
+            "a no-op must not write a second boundary row"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a no-op must not publish a second frame"
+        );
+    }
+
+    /// The resume epoch is published only on a RESUME edge: `pipeline::run` keys
+    /// its window clear off this value moving, so a pause must not move it.
+    #[test]
+    fn resume_edge_publishes_the_resume_epoch() {
+        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
+
+        let off = control_request(ControlCmd::SetObserving(false), Some(TEST_DAEMON_UID), &cx);
+        assert!(off.ok);
+        assert_eq!(
+            srv.resume_at_us.load(Ordering::Acquire),
+            0,
+            "a pause is not a resume and must not move the resume epoch"
+        );
+
+        let on = control_request(ControlCmd::SetObserving(true), Some(TEST_DAEMON_UID), &cx);
+        assert!(on.ok);
+        assert!(
+            srv.resume_at_us.load(Ordering::Acquire) > 0,
+            "a resume must publish its epoch for the pipeline to observe"
+        );
+    }
+
+    /// D4: over the cap the daemon refuses with ONE decodable
+    /// `StreamFrame::Error` rather than a bare close a client cannot distinguish
+    /// from a crash — and a refused subscription consumes no slot.
+    #[tokio::test]
+    async fn subscriber_cap_refuses_with_a_decodable_error() {
+        let (events_tx, _rx) = broadcast::channel::<EncodedFrame>(16);
+        let observing = AtomicBool::new(true);
+        // Cap of 1, already taken.
+        let subscribers = Arc::new(AtomicUsize::new(1));
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut rd = tokio::io::empty();
+        stream_events(
+            &mut rd,
+            &mut server,
+            None,
+            &events_tx,
+            &observing,
+            &subscribers,
+            1,
+        )
+        .await
+        .unwrap();
+        drop(server);
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let frame: StreamFrame = serde_json::from_str(&line).unwrap();
+        match frame {
+            StreamFrame::Error(e) => {
+                assert_eq!(e.code, StreamErrorCode::TooManySubscribers);
+                assert!(!e.message.is_empty());
+            }
+            other => panic!("expected an Error frame, got {other:?}"),
+        }
+        assert_eq!(
+            subscribers.load(Ordering::Acquire),
+            1,
+            "a refused subscription must not consume a slot"
+        );
+    }
+
+    /// A hole in the stream is stream-integrity information, not an event: a
+    /// subscriber filtered to one kind must still be told it lost frames, or it
+    /// renders a contiguous timeline across a real gap.
+    #[tokio::test]
+    async fn gap_frame_is_delivered_to_a_filtered_subscriber() {
+        // A tiny bus so a burst the server has not been polled for overruns it.
+        let (events_tx, rx) = broadcast::channel::<EncodedFrame>(2);
+        // Only the server's own receiver may exist, or the burst below would be
+        // retained for this one too.
+        drop(rx);
+        let observing = Arc::new(AtomicBool::new(true));
+        let subscribers = Arc::new(AtomicUsize::new(0));
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let tx = events_tx.clone();
+        let obs = Arc::clone(&observing);
+        let subs = Arc::clone(&subscribers);
+        let task = tokio::spawn(async move {
+            let (mut rd, mut wr) = tokio::io::split(server);
+            stream_events(
+                &mut rd,
+                &mut wr,
+                Some(vec![EventKind::Route]),
+                &tx,
+                &obs,
+                &subs,
+                8,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        // The ack: reading it proves the server's receiver exists and the task is
+        // parked in `select!`.
+        reader.read_line(&mut line).await.unwrap();
+        assert!(matches!(
+            serde_json::from_str::<StreamFrame>(&line).unwrap(),
+            StreamFrame::Ready(_)
+        ));
+
+        // A burst with no `.await` in it: on the current-thread test runtime the
+        // server task cannot be polled, so it is guaranteed to fall behind.
+        for i in 0..8 {
+            let frame = EncodedFrame::encode(&StreamFrame::Event(Event::Host(HostSample {
+                ts_us: i,
+                load1: 0.0,
+                load5: 0.0,
+                load15: 0.0,
+            })))
+            .unwrap();
+            events_tx.send(frame).unwrap();
+        }
+
+        // Every event is a `Host`, which this subscriber filtered out — so the
+        // only frame that can arrive is the gap.
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        match serde_json::from_str::<StreamFrame>(&line).unwrap() {
+            StreamFrame::Gap(g) => assert!(g.skipped > 0, "a gap must report what was lost"),
+            other => panic!("expected a Gap frame, got {other:?}"),
+        }
+
+        task.abort();
+    }
+
+    /// D3(b): the mandatory ack carries the daemon's CURRENT collection state and
+    /// echoes the filter it accepted, so a fresh subscriber never has to infer
+    /// "paused" from silence.
+    #[tokio::test]
+    async fn subscribe_ack_reports_the_current_observing_state() {
+        let (events_tx, _rx) = broadcast::channel::<EncodedFrame>(16);
+        let observing = Arc::new(AtomicBool::new(false));
+        let subscribers = Arc::new(AtomicUsize::new(0));
+
+        let (client, server) = tokio::io::duplex(4096);
+        let tx = events_tx.clone();
+        let obs = Arc::clone(&observing);
+        let subs = Arc::clone(&subscribers);
+        let task = tokio::spawn(async move {
+            let (mut rd, mut wr) = tokio::io::split(server);
+            stream_events(
+                &mut rd,
+                &mut wr,
+                Some(vec![EventKind::Route]),
+                &tx,
+                &obs,
+                &subs,
+                8,
+            )
+            .await
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        match serde_json::from_str::<StreamFrame>(&line).unwrap() {
+            StreamFrame::Ready(ready) => {
+                assert!(!ready.observing, "the ack must report the paused state");
+                assert_eq!(ready.kinds, Some(vec![EventKind::Route]));
+            }
+            other => panic!("expected a Ready ack as the first frame, got {other:?}"),
+        }
+
+        task.abort();
     }
 
     /// End-to-end streaming subscription over a real `UnixListener`: a `Subscribe`
-    /// connection is held open and streamed filtered `Event` frames pushed on the
-    /// bus (push, not poll). The client subscribes once filtered to `Route`; a
-    /// `Host` event is dropped server-side by the filter while a `Route` event is
+    /// connection is held open and streamed filtered frames pushed on the bus
+    /// (push, not poll). The client subscribes once filtered to `Route`; a `Host`
+    /// event is dropped server-side by the filter while a `Route` event is
     /// delivered on the same held-open connection.
+    ///
+    /// There is deliberately NO wait on `events_tx.receiver_count()` here: the
+    /// `Ready` ack `observer_ipc::subscribe` consumes is written only *after* the
+    /// daemon created its receiver, so publishing the instant `subscribe` returns
+    /// must reach this subscriber. That absent spin loop IS the regression test
+    /// for the old publish-before-subscribe window.
     #[tokio::test]
     async fn serve_streams_filtered_subscription_events() {
-        let dir = std::env::temp_dir().join(format!("observerd-sub-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("sub");
         let sock = dir.join("observer.sock");
         let sock_str = sock.to_str().unwrap().to_string();
 
-        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
-        let acting = ActingConfig {
-            enabled: false,
-            singbox_service: "system/sing-box".into(),
-        };
-        let observing = Arc::new(AtomicBool::new(true));
-        let (events_tx, _) = broadcast::channel(16);
-        let handle = tokio::spawn(serve(
-            sock_str.clone(),
-            0o666,
-            None,
-            acting,
-            observing,
-            snapshot.clone(),
-            events_tx.clone(),
-        ));
-
-        // Wait for the socket file to appear (bind + chmod complete).
-        for _ in 0..200 {
-            if sock.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(sock.exists(), "socket was never created");
+        let srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        let events_tx = srv.events_tx.clone();
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
 
         // Open a live subscription filtered to Route only, on a blocking thread
         // (the client is deliberately tokio-free).
         let sp = sock_str.clone();
         let sub = tokio::task::spawn_blocking(move || {
-            observer_ipc::subscribe(
-                &sp,
-                &Request::Subscribe {
-                    kinds: Some(vec![EventKind::Route]),
-                },
-            )
+            observer_ipc::subscribe(&sp, Some(&[EventKind::Route]))
         })
         .await
         .unwrap()
         .unwrap();
-
-        // Wait until the server has created its broadcast receiver; a `send` before
-        // that would reach no one (broadcast only delivers to receivers that exist
-        // at send time).
-        for _ in 0..200 {
-            if events_tx.receiver_count() >= 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(
-            events_tx.receiver_count() >= 1,
-            "server never subscribed to the bus"
-        );
+        assert_eq!(sub.ready().kinds, Some(vec![EventKind::Route]));
 
         // A Host event is filtered out server-side; a Route event passes.
         events_tx
-            .send(Event::Host(HostSample {
-                ts_us: 1,
-                load1: 0.0,
-                load5: 0.0,
-                load15: 0.0,
-            }))
+            .send(
+                EncodedFrame::encode(&StreamFrame::Event(Event::Host(HostSample {
+                    ts_us: 1,
+                    load1: 0.0,
+                    load5: 0.0,
+                    load15: 0.0,
+                })))
+                .unwrap(),
+            )
             .unwrap();
         events_tx
-            .send(Event::Route(RouteEvent {
-                ts_us: 7,
-                kind: "iface".into(),
-                iface: Some("en0".into()),
-                detail: "up".into(),
-            }))
+            .send(
+                EncodedFrame::encode(&StreamFrame::Event(Event::Route(RouteEvent {
+                    ts_us: 7,
+                    kind: "iface".into(),
+                    iface: Some("en0".into()),
+                    detail: "up".into(),
+                })))
+                .unwrap(),
+            )
             .unwrap();
 
-        // The first frame the client receives is the Route event (Host filtered).
-        let ev = tokio::task::spawn_blocking(move || {
+        // The first frame after the ack is the Route event (Host filtered).
+        let frame = tokio::task::spawn_blocking(move || {
             let mut sub = sub;
             sub.next()
         })
@@ -533,10 +1388,60 @@ mod tests {
         .unwrap()
         .expect("subscription should yield a frame")
         .expect("frame should decode");
-        match ev {
-            Event::Route(r) => assert_eq!(r.ts_us, 7),
-            other => panic!("expected Route event, got {other:?}"),
+        match frame {
+            StreamFrame::Event(Event::Route(r)) => assert_eq!(r.ts_us, 7),
+            other => panic!("expected a Route event frame, got {other:?}"),
         }
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A subscriber that goes away while the stream is *quiet* must still be
+    /// noticed: nothing is ever published here, so the write path never runs and
+    /// only the watched read half can see the client's FIN. Dropping the client
+    /// must therefore end the server's stream task and release its broadcast
+    /// receiver (otherwise every open/close of the bar's events window leaks a
+    /// task, a receiver and an fd).
+    #[tokio::test]
+    async fn serve_drops_subscription_when_client_disconnects() {
+        let dir = temp_dir("eof");
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        let events_tx = srv.events_tx.clone();
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
+
+        let sp = sock_str.clone();
+        let sub = tokio::task::spawn_blocking(move || observer_ipc::subscribe(&sp, None))
+            .await
+            .unwrap()
+            .unwrap();
+        // No spin loop: the ack the client already consumed proves the server's
+        // receiver exists.
+        assert_eq!(
+            events_tx.receiver_count(),
+            1,
+            "the ack must not be written before the receiver exists"
+        );
+
+        // Client goes away. No event is ever published, so the FIN on the read
+        // half is the only signal the server can act on.
+        drop(sub);
+
+        for _ in 0..200 {
+            if events_tx.receiver_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            events_tx.receiver_count(),
+            0,
+            "server kept the subscription alive after the client disconnected"
+        );
 
         handle.abort();
         let _ = std::fs::remove_dir_all(&dir);

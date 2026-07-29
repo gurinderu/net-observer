@@ -45,7 +45,7 @@ use objc2_app_kit::{
 use objc2_foundation::NSString;
 
 use crate::status::{render_status, status_dot};
-use crate::ui::{Glance, PanelView, read_fresh};
+use crate::ui::{Glance, GlanceError, PanelView, read_fresh};
 use config::Config;
 use observer_ipc::StatusSnapshot;
 
@@ -103,7 +103,30 @@ pub fn run(config: Option<String>, open: bool) {
     // config file is malformed — fall back to defaults and surface a down daemon
     // in the panel as an "offline" state instead. `config` is the `--config` path
     // (its `socket_path` is the daemon socket the bar talks to).
-    let cfg = Config::load(config.as_deref()).unwrap_or_default();
+    //
+    // The failure this catches is now wider than a parse error: `Config::load`
+    // also fails when an explicitly named `--config` does not exist, is not a
+    // regular file, or is not readable. `observerd` treats that as fatal — a
+    // typo'd path must not have it bind a socket and open a database nobody asked
+    // for — but the bar deliberately does not: a GUI that refuses to start leaves
+    // the user with nothing, no panel and no way to see why.
+    //
+    // Non-fatal is not the same as silent: when the operator *named* a path and
+    // it failed to load, the default socket is almost certainly the wrong one,
+    // so the bar would render an unexplained "offline". Keep launching, but say
+    // why — on stderr and (below) in the panel.
+    let (cfg, config_msg) = match Config::load(config.as_deref()) {
+        Ok(c) => (c, None),
+        Err(e) => {
+            let msg = config
+                .as_deref()
+                .map(|path| format!("failed to load {path}: {e}"));
+            if let Some(msg) = &msg {
+                eprintln!("observer-bar: {msg}");
+            }
+            (Config::default(), msg)
+        }
+    };
     let socket_path = cfg.socket_path.clone();
 
     Application::new().run(move |cx: &mut App| {
@@ -121,6 +144,12 @@ pub fn run(config: Option<String>, open: bool) {
             Err(e) => (StatusSnapshot::default(), Some(e)),
         };
         let model = cx.new(|_| Glance::new(initial.clone(), initial_err, socket_path.clone()));
+        // A bad `--config` goes into `control_msg`, not `error`: the 3s refresh
+        // task rewrites `error` on every tick (it would be gone before anyone
+        // could read it) but never touches `control_msg`.
+        if let Some(msg) = config_msg {
+            model.update(cx, |g, _| g.control_msg = Some(msg));
+        }
 
         // 3. The status-item + its button. Keep the item retained for the whole
         //    app lifetime (see the refresh task, which owns it).
@@ -228,24 +257,33 @@ pub fn run(config: Option<String>, open: bool) {
 /// The menu-bar title is just the [`status_dot`] — a single colored dot, no text
 /// (Tailscale-style). The verbose detail still lives in the hover tooltip.
 ///
-/// Three shells wrap the pure [`status_dot`]/[`render_status`] renderers (which
+/// Four shells wrap the pure [`status_dot`]/[`render_status`] renderers (which
 /// describe a live snapshot only, so they stay untouched):
-/// - **offline** (last fetch failed, daemon down / socket absent): a grey `⚫`
-///   dot and a tooltip explaining why, rather than stale health shown as live.
+/// - **offline** ([`GlanceError::Unreachable`] — daemon down / socket absent): a
+///   grey `⚫` dot and a tooltip explaining why, rather than stale health shown as
+///   live.
+/// - **bad answer** ([`GlanceError::Protocol`]): the daemon *is* reachable — it
+///   answered, we just could not use the answer (an error frame, or a decode
+///   failure against an older daemon). A `⚠` glyph and a tooltip that says so,
+///   never "offline", which would be a false claim about the world.
 /// - **paused** (collection turned off via the panel switch): a `⏸` glyph and a
 ///   "paused" tooltip prefix — the daemon is alive but not collecting, so the
 ///   live health dot would be misleading.
 /// - **observing**: the live [`status_dot`] + [`render_status`].
 fn apply_glyph(button: &NSStatusBarButton, glance: &Glance) {
     let title: &str = match &glance.error {
-        Some(_) => "\u{26AB}", // ⚫ offline (daemon down) — dot only, no text
+        Some(GlanceError::Unreachable(_)) => "\u{26AB}", // ⚫ offline (daemon down)
+        Some(GlanceError::Protocol(_)) => "\u{26A0}",    // ⚠ up, but the answer is unusable
         None if !glance.snapshot.observing => "\u{23F8}", // ⏸ paused (collection off)
         None => status_dot(&glance.snapshot),
     };
     button.setTitle(&NSString::from_str(title));
 
     let tooltip = match &glance.error {
-        Some(e) => format!("observer offline\n{e}"),
+        Some(GlanceError::Unreachable(e)) => format!("observer offline\n{e}"),
+        Some(GlanceError::Protocol(e)) => {
+            format!("observer: daemon reachable, but its answer failed\n{e}")
+        }
         None if !glance.snapshot.observing => {
             format!("paused\n{}", render_status(&glance.snapshot))
         }

@@ -16,7 +16,8 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::Config;
 use observer_ipc::{
-    ControlCmd, ControlResult, Event, EventKind, IncidentSummary, Request, Response, StatusSnapshot,
+    ControlCmd, ControlResult, EventKind, IncidentSummary, Request, Response, StatusSnapshot,
+    StreamFrame,
 };
 use std::io::Write;
 use std::process::ExitCode;
@@ -51,17 +52,25 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Tail the daemon's live event stream, printing each event
-    /// (`HH:MM:SS  kind  detail`) as it happens until interrupted (Ctrl-C).
+    /// Tail the daemon's live event stream, printing each frame
+    /// (`HH:MM:SS  label  detail`) as it happens until interrupted (Ctrl-C).
     ///
     /// This is **pub/sub, not polling**: the CLI opens ONE `Subscribe`
-    /// connection over the socket and the daemon *pushes* every event down it
-    /// (samples as they are collected, incidents as triggers fire). With
-    /// `--kind` the daemon filters the stream server-side to that single kind;
-    /// without it, every kind is streamed. Graceful if the daemon is down or the
-    /// stream drops mid-tail; never panics.
+    /// connection over the socket and the daemon *pushes* every frame down it
+    /// (samples as they are collected, incidents as triggers fire, plus the
+    /// stream-integrity frames — the opening subscription ack, gaps, and
+    /// observing transitions). With `--kind` the daemon filters the *events*
+    /// server-side to that single kind; without it, every kind is streamed.
+    ///
+    /// The tail ALWAYS prints why it ended on stderr, but only a genuine failure
+    /// exits non-zero: a decode/IO error or a daemon-reported stream error. An
+    /// orderly end — the daemon closing the stream on shutdown/restart, or our
+    /// own output pipe going away (`| head`) — exits 0, so the command does not
+    /// break under a restart-on-nonzero supervisor. Never panics.
     Events {
         /// Restrict the stream to a single event kind. Omit for all kinds.
+        /// Stream-integrity frames (subscription ack, gaps, observing
+        /// transitions) are delivered regardless of this filter.
         #[arg(long)]
         kind: Option<EventKindArg>,
     },
@@ -160,9 +169,12 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Events { kind } => {
             let cfg = load_config(cli)?;
             // `None` (no `--kind`) subscribes to every kind; `Some(k)` filters
-            // server-side to that single kind.
+            // server-side to that single kind. Either way the stream-integrity
+            // frames (ack, gap, observing) are delivered.
             let kinds = kind.map(|k| vec![k.to_kind()]);
-            stream_events(&cfg.socket_path, kinds)?;
+            // The tail owns its own exit code: an orderly end is a success even
+            // though the stream stopped (see [`TailEnd`]).
+            return stream_events(&cfg.socket_path, kinds);
         }
         Command::Kickstart => {
             let cfg = load_config(cli)?;
@@ -231,21 +243,66 @@ fn fetch_incidents(socket_path: &str, limit: usize) -> Result<Vec<IncidentSummar
     }
 }
 
-/// Open ONE live event subscription over the socket and print each pushed event
-/// as it arrives (`HH:MM:SS  kind  detail`) until interrupted (Ctrl-C) or the
-/// daemon closes the stream. This is the pub/sub tail: the daemon *pushes* frames
-/// down a held-open connection; the CLI never polls. `kinds` filters server-side
-/// (`None` = every kind).
+/// Why an `events` tail ended.
+///
+/// Always reported on stderr; only a genuine failure exits non-zero, so the
+/// command stays usable under a restart-on-nonzero supervisor — an orderly
+/// daemon shutdown is not a failure of the tail.
+#[derive(Debug, Clone, PartialEq)]
+enum TailEnd {
+    /// The daemon closed the stream cleanly (shutdown / restart) — orderly.
+    DaemonClosed,
+    /// Our stdout went away (e.g. `| head`) — orderly.
+    OutputClosed,
+    /// The daemon reported a failure on the stream (`StreamFrame::Error`).
+    ServerError(String),
+    /// A frame failed to decode, or the socket read failed.
+    Failed(String),
+}
+
+impl TailEnd {
+    /// The one-line reason printed to stderr. Never empty: an unexplained exit
+    /// is exactly what this type exists to prevent.
+    fn message(&self) -> String {
+        match self {
+            TailEnd::DaemonClosed => "event stream ended: observerd closed the connection".into(),
+            TailEnd::OutputClosed => "event stream ended: output pipe closed".into(),
+            TailEnd::ServerError(m) => format!("event stream ended: observerd reported {m}"),
+            TailEnd::Failed(m) => format!("event stream ended: {m}"),
+        }
+    }
+
+    /// `SUCCESS` for the orderly variants, `FAILURE` for the two real failures.
+    fn exit_code(&self) -> ExitCode {
+        match self {
+            TailEnd::DaemonClosed | TailEnd::OutputClosed => ExitCode::SUCCESS,
+            TailEnd::ServerError(_) | TailEnd::Failed(_) => ExitCode::FAILURE,
+        }
+    }
+}
+
+/// Open ONE live subscription over the socket and print each pushed frame as it
+/// arrives (`HH:MM:SS  label  detail`) until interrupted (Ctrl-C) or the stream
+/// ends. This is the pub/sub tail: the daemon *pushes* frames down a held-open
+/// connection; the CLI never polls. `kinds` filters events server-side (`None` =
+/// every kind); stream-integrity frames arrive regardless. A `# times in UTC`
+/// header precedes the stream so an operator reading a tail knows the zone of the
+/// printed clocks, and the daemon's `Ready` ack is printed as the first line so
+/// the tail OPENS by stating the collection state instead of implying it.
+///
+/// Every ending is named on stderr (see [`TailEnd`]), and only a real failure —
+/// a decode/IO error, or a failure the daemon reported in band — exits non-zero.
 ///
 /// Never panics:
-/// - an absent / connection-refused socket (daemon down) becomes a clear `Err`
-///   (a non-zero exit), like the one-shot commands;
-/// - a mid-stream read/decode error (daemon restart/shutdown) prints a note and
-///   ends the tail cleanly;
+/// - an absent / connection-refused socket (daemon down) and a daemon-side
+///   refusal (e.g. the subscriber cap) both become a clear `Err` (a non-zero
+///   exit), like the one-shot commands;
+/// - a mid-stream read/decode error (daemon restart/shutdown) names itself and
+///   ends the tail;
 /// - a broken output pipe (e.g. `| head`) also ends the tail cleanly, rather than
 ///   panicking the way `println!` would on a write failure.
-fn stream_events(socket_path: &str, kinds: Option<Vec<EventKind>>) -> Result<()> {
-    let sub = observer_ipc::subscribe(socket_path, &Request::Subscribe { kinds }).map_err(|e| {
+fn stream_events(socket_path: &str, kinds: Option<Vec<EventKind>>) -> Result<ExitCode> {
+    let sub = observer_ipc::subscribe(socket_path, kinds.as_deref()).map_err(|e| {
         use std::io::ErrorKind::{ConnectionRefused, NotFound};
         if matches!(e.kind(), NotFound | ConnectionRefused) {
             anyhow!("observerd not running (socket {socket_path} unavailable)")
@@ -256,73 +313,58 @@ fn stream_events(socket_path: &str, kinds: Option<Vec<EventKind>>) -> Result<()>
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    // The per-frame clock is UTC (this crate is deliberately timezone-free, while
+    // the gpui bar renders local time); say so once so a tail is unambiguous.
+    // The ack line follows it: the state at subscribe time, stated not inferred.
+    let opening = format_frame_line(&StreamFrame::Ready(sub.ready().clone()));
+    let end = if writeln!(out, "# times in UTC").is_err() || writeln!(out, "{opening}").is_err() {
+        TailEnd::OutputClosed
+    } else {
+        tail_frames(sub, &mut out)
+    };
+    // NOT `eprintln!` — it panics if the write fails, and `observer-cli events
+    // 2>&1 | head` makes stderr the broken pipe, so the panic would land on
+    // exactly the case the doc above promises ends cleanly.
+    let _ = writeln!(std::io::stderr(), "{}", end.message());
+    Ok(end.exit_code())
+}
+
+/// Print frames until the stream ends, returning why it ended. Split out of
+/// [`stream_events`] so every exit path funnels through one [`TailEnd`].
+fn tail_frames(
+    sub: impl Iterator<Item = std::io::Result<StreamFrame>>,
+    out: &mut impl Write,
+) -> TailEnd {
     for item in sub {
         match item {
-            Ok(ev) => {
+            Ok(frame) => {
                 // `writeln!` (not `println!`) so a broken pipe ends the tail
                 // instead of panicking; stdout is line-buffered so each line
                 // flushes on its newline, keeping the tail live.
-                if writeln!(out, "{}", format_event_line(&ev)).is_err() {
-                    break;
+                if writeln!(out, "{}", format_frame_line(&frame)).is_err() {
+                    return TailEnd::OutputClosed;
+                }
+                // A daemon-side failure is a decodable frame, not a bare close:
+                // print it like any other, then end the tail naming its reason.
+                if let StreamFrame::Error(e) = &frame {
+                    return TailEnd::ServerError(format!("{}: {}", e.code.as_str(), e.message));
                 }
             }
-            // The daemon went away mid-stream (restart / shutdown) or a frame
-            // failed to decode. Note it and stop — the tail is over.
-            Err(e) => {
-                eprintln!("event stream ended: {e}");
-                break;
-            }
+            // A frame failed to decode, or the socket read failed. (A clean close
+            // by the daemon ends the iterator instead, and lands below.)
+            Err(e) => return TailEnd::Failed(e.to_string()),
         }
     }
-    Ok(())
+    TailEnd::DaemonClosed
 }
 
-/// One printed line for a live event: `HH:MM:SS  kind  detail`. Pure over its
-/// input (the clock is derived arithmetically) so it is unit-tested directly.
-fn format_event_line(ev: &Event) -> String {
-    format!(
-        "{}  {}  {}",
-        clock(ev.ts_us()),
-        kind_label(ev.kind()),
-        event_detail(ev)
-    )
-}
-
-/// The short lowercase label for an [`EventKind`] (matches the `--kind` values).
-fn kind_label(kind: EventKind) -> &'static str {
-    match kind {
-        EventKind::Link => "link",
-        EventKind::Proxy => "proxy",
-        EventKind::Dns => "dns",
-        EventKind::Route => "route",
-        EventKind::Host => "host",
-        EventKind::Incident => "incident",
-    }
-}
-
-/// The per-variant one-line detail for an event.
-fn event_detail(ev: &Event) -> String {
-    match ev {
-        Event::Link(l) => format!("gw={} direct={}", l.gw, l.direct),
-        Event::Proxy(p) => {
-            let tun = p
-                .tun_code
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            let sel = p.selector.clone().unwrap_or_else(|| "-".to_string());
-            format!("tun={tun} sel={sel}")
-        }
-        Event::Dns(d) => {
-            let ip = d.ip.clone().unwrap_or_else(|| "-".to_string());
-            format!("{}/{} {} {}", d.probe, d.server, d.verdict, ip)
-        }
-        Event::Route(r) => {
-            let iface = r.iface.clone().unwrap_or_else(|| "-".to_string());
-            format!("{} {} {}", r.kind, iface, r.detail)
-        }
-        Event::Host(h) => format!("load {:.2}/{:.2}/{:.2}", h.load1, h.load5, h.load15),
-        Event::Incident(i) => format!("{} {}", i.trigger_id, i.signature),
-    }
+/// One printed line for a stream frame: `HH:MM:SS  label  detail`, with the clock
+/// in **UTC** (see [`clock`]; the gpui bar renders the same frames in local time).
+/// The label and detail come from `observer-ipc` so the CLI tail and the bar spell
+/// every frame identically. Pure over its input (the clock is derived
+/// arithmetically) so it is unit-tested directly.
+fn format_frame_line(f: &StreamFrame) -> String {
+    format!("{}  {}  {}", clock(f.ts_us()), f.label(), f.detail())
 }
 
 /// Format an epoch-microsecond timestamp as a `HH:MM:SS` wall clock in **UTC**.
@@ -404,11 +446,21 @@ fn is_lock_error(msg: &str) -> bool {
     msg.to_ascii_lowercase().contains("lock")
 }
 
-/// Summarise the live [`StatusSnapshot`]: the latest sample per collector plus an
-/// incident count. Pure over its input so it is unit-tested without a socket.
+/// Summarise the live [`StatusSnapshot`]: the observing state, the latest sample
+/// per collector, plus an incident count. Pure over its input so it is unit-tested
+/// without a socket.
 fn format_status(snap: &StatusSnapshot) -> String {
     let mut out = String::new();
     out.push_str(&format!("generated_us   {}\n", snap.generated_us));
+
+    // While paused the daemon skips the probes entirely, so the samples below are
+    // frozen at whatever they were when collection stopped — say so rather than
+    // printing stale verdicts as if they were live.
+    out.push_str(if snap.observing {
+        "observing      on\n"
+    } else {
+        "observing      off (paused - samples below are stale)\n"
+    });
 
     match &snap.link {
         Some(l) => out.push_str(&format!(
@@ -424,7 +476,7 @@ fn format_status(snap: &StatusSnapshot) -> String {
                 .tun_code
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let sel = p.selector.clone().unwrap_or_else(|| "-".to_string());
+            let sel = p.selector.as_deref().unwrap_or("-");
             out.push_str(&format!(
                 "proxy          tun={tun} selector={sel} ts_us={}\n",
                 p.ts_us
@@ -514,10 +566,8 @@ fn push_row(out: &mut String, cells: &[String], widths: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{
-        DnsSample, DnsVerdict, GwVerdict, HostSample, LinkSample, ProxySample, RouteEvent,
-        TcpVerdict,
-    };
+    use observer_ipc::{Event, Gap, Ready, StreamError, StreamErrorCode};
+    use types::{GwVerdict, LinkSample, ObservingEdge, ProxySample, TcpVerdict};
 
     fn incident(id: &str, trigger: &str, opened: i64, closed: Option<i64>) -> IncidentSummary {
         IncidentSummary {
@@ -541,9 +591,10 @@ mod tests {
         assert!(out.contains("wedge") && out.contains("open"));
     }
 
-    #[test]
-    fn format_status_renders_snapshot() {
-        let snap = StatusSnapshot {
+    /// A populated snapshot (link + proxy, two incidents, one open) whose
+    /// observing state the caller picks.
+    fn snapshot(observing: bool) -> StatusSnapshot {
+        StatusSnapshot {
             generated_us: 100,
             link: Some(LinkSample {
                 ts_us: 42,
@@ -571,16 +622,32 @@ mod tests {
                 incident("i1", "wedge", 80, None),
                 incident("i2", "gw-drop", 60, Some(70)),
             ],
-            observing: true,
-        };
-        let out = format_status(&snap);
+            observing,
+        }
+    }
+
+    #[test]
+    fn format_status_renders_snapshot() {
+        let out = format_status(&snapshot(true));
         assert!(out.contains("generated_us   100"));
+        assert!(out.contains("observing      on"));
         assert!(out.contains("link           gw=OK direct=OK ts_us=42"));
         assert!(out.contains("proxy          tun=204 selector=auto ts_us=43"));
         assert!(out.contains("dns            (no data)"));
         assert!(out.contains("host           (no data)"));
         // Two incidents, one still open.
         assert!(out.contains("incidents      2 (1 open)"));
+    }
+
+    #[test]
+    fn format_status_marks_paused_snapshot_as_stale() {
+        // Paused: the daemon skips the probes, so the samples are frozen — the
+        // line must say so instead of letting them read as live.
+        let out = format_status(&snapshot(false));
+        assert!(out.contains("observing      off (paused - samples below are stale)"));
+        assert!(!out.contains("observing      on"));
+        // The rest of the snapshot still renders.
+        assert!(out.contains("link           gw=OK direct=OK ts_us=42"));
     }
 
     #[test]
@@ -666,8 +733,8 @@ mod tests {
     }
 
     #[test]
-    fn format_event_line_renders_ts_kind_detail() {
-        let link = Event::Link(LinkSample {
+    fn format_frame_line_renders_ts_kind_detail() {
+        let link = StreamFrame::Event(Event::Link(LinkSample {
             ts_us: 3_661_000_000,
             gw: GwVerdict::Ok,
             gw_rtt_ms: None,
@@ -678,75 +745,146 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
-        });
+        }));
         assert_eq!(
-            format_event_line(&link),
+            format_frame_line(&link),
             "01:01:01  link  gw=OK direct=FAIL"
         );
     }
 
     #[test]
-    fn format_event_line_renders_incident() {
-        let inc = Event::Incident(IncidentSummary {
+    fn format_frame_line_renders_incident() {
+        let inc = StreamFrame::Event(Event::Incident(IncidentSummary {
             id: "i1".into(),
             opened_us: 0,
             closed_us: None,
             trigger_id: "wedge".into(),
             signature: "tun dead".into(),
-        });
+        }));
         assert_eq!(
-            format_event_line(&inc),
+            format_frame_line(&inc),
             "00:00:00  incident  wedge tun dead"
         );
     }
 
     #[test]
-    fn event_detail_covers_each_variant() {
-        let proxy = Event::Proxy(ProxySample {
+    fn format_frame_line_renders_a_gap() {
+        // A hole in the stream is printed like any other frame — rendering a
+        // contiguous timeline across a real hole would be a lie.
+        let gap = StreamFrame::Gap(Gap {
             ts_us: 0,
-            server_ip: "1.2.3.4".into(),
-            tcp: TcpVerdict::Ok,
-            rtt_ms: None,
-            tun_code: Some(204),
-            selector: Some("auto".into()),
+            skipped: 12,
         });
-        assert_eq!(event_detail(&proxy), "tun=204 sel=auto");
+        assert_eq!(
+            format_frame_line(&gap),
+            "00:00:00  gap  12 events dropped (subscriber lagged)"
+        );
+    }
 
-        // Missing tun_code / selector fall back to a placeholder dash.
-        let proxy_bare = Event::Proxy(ProxySample {
+    #[test]
+    fn format_frame_line_renders_the_ready_ack() {
+        // The tail's opening line: the collection state stated, not inferred
+        // from silence.
+        let ready = StreamFrame::Ready(Ready {
             ts_us: 0,
-            server_ip: "1.2.3.4".into(),
-            tcp: TcpVerdict::Skip,
-            rtt_ms: None,
-            tun_code: None,
-            selector: None,
+            kinds: None,
+            observing: false,
         });
-        assert_eq!(event_detail(&proxy_bare), "tun=- sel=-");
+        assert_eq!(
+            format_frame_line(&ready),
+            "00:00:00  subscribed  collection off; kinds: all"
+        );
+    }
 
-        let dns = Event::Dns(DnsSample {
+    #[test]
+    fn format_frame_line_renders_an_observing_edge() {
+        let edge = StreamFrame::Observing(ObservingEdge {
             ts_us: 0,
-            probe: "nks".into(),
-            server: "sb".into(),
-            verdict: DnsVerdict::FakeIp,
-            ip: Some("198.18.0.1".into()),
-            rtt_ms: None,
+            observing: false,
+            peer_uid: Some(501),
         });
-        assert_eq!(event_detail(&dns), "nks/sb FAKEIP 198.18.0.1");
+        assert_eq!(
+            format_frame_line(&edge),
+            "00:00:00  observing  collection off"
+        );
+    }
 
-        let route = Event::Route(RouteEvent {
-            ts_us: 0,
-            kind: "iface".into(),
-            iface: Some("en0".into()),
-            detail: "up".into(),
-        });
-        assert_eq!(event_detail(&route), "iface en0 up");
+    #[test]
+    fn tail_end_messages_are_never_empty() {
+        // An unexplained exit is exactly what `TailEnd` exists to prevent, so
+        // every variant must have something to say.
+        for end in [
+            TailEnd::DaemonClosed,
+            TailEnd::OutputClosed,
+            TailEnd::ServerError("too-many-subscribers: limit reached".into()),
+            TailEnd::Failed("bad frame".into()),
+        ] {
+            assert!(end.message().starts_with("event stream ended: "));
+            assert!(end.message().len() > "event stream ended: ".len());
+        }
+    }
 
-        let host = Event::Host(HostSample {
+    #[test]
+    fn tail_end_exit_codes_split_orderly_from_failure() {
+        // `ExitCode` is opaque and not `PartialEq`, so compare its debug form
+        // against the two known constants.
+        let success = format!("{:?}", ExitCode::SUCCESS);
+        let failure = format!("{:?}", ExitCode::FAILURE);
+        assert_ne!(success, failure);
+        // Orderly: a daemon shutdown or a closed pipe is not a tail failure.
+        assert_eq!(format!("{:?}", TailEnd::DaemonClosed.exit_code()), success);
+        assert_eq!(format!("{:?}", TailEnd::OutputClosed.exit_code()), success);
+        // Real failures.
+        assert_eq!(
+            format!("{:?}", TailEnd::ServerError("x: y".into()).exit_code()),
+            failure
+        );
+        assert_eq!(
+            format!("{:?}", TailEnd::Failed("boom".into()).exit_code()),
+            failure
+        );
+    }
+
+    #[test]
+    fn tail_frames_reports_a_clean_close_as_daemon_closed() {
+        let mut out: Vec<u8> = Vec::new();
+        let end = tail_frames(std::iter::empty(), &mut out);
+        assert_eq!(end, TailEnd::DaemonClosed);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn tail_frames_prints_a_server_error_then_ends_with_its_reason() {
+        // The daemon reports a refusal IN BAND: it is printed like any frame,
+        // and then names itself as the reason the tail stopped.
+        let frames = vec![Ok(StreamFrame::Error(StreamError {
             ts_us: 0,
-            load1: 1.0,
-            load5: 2.0,
-            load15: 3.0,
-        });
-        assert_eq!(event_detail(&host), "load 1.00/2.00/3.00");
+            code: StreamErrorCode::TooManySubscribers,
+            message: "subscriber limit reached (256 concurrent)".into(),
+        }))];
+        let mut out: Vec<u8> = Vec::new();
+        let end = tail_frames(frames.into_iter(), &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "00:00:00  error  too-many-subscribers: subscriber limit reached \
+             (256 concurrent)\n"
+        );
+        assert_eq!(
+            end,
+            TailEnd::ServerError(
+                "too-many-subscribers: subscriber limit reached (256 concurrent)".into()
+            )
+        );
+    }
+
+    #[test]
+    fn tail_frames_reports_a_read_failure_as_failed() {
+        let frames = vec![Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad frame",
+        ))];
+        let mut out: Vec<u8> = Vec::new();
+        let end = tail_frames(frames.into_iter(), &mut out);
+        assert_eq!(end, TailEnd::Failed("bad frame".into()));
     }
 }
