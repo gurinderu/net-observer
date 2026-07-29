@@ -19,6 +19,12 @@ pub struct Config {
     /// enabling acting so only the owner can send privileged commands). Default
     /// `None` — the socket keeps the daemon's ownership.
     pub socket_owner_uid: Option<u32>,
+    /// Extra uids allowed to send a `Request::Control`, on top of root, the
+    /// daemon's own uid, `socket_owner_uid`, and the logged-in console user.
+    /// Empty by default. The escape hatch for a host with no graphical console
+    /// session (SSH-only / headless), where the console-user rule authorises
+    /// nobody. See `observerd::api::ControlPolicy`.
+    pub control_uids: Vec<u32>,
     pub collectors: Collectors,
     /// The write/control ("acting") path. Disabled by default.
     pub acting: ActingCfg,
@@ -86,13 +92,26 @@ pub struct PcapCfg {
 }
 
 /// The write/control ("acting") path — manual recovery actions the daemon runs
-/// as root. Disabled by default: with `enabled = false`, every control request
-/// is refused without running anything. Acting NEVER happens automatically — only
+/// as root. Disabled by default: with `enabled = false`, every *acting-class*
+/// control request (`ControlCmd::KickstartProxy`) is refused without running
+/// anything. Benign self-control (`ControlCmd::SetObserving`, which only
+/// pauses/resumes this daemon's own collection) is not gated by *this* switch.
+///
+/// This switch is NOT the whole story for the control path, and never was for
+/// authorisation: **every** `Request::Control`, of either class, must first pass
+/// the daemon's peer-credential check (`observerd::api::ControlPolicy`) — root,
+/// the daemon's own uid, `socket_owner_uid`, the logged-in console user, or a
+/// uid listed in `control_uids`. `SetObserving` is exempt from the *acting*
+/// gate, not from authorisation. Both gates are applied in exactly one place,
+/// `observerd::api::control_request`. Acting NEVER happens automatically — only
 /// on an explicit `Request::Control`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActingCfg {
-    /// Master switch for the control path. `false` (default) ⇒ refuse every
-    /// control request without executing anything.
+    /// Master switch for the ACTING CLASS of the control path only. `false`
+    /// (default) ⇒ refuse every acting-class control request
+    /// (`ControlCmd::KickstartProxy`) without executing anything. Benign
+    /// self-control (`ControlCmd::SetObserving`) is not gated by this switch —
+    /// but, like every control request, it still requires an authorised peer.
     pub enabled: bool,
     /// The `launchctl` service target restarted by `ControlCmd::KickstartProxy`
     /// (`launchctl kickstart -k <service>`).
@@ -107,6 +126,7 @@ impl Default for Config {
             socket_path: "/var/lib/observer/observer.sock".into(),
             socket_mode: 0o666,
             socket_owner_uid: None,
+            control_uids: Vec::new(),
             collectors: Collectors {
                 link: LinkCfg {
                     enabled: true,
@@ -147,13 +167,47 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Load defaults, then an optional TOML file, then `OBSERVER_*` env vars.
+    ///
+    /// When `path` is `Some`, the file **must exist and be a readable regular
+    /// file**: figment treats a missing file as an empty provider, so a typo'd
+    /// `--config` would otherwise silently yield defaults for every setting —
+    /// which for `observerd` means binding a socket and opening a database
+    /// nobody asked for. The merge also uses `Toml::file_exact`, not
+    /// `Toml::file`, which walks up parent directories looking for the name: a
+    /// relative `--config` must resolve where the operator pointed, never at an
+    /// ancestor's file they never named.
+    ///
+    /// `observer-bar` deliberately treats this error as non-fatal — a GUI that
+    /// refuses to start leaves the user with nothing — and surfaces the reason
+    /// in its panel and on stderr instead.
     // Signature is a fixed cross-crate interface (see plan Task 3), so the
     // large `figment::Error` cannot be boxed away here.
     #[allow(clippy::result_large_err)]
     pub fn load(path: Option<&str>) -> Result<Config, figment::Error> {
         let mut fig = Figment::from(Serialized::defaults(Config::default()));
         if let Some(p) = path {
-            fig = fig.merge(Toml::file(p));
+            let meta = std::fs::metadata(p)
+                .map_err(|e| figment::Error::from(format!("config file `{p}`: {e}")))?;
+            if !meta.is_file() {
+                return Err(figment::Error::from(format!(
+                    "config path `{p}` is not a regular file"
+                )));
+            }
+            // Read it ONCE, here, and hand figment the bytes. Probing the path and
+            // then letting figment re-open it leaves a window in which the file can
+            // be unlinked (routine for unlink-then-write config management): the
+            // re-open finds nothing, a file provider yields an empty map rather than
+            // an error, and `load` returns pure defaults — silently binding the
+            // default socket and opening the default DB, which is the exact outcome
+            // requiring the path to exist is meant to prevent.
+            // `is_file` above is what keeps this from blocking forever on a FIFO.
+            let body = std::fs::read_to_string(p).map_err(|e| {
+                figment::Error::from(format!("config file `{p}` is not readable: {e}"))
+            })?;
+            // `Toml::string`, not `Toml::file*`: no path means no ancestor-directory
+            // search, so a named path can never resolve to a file nobody named.
+            fig = fig.merge(Toml::string(&body));
         }
         fig.merge(Env::prefixed("OBSERVER_").split("__")).extract()
     }
@@ -163,7 +217,7 @@ impl Config {
 mod tests {
     use super::*;
     #[test]
-    fn defaults_apply_when_file_absent() {
+    fn defaults_apply_when_no_config_path() {
         let c = Config::load(None).unwrap();
         assert!(c.collectors.link.enabled);
         assert_eq!(c.collectors.link.interval.as_secs(), 15);
@@ -196,7 +250,8 @@ mod tests {
     }
     #[test]
     fn acting_disabled_by_default() {
-        // Safety invariant: acting is OFF unless explicitly enabled.
+        // Asserts the default value only: `acting.enabled` ships off. What that
+        // switch gates lives in `observerd::api::control_response`.
         let c = Config::load(None).unwrap();
         assert!(!c.acting.enabled);
         assert_eq!(c.acting.singbox_service, "system/sing-box");
@@ -218,5 +273,91 @@ mod tests {
         assert!(c.acting.enabled);
         assert_eq!(c.acting.singbox_service, "system/mihomo");
         assert_eq!(c.socket_owner_uid, Some(501));
+    }
+    #[test]
+    fn missing_named_config_is_rejected() {
+        // An explicitly named file that does not exist is an error, not a
+        // silent fall-back to defaults: figment treats a missing file as an
+        // empty provider, which would hide a typo'd `--config` completely.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("nope.toml");
+        let path = p.to_str().unwrap();
+        let err = Config::load(Some(path)).unwrap_err();
+        assert!(
+            err.to_string().contains(path),
+            "error should name the path: {err}"
+        );
+    }
+    #[test]
+    fn directory_as_config_is_rejected() {
+        // `File::open` on a directory succeeds on macOS, so the `is_file` check
+        // is what catches this.
+        let dir = tempfile::tempdir().unwrap();
+        let err = Config::load(Some(dir.path().to_str().unwrap())).unwrap_err();
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected error: {err}"
+        );
+    }
+    #[test]
+    fn named_config_is_not_searched_up_the_tree() {
+        // `Toml::file` walks up parent directories looking for the file name; the
+        // bytes we read ourselves cannot. A named path must resolve where the
+        // operator pointed, never at an ancestor's file they never named.
+        //
+        // The ancestor file carries a DIFFERENT value from the named one, so a
+        // resurrected search is visible in the result. An earlier version of this
+        // test pointed at a path that did not exist, so `load` bailed on the
+        // existence check before provider construction was ever reached — it
+        // passed whether or not the search was disabled, and guarded nothing.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("o.toml"),
+            "[collectors.link]\ninterval = \"5s\"\n",
+        )
+        .unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let named = sub.join("o.toml");
+        std::fs::write(&named, "[collectors.link]\ninterval = \"9s\"\n").unwrap();
+
+        let c = Config::load(Some(named.to_str().unwrap())).unwrap();
+        assert_eq!(
+            c.collectors.link.interval.as_secs(),
+            9,
+            "loaded the ancestor's config instead of the named one"
+        );
+    }
+
+    #[test]
+    fn named_config_that_does_not_exist_is_an_error() {
+        // The existence pre-check, stated separately from the search behaviour
+        // above so neither test can silently start covering for the other.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("o.toml"),
+            "[collectors.link]\ninterval = \"5s\"\n",
+        )
+        .unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let missing = sub.join("o.toml");
+        let err = Config::load(Some(missing.to_str().unwrap())).unwrap_err();
+        assert!(
+            err.to_string().contains("o.toml"),
+            "error should name the config path: {err}"
+        );
+    }
+    #[test]
+    fn control_uids_default_empty() {
+        assert!(Config::load(None).unwrap().control_uids.is_empty());
+    }
+    #[test]
+    fn control_uids_can_be_set_via_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        std::fs::write(&p, "control_uids = [501, 502]\n").unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert_eq!(c.control_uids, vec![501, 502]);
     }
 }
