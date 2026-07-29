@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use collector_core::Source;
 
@@ -38,6 +39,166 @@ use types::{BlobRef, Sample};
 
 /// Capacity of the recent-sample window handed to the trigger engine.
 const WINDOW_CAP: usize = 64;
+
+/// How long, in MONOTONIC time, one resume edge's drain filter may stay open.
+///
+/// The filter exists only to keep samples that were already queued when the pause
+/// began — plus the rare straggler from a probe that spanned both edges — out of
+/// the freshly cleared window; that backlog drains in milliseconds. Measured with
+/// [`Instant`], never the wall clock, precisely so an NTP correction or a manual
+/// `date` can neither extend it nor stall it. Note [`Instant`] is suspend-excluding
+/// on Apple platforms, so a sleep/wake immediately after a resume edge DOES stall
+/// this deadline — which is why the clock-free
+/// [`RESUME_DRAIN_MAX_SAMPLES`] cap, not this one, is what makes the gate
+/// incapable of filtering for ever.
+const RESUME_DRAIN: Duration = Duration::from_secs(5);
+
+/// Hard cap on how many samples ONE resume edge may keep out of the window,
+/// whatever any clock says. The sample channel cannot hold more than
+/// [`crate::CHANNEL_CAP`], so twice that is a generous clock-free backstop:
+/// beyond it the timestamps are lying, not the backlog deep.
+const RESUME_DRAIN_MAX_SAMPLES: u32 = 2 * (crate::CHANNEL_CAP as u32);
+
+/// Why a [`ResumeGate`] stopped filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateClose {
+    /// The monotonic drain window elapsed. With drops still accumulating this IS
+    /// the clock-anomaly signal: the samples' wall clock never caught up with the
+    /// resume epoch, which is what a backwards step looks like from here.
+    Deadline,
+    /// [`RESUME_DRAIN_MAX_SAMPLES`] samples were kept out — far more than any real
+    /// in-flight set, so the same anomaly by a different bound.
+    Cap,
+    /// A newer resume edge replaced this one before either bound was reached.
+    Superseded,
+}
+
+impl GateClose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline",
+            Self::Cap => "cap",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+/// The BOUNDED post-resume drain filter.
+///
+/// A resume edge clears the recent-sample window; samples still queued or in
+/// flight from before the pause must not be pushed back into it, or they
+/// reinstate the very continuity the clear removed. Those samples are identified
+/// by WALL clock (`Sample::ts_us()` against the control path's resume `ts_us`) —
+/// there is nothing else to compare, since a `Sample` carries no monotonic stamp.
+///
+/// A wall-clock comparison ALONE is a latent total-detection outage: one backwards
+/// step larger than the collector cadence makes `ts_us < resume_us` hold for every
+/// future sample, and the consumer then skips `window.push` and `engine.on_sample`
+/// for ever. So the wall clock decides only WHICH sample is stale; how long the
+/// filter may be applied AT ALL is bounded by a MONOTONIC [`Instant`] deadline
+/// ([`RESUME_DRAIN`]) and a drop count ([`RESUME_DRAIN_MAX_SAMPLES`]). When either
+/// bound is reached the gate closes for good — until the next resume edge — and
+/// every sample is admitted again. The failure mode is "briefly over-accept",
+/// never "silently stop detecting".
+///
+/// Evaluated LAZILY, at sample time only: no timer and no task. An armed gate on a
+/// silent stream has by construction held nothing back.
+struct ResumeGate {
+    /// The resume epoch this consumer has applied (wall-clock `ts_us`;
+    /// `0` = never resumed).
+    applied_resume_us: i64,
+    /// Monotonic deadline; `None` once the gate is closed.
+    open_until: Option<Instant>,
+    /// Samples this edge has kept out of the window.
+    dropped: u32,
+}
+
+impl ResumeGate {
+    /// A gate that has never seen a resume edge.
+    fn new() -> Self {
+        Self {
+            applied_resume_us: 0,
+            open_until: None,
+            dropped: 0,
+        }
+    }
+
+    /// The resume epoch this gate has applied (`0` = never resumed).
+    fn applied_resume_us(&self) -> i64 {
+        self.applied_resume_us
+    }
+
+    /// Samples kept out of the window since the last edge. The consumer counts
+    /// its own drops (for the exit line) and the gate logs its own totals, so
+    /// this reader exists for the tests that pin the cap — `#[cfg(test)]` rather
+    /// than an `allow(dead_code)` that would also hide a real future orphan.
+    #[cfg(test)]
+    fn dropped(&self) -> u32 {
+        self.dropped
+    }
+
+    /// Observe the epoch the control path publishes. Returns `true` on a real
+    /// RESUME edge — the caller must then clear its window and re-arm its triggers
+    /// — and (re)opens the drain filter for [`RESUME_DRAIN`] from `now`.
+    ///
+    /// Compared with `!=`, not `>`: an epoch that moves BACKWARDS because the
+    /// clock stepped is still a real edge and must still clear the window.
+    fn observe_edge(&mut self, resume_us: i64, now: Instant) -> bool {
+        if resume_us == self.applied_resume_us {
+            return false;
+        }
+        // A previous edge's unreported drops must not vanish.
+        self.close(GateClose::Superseded);
+        self.applied_resume_us = resume_us;
+        self.open_until = Some(now + RESUME_DRAIN);
+        self.dropped = 0;
+        true
+    }
+
+    /// Whether the sample stamped `ts_us` must be kept OUT of the recent-sample
+    /// window. `true` only while the gate is open AND the sample predates the
+    /// applied resume epoch; a closed gate admits everything.
+    fn should_drop(&mut self, ts_us: i64, now: Instant) -> bool {
+        let Some(deadline) = self.open_until else {
+            return false;
+        };
+        if now >= deadline {
+            self.close(GateClose::Deadline);
+            return false;
+        }
+        if ts_us >= self.applied_resume_us {
+            return false;
+        }
+        self.dropped += 1;
+        if self.dropped == 1 {
+            tracing::warn!(
+                ts_us,
+                resume_us = self.applied_resume_us,
+                "sample predates the resume boundary; kept out of the trigger window \
+                 (still persisted and published)"
+            );
+        }
+        if self.dropped >= RESUME_DRAIN_MAX_SAMPLES {
+            self.close(GateClose::Cap);
+        }
+        true
+    }
+
+    /// Close the gate and report what it cost, exactly once per edge.
+    fn close(&mut self, reason: GateClose) {
+        if self.open_until.take().is_none() {
+            return;
+        }
+        if self.dropped > 0 {
+            tracing::warn!(
+                dropped = self.dropped,
+                resume_us = self.applied_resume_us,
+                reason = reason.as_str(),
+                "post-resume drain closed; samples kept out of the trigger window"
+            );
+        }
+    }
+}
 
 /// Drain `rx` until the stream closes, persisting and evaluating each sample and
 /// keeping the live [`StatusSnapshot`] current.
@@ -62,11 +223,46 @@ const WINDOW_CAP: usize = 64;
 /// [`SnapshotHandler`] on fire.
 ///
 /// On a RESUME edge — signalled by `resume_at_us` moving — the recent-sample
-/// window is dropped before the next sample is pushed, so the count-based
-/// conditions (`Wedge`, `GwChange`) can never span an observation gap: two bad
-/// pre-pause ticks plus one post-resume tick must not read as "tun dead 3
-/// ticks". The trigger engine's re-arm/latch state is deliberately untouched — a
-/// trigger not re-firing across a pause is intended dedup, not a bug.
+/// window is dropped before the next sample is pushed
+/// ([`RecentWindow::clear_for_resume`]), so the count-based conditions (`Wedge`)
+/// can never span an observation gap: two bad pre-pause ticks plus one
+/// post-resume tick must not read as "tun dead 3 ticks".
+///
+/// A RESUME edge RE-OPENS detection; it does not dedup it. The recent-sample
+/// window is cleared and every trigger is re-armed
+/// ([`TriggerEngine::rearm_all`]), so a fault that is still present when
+/// collection resumes is recorded again — as a NEW incident belonging to the new
+/// observation session, not as a duplicate of the pre-pause one. What a resume
+/// does NOT do is reset the firing budget: `last_fire_us` survives it, so each
+/// trigger still fires at most once per `backoff_us` and a toggled switch cannot
+/// storm the incident log. The `observing_edge` rows bound the gap between the
+/// two records.
+///
+/// Exactly one thing survives [`RecentWindow::clear_for_resume`]: the newest link
+/// sample, kept as the gateway-CHANGE BASIS and reachable ONLY through
+/// `prev_link` / `prev_link_with_provenance` — never through `last_link`,
+/// `recent_link` or any other accessor. `GwChange` can therefore still fire, and
+/// [`FreezePcapHandler`] still freeze the pcap ring, for a gateway that changed
+/// DURING the pause (the ring is started once in `main` and is not gated by
+/// `observing`, so it keeps capturing while collection is paused — the packets
+/// around that change MAY still be in it at resume, for a pause shorter than the
+/// ring's retention; a long pause on a busy link freezes noise). `Wedge` still loses
+/// its entire history and still cannot span the gap. A change measured against
+/// the basis is reported as `LinkProvenance::AcrossGap` and the incident detail
+/// ends in " (across an observation gap)", so an offline reader never mistakes it
+/// for two consecutive ticks.
+///
+/// Which sample is stale is decided on the WALL clock — a [`Sample`] carries no
+/// other time, and the resume epoch is a `types::now_us()` taken by the control
+/// path. How long that comparison may be applied AT ALL is bounded by a MONOTONIC
+/// [`Instant`] deadline (`RESUME_DRAIN`) and a drop cap
+/// (`RESUME_DRAIN_MAX_SAMPLES`) — see `ResumeGate`. When either bound is
+/// reached the gate closes until the next resume edge and every sample reaches
+/// the window again, so a backwards clock step (NTP, sleep/wake, `date`) cannot
+/// end detection. Samples kept out of the window are still written to DuckDB and
+/// still published on the bus; the first drop of an episode and the episode total
+/// are logged at `warn`, and the process total on the consumer's exit line. The
+/// failure mode is "briefly over-accept", never "silently stop detecting".
 pub async fn run(
     store: Arc<DuckdbStore>,
     mut engine: TriggerEngine,
@@ -78,8 +274,13 @@ pub async fn run(
     resume_at_us: Arc<AtomicI64>,
 ) {
     let mut window = RecentWindow::new(WINDOW_CAP);
-    // The resume edge this consumer has already applied.
-    let mut applied_resume_us: i64 = 0;
+    // The bounded post-resume drain filter, replacing the raw
+    // `now_us < applied_resume_us` comparison a single backwards clock step could
+    // otherwise make true for ever.
+    let mut gate = ResumeGate::new();
+    // Every sample this process kept out of the window, for the exit line: a
+    // filtered sample must be countable, not merely logged once.
+    let mut dropped_pre_resume: u64 = 0;
     while let Some(sample) = rx.recv().await {
         let now_us = sample.ts_us();
         if let Err(e) = store.write_sample(&sample) {
@@ -123,27 +324,36 @@ pub async fn run(
             }
         }
 
-        let resume_us = resume_at_us.load(Ordering::Acquire);
-        if resume_us != applied_resume_us {
-            window.clear();
-            applied_resume_us = resume_us;
+        // One MONOTONIC reading per sample, shared by the edge check and the gate,
+        // so a sample is never timed against two different instants.
+        let now = Instant::now();
+        if gate.observe_edge(resume_at_us.load(Ordering::Acquire), now) {
+            // Forget the samples, KEEP the gateway-change basis (see
+            // `RecentWindow::clear_for_resume`), and re-open detection.
+            window.clear_for_resume();
+            engine.rearm_all();
             tracing::info!(
-                resume_us,
-                "collection resumed; recent-sample window cleared"
+                resume_us = gate.applied_resume_us(),
+                "collection resumed; window cleared (gateway-change basis kept), triggers re-armed"
             );
         }
         // A sample produced before the resume is on the far side of the
-        // observation gap: still persisted and still published above (it is a
-        // real observation), but never seeded into the fresh window, so one
-        // stale in-flight sample cannot reinstate the very continuity the clear
-        // just removed.
-        if now_us < applied_resume_us {
+        // observation gap: still persisted and still published above (it is a real
+        // observation), but kept out of the fresh window so one stale in-flight
+        // sample cannot reinstate the continuity the clear removed. BOUNDED — see
+        // `ResumeGate`: it cannot discard indefinitely, and every drop is counted
+        // and logged.
+        if gate.should_drop(now_us, now) {
+            dropped_pre_resume = dropped_pre_resume.saturating_add(1);
             continue;
         }
         window.push(sample);
         engine.on_sample(&window, now_us);
     }
-    tracing::info!("sample stream closed; pipeline consumer exiting");
+    tracing::info!(
+        dropped_pre_resume,
+        "sample stream closed; pipeline consumer exiting"
+    );
 }
 
 /// Interval cadence: drive a timer loop, `await`ing `collect()` on each tick.
@@ -407,11 +617,20 @@ mod tests {
     use super::*;
     use collector_host::HostCollector;
     use macos::HostLoad;
-    use std::time::Duration;
     use triggers::conditions::{GwChange, GwDrop, Wedge};
     use triggers::engine::Trigger;
     use triggers::handlers::RecordHandler;
     use types::{GwVerdict, HostSample, LinkSample, ProxySample, TcpVerdict};
+
+    /// A fake freezer standing in for `macos::PcapRing` (no tcpdump / root
+    /// needed): it returns a plausible ring-file path without touching the
+    /// filesystem. Shared by every test that asserts the ring was frozen.
+    struct FakeFreezer;
+    impl PcapFreezer for FakeFreezer {
+        fn freeze(&self, dest_dir: &Path) -> Vec<PathBuf> {
+            vec![dest_dir.join("ring.pcap0")]
+        }
+    }
 
     /// Decode a bus payload back into the frame it was built from. The bus
     /// carries bytes on purpose (one encode for N subscribers), so the tests
@@ -490,15 +709,6 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_freezes_pcap_on_gw_change() {
-        // A fake freezer stands in for `macos::PcapRing` (no tcpdump / root needed):
-        // it returns a plausible ring-file path without touching the filesystem.
-        struct FakeFreezer;
-        impl PcapFreezer for FakeFreezer {
-            fn freeze(&self, dest_dir: &Path) -> Vec<PathBuf> {
-                vec![dest_dir.join("ring.pcap0")]
-            }
-        }
-
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
         let freezer: Arc<dyn PcapFreezer> = Arc::new(FakeFreezer);
@@ -1012,6 +1222,376 @@ mod tests {
                 .unwrap(),
             1,
             "three uninterrupted wedge ticks must fire"
+        );
+    }
+
+    /// The drain filter's LIFETIME is monotonic even though its predicate is not:
+    /// once `RESUME_DRAIN` has elapsed on the `Instant` clock the gate stops
+    /// filtering, however far in the future the wall-clock resume epoch sits.
+    /// Without the deadline the `ts_us < resume_us` comparison below stays true
+    /// for ever and the consumer never pushes another sample.
+    #[test]
+    fn resume_gate_closes_on_its_monotonic_deadline() {
+        let mut gate = ResumeGate::new();
+        let t0 = Instant::now();
+        assert!(
+            gate.observe_edge(1_000_000, t0),
+            "a new epoch is a resume edge"
+        );
+        assert!(
+            gate.should_drop(1, t0),
+            "a sample predating the resume epoch is kept out while the gate is open"
+        );
+
+        let past_deadline = t0 + RESUME_DRAIN + Duration::from_millis(1);
+        assert!(
+            !gate.should_drop(1, past_deadline),
+            "the gate must not filter past its monotonic deadline"
+        );
+        assert!(
+            !gate.should_drop(1, past_deadline + RESUME_DRAIN),
+            "a closed gate stays closed"
+        );
+    }
+
+    /// The second, clock-free bound: everything here happens at the SAME instant,
+    /// so the deadline can never be what closes the gate — only the drop cap can.
+    /// A gate with no cap would keep filtering at a frozen `Instant` for ever.
+    #[test]
+    fn resume_gate_closes_on_its_drop_cap() {
+        let mut gate = ResumeGate::new();
+        let t0 = Instant::now();
+        assert!(gate.observe_edge(1_000_000, t0));
+
+        for i in 0..RESUME_DRAIN_MAX_SAMPLES {
+            assert!(
+                gate.should_drop(1, t0),
+                "sample {i} is still within the cap and must be kept out"
+            );
+        }
+        assert!(
+            !gate.should_drop(1, t0),
+            "the cap must close the gate with no help from any clock"
+        );
+        assert_eq!(
+            gate.dropped(),
+            RESUME_DRAIN_MAX_SAMPLES,
+            "the cap bounds the drops exactly, and they stay countable"
+        );
+    }
+
+    /// The gate filters only what is genuinely on the far side of the boundary: a
+    /// sample stamped at or after the resume epoch is this session's own
+    /// observation and reaches the window immediately.
+    #[test]
+    fn resume_gate_admits_samples_at_or_after_the_resume_epoch() {
+        let mut gate = ResumeGate::new();
+        let t0 = Instant::now();
+        assert!(gate.observe_edge(1_000, t0));
+
+        assert!(gate.should_drop(999, t0), "pre-resume sample is kept out");
+        assert!(
+            !gate.should_drop(1_000, t0),
+            "a sample stamped exactly at the resume epoch belongs to this session"
+        );
+        assert!(
+            !gate.should_drop(1_001, t0),
+            "a post-resume sample belongs to this session"
+        );
+    }
+
+    /// Item 1: a backwards clock step must not end detection. The published
+    /// resume epoch sits far in the future — exactly what a backwards step leaves
+    /// behind — so *every* subsequent sample looks stale on the wall clock. The
+    /// bounded gate closes anyway, and the daemon keeps detecting.
+    ///
+    /// The store assertion is the non-vacuity half: the gate filters the WINDOW,
+    /// never the record, so all the fillers are still in DuckDB.
+    #[tokio::test]
+    async fn run_keeps_detecting_after_a_backwards_clock_step() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 0)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        // An epoch no future sample can reach: year ~128,000 in microseconds.
+        resume_at_us.store(4_000_000_000_000_000, Ordering::Release);
+
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+        ));
+
+        // Enough stale-looking samples to exhaust the drop cap on their own.
+        let fillers = i64::from(RESUME_DRAIN_MAX_SAMPLES);
+        for i in 1..=fillers {
+            tx.send(Sample::Host(HostSample {
+                ts_us: i,
+                load1: 0.0,
+                load5: 0.0,
+                load15: 0.0,
+            }))
+            .await
+            .unwrap();
+        }
+        // The fault itself, still "stale" by the poisoned epoch.
+        tx.send(link(fillers + 100, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap()
+                >= 1,
+            "detection must resume once the bounded drain closes"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM host_sample")
+                .unwrap(),
+            fillers,
+            "the gate filters the WINDOW, never the record"
+        );
+    }
+
+    /// Item 2: a resume RE-OPENS detection. A gateway that is still dead when
+    /// collection resumes is this observation session's own finding, so it is
+    /// recorded again rather than staying latched behind the pre-pause firing.
+    ///
+    /// The post-resume sample is deliberately a LINK: `GwDrop::eval` therefore
+    /// never returns `None` after the clear, so the latch cannot re-arm by
+    /// accident and only `TriggerEngine::rearm_all` can produce the second
+    /// incident.
+    #[tokio::test]
+    async fn run_refires_a_persistent_fault_after_a_resume() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 0)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+        ));
+
+        // Fires once, then stays latched while the fault persists.
+        tx.send(link(1, GwVerdict::Fail)).await.unwrap();
+        tx.send(link(2, GwVerdict::Fail)).await.unwrap();
+        // A sentinel past the last link: once mirrored, both are in the window,
+        // so the resume epoch below lands on a known stream position.
+        tx.send(Sample::Host(HostSample {
+            ts_us: 3,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 3).await;
+
+        resume_at_us.store(10, Ordering::Release);
+        tx.send(link(11, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            2,
+            "a fault still present when collection resumes is this session's own finding"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(
+                    "SELECT count(*) FROM incident WHERE id IN ('gw-drop-1', 'gw-drop-11')"
+                )
+                .unwrap(),
+            2,
+            "the two incidents are the pre-pause and post-resume observations, not a rewrite"
+        );
+    }
+
+    /// The matched twin of the test above: the identical stream under a one-second
+    /// backoff yields exactly ONE incident. A resume re-arms the latch; it does
+    /// not hand the trigger a fresh firing budget, so a spammed switch cannot
+    /// storm the incident log.
+    #[tokio::test]
+    async fn run_does_not_refire_within_the_backoff_after_a_resume() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 1_000_000)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+        ));
+
+        tx.send(link(1, GwVerdict::Fail)).await.unwrap();
+        tx.send(link(2, GwVerdict::Fail)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 3,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 3).await;
+
+        resume_at_us.store(10, Ordering::Release);
+        tx.send(link(11, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            1,
+            "a resume re-arms; it does not reset the firing budget"
+        );
+    }
+
+    /// Item 3, the oracle test: the pcap ring keeps capturing while collection is
+    /// paused, so the packets around a gateway change that happened DURING the
+    /// pause are physically still in it at resume. The change basis carried across
+    /// `clear_for_resume` is what lets `gw-change` still fire on the first
+    /// post-resume link sample, and the freeze then preserves real evidence.
+    #[tokio::test]
+    async fn run_freezes_the_pcap_ring_for_a_gateway_change_across_a_pause() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let freezer: Arc<dyn PcapFreezer> = Arc::new(FakeFreezer);
+        let freeze: Arc<dyn Handler> = Arc::new(FreezePcapHandler::new(
+            freezer,
+            store.clone(),
+            "/tmp/observer-blobs",
+        ));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwChange), vec![rec, freeze], 0)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+        ));
+
+        // The last gateway state observed before the pause.
+        tx.send(link(1, GwVerdict::Ok)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 2,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 2).await;
+
+        resume_at_us.store(10, Ordering::Release);
+        // The gateway changed while collection was paused.
+        tx.send(link(11, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            1,
+            "the oracle freezes the ring on ANY gateway change; a pause must not create a blind spot"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM blob_ref WHERE kind='pcap'")
+                .unwrap(),
+            1,
+            "the oracle freezes the ring on ANY gateway change; a pause must not create a blind spot"
+        );
+    }
+
+    /// The non-vacuity control for the test above: the same pause with an
+    /// UNCHANGED gateway must stay silent. The carried basis is a comparison
+    /// point, not a licence to fire at every resume.
+    #[tokio::test]
+    async fn run_does_not_freeze_when_the_gateway_is_unchanged_across_a_pause() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let freezer: Arc<dyn PcapFreezer> = Arc::new(FakeFreezer);
+        let freeze: Arc<dyn Handler> = Arc::new(FreezePcapHandler::new(
+            freezer,
+            store.clone(),
+            "/tmp/observer-blobs",
+        ));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwChange), vec![rec, freeze], 0)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+        ));
+
+        tx.send(link(1, GwVerdict::Ok)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 2,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 2).await;
+
+        resume_at_us.store(10, Ordering::Release);
+        tx.send(link(11, GwVerdict::Ok)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            0,
+            "an unchanged gateway across a pause is not a change"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM blob_ref WHERE kind='pcap'")
+                .unwrap(),
+            0,
+            "an unchanged gateway across a pause is not a change"
         );
     }
 }

@@ -50,6 +50,16 @@ impl TriggerEngine {
     /// A trigger fires only when it is `armed` and at least `backoff_us` have elapsed
     /// since its last firing; firing disarms it. It re-arms as soon as its condition
     /// stops matching (returns `None`).
+    ///
+    /// A RESUME edge RE-OPENS detection; it does not dedup it. The recent-sample
+    /// window is cleared and every trigger is re-armed
+    /// ([`TriggerEngine::rearm_all`]), so a fault that is still present when
+    /// collection resumes is recorded again — as a NEW incident belonging to the
+    /// new observation session, not as a duplicate of the pre-pause one. What a
+    /// resume does NOT do is reset the firing budget: `last_fire_us` survives it,
+    /// so each trigger still fires at most once per `backoff_us` and a toggled
+    /// switch cannot storm the incident log. The `observing_edge` rows bound the
+    /// gap between the two records.
     pub fn on_sample(&mut self, w: &RecentWindow, now_us: i64) {
         for trig in &mut self.triggers {
             match trig.condition.eval(w) {
@@ -67,6 +77,30 @@ impl TriggerEngine {
                     trig.armed = true;
                 }
             }
+        }
+    }
+
+    /// Re-arm every trigger, WITHOUT touching its backoff.
+    ///
+    /// Called by `pipeline::run` on a collection RESUME edge, together with
+    /// `RecentWindow::clear_for_resume`. A resume RE-OPENS detection; it does not
+    /// dedup it: a fault that is still present when collection resumes is
+    /// recorded again, as a NEW incident belonging to the new observation
+    /// session, rather than staying latched behind a firing that belongs to the
+    /// previous one.
+    ///
+    /// Explicit because the alternative is accidental. An emptied window already
+    /// re-arms a trigger *if* the next sample is one its condition reads nothing
+    /// from (a `host` tick re-arms `gw-drop`; a `link` tick leaves it latched),
+    /// which made "does a persistent fault re-fire across a pause?" depend on
+    /// collector arrival order. This makes it a decision.
+    ///
+    /// `last_fire_us` and `backoff_us` are deliberately NOT reset: a pause
+    /// neither shortens nor extends a trigger's firing budget, so a toggled
+    /// switch cannot storm the incident log.
+    pub fn rearm_all(&mut self) {
+        for trig in &mut self.triggers {
+            trig.armed = true;
         }
     }
 }
@@ -120,5 +154,40 @@ mod tests {
         w.push(link(3, GwVerdict::Fail));
         eng.on_sample(&w, 300_000_001);
         assert_eq!(h.0.load(Ordering::SeqCst), 2);
+    }
+
+    /// A resume starts a new observation session: the latch re-arms, the backoff
+    /// does not. Both halves are load-bearing — dropping `rearm_all` loses the
+    /// fresh record, resetting `last_fire_us` inside it lets a toggled switch
+    /// write an incident per click.
+    #[test]
+    fn rearm_all_rearms_without_resetting_the_backoff() {
+        let h = Arc::new(CountHandler(AtomicUsize::new(0)));
+        let handlers: Vec<Arc<dyn crate::handlers::Handler>> = vec![h.clone()];
+        let trig = Trigger::new(Box::new(GwDrop), handlers, 1_000);
+        let mut eng = TriggerEngine::new(vec![trig]);
+        let mut w = RecentWindow::new(8);
+        w.push(link(0, GwVerdict::Fail));
+        eng.on_sample(&w, 0);
+        assert_eq!(h.0.load(Ordering::SeqCst), 1);
+        // The resume edge exactly as `pipeline::run` performs it.
+        w.clear_for_resume();
+        eng.rearm_all();
+        // The post-resume sample is a LINK, so `GwDrop::eval` keeps returning
+        // `Some` and only `rearm_all` can have re-armed the latch — but the
+        // backoff has not elapsed, so nothing is written yet.
+        w.push(link(1, GwVerdict::Fail));
+        eng.on_sample(&w, 1);
+        assert_eq!(
+            h.0.load(Ordering::SeqCst),
+            1,
+            "re-arming must not bypass the firing backoff"
+        );
+        eng.on_sample(&w, 1_001);
+        assert_eq!(
+            h.0.load(Ordering::SeqCst),
+            2,
+            "a fault still present in a new observation session is recorded again"
+        );
     }
 }

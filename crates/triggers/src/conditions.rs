@@ -1,4 +1,4 @@
-use crate::window::RecentWindow;
+use crate::window::{LinkProvenance, RecentWindow};
 use types::{DnsVerdict, GwVerdict, TcpVerdict};
 
 /// How many recent DNS samples the `fakeip` condition scans (one polling tick
@@ -62,7 +62,9 @@ impl Condition for GwDrop {
     }
 }
 
-/// Fires on any change in the gateway verdict between the two newest link samples.
+/// Fires on any change in the gateway verdict between the two newest link samples
+/// — or, on the first sample after a resume, against the change basis carried
+/// across the observation gap (see [`RecentWindow::prev_link_with_provenance`]).
 pub struct GwChange;
 impl Condition for GwChange {
     fn id(&self) -> &'static str {
@@ -70,9 +72,16 @@ impl Condition for GwChange {
     }
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let last = w.last_link()?;
-        let prev = w.prev_link()?;
+        let (prev, provenance) = w.prev_link_with_provenance()?;
+        // A change measured against the basis carried across a pause is real —
+        // the oracle freezes on ANY gateway change — but it is not two
+        // consecutive ticks, and the incident must not read as though it were.
+        let across = match provenance {
+            LinkProvenance::Contiguous => "",
+            LinkProvenance::AcrossGap => " (across an observation gap)",
+        };
         (last.gw != prev.gw).then(|| Fire {
-            detail: format!("gateway {} -> {}", prev.gw, last.gw),
+            detail: format!("gateway {} -> {}{}", prev.gw, last.gw, across),
         })
     }
 }
@@ -161,6 +170,24 @@ mod tests {
             wifi_capture_present: false,
         })
     }
+
+    /// A link sample with an explicit gateway verdict (the existing [`link`]
+    /// helper varies `direct` and pins `gw` to OK).
+    fn link_gw(ts: i64, gw: GwVerdict) -> Sample {
+        Sample::Link(LinkSample {
+            ts_us: ts,
+            gw,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+        })
+    }
+
     fn proxy(ts: i64, tun: u16) -> Sample {
         Sample::Proxy(ProxySample {
             ts_us: ts,
@@ -213,7 +240,7 @@ mod tests {
         // The resume edge drops everything on the far side of the observation
         // gap, so the two pre-pause ticks can never combine with a post-resume
         // one into "tun dead 3 ticks" — a continuity that never existed.
-        w.clear();
+        w.clear_for_resume();
         push_wedge_ticks(&mut w, 1_000, 1);
         assert!(c.eval(&w).is_none());
     }
@@ -284,28 +311,62 @@ mod tests {
 
     #[test]
     fn gw_drop_and_change() {
-        use crate::window::RecentWindow;
-        use types::{GwVerdict, LinkSample, Sample, TcpVerdict};
-        let mk = |ts: i64, gw: GwVerdict| {
-            Sample::Link(LinkSample {
-                ts_us: ts,
-                gw,
-                gw_rtt_ms: None,
-                direct: TcpVerdict::Ok,
-                direct_rtt_ms: None,
-                dhcp_router: None,
-                dhcp_dns: None,
-                gw_arp_mac: None,
-                ssid: None,
-                wifi_capture_present: false,
-            })
-        };
         let mut w = RecentWindow::new(8);
-        w.push(mk(1, GwVerdict::Ok));
+        w.push(link_gw(1, GwVerdict::Ok));
         assert!(GwDrop.eval(&w).is_none());
         assert!(GwChange.eval(&w).is_none()); // no prev
-        w.push(mk(2, GwVerdict::Fail));
+        w.push(link_gw(2, GwVerdict::Fail));
         assert!(GwDrop.eval(&w).is_some());
         assert!(GwChange.eval(&w).is_some()); // Ok -> Fail
+    }
+
+    #[test]
+    fn gw_change_fires_across_a_resume_clear() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_gw(1, GwVerdict::Ok));
+        // The gateway changes DURING the pause. The pcap ring is not gated by
+        // `observing`, so the packets around that change are still in it at
+        // resume — the oracle freezes on ANY gateway change, so this must fire.
+        w.clear_for_resume();
+        w.push(link_gw(10, GwVerdict::Fail));
+        let fire = GwChange
+            .eval(&w)
+            .expect("a gateway change during a pause must still fire at resume");
+        // Rendered from the verdicts themselves, so the assertion tracks the
+        // verdict vocabulary instead of restating it.
+        assert!(
+            fire.detail
+                .contains(&format!("{} -> {}", GwVerdict::Ok, GwVerdict::Fail)),
+            "detail must name both verdicts: {}",
+            fire.detail
+        );
+        // …and must not read as two consecutive ticks to an offline reader.
+        assert!(
+            fire.detail.contains("across an observation gap"),
+            "a cross-gap change must be marked as such: {}",
+            fire.detail
+        );
+    }
+
+    #[test]
+    fn gw_change_silent_across_a_resume_when_the_gateway_is_unchanged() {
+        // The control for the test above: without it, "always fire at resume"
+        // would pass just as well.
+        let mut w = RecentWindow::new(8);
+        w.push(link_gw(1, GwVerdict::Ok));
+        w.clear_for_resume();
+        w.push(link_gw(10, GwVerdict::Ok));
+        assert!(GwChange.eval(&w).is_none());
+    }
+
+    #[test]
+    fn gw_drop_does_not_fire_on_the_carried_basis() {
+        // The basis is a comparison partner, never the present state: it must be
+        // invisible to `last_link`. This breaks loudly if the carry is ever
+        // implemented by re-pushing the sample into the buffer.
+        let mut w = RecentWindow::new(8);
+        w.push(link_gw(1, GwVerdict::Fail));
+        w.clear_for_resume();
+        assert!(GwDrop.eval(&w).is_none());
     }
 }
