@@ -48,6 +48,9 @@ use pipeline::{
 const BACKOFF_US: i64 = 300_000_000;
 
 /// Depth of the sample stream between the collectors and the consumer.
+/// `pipeline::RESUME_DRAIN_MAX_SAMPLES` is derived from this (twice it), so the
+/// post-resume drain cap scales with the channel automatically and this value
+/// carries no separate constraint.
 const CHANNEL_CAP: usize = 256;
 
 /// How many recent incidents the live snapshot keeps for the socket API. DuckDB
@@ -206,6 +209,14 @@ async fn run_daemon() -> anyhow::Result<()> {
             socket_mode,
             socket_owner_uid,
             max_subscribers: api::MAX_SUBSCRIBERS,
+            // Bounds for a socket that is world-connectable by default: a local
+            // process must not be able to pin unbounded tasks/fds by connecting
+            // and never speaking, nor grow a root daemon's log by looping refused
+            // control requests.
+            max_connections: api::MAX_CONNECTIONS,
+            request_timeout: api::REQUEST_READ_TIMEOUT,
+            control_refusals: api::RateLimitedLog::new(api::REFUSAL_LOG_INTERVAL),
+            sub_refusals: api::RateLimitedLog::new(api::REFUSAL_LOG_INTERVAL),
             acting,
             // Who may send a `Request::Control` at all — orthogonal to
             // `acting.enabled`, which only gates the acting *class* of commands.

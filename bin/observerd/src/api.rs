@@ -22,6 +22,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use observer_ipc::{
     ControlCmd, ControlResult, EncodedFrame, EventKind, Gap, Ready, Request, Response,
@@ -53,6 +54,99 @@ pub(crate) const MAX_SUBSCRIBERS: usize = 256;
 /// truncated, fails to parse, and is answered `Response::Error`.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
+/// Hard cap on concurrently handled socket connections, of ANY kind, enforced at
+/// accept time. [`MAX_SUBSCRIBERS`] bounds *subscriptions*; a connection that
+/// never sends a request never reaches that path at all, so without this cap a
+/// local process can pin unbounded tasks, fds and 8 KiB read buffers on a socket
+/// that is world-connectable by default (`socket_mode` 0o666).
+pub(crate) const MAX_CONNECTIONS: usize = 512;
+
+// The subscriber cap must stay the limit a well-behaved client meets FIRST: it
+// answers with a decodable `StreamFrame::Error`, while this one can only close.
+const _: () = assert!(
+    MAX_CONNECTIONS > MAX_SUBSCRIBERS,
+    "MAX_CONNECTIONS must exceed MAX_SUBSCRIBERS or the subscriber cap is unreachable"
+);
+
+/// How long a freshly accepted connection has to deliver its newline-terminated
+/// request. Bounds the WHOLE initial read, so a byte-per-second drip cannot extend
+/// it — and only that read: a held-open `Subscribe` stream is idle by design and
+/// is watched for EOF instead (see [`stream_events`]). Generous next to any honest
+/// client on a local socket; short enough that a silent connection cannot camp on
+/// a connection slot.
+pub(crate) const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Minimum interval between lines from one rate-limited log site.
+pub(crate) const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One rate-limited line's payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Burst {
+    /// Events suppressed since the previous line (`0` on the first).
+    pub suppressed: u64,
+    /// Events since this limiter was created, including this one.
+    pub total: u64,
+}
+
+/// A log throttle for a line an unprivileged local process can trigger.
+///
+/// The socket is world-connectable by default, so an unauthorised process can loop
+/// connect+`Control` and, at one `warn!` per attempt, grow a ROOT daemon's log at
+/// its own pace. At most one line per `interval`, and each line reports how many
+/// events were suppressed since the last one — deferred, never lost, so the flood
+/// stays visible and countable without being transcribed. Monotonic ([`Instant`])
+/// on purpose: a wall-clock step must be able neither to unmute the log nor to
+/// mute it for ever.
+pub struct RateLimitedLog {
+    interval: Duration,
+    state: Mutex<RateLimitState>,
+}
+
+/// How many events are waiting to be reported, and when the last line went out.
+struct RateLimitState {
+    last_logged: Option<Instant>,
+    suppressed: u64,
+    total: u64,
+}
+
+impl RateLimitedLog {
+    /// A limiter that has never logged, so the FIRST event is always reported —
+    /// one genuine misconfiguration stays loud and immediate.
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            state: Mutex::new(RateLimitState {
+                last_logged: None,
+                suppressed: 0,
+                total: 0,
+            }),
+        }
+    }
+
+    /// Record one event at `now`. `Some(Burst)` ⇒ the caller should emit its line;
+    /// `None` ⇒ counted only, and reported by the next line. `now` is injected so
+    /// the throttle is unit tested without sleeping.
+    pub fn record(&self, now: Instant) -> Option<Burst> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.total += 1;
+        let due = match st.last_logged {
+            None => true,
+            Some(prev) => now.saturating_duration_since(prev) >= self.interval,
+        };
+        if !due {
+            st.suppressed += 1;
+            return None;
+        }
+        st.last_logged = Some(now);
+        let burst = Burst {
+            suppressed: st.suppressed,
+            total: st.total,
+        };
+        st.suppressed = 0;
+        Some(burst)
+    }
+}
+
 /// Who may send a `Request::Control`. Built once at start-up from the config.
 ///
 /// Peer credentials are checked on `Request::Control` **only** — `Status`,
@@ -72,6 +166,13 @@ pub struct ControlPolicy {
     /// `config.control_uids`: extra authorised uids, for headless/multi-admin
     /// hosts with no console session.
     pub control_uids: Vec<u32>,
+    /// How the console-user clause is resolved. Always [`console_uid`] in
+    /// production ([`ControlPolicy::from_config`] is the only constructor outside
+    /// this module, so no caller can weaken it). The end-to-end control tests
+    /// substitute a stub: on a developer's Mac the test process IS the console
+    /// user, and the real lookup would authorise the very peer the refusal arm
+    /// needs refused.
+    console: fn() -> Option<u32>,
 }
 
 impl ControlPolicy {
@@ -84,6 +185,7 @@ impl ControlPolicy {
             daemon_uid,
             socket_owner_uid,
             control_uids,
+            console: console_uid,
         }
     }
 }
@@ -157,7 +259,16 @@ fn authorize_control(
     peer_uid: Option<u32>,
 ) -> Result<PeerAuthorized, ControlResult> {
     match peer_uid {
-        Some(uid) if control_authorized(policy, uid, console_uid()) => Ok(PeerAuthorized(uid)),
+        // The console clause is resolved LAST, and only when nothing cheaper has
+        // already said yes: `control_authorized(.., None)` is exactly "authorised
+        // with no console session". An authorised-by-config peer therefore costs
+        // no `stat("/dev/console")` at all.
+        Some(uid)
+            if control_authorized(policy, uid, None)
+                || control_authorized(policy, uid, (policy.console)()) =>
+        {
+            Ok(PeerAuthorized(uid))
+        }
         Some(uid) => Err(ControlResult {
             ok: false,
             message: format!("control refused: uid {uid} is not authorised to control observerd"),
@@ -228,6 +339,13 @@ pub struct ApiServer {
     /// [`MAX_SUBSCRIBERS`]; tests pass a small value so the refusal path is one
     /// extra connection rather than 257.
     pub max_subscribers: usize,
+    /// Accept-time cap on concurrently handled connections. Production passes
+    /// [`MAX_CONNECTIONS`]; tests pass a small value so the refusal path is one
+    /// extra connection rather than 513.
+    pub max_connections: usize,
+    /// How long a freshly accepted connection has to send its request. Production
+    /// passes [`REQUEST_READ_TIMEOUT`]; tests pass milliseconds.
+    pub request_timeout: Duration,
     pub acting: ActingConfig,
     /// Who may send a `Request::Control`.
     pub policy: ControlPolicy,
@@ -242,6 +360,15 @@ pub struct ApiServer {
     pub store: Arc<dyn Store + Send + Sync>,
     /// The realtime bus, carrying frames already serialised once.
     pub events_tx: broadcast::Sender<EncodedFrame>,
+    /// Bounded log for control refusals — attacker-triggerable on a mode-0666
+    /// socket, so the line is rate-limited and aggregated, never per attempt.
+    pub control_refusals: RateLimitedLog,
+    /// Same treatment for subscriber-cap refusals. `MAX_CONNECTIONS` is
+    /// deliberately larger than `MAX_SUBSCRIBERS`, so a peer holding the
+    /// subscriber cap can still loop connect+`Subscribe` in the remaining
+    /// connection slots — one refusal each, and unthrottled that is the same
+    /// root-log amplification the control path already defends against.
+    pub sub_refusals: RateLimitedLog,
 }
 
 impl ApiServer {
@@ -302,6 +429,14 @@ impl ApiServer {
         // One counter shared by every connection task: the daemon's live
         // subscriber tally, guarding `max_subscribers`.
         let subscribers = Arc::new(AtomicUsize::new(0));
+        // Live connection tally. Distinct from `subscribers`: every subscriber
+        // holds a connection, but most connections are one-shot requests that
+        // never reach `stream_events`.
+        let connections = Arc::new(AtomicUsize::new(0));
+        // Bounded logs for the two lines an unprivileged process can drive at its
+        // own rate. Separate limiters so one flood cannot mask the other.
+        let conn_refusals = RateLimitedLog::new(REFUSAL_LOG_INTERVAL);
+        let accept_errors = RateLimitedLog::new(REFUSAL_LOG_INTERVAL);
 
         // Connection tasks live in a set owned by this loop rather than detached, so
         // dropping/aborting `serve` aborts them too.
@@ -312,17 +447,51 @@ impl ApiServer {
             while conns.try_join_next().is_some() {}
             match accepted {
                 Ok((stream, _addr)) => {
+                    // Capped at ACCEPT time. Over the cap the connection is closed
+                    // immediately: nothing has been read, so there is no request to
+                    // answer and no way to know which frame type the client would
+                    // decode — writing the wrong one is strictly worse than a clean
+                    // EOF. Accept-and-close, not "stop accepting": leaving
+                    // connections in the listen backlog spins this loop and hides
+                    // the condition from the log.
+                    let Some(slot) = CountedSlot::claim(&connections, srv.max_connections) else {
+                        if let Some(burst) = conn_refusals.record(Instant::now()) {
+                            tracing::warn!(
+                                max = srv.max_connections,
+                                suppressed = burst.suppressed,
+                                total = burst.total,
+                                "connection cap reached; closing new connection"
+                            );
+                        }
+                        drop(stream);
+                        continue;
+                    };
                     let srv = Arc::clone(&srv);
                     let subscribers = Arc::clone(&subscribers);
                     // One task per connection. One-shot requests reply and close; a
                     // `Subscribe` holds the connection open and streams frames.
                     conns.spawn(async move {
+                        // Held for the whole connection, released on every exit
+                        // path, exactly like the subscriber slot.
+                        let _slot = slot;
                         if let Err(e) = handle_conn(stream, &srv, &subscribers).await {
                             tracing::debug!(error = %e, "status socket connection error");
                         }
                     });
                 }
-                Err(e) => tracing::warn!(error = %e, "status socket accept failed"),
+                // Also rate-limited: a persistent accept failure (EMFILE under fd
+                // exhaustion) spins this loop at full speed, which is the same
+                // unbounded-log path by another route.
+                Err(e) => {
+                    if let Some(burst) = accept_errors.record(Instant::now()) {
+                        tracing::warn!(
+                            error = %e,
+                            suppressed = burst.suppressed,
+                            total = burst.total,
+                            "status socket accept failed"
+                        );
+                    }
+                }
             }
         }
     }
@@ -350,16 +519,29 @@ async fn handle_conn(
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
     let mut line = String::new();
-    // Bounded: an unterminated request must not grow server memory on a
-    // world-connectable socket. Over-long frames fail to parse and are answered
-    // `Response::Error` below.
-    if (&mut reader)
-        .take(MAX_REQUEST_BYTES)
-        .read_line(&mut line)
-        .await?
-        == 0
-    {
-        return Ok(()); // client closed without sending a request
+    // Bounded in BOTH dimensions: `MAX_REQUEST_BYTES` stops an unterminated
+    // request growing server memory, `request_timeout` stops a silent one holding
+    // a connection slot, an fd and this task open for ever. Applies to the INITIAL
+    // request only — a `Subscribe` stream is idle by design and must never time
+    // out (see `stream_events`).
+    let read = tokio::time::timeout(
+        srv.request_timeout,
+        (&mut reader).take(MAX_REQUEST_BYTES).read_line(&mut line),
+    )
+    .await;
+    match read {
+        Ok(Ok(0)) => return Ok(()), // client closed without sending a request
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_elapsed) => {
+            // A slow or abandoned client is routine; the cap refusal above is the
+            // line that matters. `debug!`, matching the connection-error log.
+            tracing::debug!(
+                timeout_s = srv.request_timeout.as_secs_f64(),
+                "no request within the read timeout; closing connection"
+            );
+            return Ok(());
+        }
     }
 
     let response = match serde_json::from_str::<Request>(&line) {
@@ -371,10 +553,13 @@ async fn handle_conn(
                 &mut reader,
                 &mut wr,
                 kinds,
-                &srv.events_tx,
-                &srv.observing,
-                subscribers,
-                srv.max_subscribers,
+                StreamCtx {
+                    events_tx: &srv.events_tx,
+                    observing: &srv.observing,
+                    subscribers,
+                    max_subscribers: srv.max_subscribers,
+                    refusals: &srv.sub_refusals,
+                },
             )
             .await;
         }
@@ -400,6 +585,7 @@ async fn handle_conn(
                 snapshot: &srv.snapshot,
                 store: srv.store.as_ref(),
                 events_tx: &srv.events_tx,
+                refusals: &srv.control_refusals,
             };
             Response::Control(control_request(cmd, peer_uid, &cx))
         }
@@ -411,12 +597,12 @@ async fn handle_conn(
     wr.flush().await
 }
 
-/// One of the daemon's `max_subscribers` streaming slots, released on drop — so
-/// every exit path (client gone, write error, bus closed, task aborted at
-/// shutdown) frees it.
-struct SubscriberSlot(Arc<AtomicUsize>);
+/// One of a bounded pool of slots — connections at accept time, or held-open
+/// subscriptions — released on drop, so every exit path (reply sent, read timeout,
+/// client gone, write error, task aborted at shutdown) frees it.
+struct CountedSlot(Arc<AtomicUsize>);
 
-impl SubscriberSlot {
+impl CountedSlot {
     /// Claim a slot, or `None` when the cap is reached. `fetch_update` rather
     /// than check-then-increment: two connections racing at the boundary must
     /// not both see `< max`.
@@ -430,7 +616,7 @@ impl SubscriberSlot {
     }
 }
 
-impl Drop for SubscriberSlot {
+impl Drop for CountedSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
@@ -480,21 +666,42 @@ async fn write_stream_frame<W: AsyncWrite + Unpin>(
 /// Cancellation: `broadcast::Receiver::recv` is cancel-safe, so a `recv` dropped
 /// because the read branch won loses no event; `AsyncReadExt::read` is cancel-safe
 /// too, so a lost race the other way reads nothing.
+/// The shared state one subscription needs, grouped so the signature stays
+/// readable: the bus it reads, the pause flag it reports, and the cap plus its
+/// rate-limited refusal log.
+struct StreamCtx<'a> {
+    events_tx: &'a broadcast::Sender<EncodedFrame>,
+    observing: &'a AtomicBool,
+    subscribers: &'a Arc<AtomicUsize>,
+    max_subscribers: usize,
+    refusals: &'a RateLimitedLog,
+}
+
 async fn stream_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     rd: &mut R,
     wr: &mut W,
     kinds: Option<Vec<EventKind>>,
-    events_tx: &broadcast::Sender<EncodedFrame>,
-    observing: &AtomicBool,
-    subscribers: &Arc<AtomicUsize>,
-    max_subscribers: usize,
+    cx: StreamCtx<'_>,
 ) -> std::io::Result<()> {
+    let StreamCtx {
+        events_tx,
+        observing,
+        subscribers,
+        max_subscribers,
+        refusals,
+    } = cx;
     // 1. Reserve a slot. Refused ⇒ ONE decodable error frame, then close.
-    let Some(_slot) = SubscriberSlot::claim(subscribers, max_subscribers) else {
-        tracing::warn!(
-            max = max_subscribers,
-            "subscriber cap reached; refusing subscription"
-        );
+    // The client always gets its error frame; only the LOG line is throttled, so
+    // a peer looping on a full cap cannot grow a root daemon's log at its own rate.
+    let Some(_slot) = CountedSlot::claim(subscribers, max_subscribers) else {
+        if let Some(burst) = refusals.record(Instant::now()) {
+            tracing::warn!(
+                max = max_subscribers,
+                suppressed = burst.suppressed,
+                total = burst.total,
+                "subscriber cap reached; refusing subscription"
+            );
+        }
         return write_stream_frame(
             wr,
             &StreamFrame::Error(StreamError {
@@ -586,6 +793,9 @@ pub(crate) struct ControlCtx<'a> {
     pub snapshot: &'a Mutex<StatusSnapshot>,
     pub store: &'a (dyn Store + Send + Sync),
     pub events_tx: &'a broadcast::Sender<EncodedFrame>,
+    /// The bounded log for the refusal line, so an unauthorised local process
+    /// cannot grow a root daemon's log at its own loop rate.
+    pub refusals: &'a RateLimitedLog,
 }
 
 /// The single entry point for `Request::Control`: authorise the peer FIRST, then
@@ -598,11 +808,19 @@ pub(crate) fn control_request(
     match authorize_control(cx.policy, peer_uid) {
         Ok(authorized) => control_response(cmd, authorized, cx),
         Err(refusal) => {
-            tracing::warn!(
-                ?peer_uid,
-                ?cmd,
-                "control request refused: peer not authorised"
-            );
+            // Rate-limited: the socket is world-connectable by default, so an
+            // unauthorised local process must not be able to grow a ROOT daemon's
+            // log at its own loop rate. Never silent — suppressed refusals are
+            // counted and reported by the next line.
+            if let Some(burst) = cx.refusals.record(Instant::now()) {
+                tracing::warn!(
+                    ?peer_uid,
+                    ?cmd,
+                    suppressed = burst.suppressed,
+                    total = burst.total,
+                    "control request refused: peer not authorised"
+                );
+            }
             refusal
         }
     }
@@ -748,6 +966,27 @@ mod tests {
     /// peer is authorised by the `daemon_uid` clause and nothing else.
     const TEST_DAEMON_UID: u32 = 4242;
 
+    /// A uid no real account holds, so no policy clause can authorise a test peer
+    /// by accident.
+    const NOT_A_REAL_UID: u32 = u32::MAX - 1;
+
+    /// The test process's own effective uid — the uid a client connecting from
+    /// THIS process presents to `getpeereid(2)`, and therefore the uid the daemon
+    /// must act on.
+    fn own_uid() -> u32 {
+        // SAFETY: `geteuid` takes no arguments, dereferences nothing and cannot
+        // fail (POSIX: "always successful").
+        unsafe { libc::geteuid() }
+    }
+
+    /// A console lookup pinned to "no console session". EVERY test policy uses it:
+    /// no test may depend on whether the machine it runs on has a logged-in GUI
+    /// user, and the end-to-end refusal arm is impossible without it (on a
+    /// developer's Mac the test process IS the console user).
+    fn no_console() -> Option<u32> {
+        None
+    }
+
     fn test_acting(enabled: bool) -> ActingConfig {
         ActingConfig {
             enabled,
@@ -769,17 +1008,22 @@ mod tests {
             socket_mode: 0o666,
             socket_owner_uid: None,
             max_subscribers: MAX_SUBSCRIBERS,
+            max_connections: MAX_CONNECTIONS,
+            request_timeout: REQUEST_READ_TIMEOUT,
             acting,
             policy: ControlPolicy {
                 daemon_uid,
                 socket_owner_uid: None,
                 control_uids: Vec::new(),
+                console: no_console,
             },
             observing: Arc::new(AtomicBool::new(true)),
             resume_at_us: Arc::new(AtomicI64::new(0)),
             snapshot: Arc::new(Mutex::new(StatusSnapshot::default())),
             store: Arc::new(store::DuckdbStore::in_memory().unwrap()),
             events_tx,
+            control_refusals: RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
+            sub_refusals: RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
         }
     }
 
@@ -794,6 +1038,7 @@ mod tests {
             snapshot: &srv.snapshot,
             store: srv.store.as_ref(),
             events_tx: &srv.events_tx,
+            refusals: &srv.control_refusals,
         }
     }
 
@@ -905,6 +1150,7 @@ mod tests {
             daemon_uid: 501,
             socket_owner_uid: None,
             control_uids: Vec::new(),
+            console: no_console,
         };
 
         // root is always allowed; so is the daemon's own uid.
@@ -967,9 +1213,9 @@ mod tests {
     /// variant fails to compile until it is added here and thus asserted.
     #[test]
     fn every_control_cmd_is_refused_for_an_unauthorised_peer() {
-        // No real account holds `u32::MAX - 1`, so the per-request `/dev/console`
-        // stat cannot accidentally authorise it on any host.
-        let stranger = Some(u32::MAX - 1);
+        // No real account holds it, and `test_server` pins the console clause to
+        // "no session", so nothing on any host can accidentally authorise it.
+        let stranger = Some(NOT_A_REAL_UID);
 
         for cmd in [ControlCmd::SetObserving(false), ControlCmd::KickstartProxy] {
             // Exhaustive on purpose — a new variant breaks this arm list.
@@ -1188,10 +1434,13 @@ mod tests {
             &mut rd,
             &mut server,
             None,
-            &events_tx,
-            &observing,
-            &subscribers,
-            1,
+            StreamCtx {
+                events_tx: &events_tx,
+                observing: &observing,
+                subscribers: &subscribers,
+                max_subscribers: 1,
+                refusals: &RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
+            },
         )
         .await
         .unwrap();
@@ -1238,10 +1487,13 @@ mod tests {
                 &mut rd,
                 &mut wr,
                 Some(vec![EventKind::Route]),
-                &tx,
-                &obs,
-                &subs,
-                8,
+                StreamCtx {
+                    events_tx: &tx,
+                    observing: &obs,
+                    subscribers: &subs,
+                    max_subscribers: 8,
+                    refusals: &RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
+                },
             )
             .await
         });
@@ -1300,10 +1552,13 @@ mod tests {
                 &mut rd,
                 &mut wr,
                 Some(vec![EventKind::Route]),
-                &tx,
-                &obs,
-                &subs,
-                8,
+                StreamCtx {
+                    events_tx: &tx,
+                    observing: &obs,
+                    subscribers: &subs,
+                    max_subscribers: 8,
+                    refusals: &RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
+                },
             )
             .await
         });
@@ -1441,6 +1696,280 @@ mod tests {
             events_tx.receiver_count(),
             0,
             "server kept the subscription alive after the client disconnected"
+        );
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The throttle itself, driven by INJECTED [`Instant`]s so nothing sleeps: the
+    /// first event is always reported (a genuine misconfiguration stays loud), a
+    /// burst inside the window is counted rather than transcribed, and the next
+    /// line carries what the window swallowed. A flood must stay countable, never
+    /// silent — "SKIP, never silence" applied to the log itself.
+    #[test]
+    fn rate_limited_log_reports_the_first_then_aggregates() {
+        let lim = RateLimitedLog::new(REFUSAL_LOG_INTERVAL);
+        let t0 = Instant::now();
+
+        assert_eq!(
+            lim.record(t0),
+            Some(Burst {
+                suppressed: 0,
+                total: 1
+            }),
+            "the first event must always be reported"
+        );
+        for i in 1..=4u64 {
+            assert_eq!(
+                lim.record(t0 + Duration::from_secs(i)),
+                None,
+                "a burst inside the window must not log"
+            );
+        }
+        assert_eq!(
+            lim.record(t0 + REFUSAL_LOG_INTERVAL),
+            Some(Burst {
+                suppressed: 4,
+                total: 6
+            }),
+            "the next line must report what the window swallowed"
+        );
+    }
+
+    /// The refusal path is actually WIRED to the limiter — asserted without
+    /// capturing tracing output, by observing the budget the refusal consumed: a
+    /// limiter that has already logged returns `None` for the next event inside
+    /// its window. A refusal that bypassed the limiter would leave it fresh and
+    /// this read would be `Some(..)`.
+    #[test]
+    fn a_refused_control_request_consumes_the_log_budget() {
+        let srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
+        let result = control_request(ControlCmd::SetObserving(false), Some(NOT_A_REAL_UID), &cx);
+        assert!(!result.ok, "an unlisted uid must be refused");
+        assert!(
+            srv.control_refusals.record(Instant::now()).is_none(),
+            "the refusal path must go through the rate limiter"
+        );
+    }
+
+    /// The accept-time connection cap: a connection over it is closed rather than
+    /// served, and its slot is released the instant the holding task ends (not at
+    /// the next accept). Only the CONNECTION cap can refuse here —
+    /// `max_subscribers` stays at its production value and the read timeout stays
+    /// long.
+    #[tokio::test]
+    async fn serve_refuses_connections_over_the_cap() {
+        let dir = temp_dir("conncap");
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let mut srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        srv.max_connections = 1;
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
+
+        // Take the single slot with a real held-open subscription. The `Ready` ack
+        // `subscribe` consumes proves the connection was accepted and parked, so
+        // the assertion below cannot race the accept.
+        let sp = sock_str.clone();
+        let sub = tokio::task::spawn_blocking(move || observer_ipc::subscribe(&sp, None))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Over the cap: closed, not served. `is_err()` rather than a specific
+        // kind — a bare EOF surfaces as `UnexpectedEof` or `BrokenPipe` depending
+        // on how far the write got.
+        let sp = sock_str.clone();
+        let refused =
+            tokio::task::spawn_blocking(move || observer_ipc::query(&sp, &Request::Status))
+                .await
+                .unwrap();
+        assert!(
+            refused.is_err(),
+            "a connection over the cap is closed, not served"
+        );
+
+        // Releasing the slot happens on task end, so a retry must eventually
+        // succeed — the same bounded-poll idiom `wait_for_socket` uses.
+        drop(sub);
+        let mut served = false;
+        for _ in 0..200 {
+            let sp = sock_str.clone();
+            if tokio::task::spawn_blocking(move || observer_ipc::query(&sp, &Request::Status))
+                .await
+                .unwrap()
+                .is_ok()
+            {
+                served = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            served,
+            "the connection slot must be released when the holding task ends"
+        );
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A connection that never speaks must not camp on a slot, an fd and a task
+    /// for ever: the daemon closes it when the initial-read budget expires. The
+    /// assertion is `Ok(Ok(0))` — a SERVER-side close observed by the client, not
+    /// a client-side give-up (which would be the outer timeout firing).
+    #[tokio::test]
+    async fn serve_closes_a_connection_that_never_sends_a_request() {
+        let dir = temp_dir("readtimeout");
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let mut srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        srv.request_timeout = Duration::from_millis(50);
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
+
+        let mut stream = UnixStream::connect(&sock_str).await.unwrap();
+        // Send NOTHING. The 2 s guard is far longer than the 50 ms budget, so a
+        // clean EOF here can only be the server timing the read out.
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+        assert!(
+            matches!(&read, Ok(Ok(0))),
+            "a silent connection must be closed by the server, got {read:?}"
+        );
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item 5, refusal arm: the daemon acts on the REAL peer uid read from the
+    /// socket, not a hardcoded one.
+    ///
+    /// Acting is ENABLED and `console` is pinned to "no console session", so the
+    /// only clauses left are root, `daemon_uid` (deliberately set to a uid no
+    /// account holds) and `control_uids` (empty) — a refusal can therefore come
+    /// from the peer gate and nowhere else.
+    ///
+    /// Honest limit: server and client share this process, so `Some(geteuid())`
+    /// hardcoded at the `peer_cred()` call site would be indistinguishable from
+    /// the real lookup. Separating the two uids needs a second account and
+    /// therefore root. What this pair DOES catch is every constant: `Some(0)`
+    /// authorises this arm via the root clause and stamps `peer_uid = 0` in the
+    /// acceptance arm; `None` fails both (wrong refusal message here, a refused
+    /// acceptance there); any other literal fails the `contains` assertion below.
+    #[tokio::test]
+    async fn control_over_a_real_socket_is_refused_for_an_unlisted_peer_uid() {
+        assert_ne!(
+            own_uid(),
+            ROOT_UID,
+            "run the suite unprivileged: as root every uid is authorised and this test cannot discriminate"
+        );
+        assert_ne!(
+            own_uid(),
+            NOT_A_REAL_UID,
+            "the daemon-uid clause must not accidentally authorise this test's peer"
+        );
+
+        let dir = temp_dir("peer-refused");
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let srv = test_server(&sock_str, test_acting(true), NOT_A_REAL_UID);
+        let observing = Arc::clone(&srv.observing);
+        let store = Arc::clone(&srv.store);
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
+
+        let sp = sock_str.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            observer_ipc::query(&sp, &Request::Control(ControlCmd::SetObserving(false)))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let r = match response {
+            Response::Control(r) => r,
+            other => panic!("expected a Control response, got {other:?}"),
+        };
+
+        assert!(!r.ok, "an unlisted peer uid must be refused");
+        assert!(
+            r.message.contains(&own_uid().to_string()),
+            "the refusal must name the REAL peer uid, got: {}",
+            r.message
+        );
+        assert!(
+            observing.load(Ordering::Acquire),
+            "a refused control must not touch the observing flag"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM observing_edge")
+                .unwrap(),
+            0,
+            "a refused pause must leave no boundary row behind"
+        );
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item 5, acceptance arm: the same end-to-end path, differing ONLY in
+    /// `control_uids`, must authorise the real peer AND attribute the boundary row
+    /// to it. See the refusal arm above for the policy setup and for the one case
+    /// a single-process test cannot distinguish.
+    #[tokio::test]
+    async fn control_over_a_real_socket_is_accepted_for_a_listed_peer_uid() {
+        assert_ne!(
+            own_uid(),
+            ROOT_UID,
+            "run the suite unprivileged: as root every uid is authorised and this test cannot discriminate"
+        );
+        assert_ne!(
+            own_uid(),
+            NOT_A_REAL_UID,
+            "the daemon-uid clause must not accidentally authorise this test's peer"
+        );
+
+        let dir = temp_dir("peer-accepted");
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let mut srv = test_server(&sock_str, test_acting(true), NOT_A_REAL_UID);
+        // The ONLY difference from the refusal arm.
+        srv.policy.control_uids = vec![own_uid()];
+        let observing = Arc::clone(&srv.observing);
+        let store = Arc::clone(&srv.store);
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
+
+        let sp = sock_str.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            observer_ipc::query(&sp, &Request::Control(ControlCmd::SetObserving(false)))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let r = match response {
+            Response::Control(r) => r,
+            other => panic!("expected a Control response, got {other:?}"),
+        };
+
+        assert!(r.ok, "a listed peer uid must be authorised: {}", r.message);
+        assert!(
+            !observing.load(Ordering::Acquire),
+            "an authorised pause must flip the observing flag"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT peer_uid FROM observing_edge")
+                .unwrap(),
+            i64::from(own_uid()),
+            "the boundary row must attribute the pause to the REAL peer uid, not a constant"
         );
 
         handle.abort();
