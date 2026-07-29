@@ -22,11 +22,23 @@ socket_path = "/var/lib/observer/observer.sock"
 socket_mode = 0o666
 
 # Optional: chown the socket to this uid (control-path hardening). Unset by
-# default, so the socket keeps the daemon's ownership. When you enable acting
-# below, set this to the logged-in user's uid AND set socket_mode = 0o600 so only
-# that owner can send privileged commands — a world-connectable read socket must
-# not also accept actions.
+# default, so the socket keeps the daemon's ownership. It has a SECOND role: this
+# uid is also authorised to send control requests (Control(..)) — it is the
+# operator's explicit statement about who owns the control endpoint. When you
+# enable acting below, set this to the logged-in user's uid AND set
+# socket_mode = 0o600 so only that owner can even connect — a world-connectable
+# read socket should not also invite action attempts.
 # socket_owner_uid = 501
+
+# Optional: extra uids allowed to send control requests, on top of root, the
+# daemon's own uid, socket_owner_uid above, and the logged-in console user (the
+# owner of /dev/console, re-read on every request so logout and fast user
+# switching take effect immediately). Empty by default. This is the escape hatch
+# for a headless / SSH-only host, where /dev/console is root-owned and the
+# console-user rule therefore authorises nobody. Read requests (status,
+# incidents, subscribe) are never gated — only Control is.
+# Env override: OBSERVER_CONTROL_UIDS="[501,502]"
+# control_uids = [501]
 
 # The `link` collector probes the local network path: default gateway
 # reachability, a direct TCP connectivity check, DHCP/ARP facts and Wi-Fi SSID.
@@ -83,12 +95,16 @@ filter = "arp or icmp or udp port 67 or udp port 68 or ether broadcast"
 
 # The control (acting) path: manual recovery actions observerd runs as root
 # (currently `launchctl kickstart -k` on the sing-box service). DISABLED by
-# default — with acting off, every control request is refused WITHOUT running
-# anything, and acting NEVER happens automatically (only on an explicit request
-# from the bar's "Restart sing-box" action or the cli `kickstart` subcommand).
+# default — with acting off, every ACTING-CLASS control request (KickstartProxy)
+# is refused WITHOUT running anything, and acting NEVER happens automatically
+# (only on an explicit request from the cli `kickstart` subcommand). This switch
+# does not gate benign self-control: SetObserving, which only pauses/resumes this
+# daemon's own collection, works regardless — though it, like every control
+# request, still requires an authorised peer (see socket_owner_uid /
+# control_uids above).
 #
 # Before enabling, harden the socket: set socket_mode = 0o600 and socket_owner_uid
-# above so only the owner can send privileged commands.
+# above so only the owner can even connect to the control endpoint.
 # [acting]
 # enabled = false
 # launchctl service target restarted by KickstartProxy.

@@ -63,7 +63,17 @@ build can take up to ~10 minutes — use generous timeouts.
   `Condition → Handler` interface — do not add them to v1.
 - **SKIP, never silence.** A probe that cannot run emits a `SKIP` verdict rather
   than going quiet — absence of a signal is itself diagnostic. Preserve this and
-  the verdict vocabulary (see `ARCHITECTURE.md`).
+  the verdict vocabulary (see `ARCHITECTURE.md`). The **one** sanctioned
+  exception is an operator pause (`ControlCmd::SetObserving`): a paused daemon
+  stops collecting outright instead of emitting per-tick synthetic `SKIP`
+  samples. That silence is *bracketed*, never bare — each pause/resume **edge**
+  writes a durable `observing_edge` boundary row through the `Store` and
+  publishes the same transition as a `StreamFrame::Observing` frame on the
+  realtime bus, so the gap is bounded and attributable (to a `ts_us` and a
+  control-socket `peer_uid`) offline and after the fact. Silence that is *not*
+  bracketed by those records is a bug. The observing state itself is
+  process-scoped and deliberately never persisted — a restart always resumes
+  collecting.
 - **Isolation.** One collector failing must never take down the others; each runs
   as a supervised task (log + keep ticking). Store write failures are logged as a
   gap, not silently dropped.

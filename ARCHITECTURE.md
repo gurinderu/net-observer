@@ -17,7 +17,10 @@ request is otherwise refused without running anything. Distinct from acting is a
 **observing on/off switch** (`ControlCmd::SetObserving`): benign *self-control*
 that pauses/resumes the daemon's OWN collection (the collectors stop producing
 samples; the daemon stays alive and the socket keeps serving). It touches neither
-sing-box nor the network, so it is **not** gated by `acting.enabled` — see
+sing-box nor the network, so it is **not** gated by `acting.enabled` — though,
+like every control request of either class, it must first pass the daemon's
+peer-credential check, and every pause/resume edge is recorded durably so the
+resulting silence is bounded rather than bare. See
 [Control path](#control-path). No watchdog, no automatic recovery, no
 notifications in v1 — those remain later handlers behind the same
 `Condition → Handler` interface. The shell `net-observer` remains the behavioral
@@ -62,7 +65,7 @@ flowchart LR
     freeze --> ring[["pcap ring\n(tcpdump child)"]]
     freeze -->|blob_ref| store
 
-    snap --> apisrv{{"api::serve\nUnixListener socket"}}
+    snap --> apisrv{{"api::ApiServer::serve\nUnixListener socket"}}
     bar["observer-bar\n(unprivileged socket client)"] <-->|"Request/Response\n(observer-ipc)"| apisrv
     cli["observer-cli\n(status/incidents: socket;\nquery <SQL>: offline DB)"] <-->|"Request/Response\n(observer-ipc)"| apisrv
     cli -->|"query <SQL>\n(offline, read-only)"| store
@@ -91,7 +94,8 @@ flowchart LR
   `StatusSnapshot` (the latest sample per collector + `generated_us`) current on
   every tick, and a passive `SnapshotHandler` mirrors each fired incident into a
   bounded ring (newest first). `observerd` serves this snapshot over a
-  Unix-domain socket (`bin/observerd/src/api.rs::serve`, a tokio `UnixListener`),
+  Unix-domain socket (`bin/observerd/src/api.rs`, `ApiServer::serve` — a tokio
+  `UnixListener`),
   answering entirely from memory — no DB read on the request path, zero contention
   with the writer. See [Local socket API](#local-socket-api) below.
 - **observerd** — the root LaunchDaemon: load config → open the store → spawn the
@@ -152,15 +156,36 @@ Collectors and their probe ports are **native `async fn`** (Rust ≥ 1.75), not 
   failing collector keeps ticking and never takes down the others. The only
   blocking primitive is the PF_ROUTE `read(2)`, isolated on its own OS thread by
   `spawn_event_collector`.
-- **A shared `observing` flag pauses collection.** Both spawners take an
-  `Arc<AtomicBool>` (`observing`, default `true`) that the operator flips via the
-  `SetObserving` control command. Each cycle checks it with `Ordering::Acquire`:
-  the interval loop `continue`s **before** `collect()` (skips the probe entirely,
-  so a paused collector produces no samples), and the event thread keeps draining
-  the source with `next()` (so the PF_ROUTE socket never backs up) but `continue`s
-  **before** forwarding the batch. The loops keep running while paused, so
-  `SetObserving(true)` resumes probing/forwarding on the very next tick — this is
-  the pause/resume the menu-bar switch drives. See [Control path](#control-path).
+- **A shared `observing` flag pauses collection — and every edge is recorded.**
+  Both spawners take an `Arc<AtomicBool>` (`observing`, default `true`) that the
+  operator flips via the `SetObserving` control command. Each cycle checks it with
+  `Ordering::Acquire`: the interval loop `continue`s **before** `collect()` (skips
+  the probe entirely, so a paused collector produces no samples), and the event
+  thread keeps draining the source with `next()` (so the PF_ROUTE socket never
+  backs up) but `continue`s **before** forwarding the batch. The loops keep
+  running while paused, so `SetObserving(true)` resumes probing/forwarding on the
+  very next tick — this is the pause/resume the menu-bar switch drives.
+  The resulting silence is **bracketed, not bare**: each real transition builds a
+  single `types::ObservingEdge` that goes to two sinks — a durable
+  `observing_edge` row via the `Store`, and a `StreamFrame::Observing` frame on
+  the realtime bus — so one value describes the transition to both the offline
+  record and every live subscriber, and they cannot drift. A `SetObserving` that
+  does not change the state is not an edge: no row, no frame, because a no-op
+  click must not manufacture a gap. This is the sanctioned exception to
+  [SKIP, never silence](#verdict-vocabulary).
+- **The RESUME edge clears the pipeline's recent-sample window.** The control
+  socket publishes the resume `ts_us` into a shared `Arc<AtomicI64>`
+  (`resume_at_us`) that `pipeline::run` reads on each drained sample; when it
+  moves, the consumer calls `RecentWindow::clear()` before pushing, and keeps any
+  still-in-flight pre-resume sample *out of the fresh window* (it is still
+  persisted and still published — it is a real observation — but it must not
+  reinstate the very continuity the clear just removed). The count-based conditions
+  (`Wedge`, `GwChange`) carry **no time bound**, so pre-pause samples left in the
+  window would let two bad ticks from before an arbitrary observation gap combine
+  with one after it into an incident asserting a continuity that never existed
+  ("tun dead 3 ticks"). The trigger engine's re-arm/latch state is deliberately
+  **not** reset: a trigger not re-firing across a pause is intended dedup, not a
+  bug. See [Control path](#control-path).
 
 ## Crate graph
 
@@ -256,11 +281,15 @@ graph TD
   startup panic cannot recur. `macos` also carries the per-collector
   `preflight()` checks.
 - `observer-ipc` is the shared local-socket protocol crate: the wire types
-  (`Request`, `Response`, `StatusSnapshot`, `IncidentSummary`), the
-  newline-delimited JSON framing (`write_frame` / `read_frame`), and a blocking
-  `query` client. It depends on `types` + serde only and is deliberately
-  **runtime-agnostic** — no tokio — so both the async server in `observerd` and
-  the blocking client in `observer-bar` share one definition of the format.
+  (`Request`, `Response`, `StatusSnapshot`, `IncidentSummary`, and the
+  subscription envelope `StreamFrame` with its `Ready` / `Gap` / `StreamError`
+  payloads), the newline-delimited JSON framing (`write_frame` / `read_frame`),
+  the serialise-once bus payload `EncodedFrame` (which also owns the single
+  filter rule, `passes`), and the blocking `query` / `subscribe` clients. It
+  depends on `types` + serde only and is deliberately **runtime-agnostic** — no
+  tokio — so both the async server in `observerd` and the blocking clients in
+  `observer-bar` / `observer-cli` share one definition of the format, and one
+  rendering (`StreamFrame::label` / `detail`) of every frame.
 - `bin/observerd` wires everything and owns the DuckDB store; `bin/observer-cli`
   reads `store` read-only, while `bin/observer-bar` reads live status over the
   socket via `observer-ipc` and **never touches the DB**. `bin/observer-bar` is a
@@ -304,9 +333,18 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `incident` | `id PK, opened_us, closed_us, trigger_id, signature` | Open incident ⇒ `closed_us IS NULL`. |
 | `blob_ref` | `id, incident_id, ts_us, kind, path` | On-disk forensics blobs (pcap freeze, dumps) referenced by path. |
 | `trigger_fired` | `ts_us, trigger_id, incident_id, detail` | One row per trigger fire. |
+| `observing_edge` | `ts_us, observing, peer_uid` | One row per collection pause/resume edge — the one sanctioned gap in "SKIP, never silence"; `observing` is the state entered, so `false` opens a gap and `true` closes one, and `peer_uid` attributes it to the control-socket peer that asked. |
 
 `dns_sample`, `route_event`, and `host_sample` are created by the v1.1 `dns`,
 `route-events`, and `host-metrics` collectors respectively.
+
+`observing_edge` is empty for any database written before the pause switch
+landed, and by any daemon nobody ever paused — an empty table means "never
+paused", not "no record". A daemon killed while paused leaves a `false` row with
+no closing edge: the observing state is never persisted, so the next start simply
+resumes collecting. Read a dangling `false` as **"the process died while
+paused"**, not "still paused"; the gap it opens is closed by the first sample of
+the next run, not by a `true` row.
 
 ### Verdict vocabulary
 
@@ -319,6 +357,20 @@ Ported from the oracle and cross-checked against recorded log excerpts:
 `FAKEIP` on a `.ru` name is always a bug. **`SKIP` means a prerequisite was
 missing — it is recorded explicitly, never omitted**: absence of a signal is
 itself diagnostic.
+
+**The one sanctioned exception: an operator pause.** When collection is paused
+(`ControlCmd::SetObserving(false)`) the collectors stop probing entirely rather
+than emitting a per-tick synthetic `SKIP` — a deliberate operator decision is not
+a failed prerequisite, and a paused hour of manufactured `SKIP` rows would bury
+the real ones. That silence is nonetheless **bracketed, never bare**: every
+pause/resume *edge* writes an `observing_edge` row (`ts_us, observing, peer_uid`)
+and publishes a `StreamFrame::Observing` frame, so the gap has a start, an end
+and an owner. `SELECT ts_us, observing FROM observing_edge ORDER BY ts_us` reads
+offline as the list of intervals in which the daemon deliberately collected
+nothing, which is what keeps an operator pause distinguishable from a wedged
+collector. Silence *not* bracketed by those rows is a bug, not a pause. See
+[Control path](#control-path) and the `observing` flag under
+[Async collectors](#async-collectors).
 
 ## Local socket API
 
@@ -337,10 +389,26 @@ the durable record; the socket is the live, low-latency read path.
     (acting-class, gated) and `ControlCmd::SetObserving(bool)` (self-control,
     ungated).
   - `Request::Subscribe { kinds }` → a **held-open stream** of newline-JSON
-    `Event` frames (not a single `Response`) — the realtime pub/sub path (see
-    [Event bus and live subscriptions](#event-bus-and-live-subscriptions)
-    below). `kinds: None` streams every `EventKind`; `Some(list)` filters
-    server-side.
+    `StreamFrame`s (not a single `Response`, and not bare `Event`s) — the
+    realtime pub/sub path (see [Event bus and live
+    subscriptions](#event-bus-and-live-subscriptions) below). The stream opens
+    with a **mandatory** `StreamFrame::Ready` ack carrying the `kinds` the daemon
+    actually accepted and its current `observing` state, so a fresh subscriber
+    learns whether collection is live immediately instead of inferring it from
+    silence. Four other frame kinds follow: `Event` (a live sample or incident),
+    `Gap` (this subscriber fell behind the bus and lost `skipped` events),
+    `Observing` (a real pause/resume transition — the state at subscribe time
+    rides on `Ready` instead, so a state report can never be mistaken for an edge
+    that never happened), and `Error` (a daemon-side refusal or failure, reported
+    **in band** instead of as a bare close). Only `Event` frames are subject to
+    the `kinds` filter (`None` = every `EventKind`, `Some(list)` = server-side);
+    the stream-integrity frames are **always** delivered, because a filtered
+    subscriber has more need to know about a hole or a pause, not less. That rule
+    lives in exactly one place, `EncodedFrame::passes`. The daemon holds at most
+    **256** concurrent subscriptions (`api::MAX_SUBSCRIBERS`); beyond the cap it
+    answers with one decodable
+    `StreamFrame::Error { code: TooManySubscribers, .. }` and closes, rather than
+    a bare close a client would have to read as "daemon gone".
   - a malformed request → `Response::Error(String)`
 
   `StatusSnapshot` is the latest sample per collector (`link` / `proxy` / `dns` /
@@ -351,21 +419,30 @@ the durable record; the socket is the live, low-latency read path.
   (`serde_json` + `'\n'`); the crate is runtime-agnostic (no tokio) so the async
   server and the blocking client share one format definition.
 
-- **Server** (`bin/observerd/src/api.rs::serve`) — a tokio `UnixListener`. On
-  start it removes any stale socket file, binds `cfg.socket_path`, `chmod`s it to
-  `cfg.socket_mode` so the unprivileged bar can connect to the root-owned socket,
-  and — when `cfg.socket_owner_uid` is set — `chown`s it to that uid (control-path
-  hardening; see [Control path](#control-path)). One task per connection: read one
-  `Request`, then either answer a **one-shot** request (`Status` / `Incidents` /
-  `Control`) from the shared `Arc<Mutex<StatusSnapshot>>` the pipeline keeps
-  current (or, for a `Control`, run the gated actuator), write one `Response`, and
-  close; or, for a `Subscribe`, **hold the connection open** and stream `Event`
-  frames until the client disconnects (see [Event bus and live
-  subscriptions](#event-bus-and-live-subscriptions)). The lock is held only long
-  enough to clone what a reply needs — never across an `.await`, so a slow client
-  can never stall the collector pipeline. The server is spawned by the daemon and
-  `abort()`ed on shutdown alongside the collectors; a bind failure is logged but
-  never takes the daemon down (no API, still collecting).
+- **Server** (`bin/observerd/src/api.rs`, `ApiServer::serve`) — a tokio
+  `UnixListener`. Everything the server needs (paths, modes, the acting config,
+  the `ControlPolicy`, the `observing` flag and `resume_at_us`, the snapshot, the
+  store and the event bus) is bundled into one `ApiServer` the accept loop clones
+  a single `Arc` of per connection. On start it removes any stale socket file,
+  binds `cfg.socket_path`, `chmod`s it to `cfg.socket_mode` so the unprivileged
+  bar can connect to the root-owned socket, and — when `cfg.socket_owner_uid` is
+  set — `chown`s it to that uid (control-path hardening; see
+  [Control path](#control-path)). One task per connection: read one `Request`
+  (bounded at `MAX_REQUEST_BYTES` = 64 KiB, so a client on a world-connectable
+  socket cannot grow daemon memory by never terminating its frame), then either
+  answer a **one-shot** request (`Status` / `Incidents` / `Control`) from the
+  shared `Arc<Mutex<StatusSnapshot>>` the pipeline keeps current (or, for a
+  `Control`, pass the peer-credential gate and then run the class-gated command),
+  write one `Response`, and close; or, for a `Subscribe`, **hold the connection
+  open** and stream `StreamFrame`s until the client disconnects (see [Event bus
+  and live subscriptions](#event-bus-and-live-subscriptions)). The lock is held
+  only long enough to clone what a reply needs — never across an `.await`, so a
+  slow client can never stall the collector pipeline. Connection tasks are owned
+  by the accept loop's `JoinSet` rather than detached, so aborting the server also
+  tears down in-flight streams and releases their subscriber slots. The server is
+  spawned by the daemon and `abort()`ed on shutdown alongside the collectors; a
+  bind failure is logged but never takes the daemon down (no API, still
+  collecting).
 
 - **Client** (`observer_ipc::query`, used by `bin/observer-bar` and by
   `observer-cli`'s `status` / `incidents`) — a *blocking* round-trip: connect, write
@@ -395,34 +472,87 @@ clients *subscribe* — no polling. This backs the live event-log window in the 
 and the CLI `events` tail.
 
 - **The bus.** `observerd::main` creates one process-wide
-  `tokio::sync::broadcast::channel::<Event>(EVENT_BUS_CAP)` (1024) and threads the
-  `Sender` into both the pipeline consumer and `api::serve`. An `Event` is the
-  live sibling of a `Sample`: `Event::{Link,Proxy,Dns,Route,Host}(sample)` plus
+  `tokio::sync::broadcast::channel::<EncodedFrame>(EVENT_BUS_CAP)` (1024) and
+  threads the `Sender` into both the pipeline consumer and the `ApiServer`. An
+  `Event` is the live sibling of a `Sample`:
+  `Event::{Link,Proxy,Dns,Route,Host}(sample)` plus
   `Event::Incident(IncidentSummary)`, each carrying its own `kind()` and `ts_us()`
-  (defined in `crates/observer-ipc`).
+  (defined in `crates/observer-ipc`); `StreamFrame` wraps it alongside the
+  stream-integrity frames.
+- **The bus payload is serialised once.** What travels on the channel is not a
+  `StreamFrame` but an `EncodedFrame`: the frame already rendered to its exact
+  newline-JSON bytes behind an `Arc<[u8]>`, plus the `Option<EventKind>` a filter
+  tests. Cloning it per subscriber is a refcount bump, not a second `serde_json`
+  pass, so N subscribers cost **one** encode instead of N — which is what
+  `broadcast` requires of its payload and what makes a 256-subscriber cap
+  affordable. The routing metadata is derived *from the frame* at encode time
+  rather than passed alongside it, so a stream-integrity frame can never
+  accidentally be filtered away and an event can never accidentally bypass a
+  filter: `EncodedFrame::passes` is the single rule, tested in `observer-ipc`
+  rather than in the server loop.
 
 - **Publishers (push).** In `pipeline::run`, every drained `Sample` is published
-  as the matching `Event` on the bus (right after it updates the in-memory
-  snapshot). Incidents are published by the trigger `SnapshotHandler`: on each fire
-  it sends an `Event::Incident` in addition to mirroring it into the snapshot ring.
-  Both sends *ignore the error* a `broadcast::Sender` returns when there are no
-  receivers — with nobody subscribed the bus buffers nothing and costs nothing, so
-  the pipeline never back-pressures on it. Because a paused daemon (`observing ==
-  false`) produces no samples, the stream naturally goes quiet while paused — no
-  extra gating on the bus.
+  as the matching `StreamFrame::Event` on the bus (right after it updates the
+  in-memory snapshot), encoded once via `EncodedFrame::encode`. Incidents are
+  published by the trigger `SnapshotHandler`: on each fire it sends an
+  `Event::Incident` in addition to mirroring it into the snapshot ring. Sample
+  publishers first check `events_tx.receiver_count()` and skip building and
+  sending the frame entirely while nobody is subscribed, so the bus costs nothing
+  until someone watches (the check/subscribe race is benign — a receiver that
+  subscribes later would not have got that frame anyway). With subscribers the
+  sends *ignore the error* a `broadcast::Sender` returns when the last receiver
+  has gone, so the pipeline never back-pressures on it; an encode failure is
+  logged at `warn` and that one frame is not published.
+
+- **A pause is an explicit frame, not just quiet.** A paused daemon
+  (`observing == false`) produces no samples, so the event stream does go quiet —
+  but the quiet is *not* the signal. The control socket publishes a
+  `StreamFrame::Observing` carrying the same `types::ObservingEdge` it writes to
+  the `observing_edge` table, unconditionally (the `receiver_count()` guard the
+  sample path uses buys nothing for an operator-paced toggle), so a live
+  subscriber sees the transition rather than inferring it from a stream that
+  stopped. A subscriber that connects *while* paused learns the state from the
+  `StreamFrame::Ready` ack instead.
 
 - **Subscribers (the streaming handler).** On `Request::Subscribe { kinds }`,
-  `api::stream_events` calls `events_tx.subscribe()` for a fresh per-connection
-  receiver and loops: on `Ok(ev)` it writes the frame if `kinds` passes it (`None`
-  = all, `Some(list)` = server-side filter), on `RecvError::Lagged(n)` it logs the
-  skip and continues (a slow tail may drop old events — acceptable), on
-  `RecvError::Closed` or a socket write error it stops. The connection stays open
-  for the loop's whole life — this is push, not a reply.
+  `api::stream_events` first claims one of the daemon's `max_subscribers` slots
+  (a `fetch_update`, so two connections racing at the boundary cannot both get in;
+  the slot is an RAII `SubscriberSlot` released on *every* exit path, including a
+  task aborted at shutdown). A refused claim writes one
+  `StreamFrame::Error { code: TooManySubscribers, .. }` and closes. Otherwise it
+  calls `events_tx.subscribe()` for a fresh per-connection receiver and **then**
+  writes the mandatory `StreamFrame::Ready` ack. **That order is the invariant:**
+  the receiver exists before the client is told the subscription exists, so
+  nothing published after `subscribe()` returns can vanish into the old
+  publish-before-subscribe window — which is why the daemon's own tests no longer
+  spin on `receiver_count()` waiting to be visible. `observing` is read *after*
+  subscribing, deliberately: an edge landing in between is then delivered twice
+  (ack + bus frame) rather than lost, and duplication is free because both carry
+  an absolute state, not a delta. The loop then selects between the bus and a
+  fixed one-byte read probe on the client's half (which exists only to notice a
+  subscriber that went away while the stream is quiet — its content is never
+  inspected, so nothing a client sends can grow daemon memory). On a received
+  frame it writes the pre-encoded bytes verbatim when `EncodedFrame::passes` the
+  connection's `kinds`; on `RecvError::Lagged(n)` it writes a `StreamFrame::Gap`
+  and continues; on `RecvError::Closed`, a write error, or any completion of the
+  probe it stops. **Gap frames are per-subscriber by nature and never travel on
+  the bus** — only the connection that lagged builds and writes one, and it is
+  delivered regardless of the `kinds` filter, because rendering a contiguous
+  timeline across a real hole is, for a forensics tool, a lie.
 
 - **Client** (`observer_ipc::subscribe`) — the blocking counterpart to `query`:
-  connect, write one `Subscribe` frame, then return a `Subscription` that
-  `impl Iterator<Item = io::Result<Event>>` by looping `read_frame::<Event>`. Like
-  `query`, it links no async runtime; a clean daemon close ends iteration.
+  connect, write one `Subscribe` frame, then **complete the handshake** by reading
+  the mandatory `Ready` ack before returning a `Subscription` that
+  `impl Iterator<Item = io::Result<StreamFrame>>`. `Subscription::ready()` exposes
+  the accepted filter and the daemon's collection state at subscribe time. The
+  `QUERY_TIMEOUT` bounds the handshake only — both timeouts are cleared before
+  returning, because a live stream is idle by nature and a read timeout would
+  strand a partial frame; use `Subscription::handle()` to wake a parked reader. A
+  daemon-side refusal arrives as a decodable `StreamFrame::Error` and is mapped to
+  an `io::Error` carrying the daemon's own message (deliberately *not*
+  `ConnectionRefused`, which both clients already render as "observerd is not
+  running"). Like `query`, it links no async runtime; a clean daemon close ends
+  iteration.
 
 - **The event-log window** (`bin/observer-bar/src/events.rs`) — a resizable,
   closable `WindowKind::Normal` window ("observer — events"), opened from the
@@ -431,38 +561,104 @@ and the CLI `events` tail.
   `observer_ipc` is blocking, a dedicated OS thread drives the `Subscription` and
   forwards each frame down an `mpsc` channel; a gpui foreground task drains it into
   a shared `EventLog` model (a capped `VecDeque` of the last 1000 events) that the
-  view observes and re-renders, autoscrolling to the tail. The type selector at the
-  top filters the *displayed* rows client-side by `EventKind` — changing it never
-  touches the socket. On daemon-down / stream-drop the thread shows an "offline —
-  reconnecting" note and retries after a short delay; it never panics. The window
-  handle is stashed on the shared `Glance` so a second **Events** click focuses the
-  existing window instead of spawning a duplicate subscription.
+  view observes and re-renders, autoscrolling to the tail. Every frame kind
+  becomes a row — the `Ready` ack marks the (re)connection, and gaps, observing
+  transitions and server errors are drawn in the attention colour — so a hole in
+  the stream or a pause is *visible in the log* rather than inferred from silence.
+  The type selector at the top filters the *displayed* rows client-side by
+  `EventKind` — changing it never touches the socket, and rows with no
+  `EventKind` (the stream-integrity frames) are never filtered out, mirroring the
+  daemon's always-delivered rule. On daemon-down / stream-drop the thread shows an
+  "offline — reconnecting" note and retries after a short delay; it never panics.
+  The window handle is stashed on the shared `Glance` so a second **Events** click
+  focuses the existing window instead of spawning a duplicate subscription.
 
 - **CLI** (`observer-cli events [--kind K]`) — the pub/sub smoke test and a
-  terminal tail: one `Subscribe`, print each `Event` live until Ctrl-C; `--kind`
-  filters server-side.
+  terminal tail: one `Subscribe`, print the `Ready` ack (so the tail opens by
+  stating the collection state) and then each frame live until Ctrl-C; `--kind`
+  filters server-side, and stream-integrity frames arrive regardless of it. Every
+  ending is reported on stderr with its reason, but only a genuine failure (a
+  daemon-side `StreamFrame::Error`, a decode/read failure) exits non-zero — an
+  orderly daemon close or a closed output pipe is not a failure of the tail.
+
+- **One rendering of a frame, two clients.** `StreamFrame::label()` and
+  `StreamFrame::detail()` live on the wire type in `observer-ipc` and are pure
+  over their input (no clock, no locale), so the CLI tail's
+  `HH:MM:SS  label  detail` line and the bar's log row are the same words by
+  construction rather than by two copies kept in sync.
 
 ```mermaid
 sequenceDiagram
     participant Pipe as pipeline::run + SnapshotHandler
-    participant Bus as broadcast::Sender<Event>
+    participant Bus as broadcast::Sender<EncodedFrame>
     participant Srv as observerd stream_events
     participant Win as event-log window / cli events
-    Pipe->>Bus: send(Event) per sample / on incident fire
+    Pipe->>Bus: send(EncodedFrame) — serialised ONCE\n per sample / on incident fire
     Win->>Srv: connect + write Request::Subscribe { kinds }\n
+    Srv->>Srv: claim subscriber slot (cap 256)\n else StreamFrame::Error + close
     Srv->>Bus: events_tx.subscribe() (per-conn receiver)
+    Srv-->>Win: StreamFrame::Ready { kinds, observing }\n (AFTER subscribe: nothing published later is lost)
     loop until client disconnects
-        Bus-->>Srv: recv() -> Event
-        Srv-->>Win: write Event frame\n (if kinds passes)
+        Bus-->>Srv: recv() -> EncodedFrame
+        Srv-->>Win: write bytes verbatim\n (Event frames filtered by kinds;\n Observing/Error always)
+        Note over Srv,Win: RecvError::Lagged(n) -> StreamFrame::Gap\n (per-subscriber; never on the bus)
     end
     Note over Win: offline -> "reconnecting", retry (never polls)
 ```
 
 ### Control path
 
-The one **write** path over the socket: a `Request::Control(ControlCmd)`. There
-are two classes of command, gated differently and dispatched in exactly one
-place, `api::control_response`:
+The one **write** path over the socket: a `Request::Control(ControlCmd)`. It
+passes **two orthogonal gates**, both applied in exactly one place,
+`api::control_request`: a peer-credential check that every control request of
+either class must pass, and then the `acting.enabled` class gate below.
+
+**Gate 1 — who may command the daemon at all.** Before any dispatch on the
+`ControlCmd`, the connection's peer credentials are read from the `UnixStream`
+(`peer_cred()`, `getpeereid(2)` on macOS — the peer at `connect(2)` time) and put
+through the pure predicate `api::control_authorized`. It admits:
+
+- **root** (uid 0) — it can already stop and reconfigure the daemon, so refusing
+  it would be theatre;
+- **the daemon's own euid** — a process running as the same user can already
+  signal this one, and this is the clause that keeps an unprivileged
+  `cargo test` (server and client in one process) working with no root and no
+  console;
+- **`socket_owner_uid`**, when the operator set it — their explicit statement
+  about who owns the control endpoint (the daemon already `chown`s the socket to
+  it);
+- **the logged-in console user** — the out-of-the-box case for the menu-bar
+  toggle against a root daemon. Identified by the owner of `/dev/console`, which
+  macOS's `loginwindow` chowns to the console-session user (the same fact
+  `stat -f %Su /dev/console` reports) — plain `std`, no SystemConfiguration
+  binding. Resolved **fresh on every control request**, never cached: the daemon
+  starts at boot before anyone has logged in, and logout / fast user switching
+  must take effect immediately;
+- **any uid in the new `control_uids` config key** — the escape hatch for a
+  headless / SSH-only host where `/dev/console` is root-owned and the
+  console-user rule authorises nobody.
+
+Everything else — an unrelated local uid on the mode-`0666` socket — is refused,
+as is a peer whose credentials could not be read: an authority decision **fails
+closed**. `Status`, `Incidents` and `Subscribe` are deliberately **not** gated:
+the permissive default `socket_mode` exists precisely for unprivileged readers,
+and a read carries no authority.
+
+Two structural guarantees make this unskippable rather than conventional:
+
+- The check runs **before** any dispatch on the command, and on success produces
+  a `PeerAuthorized` token whose field is private and which only
+  `authorize_control` can construct. `control_response` — the function that
+  actually dispatches — takes one **by value**, so "dispatch without a peer
+  check" is unrepresentable rather than merely discouraged. The token also
+  carries the peer's uid, which is what lands in `observing_edge.peer_uid`.
+- The `acting.enabled` gate is derived from **one exhaustive**
+  `ControlAuthority::of(&cmd)` match rather than a per-arm decision, so adding a
+  third command fails to compile until someone classifies it — no command can
+  inherit the weaker gate by omission.
+
+**Gate 2 — what the daemon may touch.** Two classes of command, gated
+differently and dispatched in exactly one place, `api::control_response`:
 
 1. **Acting-class — gated by `acting.enabled`.** `ControlCmd::KickstartProxy`
    asks the daemon to restart the sing-box service via
@@ -472,31 +668,60 @@ place, `api::control_response`:
    **not** surfaced in the bar (the bar has no "Restart sing-box" control).
 
 2. **Self-control — NOT gated by `acting.enabled`.** `ControlCmd::SetObserving(b)`
-   turns the observer's OWN collection on/off. It stores `b` into the shared
-   `observing` `AtomicBool` the collectors check each cycle and mirrors it into
-   the live snapshot (`snapshot.observing`) so the switch shows the real state. It
-   touches neither sing-box nor the network — a purely benign, reversible pause of
-   the daemon's own probing — so the acting gate deliberately does not apply: a
-   client can pause/resume collection even with `acting.enabled == false`. The
-   daemon stays alive and the socket keeps serving throughout, so the same switch
-   can turn collection back on. Clients: the bar's toggle switch and the CLI
-   `observe on|off` subcommand.
+   turns the observer's OWN collection on/off. Under the snapshot mutex (the only
+   thing serialising concurrent control connections, and this is the sole writer
+   of both) it stores `b` into the shared `observing` `AtomicBool` the collectors
+   check each cycle and mirrors it into the live snapshot
+   (`snapshot.observing`), so the switch always shows the real state. On a
+   **resume** it first publishes the edge's `ts_us` into `resume_at_us`, before
+   the flag, so a collector that sees `observing == true` has already
+   synchronised with it and no post-resume sample can reach the consumer while it
+   still reads the old epoch (see the window clear under
+   [Async collectors](#async-collectors)). It touches neither sing-box nor the
+   network — a purely benign, reversible pause of the daemon's own probing — so
+   the *acting* gate deliberately does not apply: a client can pause/resume
+   collection even with `acting.enabled == false`. It is exempt from the acting
+   gate, **not** from authorisation: like every control request it must first
+   pass gate 1. The daemon stays alive and the socket keeps serving throughout,
+   so the same switch can turn collection back on. Clients: the bar's toggle
+   switch and the CLI `observe on|off` subcommand.
+
+   A **real transition** then goes to two sinks, from one `types::ObservingEdge`
+   built once and stamped with one `ts_us`, so the offline record and the wire
+   frame cannot describe the same transition differently: a durable
+   `observing_edge` row via the `Store`, and a `StreamFrame::Observing` on the
+   event bus. A store failure is logged as a gap and reported in the result
+   message but never fails the control — the pause really did take effect, and
+   `ok: false` would be a false statement about the daemon's state. A
+   `SetObserving` that does **not** change the state is not an edge: no row, no
+   frame, because a no-op click must not manufacture a gap in the record.
 
 ```
-Request::Control(cmd)  ──►  control_response(cmd, &observing, &snapshot, &acting)
+Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
                               │
-                              ├─ SetObserving(b)  — self-control, UNGATED
-                              │     └─► observing.store(b)  +  snapshot.observing = b
-                              │         └─► ControlResult { ok: true, "observing on|off" }
-                              │             (never touches sing-box or the network)
-                              │
-                              └─ KickstartProxy   — acting-class, GATED
-                                    ├─ acting.enabled == false (DEFAULT)
+                              ├─ GATE 1: control_authorized(policy, peer_uid, console_uid())
+                              │     ├─ refused / peer unknown
+                              │     │     └─► ControlResult { ok: false, "control refused: …" }
+                              │     │         (fails closed; nothing is dispatched)
+                              │     └─ allowed ─► PeerAuthorized(uid)  ── required BY VALUE by ──┐
+                              │                                                                  │
+                              └─ control_response(cmd, authorized, &cx)  ◄──────────────────────┘
+                                    │
+                                    ├─ GATE 2: ControlAuthority::of(&cmd) == Acting && !acting.enabled
                                     │     └─► ControlResult { ok: false, "acting disabled" }
                                     │         (returns before touching the actuator —
                                     │          nothing is executed)
                                     │
-                                    └─ acting.enabled == true
+                                    ├─ SetObserving(b)  — SelfControl, ungated by acting
+                                    │     └─► [resume: resume_at_us.store(ts)] + observing.store(b)
+                                    │         + snapshot.observing = b
+                                    │         └─► on a real EDGE only:
+                                    │             store.write_observing_edge(&edge)   (durable)
+                                    │             events_tx.send(StreamFrame::Observing(edge))
+                                    │         └─► ControlResult { ok: true, "observing on|off" }
+                                    │             (never touches sing-box or the network)
+                                    │
+                                    └─ KickstartProxy   — Acting-class, gated above
                                           └─► acting::kickstart_proxy(&singbox_service)
                                               (the ONLY place launchctl runs)
                                               └─► ControlResult { ok, message }
@@ -504,18 +729,36 @@ Request::Control(cmd)  ──►  control_response(cmd, &observing, &snapshot, &
 
 **Safety invariant:** `acting.enabled` defaults to `false` (`config::ActingCfg`),
 and no code path reaches the actuator (`bin/observerd/src/acting.rs`) unless a
-`KickstartProxy` request arrives **and** acting is enabled. Acting is never
-triggered by the pipeline or a passive handler — only by an explicit operator
-request. `SetObserving` is exempt from this gate by design (self-control, no
-external effect), but it is still a `Control` request over the same socket, so
-the socket-ownership hardening below applies to it unchanged.
+`KickstartProxy` request arrives from an **authorised peer** *and* acting is
+enabled. Acting is never triggered by the pipeline or a passive handler — only by
+an explicit operator request. `SetObserving` is exempt from the *acting* gate by
+design (self-control, no external effect) but never from authorisation: it is a
+`Control` request over the same socket, so gate 1 and the socket hardening below
+apply to it unchanged.
 
-**Socket ownership / hardening.** Because the control path accepts privileged
-commands, an operator enabling `acting` should also lock the socket down: set
-`socket_mode = 0o600` and `socket_owner_uid = <logged-in uid>` so only that owner
-can connect and send commands. With the default `socket_mode = 0o666` the socket
-is world-connectable (fine for read-only status, unsafe once acting is on), and
-`socket_owner_uid` is `None` (the socket keeps the daemon's root ownership).
+**Pause semantics: process-scoped, never persisted.** The `observing` state lives
+only in the running process — it is deliberately **not** written to the store or
+to any state file, and a restart always comes back collecting. Persisting it has
+the dangerous failure mode: a root forensics collector that silently stays blind
+across a restart nobody noticed. Restart-resumes fails safe by comparison, at the
+cost of an operator having to re-pause after a daemon restart. The daemon logs the
+effective observing state at startup, so the choice is explicit at every boot
+rather than accidental — and the `observing_edge` table still bounds the pause
+that was in effect when the process died (see the note under
+[Data model](#data-model-duckdb)).
+
+**Socket ownership / hardening.** The socket's mode and owner are *defence in
+depth*, not the authorisation mechanism — the peer-credential gate above is, and
+it applies whatever the file permissions are. Still, an operator enabling
+`acting` should narrow who can even connect: set `socket_mode = 0o600` and
+`socket_owner_uid = <logged-in uid>` so only that owner reaches the endpoint at
+all. With the default `socket_mode = 0o666` the socket is world-connectable (fine
+for read-only status; a stranger's `Control` is refused by gate 1, but tightening
+the mode removes the attempt as well as the effect), and `socket_owner_uid` is
+`None` (the socket keeps the daemon's root ownership — and then authorises no one
+through that clause). On a host with no console session, `control_uids` is the
+way to authorise an administrator, since the console-user rule admits nobody
+there.
 
 ## Privilege split
 
@@ -539,6 +782,10 @@ The menu-bar UI stays a separate unprivileged binary — never the daemon itself
 The daemon relaxes the socket file's mode (config `socket_mode`, default `0666`)
 so the logged-in user's UI can connect to the root-owned socket. The socket is
 owned by root by default; when `socket_owner_uid` is set the daemon `chown`s it to
-that uid instead. Pair a restrictive `socket_mode = 0o600` with `socket_owner_uid`
-whenever `acting.enabled` is turned on, so the world-connectable read socket does
-not also accept privileged control commands (see [Control path](#control-path)).
+that uid instead. What keeps the world-connectable read socket from also
+accepting privileged commands is the **peer-credential gate** on every
+`Request::Control` — root, the daemon's own uid, `socket_owner_uid`, the
+logged-in console user, or a uid in `control_uids` — not the file mode; a
+restrictive `socket_mode = 0o600` paired with `socket_owner_uid` is defence in
+depth on top of it, worth setting whenever `acting.enabled` is turned on (see
+[Control path](#control-path)).

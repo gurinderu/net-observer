@@ -47,6 +47,13 @@ cp observer.example.toml observer.toml
 sudo cargo run -p observerd -- --config observer.toml
 ```
 
+A `--config` path you name explicitly must exist and be a readable regular file:
+a typo is an error, not a silent fall-back to the built-in defaults — which for
+the daemon would mean binding a socket and opening a database nobody asked for.
+(`observer-bar` is deliberately exempt: it still launches and surfaces the reason
+in its panel and on stderr, because a GUI that refuses to start leaves the user
+with nothing.)
+
 Each collector is independently toggled with its own interval, e.g.:
 
 ```toml
