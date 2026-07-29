@@ -196,6 +196,40 @@ mod tests {
         assert!(c.eval(&w).is_none()); // whole-network down, not a wedge
     }
 
+    /// Push `n` wedge-shaped tick pairs (direct healthy, tun dead) starting at
+    /// `from`, two microseconds apart.
+    fn push_wedge_ticks(w: &mut RecentWindow, from: i64, n: i64) {
+        for t in 0..n {
+            w.push(link(from + t * 2, TcpVerdict::Ok));
+            w.push(proxy(from + t * 2 + 1, 0));
+        }
+    }
+
+    #[test]
+    fn wedge_does_not_fire_across_a_cleared_window() {
+        let mut w = RecentWindow::new(16);
+        let c = Wedge { consecutive: 3 };
+        push_wedge_ticks(&mut w, 0, 2);
+        // The resume edge drops everything on the far side of the observation
+        // gap, so the two pre-pause ticks can never combine with a post-resume
+        // one into "tun dead 3 ticks" — a continuity that never existed.
+        w.clear();
+        push_wedge_ticks(&mut w, 1_000, 1);
+        assert!(c.eval(&w).is_none());
+    }
+
+    #[test]
+    fn wedge_fires_without_a_clear() {
+        // The control half of the pair: the very same three tick pairs, with no
+        // clear between them, DO fire — so the test above measures the clear
+        // and not a fixture that simply never populated the window.
+        let mut w = RecentWindow::new(16);
+        let c = Wedge { consecutive: 3 };
+        push_wedge_ticks(&mut w, 0, 2);
+        push_wedge_ticks(&mut w, 1_000, 1);
+        assert!(c.eval(&w).is_some());
+    }
+
     #[test]
     fn fakeip_fires_on_ru_fakeip_answer() {
         let mut w = RecentWindow::new(16);

@@ -25,6 +25,26 @@ impl RecentWindow {
         }
     }
 
+    /// Drop every retained sample, keeping the allocated capacity.
+    ///
+    /// Called on a collection RESUME edge. The window is push-only and the
+    /// count-based conditions (`Wedge`, `GwChange`) carry no time bound, so
+    /// pre-pause samples left in it would let two bad ticks from before an
+    /// arbitrary observation gap combine with one after it into an incident
+    /// asserting a continuity that never existed ("tun dead 3 ticks").
+    ///
+    /// This forgets *samples* only. The trigger engine's re-arm/latch state is
+    /// deliberately NOT reset — a trigger not re-firing across a pause is
+    /// intended dedup, not a bug.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    /// Whether the window currently holds no samples.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     /// The most recent `n` link samples, newest first.
     pub fn recent_link(&self, n: usize) -> Vec<&LinkSample> {
         self.buf
@@ -106,5 +126,65 @@ impl RecentWindow {
                 Sample::Proxy(_) | Sample::Dns(_) | Sample::Route(_) | Sample::Host(_) => None,
             })
             .nth(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::{GwVerdict, TcpVerdict};
+
+    fn link(ts: i64) -> Sample {
+        Sample::Link(LinkSample {
+            ts_us: ts,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+        })
+    }
+
+    fn proxy(ts: i64) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us: ts,
+            server_ip: "1".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: None,
+            tun_code: Some(0),
+            selector: None,
+        })
+    }
+
+    #[test]
+    fn clear_empties_the_window() {
+        let mut w = RecentWindow::new(16);
+        w.push(link(1));
+        w.push(proxy(2));
+        assert!(!w.is_empty());
+
+        w.clear();
+
+        // Nothing from before the gap survives, through any accessor.
+        assert!(w.is_empty());
+        assert!(w.last_link().is_none());
+        assert!(w.last_proxy().is_none());
+        assert!(w.recent_link(3).is_empty());
+        assert!(w.recent_proxy(3).is_empty());
+        assert!(w.prev_link().is_none());
+
+        // A cleared window is still a usable window, not a poisoned one.
+        w.push(link(10));
+        w.push(proxy(11));
+        w.push(link(12));
+        assert!(!w.is_empty());
+        assert_eq!(w.last_link().map(|l| l.ts_us), Some(12));
+        assert_eq!(w.prev_link().map(|l| l.ts_us), Some(10));
+        assert_eq!(w.last_proxy().map(|p| p.ts_us), Some(11));
+        assert_eq!(w.recent_link(3).len(), 2);
     }
 }
