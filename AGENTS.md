@@ -71,9 +71,13 @@ build can take up to ~10 minutes — use generous timeouts.
   publishes the same transition as a `StreamFrame::Observing` frame on the
   realtime bus, so the gap is bounded and attributable (to a `ts_us` and a
   control-socket `peer_uid`) offline and after the fact. Silence that is *not*
-  bracketed by those records is a bug. The observing state itself is
-  process-scoped and deliberately never persisted — a restart always resumes
-  collecting.
+  bracketed by those records is a bug. Samples the bounded post-resume drain keeps
+  out of the trigger window are **not** a second exception: each is still written
+  to DuckDB and still published on the bus, and the drain itself is bounded by a
+  monotonic deadline and a drop cap and reports its totals, so "filtered from the
+  trigger window" never becomes "dropped from the record". The observing state
+  itself is process-scoped and deliberately never persisted — a restart always
+  resumes collecting.
 - **Isolation.** One collector failing must never take down the others; each runs
   as a supervised task (log + keep ticking). Store write failures are logged as a
   gap, not silently dropped.

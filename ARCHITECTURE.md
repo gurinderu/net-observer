@@ -173,19 +173,69 @@ Collectors and their probe ports are **native `async fn`** (Rust ≥ 1.75), not 
   does not change the state is not an edge: no row, no frame, because a no-op
   click must not manufacture a gap. This is the sanctioned exception to
   [SKIP, never silence](#verdict-vocabulary).
-- **The RESUME edge clears the pipeline's recent-sample window.** The control
-  socket publishes the resume `ts_us` into a shared `Arc<AtomicI64>`
-  (`resume_at_us`) that `pipeline::run` reads on each drained sample; when it
-  moves, the consumer calls `RecentWindow::clear()` before pushing, and keeps any
-  still-in-flight pre-resume sample *out of the fresh window* (it is still
-  persisted and still published — it is a real observation — but it must not
-  reinstate the very continuity the clear just removed). The count-based conditions
-  (`Wedge`, `GwChange`) carry **no time bound**, so pre-pause samples left in the
-  window would let two bad ticks from before an arbitrary observation gap combine
-  with one after it into an incident asserting a continuity that never existed
-  ("tun dead 3 ticks"). The trigger engine's re-arm/latch state is deliberately
-  **not** reset: a trigger not re-firing across a pause is intended dedup, not a
-  bug. See [Control path](#control-path).
+- **The RESUME edge clears the pipeline's recent-sample window — and re-opens
+  detection.** The control socket publishes the resume `ts_us` into a shared
+  `Arc<AtomicI64>` (`resume_at_us`) that `pipeline::run` reads on each drained
+  sample; when it moves, the consumer calls `RecentWindow::clear_for_resume()` and
+  then `TriggerEngine::rearm_all()` before pushing anything new. `Wedge` and the
+  other count-based conditions carry **no time bound**, so pre-pause samples left
+  in the window would let two bad ticks from before an arbitrary observation gap
+  combine with one after it into an incident asserting a continuity that never
+  existed ("tun dead 3 ticks"). A resume therefore **re-opens** detection; it does
+  not dedup it: every trigger is re-armed, so a fault that is still present when
+  collection resumes is recorded again — as a **new** incident belonging to the new
+  observation session, not as a duplicate of the pre-pause one. Re-arming is
+  explicit because the alternative is accidental: an emptied window re-arms a
+  trigger only *if* the next sample is one its condition reads nothing from (a
+  `host` tick re-arms `gw-drop`; a `link` tick leaves it latched), which made "does
+  a persistent fault re-fire across a pause?" depend on collector arrival order.
+  What a resume does **not** do is reset the firing budget: `last_fire_us` survives
+  it, so each trigger still fires at most once per `backoff_us` and a toggled
+  switch cannot storm the incident log. The `observing_edge` rows bound the gap
+  between the two records.
+- **Exactly one thing survives that clear: the gateway-CHANGE BASIS.**
+  `clear_for_resume` carries the newest `LinkSample` forward, reachable **only**
+  through `RecentWindow::prev_link` / `prev_link_with_provenance` — never through
+  `last_link`, `recent_link`, `recent_proxy`, `recent_dns` or `is_empty`. The
+  oracle freezes the pcap ring on **any** gateway change, and the ring is started
+  once in `main` and is **not** gated by `observing`, so `tcpdump` keeps filling it
+  throughout a pause: the packets around a gateway change that happened *during*
+  the pause are physically still in the ring at resume. Firing `GwChange` there
+  makes `FreezePcapHandler` preserve real evidence, where dropping it would only
+  issue a receipt for evidence that was lost. Change detection needs exactly one
+  prior sample, never a run of them, so nothing else is carried: `GwDrop` and
+  `Starvation` still cannot assert pre-pause state as the present, and `Wedge`
+  still loses its entire history and still cannot span the gap — the
+  false-continuity rule above is unchanged. The basis is retired by the **second**
+  post-clear link *push* (counted, not inferred from the buffer: a burst of
+  non-link samples can evict the first post-clear link, and an hours-old basis must
+  never resurface as the neighbour of an unrelated sample), and it is *kept* across
+  a resume that saw no link sample at all, since the last gateway state this daemon
+  actually observed stays the truthful thing to compare against however many gaps
+  sit in between. A change measured against the basis is reported as
+  `LinkProvenance::AcrossGap` and its incident detail ends in
+  " (across an observation gap)", so an offline reader never mistakes it for two
+  consecutive ticks.
+- **The post-resume in-flight filter is bounded by a MONOTONIC clock.** A sample
+  produced before the resume is on the far side of the observation gap and is kept
+  *out of the fresh window* — it is still persisted and still published (it is a
+  real observation), but it must not reinstate the very continuity the clear just
+  removed. Which sample is stale can only be decided on the **wall** clock: a
+  `Sample` carries no other time, and the resume epoch is a `types::now_us()` taken
+  by the control path. A wall-clock comparison *alone*, though, is a latent
+  total-detection outage — one backwards step (NTP, sleep/wake, a manual `date`)
+  larger than the collector cadence makes `ts_us < resume_us` hold for *every*
+  future sample, and the consumer would then skip `window.push` and
+  `engine.on_sample` for ever. So `pipeline::ResumeGate` bounds how long that
+  comparison may be applied **at all**, with a monotonic `Instant` deadline
+  (`RESUME_DRAIN`, 5 s) and a drop cap (`RESUME_DRAIN_MAX_SAMPLES` = 2 ×
+  `CHANNEL_CAP`); when either bound is reached the gate closes until the next
+  resume edge and every sample reaches the window again. It is evaluated lazily, at
+  sample time — no timer, no task — so an armed gate on a silent stream has by
+  construction held nothing back. Nothing is silent: the first drop of an episode
+  and the episode total are logged at `warn`, and the process total on the
+  consumer's exit line. The failure mode is "briefly over-accept", never "silently
+  stop detecting". See [Control path](#control-path).
 
 ## Crate graph
 
@@ -408,7 +458,15 @@ the durable record; the socket is the live, low-latency read path.
     **256** concurrent subscriptions (`api::MAX_SUBSCRIBERS`); beyond the cap it
     answers with one decodable
     `StreamFrame::Error { code: TooManySubscribers, .. }` and closes, rather than
-    a bare close a client would have to read as "daemon gone".
+    a bare close a client would have to read as "daemon gone". Underneath that, at
+    most **512** connections of *any* kind are handled concurrently
+    (`api::MAX_CONNECTIONS`), enforced at **accept** time: over the cap the
+    newcomer is closed immediately — nothing has been read, so there is no request
+    to answer and no way to know which frame type the client would decode, and a
+    clean EOF beats a mis-decodable one — while the incumbents are never shed.
+    `MAX_CONNECTIONS > MAX_SUBSCRIBERS` is asserted at **compile time**, so the cap
+    a well-behaved subscriber meets first is still the subscriber cap, with its
+    decodable `StreamFrame::Error`.
   - a malformed request → `Response::Error(String)`
 
   `StatusSnapshot` is the latest sample per collector (`link` / `proxy` / `dns` /
@@ -427,9 +485,17 @@ the durable record; the socket is the live, low-latency read path.
   binds `cfg.socket_path`, `chmod`s it to `cfg.socket_mode` so the unprivileged
   bar can connect to the root-owned socket, and — when `cfg.socket_owner_uid` is
   set — `chown`s it to that uid (control-path hardening; see
-  [Control path](#control-path)). One task per connection: read one `Request`
-  (bounded at `MAX_REQUEST_BYTES` = 64 KiB, so a client on a world-connectable
-  socket cannot grow daemon memory by never terminating its frame), then either
+  [Control path](#control-path)). One task per connection: read one `Request`,
+  bounded in the three dimensions a world-connectable socket can be attacked in —
+  **bytes** (`MAX_REQUEST_BYTES` = 64 KiB, so a client cannot grow daemon memory by
+  never terminating its frame), **time** (`REQUEST_READ_TIMEOUT` = 10 s over the
+  *whole* initial read, so a byte-per-second drip cannot extend it and a silent
+  connection cannot camp on a connection slot, an fd and a task; it covers the
+  **initial request only** — a held-open `Subscribe` stream is idle by design and
+  is watched for EOF instead), and **connections** (`MAX_CONNECTIONS`, above). All
+  three are load-bearing: without the timeout, silent connections fill the
+  connection cap and lock legitimate clients out permanently; without the cap, an
+  attacker opens fds faster than the timeout reaps them. Then either
   answer a **one-shot** request (`Status` / `Incidents` / `Control`) from the
   shared `Arc<Mutex<StatusSnapshot>>` the pipeline keeps current (or, for a
   `Control`, pass the peer-credential gate and then run the class-gated command),
@@ -642,7 +708,22 @@ Everything else — an unrelated local uid on the mode-`0666` socket — is refu
 as is a peer whose credentials could not be read: an authority decision **fails
 closed**. `Status`, `Incidents` and `Subscribe` are deliberately **not** gated:
 the permissive default `socket_mode` exists precisely for unprivileged readers,
-and a read carries no authority.
+and a read carries no authority. The console clause is evaluated **last**, and
+only when no cheaper clause has already said yes (`control_authorized(.., None)`
+is exactly "authorised with no console session"), so an authorised-by-config peer
+costs no `stat("/dev/console")` at all.
+
+Refusals are **rate-limited, never silent.** The socket is world-connectable by
+default, so an unauthorised local process could otherwise grow a **root** daemon's
+log at its own loop rate. Control refusals and accept-time connection-cap refusals
+each go through their own `api::RateLimitedLog`: at most one `warn!` per minute
+(`REFUSAL_LOG_INTERVAL`), and every line reports how many events it stands for, so
+suppressed events are deferred rather than lost and the flood stays visible and
+countable without being transcribed. Accept **errors** are throttled the same way,
+since a persistent `EMFILE` under fd exhaustion spins the accept loop at full speed
+— the same unbounded-log path by another route. The throttle is monotonic
+(`Instant`) on purpose: a wall-clock step must be able neither to unmute the log
+nor to mute it for ever.
 
 Two structural guarantees make this unskippable rather than conventional:
 
