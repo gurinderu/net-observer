@@ -1,7 +1,7 @@
 use crate::{Store, schema::SCHEMA_SQL};
 use duckdb::{Connection, params};
 use std::sync::Mutex;
-use types::{BlobRef, Incident, Sample, TriggerFired};
+use types::{BlobRef, Incident, ObservingEdge, Sample, TriggerFired};
 
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
@@ -177,6 +177,13 @@ impl Store for DuckdbStore {
         )?;
         Ok(())
     }
+    fn write_observing_edge(&self, e: &ObservingEdge) -> Result<(), StoreError> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO observing_edge VALUES (?,?,?)",
+            params![e.ts_us, e.observing, e.peer_uid.map(i64::from)],
+        )?;
+        Ok(())
+    }
     fn query_scalar_i64(&self, sql: &str) -> Result<i64, StoreError> {
         Ok(self.conn.lock().unwrap().query_row(sql, [], |r| r.get(0))?)
     }
@@ -315,6 +322,83 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], ("wedge".into(), 3000, None));
         assert_eq!(rows[1], ("gw-drop".into(), 1000, Some(2000)));
+    }
+
+    #[test]
+    fn write_observing_edge_round_trips() {
+        use types::ObservingEdge;
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_observing_edge(&ObservingEdge {
+            ts_us: 1000,
+            observing: false,
+            peer_uid: Some(501),
+        })
+        .unwrap();
+        s.write_observing_edge(&ObservingEdge {
+            ts_us: 2000,
+            observing: true,
+            peer_uid: Some(501),
+        })
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM observing_edge WHERE observing = false AND peer_uid = 501"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM observing_edge")
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn observing_edge_accepts_a_null_peer() {
+        use types::ObservingEdge;
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_observing_edge(&ObservingEdge {
+            ts_us: 1000,
+            observing: false,
+            peer_uid: None,
+        })
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM observing_edge WHERE peer_uid IS NULL")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn observing_edges_read_back_in_ts_order() {
+        use types::ObservingEdge;
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_observing_edge(&ObservingEdge {
+            ts_us: 100,
+            observing: false,
+            peer_uid: Some(501),
+        })
+        .unwrap();
+        s.write_observing_edge(&ObservingEdge {
+            ts_us: 200,
+            observing: true,
+            peer_uid: Some(501),
+        })
+        .unwrap();
+        // The pause must read back before the resume: the interval between the
+        // two rows is exactly the window in which the daemon collected nothing.
+        let t = s
+            .query_table("SELECT ts_us, observing FROM observing_edge ORDER BY ts_us")
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec!["100".to_string(), "false".to_string()],
+                vec!["200".to_string(), "true".to_string()],
+            ]
+        );
     }
 
     #[test]

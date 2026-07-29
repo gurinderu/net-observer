@@ -16,4 +16,6 @@ CREATE TABLE IF NOT EXISTS route_event (
   ts_us BIGINT, kind VARCHAR, iface VARCHAR, detail VARCHAR);
 CREATE TABLE IF NOT EXISTS host_sample (
   ts_us BIGINT, load1 DOUBLE, load5 DOUBLE, load15 DOUBLE);
+CREATE TABLE IF NOT EXISTS observing_edge (
+  ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT);
 "#;
