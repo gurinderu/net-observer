@@ -190,46 +190,14 @@ async fn run_daemon() -> anyhow::Result<()> {
     // bind failure is logged but never takes the daemon down (no API, still
     // collecting). Aborted on shutdown alongside the collectors.
     let api_handle = {
-        let snapshot = snapshot.clone();
-        let observing = observing.clone();
-        let events_tx = events_tx.clone();
-        let socket_path = cfg.socket_path.clone();
-        let socket_mode = cfg.socket_mode;
-        let socket_owner_uid = cfg.socket_owner_uid;
-        // Thread the acting config through so the control path is gated by
-        // `acting.enabled` (off by default) in one place: `api::control_response`.
-        // The `observing` flag is threaded separately: `SetObserving` is benign
-        // self-control and must NOT be gated by that switch.
-        let acting = api::ActingConfig {
-            enabled: cfg.acting.enabled,
-            singbox_service: cfg.acting.singbox_service.clone(),
-        };
-        let server = api::ApiServer {
-            socket_path,
-            socket_mode,
-            socket_owner_uid,
-            max_subscribers: api::MAX_SUBSCRIBERS,
-            // Bounds for a socket that is world-connectable by default: a local
-            // process must not be able to pin unbounded tasks/fds by connecting
-            // and never speaking, nor grow a root daemon's log by looping refused
-            // control requests.
-            max_connections: api::MAX_CONNECTIONS,
-            request_timeout: api::REQUEST_READ_TIMEOUT,
-            control_refusals: api::RateLimitedLog::new(api::REFUSAL_LOG_INTERVAL),
-            sub_refusals: api::RateLimitedLog::new(api::REFUSAL_LOG_INTERVAL),
-            acting,
-            // Who may send a `Request::Control` at all — orthogonal to
-            // `acting.enabled`, which only gates the acting *class* of commands.
-            policy: api::ControlPolicy::from_config(cfg.socket_owner_uid, cfg.control_uids.clone()),
-            observing,
-            resume_at_us: resume_at_us.clone(),
-            snapshot,
-            // The durable sink for `observing_edge` boundary rows: the daemon
-            // stays the sole DuckDB owner, so the control path writes through the
-            // same handle the pipeline does.
-            store: store.clone() as Arc<dyn store::Store + Send + Sync>,
-            events_tx,
-        };
+        let server = build_api_server(
+            &cfg,
+            snapshot.clone(),
+            observing.clone(),
+            resume_at_us.clone(),
+            store.clone(),
+            events_tx.clone(),
+        );
         tokio::spawn(async move {
             if let Err(e) = server.serve().await {
                 tracing::error!(error = %e, "status socket server exited");
@@ -518,6 +486,64 @@ fn maybe_start_pcap_ring(cfg: &Config, phys_iface: Option<&str>) -> Option<Arc<d
     }
 }
 
+/// Assemble the socket API server from `cfg` plus the daemon's shared state.
+///
+/// Split out of [`run_daemon`] so the wiring itself is addressable: this block is
+/// the ONLY place the production caps, the initial-read budget, the two
+/// rate-limited logs and the config-derived control policy are chosen, and every
+/// `api` test overrides those fields with test-sized values — so without a seam
+/// here they reach nothing but a running daemon. It is also where the shared
+/// handles must stay SHARED: a fresh `Arc` for `observing` would leave the control
+/// socket acking a pause no collector ever sees.
+///
+/// Must stay the only place an [`api::ApiServer`] is built.
+fn build_api_server(
+    cfg: &Config,
+    snapshot: Arc<Mutex<StatusSnapshot>>,
+    observing: Arc<AtomicBool>,
+    resume_at_us: Arc<AtomicI64>,
+    store: Arc<DuckdbStore>,
+    events_tx: tokio::sync::broadcast::Sender<EncodedFrame>,
+) -> api::ApiServer {
+    let socket_path = cfg.socket_path.clone();
+    let socket_mode = cfg.socket_mode;
+    let socket_owner_uid = cfg.socket_owner_uid;
+    // Thread the acting config through so the control path is gated by
+    // `acting.enabled` (off by default) in one place: `api::control_response`.
+    // The `observing` flag is threaded separately: `SetObserving` is benign
+    // self-control and must NOT be gated by that switch.
+    let acting = api::ActingConfig {
+        enabled: cfg.acting.enabled,
+        singbox_service: cfg.acting.singbox_service.clone(),
+    };
+    api::ApiServer {
+        socket_path,
+        socket_mode,
+        socket_owner_uid,
+        max_subscribers: api::MAX_SUBSCRIBERS,
+        // Bounds for a socket that is world-connectable by default: a local
+        // process must not be able to pin unbounded tasks/fds by connecting
+        // and never speaking, nor grow a root daemon's log by looping refused
+        // control requests.
+        max_connections: api::MAX_CONNECTIONS,
+        request_timeout: api::REQUEST_READ_TIMEOUT,
+        control_refusals: api::RateLimitedLog::new(api::REFUSAL_LOG_INTERVAL),
+        sub_refusals: api::RateLimitedLog::new(api::REFUSAL_LOG_INTERVAL),
+        acting,
+        // Who may send a `Request::Control` at all — orthogonal to
+        // `acting.enabled`, which only gates the acting *class* of commands.
+        policy: api::ControlPolicy::from_config(cfg.socket_owner_uid, cfg.control_uids.clone()),
+        observing,
+        resume_at_us,
+        snapshot,
+        // The durable sink for `observing_edge` boundary rows: the daemon
+        // stays the sole DuckDB owner, so the control path writes through the
+        // same handle the pipeline does.
+        store: store as Arc<dyn store::Store + Send + Sync>,
+        events_tx,
+    }
+}
+
 /// Assemble the [`TriggerEngine`] with the starter rules (wedge, gw-drop,
 /// gw-change, fakeip, starvation). Every rule records an incident (durable, in
 /// DuckDB) and mirrors it into the live snapshot's ring for the socket API;
@@ -576,4 +602,491 @@ fn build_engine(
     ];
 
     TriggerEngine::new(triggers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    use observer_ipc::{Event, StreamFrame};
+    use store::Store as _;
+    use triggers::window::RecentWindow;
+    use types::{GwVerdict, HostSample, LinkSample, ProxySample, TcpVerdict};
+
+    /// A fake freezer standing in for `macos::PcapRing` (no tcpdump, no root): it
+    /// returns a plausible ring-file path without touching the filesystem.
+    struct FakeFreezer;
+    impl PcapFreezer for FakeFreezer {
+        fn freeze(&self, dest_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+            vec![dest_dir.join("ring.pcap0")]
+        }
+    }
+
+    /// A config whose only deviations from the shipped defaults are the ones the
+    /// wiring assertions read back — so a hardcoded literal in
+    /// [`build_api_server`] cannot coincide with the value under test. Nothing
+    /// here is ever opened: the socket is never bound (no `serve()`), and
+    /// `FakeFreezer` plus `FreezePcapHandler::on_fire` only *join* `blob_dir`.
+    fn test_cfg() -> Config {
+        Config {
+            socket_path: "/tmp/observerd-wiring-test.sock".into(),
+            // Deliberately NOT the shipped 0o666: a hardcoded default dies here.
+            socket_mode: 0o600,
+            socket_owner_uid: Some(4242),
+            control_uids: vec![7, 9],
+            blob_dir: "/tmp/observerd-wiring-test-blobs".into(),
+            acting: config::ActingCfg {
+                // Also NOT the shipped default (`false`), for the same reason.
+                enabled: true,
+                singbox_service: "system/wiring-test".into(),
+            },
+            ..Config::default()
+        }
+    }
+
+    fn link(ts_us: i64, gw: GwVerdict) -> Sample {
+        Sample::Link(LinkSample {
+            ts_us,
+            gw,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+        })
+    }
+
+    /// A proxy tick with the tun dead (`tun_code` 0) while the TCP path is fine —
+    /// the wedge/starvation shape.
+    fn dead_proxy(ts_us: i64) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us,
+            server_ip: "1".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: None,
+            tun_code: Some(0),
+            selector: None,
+        })
+    }
+
+    fn host(ts_us: i64, load1: f64) -> Sample {
+        Sample::Host(HostSample {
+            ts_us,
+            load1,
+            load5: load1,
+            load15: load1,
+        })
+    }
+
+    // ── the ApiServer wiring ────────────────────────────────────────────────
+
+    /// Everything [`build_api_server`] is handed reaches the server it builds,
+    /// and the handles it is handed stay SHARED rather than copied.
+    ///
+    /// Dies under any of: a hardcoded socket field (`socket_mode: 0o666`,
+    /// `socket_owner_uid: None`, `enabled: false`); dropping `cfg.control_uids`
+    /// from the control policy; substituting a literal for `api::MAX_SUBSCRIBERS`
+    /// / `api::MAX_CONNECTIONS` / `api::REQUEST_READ_TIMEOUT`;
+    /// `RateLimitedLog::new(Duration::ZERO)` on either refusal limiter; a fresh
+    /// `Arc::new(AtomicBool::new(true))` / `AtomicI64::new(0)` /
+    /// `Mutex::new(StatusSnapshot::default())` in place of the daemon's own
+    /// handle; a fresh `broadcast::channel` for the bus; or a second
+    /// `DuckdbStore` for the control path's writes.
+    #[test]
+    fn build_api_server_wires_the_production_bounds_and_the_daemon_handles() {
+        let cfg = test_cfg();
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let observing = Arc::new(AtomicBool::new(true));
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        // A broadcast channel needs no runtime, so this whole test is a plain
+        // `#[test]`.
+        let (events_tx, _events_rx) = tokio::sync::broadcast::channel::<EncodedFrame>(4);
+
+        let srv = build_api_server(
+            &cfg,
+            snapshot.clone(),
+            observing.clone(),
+            resume_at_us.clone(),
+            store.clone(),
+            events_tx.clone(),
+        );
+
+        // The config reaches the socket verbatim.
+        assert_eq!(
+            srv.socket_path, cfg.socket_path,
+            "the daemon must bind the configured socket path"
+        );
+        assert_eq!(
+            srv.socket_mode, cfg.socket_mode,
+            "a hardcoded mode would ignore an operator who tightened it to 0o600"
+        );
+        assert_eq!(
+            srv.socket_owner_uid, cfg.socket_owner_uid,
+            "the socket must be chowned to the configured owner"
+        );
+        assert_eq!(
+            srv.acting.enabled, cfg.acting.enabled,
+            "the acting gate must come from config, not from a literal"
+        );
+        assert_eq!(
+            srv.acting.singbox_service, cfg.acting.singbox_service,
+            "KickstartProxy must target the configured launchctl service"
+        );
+
+        // …and the AUTHORISATION surface. `daemon_uid` is deliberately not
+        // asserted here: it is `from_config`'s own behaviour, covered in `api`.
+        assert_eq!(
+            srv.policy.socket_owner_uid, cfg.socket_owner_uid,
+            "the socket owner must be an authorised controller"
+        );
+        assert_eq!(
+            srv.policy.control_uids, cfg.control_uids,
+            "dropping control_uids locks out every headless host that set it"
+        );
+
+        // The production bounds, asserted by NAME: a deliberate retune must not
+        // break this test, only a mis-wiring.
+        assert_eq!(
+            srv.max_subscribers,
+            api::MAX_SUBSCRIBERS,
+            "the daemon must run with the production subscriber cap, not a test-sized one"
+        );
+        assert_eq!(
+            srv.max_connections,
+            api::MAX_CONNECTIONS,
+            "the daemon must run with the production connection cap"
+        );
+        assert_eq!(
+            srv.request_timeout,
+            api::REQUEST_READ_TIMEOUT,
+            "the daemon must run with the production initial-read budget"
+        );
+
+        // Both refusal limiters carry the production interval. Asserted
+        // BEHAVIOURALLY — there is no accessor, and `api.rs` is not this test's
+        // to change. `record` takes `now`, so nothing sleeps. A zero interval
+        // here would unbound a ROOT daemon's log while every `api` test, which
+        // builds its own limiter, stayed green.
+        for (name, lim) in [
+            ("control_refusals", &srv.control_refusals),
+            ("sub_refusals", &srv.sub_refusals),
+        ] {
+            let t0 = Instant::now();
+            assert!(
+                lim.record(t0).is_some(),
+                "{name}: the first event is always reported"
+            );
+            assert!(
+                lim.record(t0 + api::REFUSAL_LOG_INTERVAL - Duration::from_millis(1))
+                    .is_none(),
+                "{name}: a burst inside the production interval must not log"
+            );
+            assert!(
+                lim.record(t0 + api::REFUSAL_LOG_INTERVAL).is_some(),
+                "{name}: the next line is due exactly at the production interval"
+            );
+        }
+
+        // The mutable state is SHARED with the rest of the daemon, not copied.
+        assert!(
+            Arc::ptr_eq(&srv.observing, &observing),
+            "a fresh `observing` leaves the control socket acking a pause every \
+             collector keeps ignoring"
+        );
+        assert!(
+            Arc::ptr_eq(&srv.resume_at_us, &resume_at_us),
+            "a fresh `resume_at_us` leaves the pipeline's trigger window never \
+             cleared, so a count-based condition spans the observation gap"
+        );
+        assert!(
+            Arc::ptr_eq(&srv.snapshot, &snapshot),
+            "a fresh snapshot leaves the socket serving a status the pipeline \
+             never updates"
+        );
+        assert!(
+            srv.events_tx.same_channel(&events_tx),
+            "a fresh bus leaves every `Subscribe` stream silent"
+        );
+
+        // The store is the daemon's OWN handle. `Arc<dyn Store>` cannot be
+        // `ptr_eq`'d against `Arc<DuckdbStore>`, so write through the server's
+        // handle and read back through the daemon's — two in-memory DuckDBs are
+        // two databases, so this discriminates.
+        srv.store
+            .write_observing_edge(&types::ObservingEdge {
+                ts_us: 7,
+                observing: false,
+                peer_uid: Some(1),
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM observing_edge")
+                .unwrap(),
+            1,
+            "the control path must write pause/resume edges into the daemon's own store"
+        );
+    }
+
+    // ── the TriggerEngine wiring ───────────────────────────────────────────
+
+    /// The production engine under test, plus everything needed to observe what
+    /// it did: the store it records into, the live snapshot its
+    /// `SnapshotHandler` mirrors into, and a held-open bus receiver.
+    struct EngineFixture {
+        engine: TriggerEngine,
+        store: Arc<DuckdbStore>,
+        snapshot: Arc<Mutex<StatusSnapshot>>,
+        events_rx: tokio::sync::broadcast::Receiver<EncodedFrame>,
+    }
+
+    /// Build the real [`build_engine`] — five rules, production constants — with
+    /// `freezer`.
+    fn engine_under_test(freezer: Option<Arc<dyn PcapFreezer>>) -> EngineFixture {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, events_rx) = tokio::sync::broadcast::channel::<EncodedFrame>(64);
+        let engine = build_engine(
+            store.clone(),
+            &test_cfg(),
+            freezer,
+            snapshot.clone(),
+            events_tx,
+        );
+        EngineFixture {
+            engine,
+            store,
+            snapshot,
+            events_rx,
+        }
+    }
+
+    /// How many incidents `store` holds for `trigger_id`.
+    ///
+    /// ALWAYS filtered: [`build_engine`] installs five rules at once, so an
+    /// unfiltered `count(*)` would let another rule's firing stand in for the one
+    /// under test.
+    fn incidents_for(store: &DuckdbStore, trigger_id: &str) -> i64 {
+        store
+            .query_scalar_i64(&format!(
+                "SELECT count(*) FROM incident WHERE trigger_id='{trigger_id}'"
+            ))
+            .unwrap()
+    }
+
+    /// Push `s` into `w` and evaluate the engine at its timestamp, exactly as
+    /// `pipeline::run` does.
+    fn feed(engine: &mut TriggerEngine, w: &mut RecentWindow, s: Sample) {
+        let ts_us = s.ts_us();
+        w.push(s);
+        engine.on_sample(w, ts_us);
+    }
+
+    /// The `wedge` rule the daemon actually runs counts to
+    /// [`WEDGE_CONSECUTIVE`] — three — dead tick pairs, no fewer and no more.
+    ///
+    /// Dies under `WEDGE_CONSECUTIVE = 2` (the two-pair run fires, so the first
+    /// assertion reds) and under `WEDGE_CONSECUTIVE = 4` (the three-pair run stays
+    /// silent, so the second reds). The pair counts are LITERALS on purpose: a
+    /// fixture derived from `WEDGE_CONSECUTIVE` would move with the constant and
+    /// so pin nothing at all. This test IS the constant's pin — a deliberate
+    /// retune must retune it here too, and it says so when it reds.
+    ///
+    /// Nothing else in the rule set can fire on this stream: `gw-drop` needs a
+    /// FAIL, `gw-change` needs a change, `starvation` needs a host sample and
+    /// `fakeip` needs DNS.
+    #[test]
+    fn build_engine_wires_the_production_wedge_threshold() {
+        let mut fx = engine_under_test(None);
+        let mut w = RecentWindow::new(8);
+
+        // Two dead tick pairs — one short of the production threshold of three.
+        for i in 0..2 {
+            feed(&mut fx.engine, &mut w, link(2 * i + 1, GwVerdict::Ok));
+            feed(&mut fx.engine, &mut w, dead_proxy(2 * i + 2));
+        }
+        assert_eq!(
+            incidents_for(&fx.store, "wedge"),
+            0,
+            "two dead ticks are one short of WEDGE_CONSECUTIVE and must not fire"
+        );
+
+        // The third pair completes the run.
+        feed(&mut fx.engine, &mut w, link(5, GwVerdict::Ok));
+        feed(&mut fx.engine, &mut w, dead_proxy(6));
+        assert_eq!(
+            incidents_for(&fx.store, "wedge"),
+            1,
+            "the third consecutive dead tick must fire the wedge rule"
+        );
+    }
+
+    /// The re-arm/backoff budget the daemon actually runs is
+    /// [`BACKOFF_US`]: a persistent gateway fault re-fires only once the whole
+    /// budget has elapsed, and it re-fires at the FIRST microsecond it is
+    /// available.
+    ///
+    /// Dies under `BACKOFF_US = 0` (the fault at `ts = 3` re-fires, so the first
+    /// assertion reds) and under `BACKOFF_US = i64::MAX` (the fault at exactly
+    /// `last_fire + BACKOFF_US` stays latched, so the second reds). The last
+    /// sample sits at exactly that boundary, so `>=` → `>` in the engine's
+    /// predicate dies here too. `saturating_add`, not `1 + ..`: under the
+    /// `i64::MAX` mutation a plain `+` would panic on overflow instead of giving
+    /// a clean red. Filtered by `gw-drop` because the OK/FAIL alternation also
+    /// fires `gw-change`.
+    #[test]
+    fn build_engine_wires_the_production_backoff() {
+        let mut fx = engine_under_test(None);
+        let mut w = RecentWindow::new(8);
+
+        feed(&mut fx.engine, &mut w, link(1, GwVerdict::Fail)); // fires
+        feed(&mut fx.engine, &mut w, link(2, GwVerdict::Ok)); // re-arms
+        feed(&mut fx.engine, &mut w, link(3, GwVerdict::Fail)); // armed, but broke
+        assert_eq!(
+            incidents_for(&fx.store, "gw-drop"),
+            1,
+            "a re-armed trigger must still wait out BACKOFF_US before re-firing"
+        );
+
+        feed(&mut fx.engine, &mut w, link(4, GwVerdict::Ok)); // re-arms
+        feed(
+            &mut fx.engine,
+            &mut w,
+            link(1i64.saturating_add(BACKOFF_US), GwVerdict::Fail),
+        );
+        assert_eq!(
+            incidents_for(&fx.store, "gw-drop"),
+            2,
+            "exactly BACKOFF_US after the last fire the budget is available again"
+        );
+    }
+
+    /// The `starvation` rule the daemon actually runs discriminates at
+    /// [`STARVATION_LOAD`].
+    ///
+    /// Dies under `STARVATION_LOAD = 0.0` (a load of 9.0 fires, so the first
+    /// assertion reds) and under any threshold above 10.5 (the second reds).
+    /// `Starvation::eval` is "newest proxy tun dead AND newest host `load1` >
+    /// threshold", so the dead proxy tick alone must stay silent.
+    #[test]
+    fn build_engine_wires_the_production_starvation_threshold() {
+        let mut fx = engine_under_test(None);
+        let mut w = RecentWindow::new(8);
+
+        feed(&mut fx.engine, &mut w, dead_proxy(1));
+        feed(&mut fx.engine, &mut w, host(2, 9.0));
+        assert_eq!(
+            incidents_for(&fx.store, "starvation"),
+            0,
+            "a dead tun under a load below STARVATION_LOAD is a wedge, not starvation"
+        );
+
+        feed(&mut fx.engine, &mut w, host(3, 10.5));
+        assert_eq!(
+            incidents_for(&fx.store, "starvation"),
+            1,
+            "a dead tun above STARVATION_LOAD must be recorded as starvation"
+        );
+    }
+
+    /// The handler fan-out: `gw-change` — and only `gw-change` — gets the pcap
+    /// freeze, every rule gets the snapshot ring and the realtime bus, and a
+    /// daemon with no ring still records the incident.
+    ///
+    /// Dies under: dropping `freeze` from `gw_change_handlers` (no `blob_ref`);
+    /// adding it to another rule (two `blob_ref` rows for this stream); dropping
+    /// `snap` from either the `gw-change` or the `gw-drop` handler vec (the ring
+    /// and the bus lose that trigger); and dropping `record` (no incident at all,
+    /// with or without a ring).
+    #[test]
+    fn build_engine_gives_gw_change_the_pcap_freeze_and_every_rule_the_snapshot_ring() {
+        let freezer: Option<Arc<dyn PcapFreezer>> = Some(Arc::new(FakeFreezer));
+        let mut fx = engine_under_test(freezer);
+        let mut w = RecentWindow::new(8);
+
+        // OK -> FAIL is both a gateway CHANGE and a gateway DROP, so one stream
+        // exercises the rule that owns the freeze and one that must not.
+        feed(&mut fx.engine, &mut w, link(1, GwVerdict::Ok));
+        feed(&mut fx.engine, &mut w, link(2, GwVerdict::Fail));
+
+        assert_eq!(
+            incidents_for(&fx.store, "gw-change"),
+            1,
+            "a gateway change must be recorded durably"
+        );
+        assert_eq!(
+            fx.store
+                .query_scalar_i64("SELECT count(*) FROM blob_ref WHERE kind='pcap'")
+                .unwrap(),
+            1,
+            "gw-change must freeze the volatile ring and record the copied file"
+        );
+
+        // The live view the socket serves must carry BOTH firings.
+        let ring: Vec<String> = fx
+            .snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .incidents
+            .iter()
+            .map(|i| i.trigger_id.clone())
+            .collect();
+        for id in ["gw-change", "gw-drop"] {
+            assert!(
+                ring.iter().any(|t| t == id),
+                "the snapshot ring must carry {id}; it holds {ring:?}"
+            );
+        }
+
+        // …and so must the realtime bus. `SnapshotHandler` publishes
+        // unconditionally, so holding a receiver is enough.
+        let published = incident_trigger_ids(&mut fx.events_rx);
+        for id in ["gw-change", "gw-drop"] {
+            assert!(
+                published.iter().any(|t| t == id),
+                "the event bus must carry {id}; it carried {published:?}"
+            );
+        }
+
+        // Without a ring the incident is still recorded — the freeze is the only
+        // thing that goes missing.
+        let mut bare = engine_under_test(None);
+        let mut bare_w = RecentWindow::new(8);
+        feed(&mut bare.engine, &mut bare_w, link(1, GwVerdict::Ok));
+        feed(&mut bare.engine, &mut bare_w, link(2, GwVerdict::Fail));
+        assert_eq!(
+            incidents_for(&bare.store, "gw-change"),
+            1,
+            "a daemon with no pcap ring must still record the gateway change"
+        );
+        assert_eq!(
+            bare.store
+                .query_scalar_i64("SELECT count(*) FROM blob_ref WHERE kind='pcap'")
+                .unwrap(),
+            0,
+            "with no ring there is nothing to freeze, so no blob_ref"
+        );
+    }
+
+    /// Every incident the bus carried, by trigger id. The bus deliberately
+    /// carries bytes (one encode for N subscribers), so the frames are decoded
+    /// here rather than the wire type growing a test-only accessor.
+    fn incident_trigger_ids(
+        rx: &mut tokio::sync::broadcast::Receiver<EncodedFrame>,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let decoded: StreamFrame = serde_json::from_slice(frame.bytes())
+                .expect("bus payload must decode as a StreamFrame");
+            if let StreamFrame::Event(Event::Incident(summary)) = decoded {
+                ids.push(summary.trigger_id);
+            }
+        }
+        ids
+    }
 }

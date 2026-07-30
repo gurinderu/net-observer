@@ -147,6 +147,16 @@ impl RateLimitedLog {
     }
 }
 
+/// The connected peer's uid, read from the socket itself.
+///
+/// macOS: tokio implements `UnixStream::peer_cred` with `getpeereid(2)`, and the
+/// credentials describe the peer at `connect(2)` time. `None` when the lookup
+/// fails, which [`authorize_control`] turns into a refusal: an authority decision
+/// whose origin cannot be established fails closed.
+fn peer_uid_of(stream: &UnixStream) -> Option<u32> {
+    stream.peer_cred().ok().map(|c| c.uid())
+}
+
 /// Who may send a `Request::Control`. Built once at start-up from the config.
 ///
 /// Peer credentials are checked on `Request::Control` **only** — `Status`,
@@ -173,6 +183,20 @@ pub struct ControlPolicy {
     /// user, and the real lookup would authorise the very peer the refusal arm
     /// needs refused.
     console: fn() -> Option<u32>,
+    /// How a connected peer's uid is resolved. Always [`peer_uid_of`] in
+    /// production: [`ControlPolicy::from_config`] is the only constructor
+    /// reachable outside this module, the field is PRIVATE, and no config key or
+    /// CLI flag feeds it — so neither a caller nor an operator can substitute it.
+    /// A TEST SEAM, not a policy knob, exactly like `console` above.
+    ///
+    /// It exists because the end-to-end control tests run server and client in
+    /// ONE process, where `getpeereid(2)` and `geteuid(2)` return the same value:
+    /// a hardcoded `Some(geteuid())` at the lookup site is indistinguishable from
+    /// the real lookup there, while in production — where `daemon_uid` IS
+    /// `geteuid()` — it would authorise EVERY local peer on the mode-0666 socket.
+    /// Injecting a uid that is neither this process's, nor root's, nor the
+    /// console user's is the only thing that makes that substitution observable.
+    peer_uid: fn(&UnixStream) -> Option<u32>,
 }
 
 impl ControlPolicy {
@@ -186,6 +210,7 @@ impl ControlPolicy {
             socket_owner_uid,
             control_uids,
             console: console_uid,
+            peer_uid: peer_uid_of,
         }
     }
 }
@@ -482,18 +507,37 @@ impl ApiServer {
                 // Also rate-limited: a persistent accept failure (EMFILE under fd
                 // exhaustion) spins this loop at full speed, which is the same
                 // unbounded-log path by another route.
-                Err(e) => {
-                    if let Some(burst) = accept_errors.record(Instant::now()) {
-                        tracing::warn!(
-                            error = %e,
-                            suppressed = burst.suppressed,
-                            total = burst.total,
-                            "status socket accept failed"
-                        );
-                    }
-                }
+                Err(e) => log_accept_error(&accept_errors, &e, Instant::now()),
             }
         }
+    }
+}
+
+/// Emit the rate-limited "accept failed" line for `error`, or count it toward the
+/// next one.
+///
+/// A named function rather than an inline block for exactly one reason: this is
+/// the only one of the daemon's four rate-limited lines whose trigger — an
+/// `accept(2)` failure such as `EMFILE` — cannot be provoked from a test without
+/// exhausting the whole test process's file descriptors. The other three (control
+/// refusals, subscriber-cap refusals, connection-cap refusals) are driven end to
+/// end and need no seam. `now` is injected for the same reason
+/// [`RateLimitedLog::record`] already takes it: the throttle is exercised without
+/// sleeping. No behaviour changes — the message literal and every field stay at
+/// one static callsite; only the enclosing function moved.
+///
+/// Its one honest limit: this pins the LINE's volume, not its call site, because
+/// no in-process test can drive a real accept failure. Deleting the call site is
+/// caught by the build instead — the only other caller is `#[cfg(test)]`, so a
+/// dropped `Err` arm makes this `dead_code` under `-D warnings`.
+fn log_accept_error(limiter: &RateLimitedLog, error: &std::io::Error, now: Instant) {
+    if let Some(burst) = limiter.record(now) {
+        tracing::warn!(
+            error = %error,
+            suppressed = burst.suppressed,
+            total = burst.total,
+            "status socket accept failed"
+        );
     }
 }
 
@@ -514,8 +558,10 @@ async fn handle_conn(
     // the split (only a `UnixStream` exposes them; on macOS tokio implements
     // this with `getpeereid(2)`). They describe the peer at connect(2) time.
     // Read paths never consult it: the permissive default socket mode exists for
-    // unprivileged readers, and a read carries no authority.
-    let peer_uid = stream.peer_cred().ok().map(|c| c.uid());
+    // unprivileged readers, and a read carries no authority. The resolution goes
+    // through the policy's lookup hook — `peer_uid_of` in production, and a
+    // second local account's uid injected by the tests that cannot have one.
+    let peer_uid = (srv.policy.peer_uid)(&stream);
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd);
     let mut line = String::new();
@@ -987,6 +1033,101 @@ mod tests {
         None
     }
 
+    /// A uid the peer-lookup seam injects: not this process's, not root's, and
+    /// not the console user's (every test policy pins the console clause to "no
+    /// session"), so ONLY `control_uids` can authorise it. Distinct from
+    /// [`NOT_A_REAL_UID`], which the same tests use as the daemon's own uid.
+    const FOREIGN_UID: u32 = u32::MAX - 2;
+
+    /// The injected stand-in for a second local account, which a single-process
+    /// test cannot otherwise have. A plain `fn` item, not a closure, so it matches
+    /// the seam's function-pointer type.
+    fn foreign_peer(_: &UnixStream) -> Option<u32> {
+        Some(FOREIGN_UID)
+    }
+
+    /// Events big enough that "one line per interval" and "one line per event"
+    /// give different numbers, small enough to stay obvious. The whole burst lands
+    /// inside one [`REFUSAL_LOG_INTERVAL`].
+    const REFUSAL_BURST: usize = 5;
+
+    /// Messages captured from a scoped `tracing` subscriber.
+    ///
+    /// The rate-limited logs exist to bound VOLUME, and volume is observable only
+    /// at a subscriber: no assertion on `record()`'s return value can tell
+    /// `if let Some(b) = lim.record(..) { warn!(..) }` from a `warn!` that ignores
+    /// the `Option`. Not a general logging harness — it keeps the `message` field
+    /// and nothing else, because the socket server also emits an `info` listening
+    /// line and `debug` connection errors on the same thread and a count that
+    /// swept those up would be a proxy for the property rather than the property.
+    #[derive(Clone, Default)]
+    struct EventLog(Arc<Mutex<Vec<String>>>);
+
+    impl EventLog {
+        fn push(&self, message: String) {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(message);
+        }
+        /// How many captured messages contain `needle`.
+        fn count(&self, needle: &str) -> usize {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|m| m.contains(needle))
+                .count()
+        }
+        /// Everything captured, for a failure message that names what DID arrive.
+        fn messages(&self) -> Vec<String> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    /// A minimal `tracing::Subscriber` that records event messages into an
+    /// [`EventLog`] and does nothing else. Installed per test with
+    /// `tracing::subscriber::with_default` (sync) or `set_default` (async) — both
+    /// THREAD-LOCAL, so parallel tests cannot see each other's events and nothing
+    /// survives the guard. Spans are unused (the daemon logs bare events), so the
+    /// span half of the trait is the minimum that compiles. No new dependency:
+    /// `tracing` is already a direct dependency of this binary.
+    struct CountingSubscriber(EventLog);
+
+    impl tracing::Subscriber for CountingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MessageVisitor(None);
+            event.record(&mut visitor);
+            if let Some(message) = visitor.0 {
+                self.0.push(message);
+            }
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Pulls just the `message` field out of an event. `record_debug` is `Visit`'s
+    /// only required method and every other `record_*` defaults to it, so this is
+    /// complete: a macro message literal arrives as `fmt::Arguments`, whose Debug
+    /// forwards to Display, so the captured string is the message text.
+    struct MessageVisitor(Option<String>);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
     fn test_acting(enabled: bool) -> ActingConfig {
         ActingConfig {
             enabled,
@@ -1016,6 +1157,9 @@ mod tests {
                 socket_owner_uid: None,
                 control_uids: Vec::new(),
                 console: no_console,
+                // The REAL lookup: every pre-existing test keeps exercising it,
+                // and only the two injected-peer tests below override it.
+                peer_uid: peer_uid_of,
             },
             observing: Arc::new(AtomicBool::new(true)),
             resume_at_us: Arc::new(AtomicI64::new(0)),
@@ -1151,6 +1295,7 @@ mod tests {
             socket_owner_uid: None,
             control_uids: Vec::new(),
             console: no_console,
+            peer_uid: peer_uid_of,
         };
 
         // root is always allowed; so is the daemon's own uid.
@@ -1855,18 +2000,29 @@ mod tests {
     /// from the peer gate and nowhere else.
     ///
     /// Honest limit: server and client share this process, so `Some(geteuid())`
-    /// hardcoded at the `peer_cred()` call site would be indistinguishable from
-    /// the real lookup. Separating the two uids needs a second account and
-    /// therefore root. What this pair DOES catch is every constant: `Some(0)`
-    /// authorises this arm via the root clause and stamps `peer_uid = 0` in the
-    /// acceptance arm; `None` fails both (wrong refusal message here, a refused
-    /// acceptance there); any other literal fails the `contains` assertion below.
+    /// hardcoded at the lookup site would be indistinguishable from the real
+    /// lookup HERE — that one substitution is covered by
+    /// `control_from_an_injected_peer_uid_is_*`, which injects a uid no account
+    /// holds through the policy's lookup hook. What this pair uniquely covers is
+    /// the REAL `getpeereid` path end to end, including every constant substituted
+    /// INSIDE [`peer_uid_of`] itself, which the injected pair overrides and cannot
+    /// see: `Some(0)` authorises this arm via the root clause and stamps
+    /// `peer_uid = 0` in the acceptance arm; `None` fails both (wrong refusal
+    /// message here, a refused acceptance there); any other literal fails the
+    /// `contains` assertion below.
     #[tokio::test]
     async fn control_over_a_real_socket_is_refused_for_an_unlisted_peer_uid() {
+        // A hard failure, deliberately not a skip: `if root { return; }` prints
+        // `ok` and would silently retire the repo's only end-to-end proof of the
+        // peer gate on exactly the machine (a root shell) where the daemon
+        // actually runs. AGENTS.md says the suite needs no root, so `sudo cargo
+        // test` is operator error, and the failure must say so.
         assert_ne!(
             own_uid(),
             ROOT_UID,
-            "run the suite unprivileged: as root every uid is authorised and this test cannot discriminate"
+            "run the suite unprivileged: as root every uid is authorised and this test cannot discriminate \
+             — the injected-peer pair (control_from_an_injected_peer_uid_is_*) covers the policy at any uid; \
+             THIS pair covers the real getpeereid lookup and needs an unprivileged process"
         );
         assert_ne!(
             own_uid(),
@@ -1924,10 +2080,17 @@ mod tests {
     /// a single-process test cannot distinguish.
     #[tokio::test]
     async fn control_over_a_real_socket_is_accepted_for_a_listed_peer_uid() {
+        // A hard failure, deliberately not a skip: `if root { return; }` prints
+        // `ok` and would silently retire the repo's only end-to-end proof of the
+        // peer gate on exactly the machine (a root shell) where the daemon
+        // actually runs. AGENTS.md says the suite needs no root, so `sudo cargo
+        // test` is operator error, and the failure must say so.
         assert_ne!(
             own_uid(),
             ROOT_UID,
-            "run the suite unprivileged: as root every uid is authorised and this test cannot discriminate"
+            "run the suite unprivileged: as root every uid is authorised and this test cannot discriminate \
+             — the injected-peer pair (control_from_an_injected_peer_uid_is_*) covers the policy at any uid; \
+             THIS pair covers the real getpeereid lookup and needs an unprivileged process"
         );
         assert_ne!(
             own_uid(),
@@ -1972,6 +2135,323 @@ mod tests {
             "the boundary row must attribute the pause to the REAL peer uid, not a constant"
         );
 
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The peer gate acts on the uid the POLICY's lookup produced, not on the uid
+    /// this process happens to run as.
+    ///
+    /// The injected uid is what makes the claim testable at all: with server and
+    /// client in one process `getpeereid(2)` and `geteuid(2)` agree, so a
+    /// hardcoded `Some(geteuid())` at the lookup site reads exactly like the real
+    /// lookup — while in production, where `daemon_uid` IS `geteuid()`, it would
+    /// authorise EVERY local peer on the mode-0666 socket. Driven through
+    /// [`handle_conn`], because that is where the lookup lives; calling
+    /// [`control_request`] directly would prove nothing about it.
+    ///
+    /// `!r.ok` alone does NOT discriminate — under that substitution the peer
+    /// becomes `own_uid()`, which is also unauthorised here. The `contains`
+    /// assertion on the injected uid is what kills it. No negative substring
+    /// assertion: a short `own_uid()` can be a substring of `4294967293`.
+    #[tokio::test]
+    async fn control_from_an_injected_peer_uid_is_refused_when_unlisted() {
+        assert_ne!(
+            own_uid(),
+            FOREIGN_UID,
+            "the injected uid must differ from this process's own, or a hardcoded geteuid() at the lookup site would be invisible here"
+        );
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        // Acting is ENABLED, `console` is pinned to "no session",
+        // `socket_owner_uid` is None, `control_uids` is empty and `daemon_uid` is
+        // a uid no account holds — so a refusal can come from the peer gate and
+        // from nowhere else.
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), NOT_A_REAL_UID);
+        // The seam: a second local account, which one process cannot otherwise
+        // have.
+        srv.policy.peer_uid = foreign_peer;
+
+        let frame =
+            observer_ipc::encode_frame(&Request::Control(ControlCmd::SetObserving(false))).unwrap();
+        client.write_all(&frame).await.unwrap();
+        client.flush().await.unwrap();
+
+        handle_conn(server, &srv, &Arc::new(AtomicUsize::new(0)))
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let r = match serde_json::from_str::<Response>(&line).unwrap() {
+            Response::Control(r) => r,
+            other => panic!("expected a Control response, got {other:?}"),
+        };
+
+        assert!(!r.ok, "an unlisted peer uid must be refused");
+        assert!(
+            r.message.contains(&FOREIGN_UID.to_string()),
+            "the refusal must name the uid the policy's lookup produced, got: {}",
+            r.message
+        );
+        assert!(
+            srv.observing.load(Ordering::Acquire),
+            "a refused control must not touch the observing flag"
+        );
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM observing_edge")
+                .unwrap(),
+            0,
+            "a refused pause must leave no boundary row behind"
+        );
+    }
+
+    /// The decisive arm: the same path, differing ONLY in `control_uids`, must
+    /// authorise the INJECTED uid and attribute the boundary row to it.
+    ///
+    /// Under a hardcoded `Some(geteuid())` at the lookup site the peer becomes
+    /// `own_uid()`, which matches no clause of this policy — so the request is
+    /// refused and `r.ok` fails. Both arms discriminate at ANY privilege level,
+    /// root included, because the uid under test is [`FOREIGN_UID`] rather than
+    /// the process's own; that is what lets the real-socket pair above keep its
+    /// hard unprivileged precondition without losing the policy claim.
+    #[tokio::test]
+    async fn control_from_an_injected_peer_uid_is_accepted_when_listed() {
+        assert_ne!(
+            own_uid(),
+            FOREIGN_UID,
+            "the injected uid must differ from this process's own, or a hardcoded geteuid() at the lookup site would be invisible here"
+        );
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), NOT_A_REAL_UID);
+        srv.policy.peer_uid = foreign_peer;
+        // The ONLY difference from the refusal arm.
+        srv.policy.control_uids = vec![FOREIGN_UID];
+
+        let frame =
+            observer_ipc::encode_frame(&Request::Control(ControlCmd::SetObserving(false))).unwrap();
+        client.write_all(&frame).await.unwrap();
+        client.flush().await.unwrap();
+
+        handle_conn(server, &srv, &Arc::new(AtomicUsize::new(0)))
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let r = match serde_json::from_str::<Response>(&line).unwrap() {
+            Response::Control(r) => r,
+            other => panic!("expected a Control response, got {other:?}"),
+        };
+
+        assert!(r.ok, "a listed peer uid must be authorised: {}", r.message);
+        assert!(
+            !srv.observing.load(Ordering::Acquire),
+            "an authorised pause must flip the observing flag"
+        );
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT peer_uid FROM observing_edge")
+                .unwrap(),
+            i64::from(FOREIGN_UID),
+            "the boundary row must attribute the pause to the uid the lookup produced"
+        );
+    }
+
+    /// The seam's anti-neutering guard: production wires BOTH lookups to the real
+    /// thing.
+    ///
+    /// Neutering either one at its single assignment site is green across the rest
+    /// of the suite, because every test policy substitutes a stub for both:
+    /// `console: || None` silently disables the console-user clause — the
+    /// out-of-the-box menu-bar toggle against a root daemon — and a constant
+    /// `peer_uid` authorises every local peer on the mode-0666 socket.
+    ///
+    /// [`std::ptr::fn_addr_eq`], never a bare `==`: rustc's
+    /// `unpredictable_function_pointer_comparisons` is warn-by-default and this
+    /// workspace builds with `-D warnings`.
+    #[test]
+    fn from_config_wires_the_real_console_and_peer_lookups() {
+        let p = ControlPolicy::from_config(Some(7), vec![9]);
+        assert_eq!(p.daemon_uid, own_uid());
+        assert_eq!(p.socket_owner_uid, Some(7));
+        assert_eq!(p.control_uids, vec![9]);
+        assert!(
+            std::ptr::fn_addr_eq(p.console, console_uid as fn() -> Option<u32>),
+            "production must resolve the console user with the REAL lookup"
+        );
+        assert!(
+            std::ptr::fn_addr_eq(p.peer_uid, peer_uid_of as fn(&UnixStream) -> Option<u32>),
+            "production must read peer credentials from the socket, never a constant"
+        );
+    }
+
+    /// The refusal log's VOLUME, not merely its wiring: a burst of refusals inside
+    /// one [`REFUSAL_LOG_INTERVAL`] emits exactly ONE line.
+    ///
+    /// [`a_refused_control_request_consumes_the_log_budget`] proves the limiter is
+    /// CONSULTED; nothing there can tell that apart from a caller that consults it
+    /// and logs anyway, because the observable a dropped `None` changes is the
+    /// number of emitted events. So the assertion has to be made at a subscriber.
+    /// Exactly `1` kills both directions: `{REFUSAL_BURST}` means unbounded, `0`
+    /// means the line was deleted.
+    #[test]
+    fn a_burst_of_refused_controls_logs_exactly_one_line() {
+        let log = EventLog::default();
+        let srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
+        tracing::subscriber::with_default(CountingSubscriber(log.clone()), || {
+            for _ in 0..REFUSAL_BURST {
+                let r = control_request(ControlCmd::SetObserving(false), Some(NOT_A_REAL_UID), &cx);
+                // So the loop cannot be vacuous: every iteration really refuses.
+                assert!(!r.ok, "an unlisted uid must be refused");
+            }
+        });
+        assert_eq!(
+            log.count("control request refused"),
+            1,
+            "{REFUSAL_BURST} refusals inside one interval must emit exactly one line, captured: {:?}",
+            log.messages()
+        );
+    }
+
+    /// Same property on the accept-error line. Driven through
+    /// [`log_accept_error`] — the ONE rate-limited line of the four that has a
+    /// production seam, because a real `accept(2)` failure needs process-global fd
+    /// exhaustion, which would wreck every other test in this binary. Injected
+    /// [`Instant`]s, so nothing sleeps and the whole burst provably lands inside
+    /// one interval.
+    #[test]
+    fn a_burst_of_accept_failures_logs_exactly_one_line() {
+        let log = EventLog::default();
+        let limiter = RateLimitedLog::new(REFUSAL_LOG_INTERVAL);
+        let t0 = Instant::now();
+        tracing::subscriber::with_default(CountingSubscriber(log.clone()), || {
+            for i in 0..REFUSAL_BURST as u64 {
+                log_accept_error(
+                    &limiter,
+                    &std::io::Error::from_raw_os_error(libc::EMFILE),
+                    t0 + Duration::from_secs(i),
+                );
+            }
+        });
+        assert_eq!(
+            log.count("status socket accept failed"),
+            1,
+            "{REFUSAL_BURST} accept failures inside one interval must emit exactly one line, captured: {:?}",
+            log.messages()
+        );
+    }
+
+    /// Same property on the subscriber-cap line, driven end to end through
+    /// [`stream_events`].
+    ///
+    /// [`subscriber_cap_refuses_with_a_decodable_error`] cannot assert this: it
+    /// passes a FRESH limiter per call, so every call is that limiter's first
+    /// event. Here ONE limiter and ONE subscriber tally span the whole burst.
+    #[tokio::test]
+    async fn a_burst_of_refused_subscriptions_logs_exactly_one_line() {
+        // MUST stay a current-thread runtime (tokio's default): the subscriber
+        // guard is THREAD-LOCAL, so a `flavor = "multi_thread"` runtime could poll
+        // this future on a worker thread where nothing is installed. The failure
+        // mode is a red test (0 observed, 1 expected), never a false green.
+        let log = EventLog::default();
+        let _guard = tracing::subscriber::set_default(CountingSubscriber(log.clone()));
+
+        let (events_tx, _rx) = broadcast::channel::<EncodedFrame>(16);
+        let observing = AtomicBool::new(true);
+        // Cap of 1, already taken, so every attempt below is refused.
+        let subscribers = Arc::new(AtomicUsize::new(1));
+        let refusals = RateLimitedLog::new(REFUSAL_LOG_INTERVAL);
+
+        for _ in 0..REFUSAL_BURST {
+            // The client half stays BOUND for the whole call: dropped, the
+            // refusal frame's write fails with `BrokenPipe` and `stream_events`
+            // returns `Err` before the line is ever reached.
+            let (_client, mut server) = tokio::io::duplex(4096);
+            let mut rd = tokio::io::empty();
+            stream_events(
+                &mut rd,
+                &mut server,
+                None,
+                StreamCtx {
+                    events_tx: &events_tx,
+                    observing: &observing,
+                    subscribers: &subscribers,
+                    max_subscribers: 1,
+                    refusals: &refusals,
+                },
+            )
+            .await
+            .expect("a refusal writes one error frame and returns Ok");
+        }
+
+        assert_eq!(
+            log.count("subscriber cap reached"),
+            1,
+            "{REFUSAL_BURST} refused subscriptions inside one interval must emit exactly one line, captured: {:?}",
+            log.messages()
+        );
+    }
+
+    /// Same property on the connection-cap line — which has no coverage of ANY
+    /// kind today, so this is also the first test that the line exists.
+    ///
+    /// Over a real `UnixListener`, because the limiter lives inside the accept
+    /// loop and is reachable no other way. The single slot is taken by a real
+    /// held-open subscription: the `Ready` ack `subscribe` consumes proves the
+    /// connection was accepted and parked, so the burst cannot race the accept.
+    #[tokio::test]
+    async fn a_burst_of_connections_over_the_cap_logs_exactly_one_line() {
+        // MUST stay a current-thread runtime (tokio's default): the subscriber
+        // guard is THREAD-LOCAL and `serve()` is polled by this thread. On a
+        // multi_thread runtime the accept loop could run on a worker where nothing
+        // is installed — a red test, never a false green.
+        let log = EventLog::default();
+        let _guard = tracing::subscriber::set_default(CountingSubscriber(log.clone()));
+
+        let dir = temp_dir("connlog");
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let mut srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        srv.max_connections = 1;
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
+
+        let sp = sock_str.clone();
+        let sub = tokio::task::spawn_blocking(move || observer_ipc::subscribe(&sp, None))
+            .await
+            .unwrap()
+            .unwrap();
+
+        for i in 0..REFUSAL_BURST {
+            let mut s = UnixStream::connect(&sock_str).await.unwrap();
+            let mut buf = [0u8; 1];
+            // The EOF proves two things at once: the server closed the connection
+            // (the `record()` call precedes `drop(stream)`), and it REFUSED rather
+            // than served it — a served connection would sit on the 10 s
+            // initial-read budget and blow this 2 s guard, so a raised
+            // `max_connections` dies here too.
+            let read = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await;
+            assert!(
+                matches!(&read, Ok(Ok(0))),
+                "connection {i} over the cap must be closed by the server, got {read:?}"
+            );
+        }
+
+        assert_eq!(
+            log.count("connection cap reached"),
+            1,
+            "{REFUSAL_BURST} refused connections inside one interval must emit exactly one line, captured: {:?}",
+            log.messages()
+        );
+
+        drop(sub);
         handle.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
