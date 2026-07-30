@@ -615,12 +615,14 @@ impl Handler for SnapshotHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use collector_core::Readiness;
     use collector_host::HostCollector;
+    use collector_route::RouteCollector;
     use macos::HostLoad;
     use triggers::conditions::{GwChange, GwDrop, Wedge};
     use triggers::engine::Trigger;
     use triggers::handlers::RecordHandler;
-    use types::{GwVerdict, HostSample, LinkSample, ProxySample, TcpVerdict};
+    use types::{GwVerdict, HostSample, LinkSample, ProxySample, RouteEvent, TcpVerdict};
 
     /// A fake freezer standing in for `macos::PcapRing` (no tcpdump / root
     /// needed): it returns a plausible ring-file path without touching the
@@ -818,13 +820,23 @@ mod tests {
             .expect("collector task should not panic");
     }
 
-    /// A pause that lands *after* a tick has begun must not produce a sample: the
-    /// spawner re-checks `observing` between `collect()` and the forward, so an
-    /// in-flight probe is discarded rather than advancing `generated_us` after the
-    /// control socket already acked `observing: false`. The tick interval is long
-    /// relative to `getloadavg` so the flag flips inside a tick, not between them.
+    /// Once `observing` goes false NOTHING more reaches the consumer, however far
+    /// into a tick the flag flips: the collector that was forwarding a moment ago
+    /// goes silent and stays silent, so nothing advances `generated_us` after the
+    /// control socket has already acked `observing: false`.
+    ///
+    /// What this does NOT cover, despite the pause landing "mid-tick" in wall-clock
+    /// terms: the post-probe re-check at the top of this file (the second
+    /// `observing` load, between `collect()` and the forward). `HostCollector::collect`
+    /// is a single instant `getloadavg`, so the loop is parked in `ticker.tick()`
+    /// when the flag flips and the pre-probe check catches it every time — deleting
+    /// the re-check leaves this test green. Nothing else covers it either; making it
+    /// genuinely testable needs a `#[cfg(test)]` collector whose `collect()` can be
+    /// held open, which is a production change out of proportion to the line. Named
+    /// here so the next auditor does not re-trip on the name (this test used to be
+    /// called `interval_collector_drops_in_flight_probe_on_pause`).
     #[tokio::test]
-    async fn interval_collector_drops_in_flight_probe_on_pause() {
+    async fn interval_collector_forwards_nothing_after_a_pause() {
         let c = AnyCollector::Host(HostCollector::new(
             Arc::new(HostLoad::new()),
             Duration::from_millis(100),
@@ -855,6 +867,97 @@ mod tests {
             .await
             .expect("collector task should exit after the receiver is dropped")
             .expect("collector task should not panic");
+    }
+
+    /// A fake blocking [`EventSource`] standing in for the PF_ROUTE socket: its
+    /// `next()` parks on a std channel the test feeds, so batches arrive exactly
+    /// when the test says and the detached thread ends as soon as the test drops
+    /// the sender.
+    struct FakeRouteSource {
+        batches: std::sync::mpsc::Receiver<Vec<Sample>>,
+        /// Batches taken OUT of the source. The daemon must keep draining while
+        /// paused, or the real PF_ROUTE socket backs up.
+        drained: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl collector_core::EventSource for FakeRouteSource {
+        fn next(&mut self) -> Option<Vec<Sample>> {
+            let batch = self.batches.recv().ok()?;
+            self.drained.fetch_add(1, Ordering::Release);
+            Some(batch)
+        }
+    }
+
+    /// A PF_ROUTE-shaped event: an interface coming up.
+    fn route(ts_us: i64) -> Sample {
+        Sample::Route(RouteEvent {
+            ts_us,
+            kind: "iface".into(),
+            iface: Some("en0".into()),
+            detail: "up".into(),
+        })
+    }
+
+    /// The event spawner's pause path, which had no test at all: while `observing`
+    /// is false every batch is DROPPED, and the source is nonetheless still
+    /// DRAINED. Two halves, two mutations. Deleting the spawner's
+    /// `if !observing.load(..) { .. continue; }` block lets the paused batches reach
+    /// the consumer and kills the 200 ms negative bound; hoisting that same check
+    /// ABOVE `src.next()` stops the source being drained (which is what backs the
+    /// real PF_ROUTE socket up) and kills the `drained` wait.
+    ///
+    /// The `drained` half is also what makes the negative bound meaningful rather
+    /// than a race with a thread that has not started yet: nothing is asserted about
+    /// silence until the source is provably two batches lighter.
+    #[tokio::test]
+    async fn event_collector_drops_batches_while_paused_but_keeps_draining() {
+        let (batch_tx, batches) = std::sync::mpsc::channel::<Vec<Sample>>();
+        let drained = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = AnyCollector::Route(RouteCollector::new(
+            Box::new(FakeRouteSource {
+                batches,
+                drained: drained.clone(),
+            }),
+            Readiness::Ready,
+        ));
+        let (tx, mut rx) = mpsc::channel(16);
+        let observing = Arc::new(AtomicBool::new(false));
+        let _handle = spawn_event_collector(c, tx, observing.clone());
+
+        // Paused: both batches are taken out of the source…
+        batch_tx.send(vec![route(1)]).unwrap();
+        batch_tx.send(vec![route(2)]).unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                if drained.load(Ordering::Acquire) >= 2 {
+                    return;
+                }
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a paused event collector must keep draining its source");
+        // …and none of them reaches the consumer.
+        assert!(
+            time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "a paused event collector forwards nothing"
+        );
+
+        // Resume: the next batch flows again on the very next `next()`.
+        observing.store(true, Ordering::Release);
+        batch_tx.send(vec![route(3)]).unwrap();
+        let resumed = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a resumed event collector should forward a batch within 5s")
+            .expect("channel should stay open while the collector runs");
+        assert!(matches!(resumed, Sample::Route(_)));
+
+        // Dropping the sender makes `next()` return `None`, so the detached thread
+        // ends with the test rather than outliving it.
+        drop(batch_tx);
+        drop(rx);
     }
 
     #[tokio::test]
@@ -1225,6 +1328,135 @@ mod tests {
         );
     }
 
+    /// The resume epoch the straggler pair publishes BEFORE the consumer starts,
+    /// so the very first sample carries the edge and the stream needs no sentinel.
+    const STRADDLE_EPOCH_US: i64 = 1_000;
+
+    /// The straggler arithmetic below needs at least two ticks to be one short of.
+    const _: () = assert!(
+        crate::WEDGE_CONSECUTIVE >= 2,
+        "the pre-epoch straggler pair is built as `n` links + `n - 1` proxies"
+    );
+
+    /// Drive a wedge run that is deliberately ONE PROXY TICK short of
+    /// [`crate::WEDGE_CONSECUTIVE`], preceded by a single extra proxy tick stamped
+    /// `straggler_us`, across a resume edge at [`STRADDLE_EPOCH_US`]. Returns the
+    /// store so each half can assert on what was — and was not — written.
+    ///
+    /// `Wedge` needs `n` link ticks AND `n` proxy ticks, so the straggler is the
+    /// only sample that can complete the run: that is what makes the gate's
+    /// ATTACHMENT to the consumer loop, and not merely its own semantics, the thing
+    /// under test. Every timestamp is derived from `crate::WEDGE_CONSECUTIVE`, so
+    /// retuning the production threshold cannot leave this fixture asserting a
+    /// behaviour production no longer has.
+    async fn wedge_one_proxy_short_across_a_resume(straggler_us: i64) -> Arc<DuckdbStore> {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let n = crate::WEDGE_CONSECUTIVE;
+        let eng = TriggerEngine::new(vec![Trigger::new(
+            Box::new(Wedge { consecutive: n }),
+            vec![rec],
+            0,
+        )]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        // Published BEFORE the consumer exists, so the first sample it sees
+        // already carries the resume edge: no sentinel, no wait, no race.
+        let resume_at_us = Arc::new(AtomicI64::new(STRADDLE_EPOCH_US));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot,
+            events_tx,
+            resume_at_us,
+        ));
+
+        // The straggler: the probe that spanned both edges.
+        tx.send(dead_proxy(straggler_us)).await.unwrap();
+        // `n` fresh link ticks but only `n - 1` fresh proxy ticks: one short.
+        for i in 0..n as i64 {
+            tx.send(link(STRADDLE_EPOCH_US + 1 + 2 * i, GwVerdict::Ok))
+                .await
+                .unwrap();
+            if i + 1 < n as i64 {
+                tx.send(dead_proxy(STRADDLE_EPOCH_US + 2 + 2 * i))
+                    .await
+                    .unwrap();
+            }
+        }
+        drop(tx);
+        h.await.unwrap();
+        store
+    }
+
+    /// The resume gate must be ATTACHED to the consumer loop, not merely correct in
+    /// isolation. A wedge run that only a pre-epoch straggler could complete stays
+    /// silent: the straggler is one microsecond on the far side of the boundary, so
+    /// the window holds `n - 1` proxy ticks and `Wedge` can never see its `n`th.
+    ///
+    /// Dies under `if gate.should_drop(now_us, now) {` -> `if false {` — the
+    /// straggler then becomes the oldest of `n` proxies and the wedge fires — and
+    /// under an `observe_edge` that never reports an edge, which leaves the gate
+    /// closed and filters nothing. Neither mutation is visible to
+    /// `run_clears_the_window_on_a_resume_edge` (one extra admitted sample still
+    /// leaves every count far below `n`) or to
+    /// `run_keeps_detecting_after_a_backwards_clock_step` (its `incident >= 1` is
+    /// satisfied more easily by a bypassed gate, not less).
+    ///
+    /// The sample-count assertions are the non-vacuity half: the gate filters the
+    /// WINDOW, never the record, so a fixture whose sends had silently vanished —
+    /// which would read 0 incidents just as happily — fails here instead.
+    #[tokio::test]
+    async fn run_does_not_fire_a_wedge_completed_only_by_a_pre_epoch_straggler() {
+        let store = wedge_one_proxy_short_across_a_resume(STRADDLE_EPOCH_US - 1).await;
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            0,
+            "a sample from before the resume epoch must not complete a post-resume wedge run"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM proxy_sample")
+                .unwrap(),
+            crate::WEDGE_CONSECUTIVE as i64,
+            "the gate filters the WINDOW, never the record: the straggler is still persisted"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM link_sample")
+                .unwrap(),
+            crate::WEDGE_CONSECUTIVE as i64,
+            "every fresh link tick is persisted too"
+        );
+    }
+
+    /// The matched twin, differing by exactly ONE MICROSECOND: a straggler stamped
+    /// AT the resume epoch belongs to this observation session, so it is admitted
+    /// and completes the run.
+    ///
+    /// The pair therefore measures the gate and nothing else, and it is a two-sided
+    /// boundary test as well as a wiring test: `if false` and a disabled
+    /// `observe_edge` die in the half above, while `if true` (nothing is ever
+    /// admitted) and `ts_us >= applied_resume_us` -> `>` (the epoch sample itself is
+    /// filtered) die here.
+    #[tokio::test]
+    async fn run_fires_a_wedge_completed_by_a_straggler_at_the_resume_epoch() {
+        let store = wedge_one_proxy_short_across_a_resume(STRADDLE_EPOCH_US).await;
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            1,
+            "a sample stamped at the resume epoch is this session's own and completes the run"
+        );
+    }
+
     /// The drain filter's LIFETIME is monotonic even though its predicate is not:
     /// once `RESUME_DRAIN` has elapsed on the `Instant` clock the gate stops
     /// filtering, however far in the future the wall-clock resume epoch sits.
@@ -1425,15 +1657,25 @@ mod tests {
         );
     }
 
-    /// The matched twin of the test above: the identical stream under a one-second
-    /// backoff yields exactly ONE incident. A resume re-arms the latch; it does
-    /// not hand the trigger a fresh firing budget, so a spammed switch cannot
-    /// storm the incident log.
+    /// The matched twin of the test above: the identical stream under the daemon's
+    /// PRODUCTION backoff yields exactly ONE incident. A resume re-arms the latch;
+    /// it does not hand the trigger a fresh firing budget, so a spammed switch
+    /// cannot storm the incident log.
+    ///
+    /// The operator scenario, stated plainly: toggling collection off and on again
+    /// inside [`crate::BACKOFF_US`] — the real firing budget the daemon ships with,
+    /// not a synthetic one — writes no second incident. Reading the production
+    /// constant here is what makes this die under `BACKOFF_US = 0`, which nothing
+    /// else in the suite reads.
     #[tokio::test]
     async fn run_does_not_refire_within_the_backoff_after_a_resume() {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
-        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 1_000_000)]);
+        let eng = TriggerEngine::new(vec![Trigger::new(
+            Box::new(GwDrop),
+            vec![rec],
+            crate::BACKOFF_US,
+        )]);
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let (events_tx, _events_rx) = broadcast::channel(16);
         let resume_at_us = Arc::new(AtomicI64::new(0));
@@ -1470,6 +1712,81 @@ mod tests {
                 .unwrap(),
             1,
             "a resume re-arms; it does not reset the firing budget"
+        );
+    }
+
+    /// The other direction of that same boundary: once the production budget HAS
+    /// elapsed, a fault still present at resume is recorded again. The post-resume
+    /// link is stamped at exactly `1 + crate::BACKOFF_US` — the FIRST microsecond
+    /// the budget is available, since the pre-pause fire was at ts 1 and the
+    /// engine's guard is `>=`.
+    ///
+    /// Two mutations die here, one from each side: `>=` -> `>` in
+    /// `TriggerEngine::on_sample` (2 -> 1) and `BACKOFF_US = i64::MAX` (2 -> 1).
+    /// `saturating_add`, not `+`, precisely because of the second: a plain `+` would
+    /// panic on overflow under it and mask the assertion behind an arithmetic error.
+    ///
+    /// The post-resume sample is deliberately a LINK, so `GwDrop::eval` never
+    /// returns `None` after the clear and the latch cannot re-arm by accident — only
+    /// `TriggerEngine::rearm_all` can have produced the second incident.
+    #[tokio::test]
+    async fn run_refires_a_persistent_fault_once_the_production_backoff_has_elapsed() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(
+            Box::new(GwDrop),
+            vec![rec],
+            crate::BACKOFF_US,
+        )]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+        ));
+
+        // Fires once at ts 1, then stays latched while the fault persists.
+        tx.send(link(1, GwVerdict::Fail)).await.unwrap();
+        tx.send(link(2, GwVerdict::Fail)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 3,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 3).await;
+
+        resume_at_us.store(10, Ordering::Release);
+        // The first microsecond at which the production budget is spent.
+        let refire_us = 1i64.saturating_add(crate::BACKOFF_US);
+        tx.send(link(refire_us, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            2,
+            "a persistent fault re-fires once the production backoff has elapsed"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(&format!(
+                    "SELECT count(*) FROM incident \
+                     WHERE id IN ('gw-drop-1', 'gw-drop-{refire_us}')"
+                ))
+                .unwrap(),
+            2,
+            "the two incidents are the pre-pause and post-resume observations, not a rewrite"
         );
     }
 
@@ -1592,6 +1909,152 @@ mod tests {
                 .unwrap(),
             0,
             "an unchanged gateway across a pause is not a change"
+        );
+    }
+
+    /// The cross-gap freeze stream at a given `backoff_us`: a gateway change that
+    /// FIRES before the pause, then a second change visible at resume only against
+    /// the carried basis. Returns the store.
+    ///
+    /// The existing cross-gap tests fire for the FIRST time at the resume, so the
+    /// firing budget is never in play there and the interaction between the carried
+    /// basis and the backoff is never built. Here `gw-change` has already spent its
+    /// budget at ts 2, so the cross-gap change at ts 11 is decided by `backoff_us`
+    /// alone.
+    async fn gw_change_across_a_pause_after_an_earlier_fire(backoff_us: i64) -> Arc<DuckdbStore> {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let freezer: Arc<dyn PcapFreezer> = Arc::new(FakeFreezer);
+        let freeze: Arc<dyn Handler> = Arc::new(FreezePcapHandler::new(
+            freezer,
+            store.clone(),
+            "/tmp/observer-blobs",
+        ));
+        let eng = TriggerEngine::new(vec![Trigger::new(
+            Box::new(GwChange),
+            vec![rec, freeze],
+            backoff_us,
+        )]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+        ));
+
+        // No predecessor yet, so `GwChange::eval` returns `None` and the trigger
+        // stays armed…
+        tx.send(link(1, GwVerdict::Ok)).await.unwrap();
+        // …then OK -> FAIL is a contiguous two-tick change: it FIRES, spending the
+        // budget at ts 2 and recording the first incident + the first freeze.
+        tx.send(link(2, GwVerdict::Fail)).await.unwrap();
+        // A sentinel past the last link: once it is mirrored, both links are in the
+        // window, so the resume epoch below lands on a known stream position.
+        tx.send(Sample::Host(HostSample {
+            ts_us: 3,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 3).await;
+
+        resume_at_us.store(10, Ordering::Release);
+        // At this sample the window is cleared with the FAIL link carried as the
+        // change basis and every trigger re-armed, so `prev_link_with_provenance`
+        // yields (FAIL, AcrossGap) and `eval` returns `Some`. Only the backoff
+        // decides whether it fires.
+        tx.send(link(11, GwVerdict::Ok)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+        store
+    }
+
+    /// The non-vacuity twin of the test below, and an interaction nothing covered
+    /// before it: the cross-gap freeze DOES happen once the budget permits, even
+    /// though this is `gw-change`'s SECOND firing rather than its first. Exactly one
+    /// of the two incidents carries the marker — the pre-pause firing is two
+    /// consecutive ticks and its signature is unmarked — so the `LIKE` count is not
+    /// something either firing alone could satisfy.
+    ///
+    /// Without this half, the suppression test below would pass just as well against
+    /// a `GwChange` that had simply stopped firing at all.
+    #[tokio::test]
+    async fn run_freezes_a_cross_gap_gw_change_once_the_backoff_has_elapsed() {
+        let store = gw_change_across_a_pause_after_an_earlier_fire(0).await;
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            2,
+            "a cross-gap gateway change still fires when the firing budget permits"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM blob_ref WHERE kind='pcap'")
+                .unwrap(),
+            2,
+            "the ring is frozen for the cross-gap change too"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(
+                    "SELECT count(*) FROM incident \
+                     WHERE signature LIKE '%across an observation gap%'"
+                )
+                .unwrap(),
+            1,
+            "only the cross-gap firing is marked; the pre-pause one is two consecutive ticks"
+        );
+    }
+
+    /// The BOUND on the cross-gap freeze guarantee the previous commits advertise: a
+    /// gateway change visible only against the carried basis is still subject to the
+    /// trigger's firing budget, so one that lands inside [`crate::BACKOFF_US`] of an
+    /// earlier firing is suppressed. Dies under `BACKOFF_US = 0` and under an
+    /// `on_sample` that ignores the backoff once a trigger has been re-armed.
+    ///
+    /// All three consequences are asserted as SEPARATE observables because the
+    /// freeze is a handler and could be lost independently of the incident: no second
+    /// incident, no cross-gap marker anywhere, and — the operator-visible cost — no
+    /// second freeze, so the packets the ring kept through the pause are NOT
+    /// preserved. The twin above is what keeps this from passing against a
+    /// `GwChange` that had simply stopped firing.
+    #[tokio::test]
+    async fn run_does_not_freeze_a_cross_gap_gw_change_still_inside_the_backoff() {
+        let store = gw_change_across_a_pause_after_an_earlier_fire(crate::BACKOFF_US).await;
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            1,
+            "the pre-pause firing spent the budget; the cross-gap change is suppressed"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(
+                    "SELECT count(*) FROM incident \
+                     WHERE signature LIKE '%across an observation gap%'"
+                )
+                .unwrap(),
+            0,
+            "a suppressed cross-gap change leaves no marker"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM blob_ref WHERE kind='pcap'")
+                .unwrap(),
+            1,
+            "no second freeze: the packets the ring kept through the pause are not preserved"
         );
     }
 }
