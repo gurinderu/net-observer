@@ -268,8 +268,21 @@ mod tests {
         assert_eq!(w.recent_link(4).len(), 1);
     }
 
+    /// PRECEDENCE: with two links in the window the in-window predecessor answers,
+    /// the carried basis is not consulted at all, and the provenance says so.
+    ///
+    /// This does NOT pin the basis's RETIREMENT. Deleting the `carried_link = None`
+    /// branch in `push` leaves it green, because `prev_link_with_provenance` reaches
+    /// the basis only as a FALLBACK and two in-window links never reach it — see
+    /// `the_change_basis_is_retired_by_the_second_post_resume_link` for that.
+    ///
+    /// What it uniquely owns is the [`LinkProvenance::Contiguous`] label, asserted
+    /// nowhere else in the workspace: relabelling it `AcrossGap` would append
+    /// " (across an observation gap)" to the signature of every ordinary two-tick
+    /// gateway-change incident, marking routine ticks as spanning a pause that
+    /// never happened.
     #[test]
-    fn the_change_basis_expires_with_the_second_post_resume_link() {
+    fn the_in_window_predecessor_wins_over_the_carried_basis() {
         let mut w = RecentWindow::new(16);
         w.push(link(1));
         w.clear_for_resume();
@@ -284,6 +297,59 @@ mod tests {
         );
     }
 
+    /// RETIREMENT: the SECOND post-resume link drops the basis for good, so it can
+    /// never resurface as the neighbour of a much later sample once eviction has
+    /// emptied the window of links again.
+    ///
+    /// The basis is only *reachable* while the window holds exactly one link, so
+    /// the fixture retires it with a second link and then evicts only the OLDER of
+    /// the two — restoring the one shape in which a surviving basis would be read.
+    /// It dies under both mutations of the retirement: deleting the
+    /// `carried_link = None` branch, and widening its condition to
+    /// `links_since_clear >= 2` (an off-by-one that survives the rest of the
+    /// suite, because every other fixture pushes a third link before reading).
+    ///
+    /// The `None` at the end is the retirement and not a window that never carried
+    /// anything: `clear_for_resume_keeps_only_the_change_basis` runs the same
+    /// opening with only ONE post-resume link and reads the basis back as
+    /// `AcrossGap`. There is deliberately no eviction-based control beyond that —
+    /// with one post-resume link, the link that follows the eviction is itself the
+    /// second one and retires the basis, so both arms would read `None` and the
+    /// control would prove nothing.
+    #[test]
+    fn the_change_basis_is_retired_by_the_second_post_resume_link() {
+        let mut w = RecentWindow::new(4);
+        w.push(link(1));
+        w.clear_for_resume(); // carried = link(1), links_since_clear = 0
+        w.push(link(10)); // first post-resume link: nothing retired
+        w.push(link(11)); // the second one: the basis is retired HERE
+        // Precedence still answers while both links are in the window, so the
+        // retirement is not observable yet.
+        assert_eq!(w.prev_link().map(|l| l.ts_us), Some(10));
+
+        // Evict only the OLDER link, so the newest one has no in-window
+        // predecessor again — the exact shape a surviving basis would fill.
+        w.push(proxy(100));
+        w.push(proxy(101));
+        w.push(proxy(102));
+        assert_eq!(
+            w.last_link().map(|l| l.ts_us),
+            Some(11),
+            "only the OLDER link may be evicted, or `prev_link` is None for the wrong reason"
+        );
+        assert!(
+            w.prev_link().is_none(),
+            "a retired basis must never resurface as a much later sample's predecessor"
+        );
+    }
+
+    /// The distinct "no link history at all" case: eviction takes BOTH post-resume
+    /// links, so a retirement implemented by scanning the buffer would have found
+    /// nothing to retire against and left the basis standing.
+    ///
+    /// The `last_link()` assertion is what makes the `None` mean that: without it
+    /// the test also passes against a `push` that drops link samples on the floor,
+    /// reading `None` for a reason that has nothing to do with retirement.
     #[test]
     fn an_evicted_link_history_reads_as_absent() {
         let mut w = RecentWindow::new(4);
@@ -297,6 +363,11 @@ mod tests {
             w.push(proxy(100 + t));
         }
         w.push(link(30));
+        assert_eq!(
+            w.last_link().map(|l| l.ts_us),
+            Some(30),
+            "the window must still hold the newest link, or `prev_link` is None for the wrong reason"
+        );
         assert!(
             w.prev_link().is_none(),
             "an evicted neighbour must never be replaced by a pre-pause one"
