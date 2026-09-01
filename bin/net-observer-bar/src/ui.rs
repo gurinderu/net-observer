@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gpui::prelude::*;
 use gpui::{
     App, AsyncApp, Context, Entity, Rgba, SharedString, Subscription, Window, WindowAppearance,
-    div, px, rgb,
+    div, px, rgb, rgba,
 };
 
 use net_observer_ipc::{
@@ -56,14 +56,27 @@ use crate::status::{Health, health};
 /// the panel and the window read as one consistent, appearance-aware surface.
 #[derive(Clone, Copy)]
 pub(crate) struct Theme {
-    /// The popover surface.
+    /// Opaque surface, for the windows that are ordinary windows — the event
+    /// log. Never the popover: see `surface`.
     pub(crate) bg: u32,
+    /// The popover surface, **`0xRRGGBBAA`**. Deliberately translucent: the
+    /// panel window is opened `Blurred`, which puts an `NSVisualEffectView`
+    /// behind it, and a fully opaque fill would hide the very material that
+    /// makes a menu-bar popover look like part of the menu bar. This is also
+    /// why the base colour is lighter than instinct suggests — Apple's dark
+    /// menu reads mid-grey, not near-black, because the desktop shows through
+    /// it. Darkening the fill walks away from the target instead of toward it.
+    pub(crate) surface: u32,
     /// Primary ink (labels, app name).
     pub(crate) fg: u32,
     /// Secondary text and disabled/muted values.
     pub(crate) muted: u32,
     /// Hairline separator between sections.
     pub(crate) separator: u32,
+    /// The popover's outer edge, `0xRRGGBBAA`. A native menu is not a flat
+    /// rectangle: it carries a faint light rim that lifts it off whatever is
+    /// behind. Without it the panel reads as a hole rather than a surface.
+    pub(crate) edge: u32,
     /// Semantic "good" (healthy verdicts).
     pub(crate) ok: u32,
     /// Semantic "bad" (failed/degraded verdicts, open incidents).
@@ -96,6 +109,8 @@ impl Theme {
     fn light() -> Self {
         Self {
             bg: 0xf6f6f7,
+            surface: 0xf2f2f4f2,
+            edge: 0x00000026,
             fg: 0x1d1d1f,
             muted: 0x86868b,
             separator: 0xe4e4e7,
@@ -110,10 +125,22 @@ impl Theme {
         }
     }
 
-    /// Dark-grey surface, light ink — the macOS dark menu.
+    /// Near-black surface, light ink — the macOS dark menu. The surface is
+    /// deliberately darker than the app chrome around it: a menu-bar popover
+    /// reads as part of the menu bar, not as a window, and a mid-grey panel
+    /// floats away from it. `separator` and `hover` are pinned to this surface
+    /// rather than chosen independently — lighten the background without them
+    /// and the hairlines turn into visible bars.
     fn dark() -> Self {
         Self {
             bg: 0x1f1f22,
+            // Landed by bisection against a native NSMenu shown side by side:
+            // #0d0d0f read darker than the system menu, #1e1e20 read lighter,
+            // so the surface sits between them. Do not "correct" this by eye
+            // against the app chrome — the reference is a real menu on the same
+            // display, and both directions were tried and rejected.
+            surface: 0x161618f2,
+            edge: 0xffffff1f,
             fg: 0xe8e8ec,
             muted: 0x9a9aa2,
             separator: 0x38383d,
@@ -430,7 +457,13 @@ impl Render for PanelView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(theme.bg))
+            // A native menu is rounded and rimmed, not a square slab. Both need
+            // the window to be non-opaque: with an opaque window the corners are
+            // filled by the window server and the rounding is invisible.
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(rgba(theme.edge))
+            .bg(rgba(theme.surface))
             .text_color(rgb(theme.fg))
             .font_family(".SystemUIFont")
             .text_size(px(13.0))

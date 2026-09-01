@@ -31,8 +31,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext, Application, AsyncApp, Bounds, Entity, Pixels, Timer, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, point, px, size,
+    App, AppContext, Application, AsyncApp, Bounds, Entity, Pixels, Timer,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px,
+    size,
 };
 
 use objc2::rc::Retained;
@@ -400,6 +401,11 @@ fn open_panel(
 /// positioned at `anchor` (see [`compute_anchor_bounds`]).
 fn panel_window_options(anchor: Bounds<Pixels>) -> WindowOptions {
     WindowOptions {
+        // The whole point of the look: `Blurred` installs an NSVisualEffectView
+        // behind the window, which is the same mechanism Apple's own menus use.
+        // The panel fill (`Theme::surface`) must stay translucent or this buys
+        // nothing — an opaque fill covers the material completely.
+        window_background: WindowBackgroundAppearance::Blurred,
         window_bounds: Some(WindowBounds::Windowed(anchor)),
         titlebar: None,
         kind: WindowKind::PopUp,
@@ -417,33 +423,46 @@ fn panel_window_options(anchor: Bounds<Pixels>) -> WindowOptions {
 ///
 /// ## Coordinate conversion
 ///
-/// gpui-0.2.2's macOS backend turns `WindowBounds::Windowed(bounds)` into the
-/// native window's bottom-left content-rect origin as (see gpui
-/// `platform/mac/window.rs`):
+/// Two coordinate systems meet here and they disagree about which way `y` runs.
+/// Cocoa's `NSScreen`/`NSWindow` frames put the origin at the screen's
+/// **bottom**-left, so a menu-bar item sits near `display_height`. gpui's
+/// `WindowBounds::Windowed(bounds)` takes `bounds.origin` as the window's
+/// **top**-left with `y` measured from the screen's *top*. So the conversion is
+/// one subtraction and no panel-height term:
 ///
 /// ```text
-/// ns.x = screen.origin.x + bounds.origin.x
-/// ns.y = screen.origin.y + (display_height - bounds.origin.y)
+/// ox = btn.origin.x - screen.origin.x     // panel's left edge under the icon
+/// oy = display_height - btn.origin.y      // panel's top edge at the menu-bar bottom
 /// ```
 ///
-/// where `ns` is the window's **bottom-left** corner in Cocoa screen coords and
-/// `display_height == main screen frame height`. So `bounds.origin.y` maps to the
-/// window's *bottom*, not its top — we must account for the panel height. We pick
-/// the desired native rect (right edge under the icon, top edge at the menu-bar
-/// bottom `btn.origin.y`, hence Cocoa bottom `btn.origin.y - PANEL_H`) and invert
-/// the mapping to get `bounds.origin`. gpui opens `display_id: None` windows on
-/// the primary display (which owns the menu bar), matching `NSScreen::mainScreen`.
+/// Verified on a 1470x956 display: a laid-out item reports `origin (871, 923)`,
+/// which yields `(871, 33)` and draws the panel directly under the icon. An
+/// earlier version of this comment claimed gpui's origin was the window's bottom
+/// and that `PANEL_H` had to be subtracted; that would have put the panel's top
+/// at y≈1383, entirely above the screen. It was wrong.
 ///
-/// Captured once at startup: menu-bar status items are stable for the app's life,
-/// so the frame does not move. Assumes the status item lives on the primary
-/// display (the usual case); a graceful fallback covers the rare cases where the
-/// status window or main screen isn't available yet.
+/// gpui opens `display_id: None` windows on the primary display (which owns the
+/// menu bar), matching `NSScreen::mainScreen`; the status item is assumed to live
+/// there too, which is the usual case.
 fn compute_anchor_bounds(button: &NSStatusBarButton, mtm: MainThreadMarker) -> Bounds<Pixels> {
     let panel_size = size(px(PANEL_W as f32), px(PANEL_H as f32));
 
     let btn = button.window().map(|w| w.frame());
     let scr = NSScreen::mainScreen(mtm).map(|s| s.frame());
 
+    // A status-item window that has not been laid out yet reports a frame that
+    // is not on the screen at all — measured: origin (0, -33) on a 1470x956
+    // display, which the arithmetic below faithfully turns into an anchor below
+    // the screen's bottom edge. Cocoa screen coordinates put the origin at the
+    // BOTTOM-left, so a real menu-bar item sits near `display_height`, never at
+    // a negative y. Treat anything else as "not laid out" and fall through to
+    // the nominal top-right anchor, which is wrong by a few pixels rather than
+    // off-screen. (Reproduced with `--open`, which opens the panel during
+    // startup, before the item is placed.)
+    let btn = btn.filter(|b| match scr {
+        Some(scr) => b.origin.y > scr.size.height * 0.5,
+        None => false,
+    });
     match (btn, scr) {
         (Some(btn), Some(scr)) => {
             let display_height = scr.size.height;
