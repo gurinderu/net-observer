@@ -121,13 +121,15 @@ crates/
 |---|---|
 | build | `cargo build --all` |
 | test | `just test` → `cargo test --all` |
-| lint | `just clippy` → `cargo clippy --all-targets --all-features -- -D warnings` |
+| lint | `just clippy` → `cargo clippy --all --all-targets --all-features -- -D warnings` |
 | format | `cargo fmt --all` |
 | run | `just run ARGS` → `cargo run -p net-observerd -- ARGS` |
 
-Green means the sequence `cargo fmt --all` → `cargo build --all` → `cargo test --all` → `cargo clippy --all-targets --all-features -- -D warnings`, **run from inside `nix develop`** — the `--all` steps include the menu bar, which only compiles there (see the gotcha below).
+Green means the sequence `cargo fmt --all` → `cargo build --all` → `cargo test --all` → `cargo clippy --all --all-targets --all-features -- -D warnings`, **run from inside `nix develop`** — the `--all` steps include the menu bar, which only compiles there (see the gotcha below).
 
-Run each step so its **own** exit code is visible. Piping cargo into `tail`/`head` makes the pipeline exit status that of the pager, so a failing build reports success — this has already produced a false "green" in this repo.
+Run each step so its **own** exit code is visible. Piping cargo into `tail`/`head` makes the pipeline exit status that of the pager, so a failing build reports success — this has already produced a false "green" in this repo, and the unformatted commit it let through was caught only by CI.
+
+Every step carries `--all`. Without it cargo uses `default-members`, which excludes `net-observer-bar` — a clippy run that looks workspace-wide but never checks the GUI is exactly how a `type_complexity` error reached `main`.
 
 `clippy::pedantic` is deliberately NOT enabled: measured on 2026-09-01 it raises **215** warnings (largest groups `doc_markdown`, `must_use_candidate`, `cast_possible_truncation`, `map_unwrap_or`). Turning it on is a refactoring commitment, not a flag — it needs an explicit decision, not a bootstrap.
 

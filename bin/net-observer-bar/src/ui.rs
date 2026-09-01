@@ -877,6 +877,18 @@ fn footer(
         .child(meta)
 }
 
+/// One blocking control round-trip: send a command, then re-read status so the
+/// panel shows what the daemon actually holds rather than what the click asked
+/// for. Both halves are fallible and fail differently — the command can be
+/// refused (`String`) while the follow-up read can find no daemon at all
+/// (`GlanceError`) — so neither collapses into the other.
+type ControlRoundTrip = fn(
+    &str,
+) -> (
+    Result<ControlResult, String>,
+    Result<StatusSnapshot, GlanceError>,
+);
+
 /// Run one blocking control round-trip on the background executor and apply its
 /// outcome to the shared model on the foreground.
 ///
@@ -884,16 +896,7 @@ fn footer(
 /// the gpui main thread" and "a daemon that is not there is a message, not a
 /// crash" are decided once rather than per button. The model is held weakly, so a
 /// shut-down app just drops the result.
-fn spawn_control(
-    view: &PanelView,
-    cx: &mut Context<PanelView>,
-    round_trip: fn(
-        &str,
-    ) -> (
-        Result<ControlResult, String>,
-        Result<StatusSnapshot, GlanceError>,
-    ),
-) {
+fn spawn_control(view: &PanelView, cx: &mut Context<PanelView>, round_trip: ControlRoundTrip) {
     let model = view.model.downgrade();
     let socket = view.model.read(cx).socket_path.clone();
     cx.spawn(async move |_view, acx: &mut AsyncApp| {
