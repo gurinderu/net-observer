@@ -3,13 +3,13 @@ A Rust network-forensics daemon for macOS: writes layered telemetry into DuckDB 
 
 ## What this project is
 - **Language of the repo is English** — code, comments, docs, commit messages, this file. The graph is written in Russian; do not translate graph node names when you reference them.
-- **Nature**: not agreed — run `iskron:iskronify` for the full pass. Until then act under full production discipline: no relaxation has been declared, so there is none.
+- **Nature**: `sandbox`, for now. That describes the stakes, not a licence: **no working principle is relaxed**, and the gate below is not optional. What sandbox buys you is that breakage is cheap and recoverable — one machine, one user, nothing downstream. It stops being cheap the moment the shell oracle is retired and this daemon is the only record of an outage.
 - **Realm**: `net-observer` (`r210`) — every session starts with `iskron_orient` here.
 - **Focus holon**: `#1 «🛰 Контур сетевой форензики мака»`.
 - **Agent role**: `#2 «🔧 Сопровождающий демона net-observer»` — adhikarin, steward of the focus holon. Your inbox: `iskron_orient(realm="r210", focus="#2")` at session start.
 - **Owner role**: `#3 «🧭 Владелец расследования»` (svatantra 主) — questions beyond your mandate go here as `posed_to` vimarshas.
 - **Stack**: Rust edition 2024 (toolchain pinned in `rust-toolchain.toml`), tokio, DuckDB (`bundled`), figment, thiserror/anyhow, tracing, gpui for the menu bar.
-- **Production statement**: not agreed — run `iskron:iskronify` for the full pass.
+- **Production statement**: ships nowhere and to no one. It runs on its author's own Mac, and its only consumer is the person reading an incident afterwards. The cost of breakage is not downtime — it is a missed incident: an outage that happened and left no usable record, and therefore an argument with the network's operators that cannot be made. Silent wrong data is worse than no data, which is why `SKIP` and the bracketed pause exist.
 
 ## Persistence rules
 State lives in the **repo** or in the **graph** — nowhere else. The harness's built-in memory (per-project memory directory, conversation summaries, `/tmp`, machine-local files) is **forbidden entirely, not by category**: no project fact, no user preference, no note on working style. (why: local memory is invisible to every other agent and machine, so it drifts silently and breaks the reproducibility that makes a second machine or agent possible.)
@@ -50,7 +50,15 @@ One branch until it merges — commit follow-ups into it. After a merge: `git ch
 8. **Think in the graph, speak the project's language.** The structural vocabulary (kriya, phenomenon, holon, vimarsha, modes) is for reasoning; it does not appear in what you say to the user until they use it first.
 
 ## Shared surfaces
-Not settled yet: run the interview (say `iskron:iskronify`) before accepting any behavioral claim here. Until then Working principle 4 is executed by hand — a graph walk from `#1`.
+One surface here has more than one consumer, and it is derived from the code, not from prose: the local socket protocol.
+
+| Shared surface | Traversal anchor | What leads to the consumers |
+|---|---|---|
+| `net-observer-ipc` — `Request`/`Response`, `ControlCmd`, `StatusSnapshot`, `StreamFrame` | holon `#7` «Подсистема чтения» in realm `r210` | `context` edges into `#7` reach the readers; the writing side is `bin/net-observerd` (`api.rs`), which serves the same types |
+
+Do not keep a consumer list in this file — walk the graph. Three consumers exist today (`net-observerd` serves, `net-observer-cli` and `net-observer-bar` call), and the bar is the one that breaks *silently*: it is not built here or in CI, so a field added to `StatusSnapshot` without updating the bar compiles everywhere you can look. `serde(default)` on new fields is the standing mitigation — it kept a pre-quiet daemon decodable — but it does not save a *sender* that forgot a field.
+
+Touching this surface obliges the walk; adding a consumer obliges the edge, or the next walk will not know it exists.
 
 ## External surfaces — what you use and do not own
 There are many here and they are undocumented: private macOS tools and logs (`wdutil`, `ipconfig getpacket`, `scutil --nwi`, CoreCapture, `symptomsd netepochs`), sing-box's Clash API, DuckDB.
@@ -60,7 +68,19 @@ There are many here and they are undocumented: private macOS tools and logs (`wd
 - **The reference works both ways.** Source that touches an external surface carries `(realm net-observer, node #N)` — and you read that node before the work.
 
 ## Reality — what a claim is checked against
-Not settled yet: run the interview (say `iskron:iskronify`) before accepting any behavioral claim here. Until the table exists, a behavioral claim is closed only by an observation you named aloud before you looked.
+Only the rows below are settled; the owner has not yet named carriers for the rest, so they sit in *Ceiling* rather than as aspirational lines.
+
+| Claim class | Canonical carrier | How to observe | Who |
+|---|---|---|---|
+| Pure logic (sample mapping, trigger conditions, wire round-trip) | the test binaries of the default members | `cargo test` — read its own exit code, never a pipeline's | agent |
+| Compiles and lints clean | the default-member build | `cargo build` then `cargo clippy --all-targets --all-features -- -D warnings`, each exit code read separately | agent |
+| Anything about the menu bar | a compiled `net-observer-bar` | **unreachable** — see *Ceiling* | — |
+
+**Ceiling** — claim classes with no reachable observation, and why:
+- **The menu bar renders / its buttons work.** `gpui` needs the macOS Metal Toolchain. `xcode-select` here points at the nix `apple-sdk`, which has no shader compiler; pointing `DEVELOPER_DIR` at Xcode finds `metal` but then breaks linking against the nix toolchain. CI does not build the bar either (`--workspace` is not passed). Any claim about the bar is `unreachable`, never confirmed from the source.
+- **The daemon's live behavior** (it really writes that row, the ring really freezes, quiet really silences the wire). Needs a root run on this Mac against a real network, and the owner has not named how he wants that observed. Until he does, such a claim is closed only by an observation named aloud *before* looking — never by re-reading the diff.
+
+**The table grows by use.** The moment a session learns a carrier this table does not hold, write the row then — in that session, before the work that taught it closes.
 
 ## Graph ↔ repo: where things live
 | Concern | Repo | Graph |
@@ -136,13 +156,13 @@ Run each step so its **own** exit code is visible. Piping cargo into `tail`/`hea
 - **Forge**: GitHub, `origin` = `git@github.com:gurinderu/net-observer.git`. CLI is `gh` (installed, authenticated as `gurinderu`); watch checks with `gh pr checks <n> --watch`.
 - **Local gate**: there is no pre-commit hook in this repo — run `cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all` by hand before pushing.
 - **CI**: two workflows on `macos-latest`, both gating pull requests *and* pushes to `main` — `lints` (`cargo fmt --all --check`, clippy with `-D warnings`, `RUSTFLAGS: -D warnings`) and `tests` (`cargo build --all`, `cargo test --all`). There are no post-merge-only jobs, so PR↔main parity is complete. `net-observer-bar` is not built in CI: it is outside `default-members` and `--workspace` is not passed, so the GUI only breaks locally.
-- **Definition of done**: not agreed — run `iskron:iskronify` for the full pass. Until then the owner declares a merge, and branch discipline waits for that declaration.
+- **Definition of done**: a pull request into `main`, `gh pr checks <n> --watch` green, merged without conflicts. Branch discipline keys on that merge, not on a push: a push that only opened or updated the PR has shipped nothing.
 - **Never** `--no-verify`, `--force`, `--no-gpg-sign`, or `git reset --hard` without an explicit instruction from the user. Stage explicit paths only — never `git add -A` / `.` / `-u`.
 
 *(iskronify: contract `5`, stamp `2026-09-01` (full pass) — re-run when the installed
 iskronify's description names a higher contract, or when the sources this file
 was derived from have moved since that date.)*
 
-Still not agreed, and named rather than guessed: Nature, the production
-statement, the *Reality* table, shared surfaces, and the definition of done.
-Everything derivable has been re-projected from its source in this pass.
+Every authored slot is now filled. The *Reality* table is deliberately partial:
+its *Ceiling* names the claim classes with no reachable observation instead of
+pretending they have one.
