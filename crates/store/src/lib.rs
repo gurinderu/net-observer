@@ -1,3 +1,4 @@
+pub mod diagnosis;
 mod duckdb_store;
 mod schema;
 
