@@ -1038,14 +1038,16 @@ fn spawn_control(view: &PanelView, cx: &mut Context<PanelView>, round_trip: Cont
 /// still answering is the early warning a single current number hides.
 const RTT_THRESHOLD_MS: f64 = 300.0;
 
-/// Host 1-minute load above which the panel calls the host starved.
+/// Host 1-minute load above which the panel calls the host starved — the same
+/// number the daemon's `Starvation` condition uses (`STARVATION_LOAD`,
+/// `bin/net-observerd/src/main.rs`), so the line the operator watches and the
+/// line the trigger fires on are one line.
 ///
-/// NOTE: the daemon's own `Starvation` condition discriminates at `10.0`
-/// (`STARVATION_LOAD` in `bin/net-observerd/src/main.rs`), not at 16. This line is
-/// the operator-visible threshold this panel was asked for; it is deliberately
-/// *not* wired to the daemon's constant, and the two want reconciling by whoever
-/// owns the trigger rule.
-const LOAD_THRESHOLD: f64 = 16.0;
+/// 16 belongs to a different daemon: the shell LaunchDaemon this project
+/// replaces gates its watchdog at `load1 < 16`. Reading that number off the
+/// oracle and drawing it here would put the panel a whole failure-band away from
+/// the trigger it is supposed to preview.
+const LOAD_THRESHOLD: f64 = 10.0;
 
 /// Height of a sparkline's plot area, in gpui logical pixels.
 const SPARK_H: f32 = 28.0;
