@@ -1,5 +1,5 @@
 [package]
-name = "observer-ipc"
+name = "net-observer-ipc"
 edition.workspace = true
 
 [dependencies]

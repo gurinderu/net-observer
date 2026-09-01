@@ -13,7 +13,7 @@
       in {
         formatter = pkgs.nixfmt-rfc-style;
         devShells.default = pkgs.mkShell {
-          name = "observer-dev";
+          name = "net-observer-dev";
           packages = [ rust pkgs.bashInteractive pkgs.pkg-config pkgs.duckdb pkgs.libpcap pkgs.iconv ];
           # duckdb crate links the system lib when DUCKDB_LIB_DIR is set; else it builds bundled.
         };

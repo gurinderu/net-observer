@@ -1,5 +1,5 @@
-//! Pure render layer for `observer-bar`: turn an [`observer_ipc::StatusSnapshot`]
-//! (fetched live from `observerd` over the local socket) into the menu-bar health
+//! Pure render layer for `net-observer-bar`: turn an [`net_observer_ipc::StatusSnapshot`]
+//! (fetched live from `net-observerd` over the local socket) into the menu-bar health
 //! dot (and the retained compact glyph), the health classification, and the
 //! multi-line tooltip/panel text.
 //!
@@ -7,15 +7,15 @@
 //! over its input — no DB, no socket, no GUI — so every renderer is tested here
 //! against synthetic [`StatusSnapshot`]s. The bar no longer touches DuckDB at
 //! all: the daemon is the sole DB owner and serves the snapshot from memory (see
-//! [`crate::ui::read_fresh`], which calls [`observer_ipc::query`]).
+//! [`crate::ui::read_fresh`], which calls [`net_observer_ipc::query`]).
 
-use observer_ipc::StatusSnapshot;
+use net_observer_ipc::StatusSnapshot;
 use types::GwVerdict;
 
 /// Render a [`StatusSnapshot`] as a compact, human-readable multi-line glance.
 /// Pure over its input so it can be unit-tested without a socket or a GUI.
 pub fn render_status(snap: &StatusSnapshot) -> String {
-    let mut out = String::from("observer\n");
+    let mut out = String::from("net-observer\n");
 
     match &snap.link {
         Some(l) => out.push_str(&format!(
@@ -146,7 +146,7 @@ pub fn status_glyph(snap: &StatusSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use observer_ipc::IncidentSummary;
+    use net_observer_ipc::IncidentSummary;
     use types::{LinkSample, ProxySample, TcpVerdict};
 
     /// A synthetic link sample with the given gateway verdict; other fields are

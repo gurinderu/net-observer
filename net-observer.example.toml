@@ -1,10 +1,10 @@
-# observer configuration — copy to observer.toml and edit.
+# net-observer configuration — copy to net-observer.toml and edit.
 #
 # Every field has a built-in default (see crates/config). This file mirrors
 # those defaults; uncomment and change only what you need. Values here are
-# overridden, in turn, by `OBSERVER_`-prefixed environment variables, where
+# overridden, in turn, by `NET_OBSERVER_`-prefixed environment variables, where
 # nested keys use `__` as the separator, e.g.
-#   OBSERVER_COLLECTORS__LINK__INTERVAL="5s"
+#   NET_OBSERVER_COLLECTORS__LINK__INTERVAL="5s"
 
 # DuckDB database file. Large blobs (pcap, `log show`) live on disk under
 # `blob_dir`; only `blob_ref` metadata rows go in the DB.
@@ -37,7 +37,7 @@ socket_mode = 0o666
 # for a headless / SSH-only host, where /dev/console is root-owned and the
 # console-user rule therefore authorises nobody. Read requests (status,
 # incidents, subscribe) are never gated — only Control is.
-# Env override: OBSERVER_CONTROL_UIDS="[501,502]"
+# Env override: NET_OBSERVER_CONTROL_UIDS="[501,502]"
 # control_uids = [501]
 
 # The `link` collector probes the local network path: default gateway
@@ -93,7 +93,7 @@ ring_mb = 8
 # BPF filter — keep it cheap: link-layer control traffic only.
 filter = "arp or icmp or udp port 67 or udp port 68 or ether broadcast"
 
-# The control (acting) path: manual recovery actions observerd runs as root
+# The control (acting) path: manual recovery actions net-observerd runs as root
 # (currently `launchctl kickstart -k` on the sing-box service). DISABLED by
 # default — with acting off, every ACTING-CLASS control request (KickstartProxy)
 # is refused WITHOUT running anything, and acting NEVER happens automatically

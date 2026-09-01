@@ -1,4 +1,4 @@
-//! `observerd` — the headless root LaunchDaemon (plan Task 13).
+//! `net-observerd` — the headless root LaunchDaemon (plan Task 13).
 //!
 //! Loads config, opens the DuckDB store, spawns the enabled collectors onto an
 //! mpsc stream, builds the trigger engine with the starter rules + passive
@@ -31,7 +31,7 @@ use macos::{
     BoundTcpProber, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource, ProxySystemFacts,
     SystemFacts,
 };
-use observer_ipc::{EncodedFrame, StatusSnapshot};
+use net_observer_ipc::{EncodedFrame, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{FakeIp, GwChange, GwDrop, Starvation, Wedge};
 use triggers::engine::{Trigger, TriggerEngine};
@@ -89,11 +89,11 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "observerd",
-    about = "observer network-forensics collector daemon"
+    name = "net-observerd",
+    about = "net-observer network-forensics collector daemon"
 )]
 struct Cli {
-    /// Path to the TOML config file (`OBSERVER_*` env overrides still apply).
+    /// Path to the TOML config file (`NET_OBSERVER_*` env overrides still apply).
     #[arg(long)]
     config: Option<String>,
 }
@@ -127,7 +127,7 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let cfg = Config::load(cli.config.as_deref()).context("loading config")?;
-    tracing::info!(db = %cfg.db_path, "starting observerd");
+    tracing::info!(db = %cfg.db_path, "starting net-observerd");
 
     // Ensure the store + blob directories exist before opening the database.
     if let Some(parent) = Path::new(&cfg.db_path).parent() {
@@ -357,7 +357,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     abort_all(&handles);
     api_handle.abort();
     match tokio::time::timeout(SHUTDOWN_GRACE, &mut consumer).await {
-        Ok(Ok(())) => tracing::info!("observerd shut down cleanly"),
+        Ok(Ok(())) => tracing::info!("net-observerd shut down cleanly"),
         Ok(Err(e)) => tracing::error!(error = %e, "consumer join failed during shutdown"),
         Err(_) => tracing::warn!(
             grace_s = SHUTDOWN_GRACE.as_secs(),
@@ -609,7 +609,7 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    use observer_ipc::{Event, StreamFrame};
+    use net_observer_ipc::{Event, StreamFrame};
     use store::Store as _;
     use triggers::window::RecentWindow;
     use types::{GwVerdict, HostSample, LinkSample, ProxySample, TcpVerdict};
@@ -630,12 +630,12 @@ mod tests {
     /// `FakeFreezer` plus `FreezePcapHandler::on_fire` only *join* `blob_dir`.
     fn test_cfg() -> Config {
         Config {
-            socket_path: "/tmp/observerd-wiring-test.sock".into(),
+            socket_path: "/tmp/net-observerd-wiring-test.sock".into(),
             // Deliberately NOT the shipped 0o666: a hardcoded default dies here.
             socket_mode: 0o600,
             socket_owner_uid: Some(4242),
             control_uids: vec![7, 9],
-            blob_dir: "/tmp/observerd-wiring-test-blobs".into(),
+            blob_dir: "/tmp/net-observerd-wiring-test-blobs".into(),
             acting: config::ActingCfg {
                 // Also NOT the shipped default (`false`), for the same reason.
                 enabled: true,

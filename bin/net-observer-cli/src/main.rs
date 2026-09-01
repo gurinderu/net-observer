@@ -1,21 +1,21 @@
-//! `observer-cli` — an unprivileged reader for the observer store.
+//! `net-observer-cli` — an unprivileged reader for the observer store.
 //!
-//! `observerd` is the **sole owner** of the DuckDB file: DuckDB takes a
+//! `net-observerd` is the **sole owner** of the DuckDB file: DuckDB takes a
 //! per-process file lock, so a second opener (even read-only) is blocked while
 //! the daemon runs. This CLI therefore splits into two access paths:
 //!
 //! - **LIVE** — `status` and `incidents` read the daemon's in-memory snapshot
-//!   over its Unix-domain socket (`observer-ipc`). No DB is opened, so there is
+//!   over its Unix-domain socket (`net-observer-ipc`). No DB is opened, so there is
 //!   zero contention with the running daemon.
 //! - **OFFLINE** — `query <SQL>` opens the DuckDB file directly for ad-hoc
-//!   forensics. This only works while the daemon is stopped; if `observerd` is
+//!   forensics. This only works while the daemon is stopped; if `net-observerd` is
 //!   running it holds the lock and the open fails with a clear message rather
 //!   than a panic.
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::Config;
-use observer_ipc::{
+use net_observer_ipc::{
     ControlCmd, ControlResult, EventKind, IncidentSummary, Request, Response, StatusSnapshot,
     StreamFrame,
 };
@@ -25,8 +25,8 @@ use store::{DuckdbStore, QueryTable};
 
 #[derive(Parser)]
 #[command(
-    name = "observer-cli",
-    about = "Query the observer store (live via socket, offline via SQL)"
+    name = "net-observer-cli",
+    about = "Query the net-observer store (live via socket, offline via SQL)"
 )]
 struct Cli {
     /// Optional path to the observer config file (TOML). Supplies the daemon
@@ -93,7 +93,7 @@ enum Command {
         state: ObserveState,
     },
     /// Run an arbitrary SQL query directly against the DuckDB file (offline
-    /// forensics — only works while `observerd` is stopped).
+    /// forensics — only works while `net-observerd` is stopped).
     Query {
         /// The SQL statement to run against the store.
         sql: String,
@@ -204,21 +204,21 @@ fn run(cli: &Cli) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Load the daemon config (defaults + optional TOML file + `OBSERVER_*` env),
+/// Load the daemon config (defaults + optional TOML file + `NET_OBSERVER_*` env),
 /// mapping the large `figment::Error` into a clear `anyhow` message.
 fn load_config(cli: &Cli) -> Result<Config> {
     Config::load(cli.config.as_deref()).map_err(|e| anyhow!("failed to load observer config: {e}"))
 }
 
 /// Send one request to the daemon over the socket. An absent / refused socket
-/// (`observerd` not running) becomes a clear message, never a panic.
+/// (`net-observerd` not running) becomes a clear message, never a panic.
 fn daemon_query(socket_path: &str, req: &Request) -> Result<Response> {
-    observer_ipc::query(socket_path, req).map_err(|e| {
+    net_observer_ipc::query(socket_path, req).map_err(|e| {
         use std::io::ErrorKind::{ConnectionRefused, NotFound};
         if matches!(e.kind(), NotFound | ConnectionRefused) {
-            anyhow!("observerd not running (socket {socket_path} unavailable)")
+            anyhow!("net-observerd not running (socket {socket_path} unavailable)")
         } else {
-            anyhow!("failed to query observerd over socket {socket_path}: {e}")
+            anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
         }
     })
 }
@@ -227,7 +227,7 @@ fn daemon_query(socket_path: &str, req: &Request) -> Result<Response> {
 fn fetch_status(socket_path: &str) -> Result<StatusSnapshot> {
     match daemon_query(socket_path, &Request::Status)? {
         Response::Status(snap) => Ok(snap),
-        Response::Error(e) => Err(anyhow!("observerd returned an error: {e}")),
+        Response::Error(e) => Err(anyhow!("net-observerd returned an error: {e}")),
         other => Err(anyhow!("unexpected daemon response to Status: {other:?}")),
     }
 }
@@ -236,7 +236,7 @@ fn fetch_status(socket_path: &str) -> Result<StatusSnapshot> {
 fn fetch_incidents(socket_path: &str, limit: usize) -> Result<Vec<IncidentSummary>> {
     match daemon_query(socket_path, &Request::Incidents { limit })? {
         Response::Incidents(list) => Ok(list),
-        Response::Error(e) => Err(anyhow!("observerd returned an error: {e}")),
+        Response::Error(e) => Err(anyhow!("net-observerd returned an error: {e}")),
         other => Err(anyhow!(
             "unexpected daemon response to Incidents: {other:?}"
         )),
@@ -265,9 +265,9 @@ impl TailEnd {
     /// is exactly what this type exists to prevent.
     fn message(&self) -> String {
         match self {
-            TailEnd::DaemonClosed => "event stream ended: observerd closed the connection".into(),
+            TailEnd::DaemonClosed => "event stream ended: net-observerd closed the connection".into(),
             TailEnd::OutputClosed => "event stream ended: output pipe closed".into(),
-            TailEnd::ServerError(m) => format!("event stream ended: observerd reported {m}"),
+            TailEnd::ServerError(m) => format!("event stream ended: net-observerd reported {m}"),
             TailEnd::Failed(m) => format!("event stream ended: {m}"),
         }
     }
@@ -302,12 +302,12 @@ impl TailEnd {
 /// - a broken output pipe (e.g. `| head`) also ends the tail cleanly, rather than
 ///   panicking the way `println!` would on a write failure.
 fn stream_events(socket_path: &str, kinds: Option<Vec<EventKind>>) -> Result<ExitCode> {
-    let sub = observer_ipc::subscribe(socket_path, kinds.as_deref()).map_err(|e| {
+    let sub = net_observer_ipc::subscribe(socket_path, kinds.as_deref()).map_err(|e| {
         use std::io::ErrorKind::{ConnectionRefused, NotFound};
         if matches!(e.kind(), NotFound | ConnectionRefused) {
-            anyhow!("observerd not running (socket {socket_path} unavailable)")
+            anyhow!("net-observerd not running (socket {socket_path} unavailable)")
         } else {
-            anyhow!("failed to subscribe to observerd over socket {socket_path}: {e}")
+            anyhow!("failed to subscribe to net-observerd over socket {socket_path}: {e}")
         }
     })?;
 
@@ -322,7 +322,7 @@ fn stream_events(socket_path: &str, kinds: Option<Vec<EventKind>>) -> Result<Exi
     } else {
         tail_frames(sub, &mut out)
     };
-    // NOT `eprintln!` — it panics if the write fails, and `observer-cli events
+    // NOT `eprintln!` — it panics if the write fails, and `net-observer-cli events
     // 2>&1 | head` makes stderr the broken pipe, so the panic would land on
     // exactly the case the doc above promises ends cleanly.
     let _ = writeln!(std::io::stderr(), "{}", end.message());
@@ -360,7 +360,7 @@ fn tail_frames(
 
 /// One printed line for a stream frame: `HH:MM:SS  label  detail`, with the clock
 /// in **UTC** (see [`clock`]; the gpui bar renders the same frames in local time).
-/// The label and detail come from `observer-ipc` so the CLI tail and the bar spell
+/// The label and detail come from `net-observer-ipc` so the CLI tail and the bar spell
 /// every frame identically. Pure over its input (the clock is derived
 /// arithmetically) so it is unit-tested directly.
 fn format_frame_line(f: &StreamFrame) -> String {
@@ -369,7 +369,7 @@ fn format_frame_line(f: &StreamFrame) -> String {
 
 /// Format an epoch-microsecond timestamp as a `HH:MM:SS` wall clock in **UTC**.
 ///
-/// `observer-cli` does not depend on a timezone crate (only the gpui bar does, via
+/// `net-observer-cli` does not depend on a timezone crate (only the gpui bar does, via
 /// `jiff`), so this uses pure integer math over `ts_us` — deterministic, never
 /// panics (Euclidean division handles any `i64`, including negatives).
 fn clock(ts_us: i64) -> String {
@@ -387,7 +387,7 @@ fn clock(ts_us: i64) -> String {
 fn fetch_kickstart(socket_path: &str) -> Result<ControlResult> {
     match daemon_query(socket_path, &Request::Control(ControlCmd::KickstartProxy))? {
         Response::Control(result) => Ok(result),
-        Response::Error(e) => Err(anyhow!("observerd returned an error: {e}")),
+        Response::Error(e) => Err(anyhow!("net-observerd returned an error: {e}")),
         other => Err(anyhow!("unexpected daemon response to Control: {other:?}")),
     }
 }
@@ -404,7 +404,7 @@ fn fetch_set_observing(socket_path: &str, observing: bool) -> Result<ControlResu
         &Request::Control(ControlCmd::SetObserving(observing)),
     )? {
         Response::Control(result) => Ok(result),
-        Response::Error(e) => Err(anyhow!("observerd returned an error: {e}")),
+        Response::Error(e) => Err(anyhow!("net-observerd returned an error: {e}")),
         other => Err(anyhow!("unexpected daemon response to Control: {other:?}")),
     }
 }
@@ -418,7 +418,7 @@ fn format_control(result: &ControlResult) -> String {
 }
 
 /// Open the DuckDB file directly and run one query (offline forensics). If
-/// `observerd` is running it holds the per-process DuckDB lock, so the open
+/// `net-observerd` is running it holds the per-process DuckDB lock, so the open
 /// fails — detect that and print a clear, actionable message instead of leaking
 /// the raw driver error (and never panic).
 fn run_query(db_path: &str, sql: &str) -> Result<QueryTable> {
@@ -426,7 +426,7 @@ fn run_query(db_path: &str, sql: &str) -> Result<QueryTable> {
         let msg = e.to_string();
         if is_lock_error(&msg) {
             anyhow!(
-                "observerd is running and holds the DuckDB lock; stop it for \
+                "net-observerd is running and holds the DuckDB lock; stop it for \
                  offline SQL, or use `status`/`incidents` (live via socket)"
             )
         } else {
@@ -566,7 +566,7 @@ fn push_row(out: &mut String, cells: &[String], widths: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use observer_ipc::{Event, Gap, Ready, StreamError, StreamErrorCode};
+    use net_observer_ipc::{Event, Gap, Ready, StreamError, StreamErrorCode};
     use types::{GwVerdict, LinkSample, ObservingEdge, ProxySample, TcpVerdict};
 
     fn incident(id: &str, trigger: &str, opened: i64, closed: Option<i64>) -> IncidentSummary {
@@ -699,7 +699,7 @@ mod tests {
     fn is_lock_error_detects_duckdb_lock_message() {
         // Representative DuckDB message when the daemon holds the file lock.
         let locked = "IO Error: Could not set lock on file \"/var/lib/observer/observer.duckdb\": \
-             Conflicting lock is held in /usr/bin/observerd (PID 4242)";
+             Conflicting lock is held in /usr/bin/net-observerd (PID 4242)";
         assert!(is_lock_error(locked));
     }
 

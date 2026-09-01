@@ -1,5 +1,5 @@
 [package]
-name = "observerd"
+name = "net-observerd"
 edition.workspace = true
 
 [dependencies]
@@ -14,7 +14,7 @@ collector-route.workspace = true
 collector-host.workspace = true
 triggers.workspace = true
 macos.workspace = true
-observer-ipc.workspace = true
+net-observer-ipc.workspace = true
 tokio = { workspace = true, features = ["net", "io-util"] }
 # Only for `geteuid` in the control-path authorisation policy (`api::ControlPolicy`).
 # Peer credentials themselves come from `tokio::net::UnixStream::peer_cred()`.

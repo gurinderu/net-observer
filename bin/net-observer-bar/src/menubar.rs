@@ -47,7 +47,7 @@ use objc2_foundation::NSString;
 use crate::status::{render_status, status_dot};
 use crate::ui::{Glance, GlanceError, PanelView, read_fresh};
 use config::Config;
-use observer_ipc::StatusSnapshot;
+use net_observer_ipc::StatusSnapshot;
 
 /// How often the glance re-reads the store and refreshes the status dot + panel.
 const REFRESH: Duration = Duration::from_secs(3);
@@ -106,7 +106,7 @@ pub fn run(config: Option<String>, open: bool) {
     //
     // The failure this catches is now wider than a parse error: `Config::load`
     // also fails when an explicitly named `--config` does not exist, is not a
-    // regular file, or is not readable. `observerd` treats that as fatal — a
+    // regular file, or is not readable. `net-observerd` treats that as fatal — a
     // typo'd path must not have it bind a socket and open a database nobody asked
     // for — but the bar deliberately does not: a GUI that refuses to start leaves
     // the user with nothing, no panel and no way to see why.
@@ -122,7 +122,7 @@ pub fn run(config: Option<String>, open: bool) {
                 .as_deref()
                 .map(|path| format!("failed to load {path}: {e}"));
             if let Some(msg) = &msg {
-                eprintln!("observer-bar: {msg}");
+                eprintln!("net-observer-bar: {msg}");
             }
             (Config::default(), msg)
         }
@@ -280,9 +280,9 @@ fn apply_glyph(button: &NSStatusBarButton, glance: &Glance) {
     button.setTitle(&NSString::from_str(title));
 
     let tooltip = match &glance.error {
-        Some(GlanceError::Unreachable(e)) => format!("observer offline\n{e}"),
+        Some(GlanceError::Unreachable(e)) => format!("net-observer offline\n{e}"),
         Some(GlanceError::Protocol(e)) => {
-            format!("observer: daemon reachable, but its answer failed\n{e}")
+            format!("net-observer: daemon reachable, but its answer failed\n{e}")
         }
         None if !glance.snapshot.observing => {
             format!("paused\n{}", render_status(&glance.snapshot))
@@ -391,7 +391,7 @@ fn open_panel(
             // focus (the click-away dismiss).
             cx.activate(true);
         }
-        Err(e) => eprintln!("observer-bar: failed to open panel window: {e}"),
+        Err(e) => eprintln!("net-observer-bar: failed to open panel window: {e}"),
     }
 }
 

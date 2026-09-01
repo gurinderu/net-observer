@@ -5,9 +5,9 @@ symlink to this file.
 
 ## What this is
 
-`observer` — a Rust network-forensics collector daemon for macOS. It replaces the
-hand-rolled `net-observer` bash LaunchDaemon with a structured pipeline that
-writes queryable telemetry into DuckDB. Read `ARCHITECTURE.md` for the pipeline,
+`net-observer` — a Rust network-forensics collector daemon for macOS. It writes
+queryable telemetry into DuckDB, superseding the hand-rolled `bash` LaunchDaemon
+of the same name (still the behavioral oracle — see below). Read `ARCHITECTURE.md` for the pipeline,
 crate graph, and data model; `README.md` for a quick start; and the design +
 plan under `docs/superpowers/` for the full rationale.
 
@@ -17,8 +17,8 @@ A Cargo workspace (`edition = "2024"`, toolchain pinned in `rust-toolchain.toml`
 
 ```
 bin/
-  observerd/        # headless root LaunchDaemon: config → collectors → store + triggers
-  observer-cli/     # unprivileged reader: status / incidents (live via socket), query <SQL> (offline DB)
+  net-observerd/        # headless root LaunchDaemon: config → collectors → store + triggers
+  net-observer-cli/     # unprivileged reader: status / incidents (live via socket), query <SQL> (offline DB)
 crates/
   types/            # Sample, verdict enums, Incident, BlobRef, TriggerFired
   store/            # Store trait + DuckDB backend, schema, QueryTable
@@ -39,7 +39,7 @@ Each collector is its own crate depending on `collector-core`. Adding a subsyste
 ```
 just clippy   # cargo clippy --all-targets --all-features -- -D warnings
 just test     # cargo test --all
-just run ARGS # cargo run -p observerd -- ARGS
+just run ARGS # cargo run -p net-observerd -- ARGS
 ```
 
 Before finishing any change, keep it green:
@@ -82,7 +82,7 @@ build can take up to ~10 minutes — use generous timeouts.
   as a supervised task (log + keep ticking). Store write failures are logged as a
   gap, not silently dropped.
 - **Errors:** `thiserror` in library crates, `anyhow` in binaries. **Config:**
-  `figment` (file + `OBSERVER_*` env). **Async:** `tokio` (kept out of
+  `figment` (file + `NET_OBSERVER_*` env). **Async:** `tokio` (kept out of
   `collector-core`). **Logging:** `tracing`.
 
 ## Behavioral oracle

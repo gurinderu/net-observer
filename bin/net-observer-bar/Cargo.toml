@@ -1,22 +1,22 @@
 [package]
-name = "observer-bar"
+name = "net-observer-bar"
 edition.workspace = true
 
 [dependencies]
 types.workspace = true
 config.workspace = true
-# Same CLI surface as the sibling binaries (`observerd`, `observer-cli`): a
+# Same CLI surface as the sibling binaries (`net-observerd`, `net-observer-cli`): a
 # derive parser that accepts `--config=<path>` and hard-errors on a missing
 # value / unknown flag, instead of silently dropping them onto the default
 # socket (which renders as an unexplained "offline").
 clap.workspace = true
-# `observer-bar` is a pure socket client: `observerd` owns the DuckDB store (its
+# `net-observer-bar` is a pure socket client: `net-observerd` owns the DuckDB store (its
 # per-process file lock blocks any second opener while the daemon runs), so the
 # bar never touches the DB. It fetches a live `StatusSnapshot` over the daemon's
-# Unix-domain socket via `observer_ipc::query` and renders it; a down daemon /
-# absent socket degrades to a graceful "observer offline" state. No DB, `store`,
-# or `anyhow` dependency here — the wire types come from `observer-ipc`.
-observer-ipc.workspace = true
+# Unix-domain socket via `net_observer_ipc::query` and renders it; a down daemon /
+# absent socket degrades to a graceful "net-observer offline" state. No DB, `store`,
+# or `anyhow` dependency here — the wire types come from `net-observer-ipc`.
+net-observer-ipc.workspace = true
 # Local `HH:MM:SS` wall-clock formatting for event-log rows (the daemon reports
 # epoch-microsecond timestamps). Same crate the daemon/types layer already uses.
 jiff.workspace = true
@@ -26,7 +26,7 @@ jiff.workspace = true
 # dockless activation policy are thin AppKit interop via `objc2` + `objc2-app-kit`.
 # gpui's build script compiles Metal shaders and needs the macOS Metal Toolchain,
 # which is why this crate is excluded from the workspace default-members (a plain
-# `cargo build` skips it); build it explicitly with `cargo build -p observer-bar`
+# `cargo build` skips it); build it explicitly with `cargo build -p net-observer-bar`
 # on a machine that has the Metal Toolchain installed.
 gpui.workspace = true
 objc2.workspace = true

@@ -1,4 +1,4 @@
-//! The observerd data pipeline (plan Task 13).
+//! The net-observerd data pipeline (plan Task 13).
 //!
 //! Two halves of the streaming architecture from the spec:
 //! - [`run`] — the consumer loop: drains the sample stream, persists each
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use collector_core::Source;
 
 use crate::AnyCollector;
-use observer_ipc::{EncodedFrame, Event, IncidentSummary, StatusSnapshot, StreamFrame};
+use net_observer_ipc::{EncodedFrame, Event, IncidentSummary, StatusSnapshot, StreamFrame};
 use store::{DuckdbStore, Store};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -420,7 +420,7 @@ pub(crate) fn spawn_interval_collector(
 /// consumer: its `next()` is a blocking `read(2)` driven here on a dedicated
 /// thread. Because that `read(2)` cannot be interrupted, a `next()` parked on an
 /// idle socket keeps its stream sender alive through `abort_all`; the daemon
-/// therefore bounds its shutdown drain (see `observerd::main`) and the OS reaps
+/// therefore bounds its shutdown drain (see `net-observerd::main`) and the OS reaps
 /// the detached thread on process exit, rather than relying on this task to
 /// release the sender.
 ///
@@ -1093,7 +1093,7 @@ mod tests {
         let frame = events_rx.recv().await.unwrap();
         // The routing metadata rides along with the bytes, so the server loop
         // never has to re-inspect the payload to filter it.
-        assert_eq!(frame.kind(), Some(observer_ipc::EventKind::Link));
+        assert_eq!(frame.kind(), Some(net_observer_ipc::EventKind::Link));
         match decode(&frame) {
             StreamFrame::Event(Event::Link(l)) => {
                 assert_eq!(l.ts_us, 11);

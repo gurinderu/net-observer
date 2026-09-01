@@ -1,4 +1,4 @@
-# observer — Rust network-forensics collector (design)
+# net-observer — Rust network-forensics collector (design)
 
 _Date: 2026-07-24. Seed: `~/projects/wiki/.raw/2026-07-24-net-collector-idea.md`.
 Behavioral oracle: `~/projects/nix-config/hosts/mac_aarch64/net-observer.nix`._
@@ -58,8 +58,8 @@ socket, notification channels, any recovery action.
 - **Per-subsystem toggles, not a verbosity tier.** Each collector is
   independently enabled/disabled with its own frequency (a constructor, not an
   off/normal/debug dial).
-- **Privilege split:** `observerd` is a headless **root** LaunchDaemon (needs raw
-  ICMP, PF_ROUTE, tcpdump, `arp -d`, reading the sing-box config). `observer-cli`
+- **Privilege split:** `net-observerd` is a headless **root** LaunchDaemon (needs raw
+  ICMP, PF_ROUTE, tcpdump, `arp -d`, reading the sing-box config). `net-observer-cli`
   is unprivileged and reads the DB. A future toolbar is a separate unprivileged
   UI over a local socket — never the daemon itself.
 
@@ -81,9 +81,9 @@ Collectors ──Sample──▶ [stream: mpsc/broadcast] ──┬──▶ Sto
     before the pcap ring rotates over the packets around the drop.
   - **Analytical rules** (ASOF correlations) expressed as SQL views over DuckDB
     for post-hoc analysis.
-- **observerd** — the root daemon: load config, spawn enabled collectors + the
+- **net-observerd** — the root daemon: load config, spawn enabled collectors + the
   store writer + the trigger engine, supervise them.
-- **observer-cli** — ad-hoc DB queries, status, manual trigger/dump (debugging).
+- **net-observer-cli** — ad-hoc DB queries, status, manual trigger/dump (debugging).
 
 ### Communication model (chosen: streaming pipeline)
 
@@ -218,7 +218,7 @@ etc.) stays SYNC — `collect()` `await`s the probes, then a sync `build_*`
 composes the `Sample` from the fetched values, so mapping stays trivially
 testable while async lives only in the probe fakes (`#[tokio::test]`).
 
-Heterogeneous dispatch without `dyn`-async friction: `observerd` holds an
+Heterogeneous dispatch without `dyn`-async friction: `net-observerd` holds an
 `enum AnyCollector { Link(..), Proxy(..), Dns(..), Route(..), Host(..) }` and
 matches per method (native `async fn`, zero boxing, zero macros). `collector-core`
 defines the trait but cannot enumerate the concrete collectors, so the enum lives
@@ -230,7 +230,7 @@ in the daemon.
   dedicated OS thread bridged to the async daemon via a channel. PF_ROUTE's
   `read(2)` is genuinely uninterruptible-blocking, so it stays on a thread
   regardless — the only truly blocking probe. `collector-core` still declares no
-  tokio dependency it can avoid; the async driving lives in `observerd`.
+  tokio dependency it can avoid; the async driving lives in `net-observerd`.
 
 `pcap-ring` is not a sample-producing collector — it is continuous capture
 infrastructure (in `macos`) frozen on a trigger, not a stream of `Sample` rows.
@@ -259,9 +259,9 @@ mapping logic unit-testable with fakes; `macos` provides the real adapters.
 ```
 observer/
   bin/
-    observerd/        # headless root LaunchDaemon
-    observer-cli/     # ad-hoc queries, status, manual trigger/dump
-    # observer-bar/   # [post-v1] gpui menu-bar UI over a local socket
+    net-observerd/        # headless root LaunchDaemon
+    net-observer-cli/     # ad-hoc queries, status, manual trigger/dump
+    # net-observer-bar/   # [post-v1] gpui menu-bar UI over a local socket
   crates/
     types/            # Sample, Verdict enums, Incident, TriggerEvent
     store/            # Store trait + DuckDB backend, schema, migrations, blob refs
@@ -353,29 +353,29 @@ Plan: `docs/superpowers/plans/2026-07-25-next-collectors-and-bar.md`.
 - `dns`, `route-events`, `host-metrics` collectors (own crates), activating the
   `FakeIp` and `Starvation` trigger conditions with real data. `route-events` is
   the first **Event**-cadence collector (PF_ROUTE via `EventSource`).
-- **gpui menu-bar** (`bin/observer-bar`) — `NSStatusItem` (via `objc2`) + a gpui
+- **gpui menu-bar** (`bin/net-observer-bar`) — `NSStatusItem` (via `objc2`) + a gpui
   panel showing the last tick per collector + recent incidents. No toggles yet.
 
 ## Local API (the daemon is the sole DB owner)
 
-`observerd` is the **only** process that touches the DuckDB store (DuckDB takes a
+`net-observerd` is the **only** process that touches the DuckDB store (DuckDB takes a
 per-process file lock — a second opener, even read-only, is blocked while the
 daemon runs). Every other component reads through a **local API**, never the DB.
 
-- **`observerd` exposes a Unix-domain socket** (`/var/lib/observer/observer.sock`,
+- **`net-observerd` exposes a Unix-domain socket** (`/var/lib/observer/observer.sock`,
   path + mode configurable; the root daemon `chmod`s it so the logged-in user's
   UI can connect). Served async via `tokio::net::UnixListener`.
 - The daemon keeps an **in-memory live snapshot** (`tokio::sync::watch`) updated
   by the pipeline consumer on every sample, plus a small ring of recent
   incidents pushed when a trigger fires. The socket answers **from memory** — no
   DB read on the request path, zero contention with the writer, always live.
-- **`crates/observer-ipc`** holds the shared protocol: `Request { Status,
+- **`crates/net-observer-ipc`** holds the shared protocol: `Request { Status,
   Incidents { limit } }`, `StatusSnapshot { link/proxy/dns/host: Option<*Sample>,
   incidents: Vec<IncidentSummary>, generated_us }` (reuses `types`), newline-JSON
   framing, a blocking `query()` client (for the bar) + an async serve helper.
-- **`observer-bar` is a pure socket client** — no `duckdb` dependency at all. Its
-  refresh timer calls `observer_ipc::query(sock, Request::Status)` and renders;
-  daemon-down ⇒ a graceful "offline" state. `observer-cli`'s `status`/`incidents`
+- **`net-observer-bar` is a pure socket client** — no `duckdb` dependency at all. Its
+  refresh timer calls `net_observer_ipc::query(sock, Request::Status)` and renders;
+  daemon-down ⇒ a graceful "offline" state. `net-observer-cli`'s `status`/`incidents`
   also go through the socket; only its offline `query <SQL>` opens the DB directly.
 
 ## Control path — manual acting (conservative first step)
@@ -385,7 +385,7 @@ The Act layer starts with ONE safe, human-in-the-loop action; automatic acting
 
 - **`Request::Control(ControlCmd)`** with `ControlCmd::KickstartProxy` (extensible),
   answered by `Response::Control(ControlResult { ok, message })`.
-- **`observerd` runs the action as root** — `launchctl kickstart -k <service>`
+- **`net-observerd` runs the action as root** — `launchctl kickstart -k <service>`
   (service label from config), the same recovery net-observer's watchdog used,
   but triggered manually.
 - **Gated OFF by default:** `config.acting.enabled = false` ⇒ any control request
@@ -395,7 +395,7 @@ The Act layer starts with ONE safe, human-in-the-loop action; automatic acting
   `socket_owner_uid`, it `chown`s the socket to that uid; operators set mode
   `0600` when enabling acting so only the owner can send commands (a world-
   connectable read socket must not also accept privileged actions).
-- **Clients:** `observer-bar` gets a "Restart sing-box" action; `observer-cli`
+- **Clients:** `net-observer-bar` gets a "Restart sing-box" action; `net-observer-cli`
   gets a `kickstart` subcommand — both send `Control(KickstartProxy)`.
 
 ## Open questions still deferred

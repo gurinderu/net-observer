@@ -1,7 +1,7 @@
 //! The gpui panel view for the menu-bar app.
 //!
 //! [`Glance`] is a shared entity holding the most recent
-//! [`StatusSnapshot`](observer_ipc::StatusSnapshot) fetched from `observerd` over
+//! [`StatusSnapshot`](net_observer_ipc::StatusSnapshot) fetched from `net-observerd` over
 //! the local socket (plus the last fetch error and the socket path used to
 //! refresh). The menu-bar refresh timer writes into it (see [`crate::menubar`]);
 //! [`PanelView`] observes it and re-renders whenever it changes, so an open panel
@@ -10,7 +10,7 @@
 //! The bar is a pure socket client — it never opens the DuckDB store (the daemon
 //! is the sole DB owner). When the daemon is down / the socket is absent,
 //! [`read_fresh`] returns [`GlanceError::Unreachable`] and the panel renders a
-//! graceful "observer offline" state instead of crashing. A daemon that *does*
+//! graceful "net-observer offline" state instead of crashing. A daemon that *does*
 //! answer but whose answer we cannot use ([`GlanceError::Protocol`]) is a
 //! different state: the panel stays online and shows the message rather than
 //! claiming the daemon is not there.
@@ -42,7 +42,7 @@ use gpui::{
     div, px, rgb,
 };
 
-use observer_ipc::{ControlCmd, ControlResult, IncidentSummary, Request, Response, StatusSnapshot};
+use net_observer_ipc::{ControlCmd, ControlResult, IncidentSummary, Request, Response, StatusSnapshot};
 
 use crate::status::{Health, health};
 
@@ -160,7 +160,7 @@ impl std::fmt::Display for GlanceError {
     }
 }
 
-/// Classify a transport failure from [`observer_ipc::query`]. Only the kinds that
+/// Classify a transport failure from [`net_observer_ipc::query`]. Only the kinds that
 /// mean "nobody was there" are [`GlanceError::Unreachable`]; everything else
 /// (`InvalidData` from a frame we cannot decode, a broken pipe mid-exchange, …)
 /// happened *with* a daemon on the other end.
@@ -173,29 +173,29 @@ fn classify_io(e: std::io::Error) -> GlanceError {
     }
 }
 
-/// Fetch the live [`StatusSnapshot`] from `observerd` over the local socket.
+/// Fetch the live [`StatusSnapshot`] from `net-observerd` over the local socket.
 ///
 /// The bar owns no DB — the daemon does — so every refresh is a blocking
-/// [`observer_ipc::query`] round-trip. Re-querying each tick means the glance
+/// [`net_observer_ipc::query`] round-trip. Re-querying each tick means the glance
 /// recovers on its own once the daemon comes back, and fails gracefully when it
 /// is not there: a missing socket, connection-refused or a timeout map to
-/// [`GlanceError::Unreachable`], which the panel surfaces as "observer offline"
+/// [`GlanceError::Unreachable`], which the panel surfaces as "net-observer offline"
 /// and the status item as a grey dot. An `Error` frame, an unexpected variant or a
 /// decode failure map to [`GlanceError::Protocol`] — the daemon is up, so the
 /// panel stays online and shows the message. Either way it is retried on the next
 /// tick instead of crashing.
 pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, GlanceError> {
-    match observer_ipc::query(socket_path, &Request::Status) {
+    match net_observer_ipc::query(socket_path, &Request::Status) {
         Ok(Response::Status(snap)) => Ok(snap),
         Ok(Response::Error(msg)) => Err(GlanceError::Protocol(msg)),
         Ok(_) => Err(GlanceError::Protocol(
-            "unexpected response from observerd".to_string(),
+            "unexpected response from net-observerd".to_string(),
         )),
         Err(e) => Err(classify_io(e)),
     }
 }
 
-/// Ask `observerd` to turn its OWN collection on (`true`) or off (`false`) over
+/// Ask `net-observerd` to turn its OWN collection on (`true`) or off (`false`) over
 /// the local socket (`Control(SetObserving(on))`) and return its [`ControlResult`].
 ///
 /// Like the other requests this maps to a `Control` command on the wire, but it is
@@ -208,10 +208,10 @@ pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, GlanceError> {
 /// the panel can surface it as a transient line instead of crashing — never a
 /// panic.
 pub fn send_set_observing(socket_path: &str, on: bool) -> Result<ControlResult, String> {
-    match observer_ipc::query(socket_path, &Request::Control(ControlCmd::SetObserving(on))) {
+    match net_observer_ipc::query(socket_path, &Request::Control(ControlCmd::SetObserving(on))) {
         Ok(Response::Control(result)) => Ok(result),
         Ok(Response::Error(msg)) => Err(msg),
-        Ok(_) => Err("unexpected response from observerd".to_string()),
+        Ok(_) => Err("unexpected response from net-observerd".to_string()),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -304,7 +304,7 @@ impl Glance {
 /// background executor).
 ///
 /// The *leading* read is the point: `SetObserving(bool)` is absolute on the wire
-/// and a second controller genuinely exists (`observer-cli observe on|off`), so a
+/// and a second controller genuinely exists (`net-observer-cli observe on|off`), so a
 /// cached snapshot up to one refresh tick old is not a safe premise — a state
 /// change inside that window would be silently overwritten. The target is derived
 /// from the freshly-read state instead. If that read fails there is no premise, so
@@ -418,7 +418,7 @@ fn header_row(
             div()
                 .text_size(px(15.0))
                 .font_weight(gpui::FontWeight::BOLD)
-                .child("observer"),
+                .child("net-observer"),
         );
     // Only a muted "paused" label when the daemon is up but collection is off.
     // Offline is conveyed by a warning glyph next to the (disabled) toggle — no text.
@@ -463,7 +463,7 @@ fn header_row(
 /// canned diagnosis.
 fn warn_offline(reason: String, theme: Theme) -> impl IntoElement {
     let tip = SharedString::from(format!(
-        "observer offline — can't toggle collection ({reason})"
+        "net-observer offline — can't toggle collection ({reason})"
     ));
     div()
         .id("offline-warn")
@@ -902,7 +902,7 @@ mod tests {
     }
 
     /// Daemon down / socket absent must map to a graceful `Err`, never a panic —
-    /// this is the "observer offline" path the panel renders. It is specifically
+    /// this is the "net-observer offline" path the panel renders. It is specifically
     /// `Unreachable`: nothing answered, so "daemon not reachable" is true.
     #[test]
     fn read_fresh_offline_when_socket_absent() {

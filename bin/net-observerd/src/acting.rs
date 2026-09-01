@@ -1,7 +1,7 @@
-//! The actuator — the *only* place `observerd` executes a recovery action
+//! The actuator — the *only* place `net-observerd` executes a recovery action
 //! (plan Task 2 / spec "Control path — manual acting").
 //!
-//! `observerd` runs as root, so it can restart a system LaunchDaemon; clients
+//! `net-observerd` runs as root, so it can restart a system LaunchDaemon; clients
 //! merely *request* an action over the socket. Acting is gated OFF by default
 //! (`config.acting.enabled = false`) — the gate lives in [`crate::api`]; this
 //! module is reached only after the gate has passed. Nothing here ever fires
@@ -12,7 +12,7 @@ use std::process::Command;
 
 /// Restart the sing-box LaunchDaemon via `launchctl kickstart -k <service>`
 /// (`-k` kills-then-restarts), the same recovery net-observer's watchdog used —
-/// but here only on an explicit, gated [`observer_ipc::ControlCmd::KickstartProxy`].
+/// but here only on an explicit, gated [`net_observer_ipc::ControlCmd::KickstartProxy`].
 ///
 /// Returns `Ok(message)` on success or `Err(message)` on any failure (the child
 /// could not be spawned, or `launchctl` exited non-zero). Never panics.

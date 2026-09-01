@@ -1,30 +1,30 @@
-//! `observer-bar` — a macOS **menu-bar** glance at the live observer status.
+//! `net-observer-bar` — a macOS **menu-bar** glance at the live observer status.
 //!
 //! An `NSStatusItem` in the system menu bar shows an icon-only health dot derived
 //! from the latest link/proxy tick (green when healthy, red when gw/tun are bad,
 //! white before any data). Clicking it toggles an anchored **gpui** popup (a
 //! Tailscale-style dropdown, dismissed on click-away) rendering the full
-//! [`StatusSnapshot`](observer_ipc::StatusSnapshot): the latest link tick
+//! [`StatusSnapshot`](net_observer_ipc::StatusSnapshot): the latest link tick
 //! (gw/direct), the latest proxy tick (tun/selector), and the most recent
 //! incidents, plus a Quit control. The glance re-queries the daemon on a ~3s
 //! timer, updating both the status-item dot and any open panel.
 //!
 //! ## Data source: the daemon's local socket (no DB)
 //!
-//! The bar is a **pure socket client**. `observerd` is the sole owner of the
+//! The bar is a **pure socket client**. `net-observerd` is the sole owner of the
 //! DuckDB store (DuckDB takes a per-process file lock, so a second opener — even
 //! read-only — is blocked while the daemon runs). Instead of opening the DB, the
-//! bar fetches a live in-memory [`StatusSnapshot`](observer_ipc::StatusSnapshot)
-//! via [`observer_ipc::query`] over the Unix-domain socket at `cfg.socket_path`.
+//! bar fetches a live in-memory [`StatusSnapshot`](net_observer_ipc::StatusSnapshot)
+//! via [`net_observer_ipc::query`] over the Unix-domain socket at `cfg.socket_path`.
 //! When the daemon is down / the socket is absent the query fails and the bar
-//! renders a graceful **"observer offline"** state (grey dot, message in the
+//! renders a graceful **"net-observer offline"** state (grey dot, message in the
 //! panel) — it never panics.
 //!
 //! ## Layers
 //!
 //! - [`status`] — the load-bearing, unit-tested pure render layer:
 //!   `render_status` + `status_dot`/`status_glyph` + `health`, all over an
-//!   [`observer_ipc::StatusSnapshot`], tested against synthetic snapshots.
+//!   [`net_observer_ipc::StatusSnapshot`], tested against synthetic snapshots.
 //! - [`ui`] — the gpui panel view + shared model, and [`ui::read_fresh`], the
 //!   blocking socket fetch that maps daemon-down to an "offline" `Err`.
 //! - [`menubar`] — the dockless (`.accessory`) `NSStatusItem` shell (AppKit
@@ -44,14 +44,14 @@ mod ui;
 
 use clap::Parser;
 
-// The same `clap` surface as the sibling binaries (`observerd`, `observer-cli`):
+// The same `clap` surface as the sibling binaries (`net-observerd`, `net-observer-cli`):
 // `--config=<path>` works, a `--config` without a value is a hard error rather
 // than a silently ignored flag, and an unknown argument exits non-zero instead of
 // being swallowed. A dropped `--config` would fall back to the default socket and
 // render as "offline" with nothing said about why.
 #[derive(Parser)]
 #[command(
-    name = "observer-bar",
+    name = "net-observer-bar",
     about = "macOS menu-bar glance at the live observer status"
 )]
 struct Cli {

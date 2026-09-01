@@ -1,14 +1,14 @@
 //! The local API server (plan Task 2 / spec "Local API").
 //!
-//! `observerd` is the sole DuckDB owner (DuckDB takes a per-process file lock, so
+//! `net-observerd` is the sole DuckDB owner (DuckDB takes a per-process file lock, so
 //! a second opener — even read-only — is blocked while the daemon runs). Every
 //! other process reads live status over this Unix-domain socket instead of
 //! opening the database. The server answers entirely from the in-memory
 //! [`StatusSnapshot`] the pipeline keeps current — no DB read on the request
 //! path, zero contention with the writer, always live.
 //!
-//! The wire format is `observer_ipc`'s: frames are encoded with
-//! `observer_ipc::encode_frame` (the same bytes `write_frame` produces) — one
+//! The wire format is `net_observer_ipc`'s: frames are encoded with
+//! `net_observer_ipc::encode_frame` (the same bytes `write_frame` produces) — one
 //! newline-terminated JSON [`Request`] in, one newline-terminated JSON
 //! [`Response`] out, then the connection closes. The one exception is
 //! [`Request::Subscribe`], which is answered by a stream of
@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use observer_ipc::{
+use net_observer_ipc::{
     ControlCmd, ControlResult, EncodedFrame, EventKind, Gap, Ready, Request, Response,
     StatusSnapshot, StreamError, StreamErrorCode, StreamFrame,
 };
@@ -224,7 +224,7 @@ impl ControlPolicy {
 /// - `root` (uid 0): it can already kill and reconfigure the daemon;
 /// - the daemon's own uid: it can already signal this process;
 /// - `socket_owner_uid`, when the operator set it;
-/// - the **console user** — the logged-in GUI user running `observer-bar`, which
+/// - the **console user** — the logged-in GUI user running `net-observer-bar`, which
 ///   is the out-of-the-box case for the menu-bar toggle against a root daemon;
 /// - any uid explicitly listed in `control_uids`.
 ///
@@ -296,7 +296,7 @@ fn authorize_control(
         }
         Some(uid) => Err(ControlResult {
             ok: false,
-            message: format!("control refused: uid {uid} is not authorised to control observerd"),
+            message: format!("control refused: uid {uid} is not authorised to control net-observerd"),
         }),
         None => Err(ControlResult {
             ok: false,
@@ -638,7 +638,7 @@ async fn handle_conn(
         Err(e) => Response::Error(format!("bad request: {e}")),
     };
 
-    let buf = observer_ipc::encode_frame(&response)?;
+    let buf = net_observer_ipc::encode_frame(&response)?;
     wr.write_all(&buf).await?;
     wr.flush().await
 }
@@ -670,12 +670,12 @@ impl Drop for CountedSlot {
 
 /// Write one PER-CONNECTION frame (ack, gap, error). Bus frames are never
 /// written this way — they arrive already encoded once for everyone (see
-/// [`observer_ipc::EncodedFrame`]).
+/// [`net_observer_ipc::EncodedFrame`]).
 async fn write_stream_frame<W: AsyncWrite + Unpin>(
     wr: &mut W,
     frame: &StreamFrame,
 ) -> std::io::Result<()> {
-    let buf = observer_ipc::encode_frame(frame)?;
+    let buf = net_observer_ipc::encode_frame(frame)?;
     wr.write_all(&buf).await?;
     wr.flush().await
 }
@@ -689,7 +689,7 @@ async fn write_stream_frame<W: AsyncWrite + Unpin>(
 /// 2. create the broadcast receiver;
 /// 3. only then write the mandatory [`StreamFrame::Ready`] ack. The ack is the
 ///    client's proof that the receiver exists, so nothing published after
-///    `observer_ipc::subscribe` returns can vanish into a
+///    `net_observer_ipc::subscribe` returns can vanish into a
 ///    publish-before-subscribe window.
 ///
 /// Then loop, writing each bus frame's already-encoded bytes to `wr`, filtered by
@@ -795,7 +795,7 @@ async fn stream_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         };
         match recv {
             Ok(frame) => {
-                // The delivery rule lives in `observer-ipc`, not here: stream
+                // The delivery rule lives in `net-observer-ipc`, not here: stream
                 // frames that are not events are always delivered.
                 if !frame.passes(kinds.as_deref()) {
                     continue;
@@ -1004,7 +1004,7 @@ fn snapshot_clone(snapshot: &Mutex<StatusSnapshot>) -> StatusSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use observer_ipc::{Event, IncidentSummary};
+    use net_observer_ipc::{Event, IncidentSummary};
     use types::{GwVerdict, HostSample, LinkSample, RouteEvent, TcpVerdict};
 
     /// The uid the tests' policies claim as the daemon's own — an arbitrary value
@@ -1188,7 +1188,7 @@ mod tests {
 
     /// A scratch directory for a socket-bound test.
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("observerd-{tag}-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("net-observerd-{tag}-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1204,7 +1204,7 @@ mod tests {
     }
 
     /// End-to-end round-trip over a real `UnixListener` bound to a temp path,
-    /// answered with the blocking `observer_ipc::query` client the bar uses.
+    /// answered with the blocking `net_observer_ipc::query` client the bar uses.
     #[tokio::test]
     async fn serve_answers_status_and_incidents() {
         let dir = temp_dir("api");
@@ -1252,7 +1252,7 @@ mod tests {
         // Status: the whole snapshot, cloned from memory.
         let sp = sock_str.clone();
         let status =
-            tokio::task::spawn_blocking(move || observer_ipc::query(&sp, &Request::Status))
+            tokio::task::spawn_blocking(move || net_observer_ipc::query(&sp, &Request::Status))
                 .await
                 .unwrap()
                 .unwrap();
@@ -1269,7 +1269,7 @@ mod tests {
         // Incidents{limit}: newest `limit` of the ring.
         let sp = sock_str.clone();
         let inc = tokio::task::spawn_blocking(move || {
-            observer_ipc::query(&sp, &Request::Incidents { limit: 1 })
+            net_observer_ipc::query(&sp, &Request::Incidents { limit: 1 })
         })
         .await
         .unwrap()
@@ -1729,7 +1729,7 @@ mod tests {
     /// delivered on the same held-open connection.
     ///
     /// There is deliberately NO wait on `events_tx.receiver_count()` here: the
-    /// `Ready` ack `observer_ipc::subscribe` consumes is written only *after* the
+    /// `Ready` ack `net_observer_ipc::subscribe` consumes is written only *after* the
     /// daemon created its receiver, so publishing the instant `subscribe` returns
     /// must reach this subscriber. That absent spin loop IS the regression test
     /// for the old publish-before-subscribe window.
@@ -1748,7 +1748,7 @@ mod tests {
         // (the client is deliberately tokio-free).
         let sp = sock_str.clone();
         let sub = tokio::task::spawn_blocking(move || {
-            observer_ipc::subscribe(&sp, Some(&[EventKind::Route]))
+            net_observer_ipc::subscribe(&sp, Some(&[EventKind::Route]))
         })
         .await
         .unwrap()
@@ -1815,7 +1815,7 @@ mod tests {
         wait_for_socket(&sock).await;
 
         let sp = sock_str.clone();
-        let sub = tokio::task::spawn_blocking(move || observer_ipc::subscribe(&sp, None))
+        let sub = tokio::task::spawn_blocking(move || net_observer_ipc::subscribe(&sp, None))
             .await
             .unwrap()
             .unwrap();
@@ -1919,7 +1919,7 @@ mod tests {
         // `subscribe` consumes proves the connection was accepted and parked, so
         // the assertion below cannot race the accept.
         let sp = sock_str.clone();
-        let sub = tokio::task::spawn_blocking(move || observer_ipc::subscribe(&sp, None))
+        let sub = tokio::task::spawn_blocking(move || net_observer_ipc::subscribe(&sp, None))
             .await
             .unwrap()
             .unwrap();
@@ -1929,7 +1929,7 @@ mod tests {
         // on how far the write got.
         let sp = sock_str.clone();
         let refused =
-            tokio::task::spawn_blocking(move || observer_ipc::query(&sp, &Request::Status))
+            tokio::task::spawn_blocking(move || net_observer_ipc::query(&sp, &Request::Status))
                 .await
                 .unwrap();
         assert!(
@@ -1943,7 +1943,7 @@ mod tests {
         let mut served = false;
         for _ in 0..200 {
             let sp = sock_str.clone();
-            if tokio::task::spawn_blocking(move || observer_ipc::query(&sp, &Request::Status))
+            if tokio::task::spawn_blocking(move || net_observer_ipc::query(&sp, &Request::Status))
                 .await
                 .unwrap()
                 .is_ok()
@@ -2042,7 +2042,7 @@ mod tests {
 
         let sp = sock_str.clone();
         let response = tokio::task::spawn_blocking(move || {
-            observer_ipc::query(&sp, &Request::Control(ControlCmd::SetObserving(false)))
+            net_observer_ipc::query(&sp, &Request::Control(ControlCmd::SetObserving(false)))
         })
         .await
         .unwrap()
@@ -2112,7 +2112,7 @@ mod tests {
 
         let sp = sock_str.clone();
         let response = tokio::task::spawn_blocking(move || {
-            observer_ipc::query(&sp, &Request::Control(ControlCmd::SetObserving(false)))
+            net_observer_ipc::query(&sp, &Request::Control(ControlCmd::SetObserving(false)))
         })
         .await
         .unwrap()
@@ -2173,7 +2173,7 @@ mod tests {
         srv.policy.peer_uid = foreign_peer;
 
         let frame =
-            observer_ipc::encode_frame(&Request::Control(ControlCmd::SetObserving(false))).unwrap();
+            net_observer_ipc::encode_frame(&Request::Control(ControlCmd::SetObserving(false))).unwrap();
         client.write_all(&frame).await.unwrap();
         client.flush().await.unwrap();
 
@@ -2232,7 +2232,7 @@ mod tests {
         srv.policy.control_uids = vec![FOREIGN_UID];
 
         let frame =
-            observer_ipc::encode_frame(&Request::Control(ControlCmd::SetObserving(false))).unwrap();
+            net_observer_ipc::encode_frame(&Request::Control(ControlCmd::SetObserving(false))).unwrap();
         client.write_all(&frame).await.unwrap();
         client.flush().await.unwrap();
 
@@ -2424,7 +2424,7 @@ mod tests {
         wait_for_socket(&sock).await;
 
         let sp = sock_str.clone();
-        let sub = tokio::task::spawn_blocking(move || observer_ipc::subscribe(&sp, None))
+        let sub = tokio::task::spawn_blocking(move || net_observer_ipc::subscribe(&sp, None))
             .await
             .unwrap()
             .unwrap();

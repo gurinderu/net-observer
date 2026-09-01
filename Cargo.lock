@@ -3906,6 +3906,68 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-observer-bar"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "config",
+ "gpui",
+ "jiff",
+ "net-observer-ipc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "tempfile",
+ "types",
+]
+
+[[package]]
+name = "net-observer-cli"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "config",
+ "net-observer-ipc",
+ "store",
+ "types",
+]
+
+[[package]]
+name = "net-observer-ipc"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "types",
+]
+
+[[package]]
+name = "net-observerd"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "collector-core",
+ "collector-dns",
+ "collector-host",
+ "collector-link",
+ "collector-proxy",
+ "collector-route",
+ "config",
+ "libc",
+ "macos",
+ "net-observer-ipc",
+ "serde_json",
+ "store",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "triggers",
+ "types",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4330,68 +4392,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "observer-bar"
-version = "0.0.0"
-dependencies = [
- "clap",
- "config",
- "gpui",
- "jiff",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "observer-ipc",
- "tempfile",
- "types",
-]
-
-[[package]]
-name = "observer-cli"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "config",
- "observer-ipc",
- "store",
- "types",
-]
-
-[[package]]
-name = "observer-ipc"
-version = "0.0.0"
-dependencies = [
- "serde",
- "serde_json",
- "types",
-]
-
-[[package]]
-name = "observerd"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "collector-core",
- "collector-dns",
- "collector-host",
- "collector-link",
- "collector-proxy",
- "collector-route",
- "config",
- "libc",
- "macos",
- "observer-ipc",
- "serde_json",
- "store",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "triggers",
- "types",
 ]
 
 [[package]]

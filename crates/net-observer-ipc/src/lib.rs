@@ -1,4 +1,4 @@
-//! Local socket protocol shared by `observerd` (server) and `observer-bar` (client).
+//! Local socket protocol shared by `net-observerd` (server) and `net-observer-bar` (client).
 //!
 //! The daemon is the sole owner of the DuckDB file; every other process reads
 //! live status through a Unix-domain socket. This crate defines the wire types
@@ -21,7 +21,7 @@
 //!
 //! Deliberately runtime-agnostic: there is **no** tokio dependency here. The
 //! blocking [`query`]/[`subscribe`] clients are all the bar needs; the async
-//! server in `observerd` reuses
+//! server in `net-observerd` reuses
 //! [`encode_frame`]/[`write_frame`]/[`read_frame`]/[`EncodedFrame`] over its own
 //! runtime.
 //!
@@ -465,8 +465,8 @@ impl Default for StatusSnapshot {
 ///
 /// `Status` is the large, hot variant; `Error`/`Incidents` are small. Clippy's
 /// `large_enum_variant` would suggest boxing `StatusSnapshot`, but this is the
-/// shared wire type both `observerd` (which constructs `Response::Status(..)`
-/// directly) and `observer-bar` depend on, so introducing `Box` here would be a
+/// shared wire type both `net-observerd` (which constructs `Response::Status(..)`
+/// directly) and `net-observer-bar` depend on, so introducing `Box` here would be a
 /// cross-crate contract change and add an allocation on the common response path.
 /// The size difference is intentional and harmless for a single-response socket
 /// reply, so the lint is allowed rather than the type reshaped.
@@ -595,7 +595,7 @@ impl Iterator for Subscription {
 ///   clients already render this as "offline");
 /// - the daemon refused the subscription in band (e.g. the subscriber cap) ⇒
 ///   `ErrorKind::Other` carrying the daemon's own message. Deliberately NOT
-///   `ConnectionRefused`: that kind already means "observerd is not running" to
+///   `ConnectionRefused`: that kind already means "net-observerd is not running" to
 ///   both clients, and a refusal is not a dead daemon;
 /// - anything else undecodable ⇒ `InvalidData`.
 pub fn subscribe(sock_path: &str, kinds: Option<&[EventKind]>) -> std::io::Result<Subscription> {
@@ -615,7 +615,7 @@ pub fn subscribe(sock_path: &str, kinds: Option<&[EventKind]>) -> std::io::Resul
     match first {
         StreamFrame::Ready(ready) => Ok(Subscription { reader, ready }),
         StreamFrame::Error(e) => Err(std::io::Error::other(format!(
-            "observerd refused the subscription ({}): {}",
+            "net-observerd refused the subscription ({}): {}",
             e.code.as_str(),
             e.message
         ))),

@@ -4,8 +4,8 @@
 //!
 //! ## Push, not poll
 //!
-//! `observerd` runs an internal broadcast bus and answers a held-open
-//! [`observer_ipc::Request::Subscribe`] by writing a mandatory
+//! `net-observerd` runs an internal broadcast bus and answers a held-open
+//! [`net_observer_ipc::Request::Subscribe`] by writing a mandatory
 //! [`StreamFrame::Ready`] ack — created *after* its bus receiver exists, so
 //! nothing published once the subscription is up can be lost — and then
 //! streaming newline-JSON [`StreamFrame`]s until the client disconnects. This
@@ -23,7 +23,7 @@
 //!
 //! ## The bridge (blocking socket → gpui model)
 //!
-//! [`observer_ipc`] is deliberately tokio-free: [`observer_ipc::subscribe`] is a
+//! [`net_observer_ipc`] is deliberately tokio-free: [`net_observer_ipc::subscribe`] is a
 //! blocking iterator over a plain `UnixStream`. So a dedicated OS thread
 //! ([`run_subscription`]) drives it, forwarding each frame down a **bounded**
 //! `mpsc` channel as a [`BridgeMsg`]. The bound is deliberate — the reader drains
@@ -69,7 +69,7 @@ use gpui::{
     WindowKind, WindowOptions, div, px, rgb, size, uniform_list,
 };
 
-use observer_ipc::{Event, EventKind, StreamFrame, SubscriptionHandle};
+use net_observer_ipc::{Event, EventKind, StreamFrame, SubscriptionHandle};
 
 use crate::ui::{Glance, Theme};
 
@@ -468,7 +468,7 @@ fn separator(theme: Theme) -> impl IntoElement {
 }
 
 /// Format one [`StreamFrame`] as its one-line log body: `"<label>  <detail>"`.
-/// Both halves live on the wire types in [`observer_ipc`], so this window and the
+/// Both halves live on the wire types in [`net_observer_ipc`], so this window and the
 /// CLI tail cannot drift apart. Pure over its input (no clock, no locale), so it is
 /// unit-tested directly; the row renders the timestamp separately (see [`clock`]).
 pub(crate) fn format_frame(f: &StreamFrame) -> String {
@@ -532,7 +532,7 @@ fn open_window(cx: &mut App, socket_path: String) -> Option<WindowHandle<EventLo
         .name("observer-events".to_string())
         .spawn(move || run_subscription(&socket_path, &tx, &thread_shutdown))
     {
-        eprintln!("observer-bar: failed to spawn events subscription thread: {e}");
+        eprintln!("net-observer-bar: failed to spawn events subscription thread: {e}");
     }
 
     // Foreground task: drain the channel into the model until the window closes
@@ -584,19 +584,19 @@ fn open_window(cx: &mut App, socket_path: String) -> Option<WindowHandle<EventLo
     }) {
         Ok(handle) => Some(handle),
         Err(e) => {
-            eprintln!("observer-bar: failed to open events window: {e}");
+            eprintln!("net-observer-bar: failed to open events window: {e}");
             None
         }
     }
 }
 
 /// Window options for the event log: a normal, resizable, closable window with a
-/// native titlebar ("observer — events"), centered on the primary display.
+/// native titlebar ("net-observer — events"), centered on the primary display.
 fn window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(WIN_W), px(WIN_H)), cx)),
         titlebar: Some(TitlebarOptions {
-            title: Some(SharedString::from("observer — events")),
+            title: Some(SharedString::from("net-observer — events")),
             appears_transparent: false,
             traffic_light_position: None,
         }),
@@ -623,7 +623,7 @@ fn run_subscription(sock_path: &str, tx: &mpsc::SyncSender<BridgeMsg>, shutdown:
         if shutdown.stopped() {
             return;
         }
-        match observer_ipc::subscribe(sock_path, None) {
+        match net_observer_ipc::subscribe(sock_path, None) {
             Ok(sub) => {
                 // Publish the handle before reading: a close arriving mid-stream
                 // must be able to unblock the parked read below.
@@ -649,7 +649,7 @@ fn run_subscription(sock_path: &str, tx: &mpsc::SyncSender<BridgeMsg>, shutdown:
                                 return;
                             }
                         }
-                        // `observer_ipc` funnels every non-EOF failure here
+                        // `net_observer_ipc` funnels every non-EOF failure here
                         // (truncated frame, decode error, an error response
                         // mis-decoded as a frame), so keep the detail.
                         Err(e) => {
@@ -708,7 +708,7 @@ fn bridge_send(tx: &mpsc::SyncSender<BridgeMsg>, msg: BridgeMsg, dropped: &mut u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use observer_ipc::{Gap, IncidentSummary, Ready, StreamError, StreamErrorCode};
+    use net_observer_ipc::{Gap, IncidentSummary, Ready, StreamError, StreamErrorCode};
     use types::{
         DnsSample, DnsVerdict, GwVerdict, HostSample, LinkSample, ObservingEdge, TcpVerdict,
     };

@@ -23,7 +23,7 @@ pub struct Config {
     /// daemon's own uid, `socket_owner_uid`, and the logged-in console user.
     /// Empty by default. The escape hatch for a host with no graphical console
     /// session (SSH-only / headless), where the console-user rule authorises
-    /// nobody. See `observerd::api::ControlPolicy`.
+    /// nobody. See `net-observerd::api::ControlPolicy`.
     pub control_uids: Vec<u32>,
     pub collectors: Collectors,
     /// The write/control ("acting") path. Disabled by default.
@@ -99,11 +99,11 @@ pub struct PcapCfg {
 ///
 /// This switch is NOT the whole story for the control path, and never was for
 /// authorisation: **every** `Request::Control`, of either class, must first pass
-/// the daemon's peer-credential check (`observerd::api::ControlPolicy`) — root,
+/// the daemon's peer-credential check (`net-observerd::api::ControlPolicy`) — root,
 /// the daemon's own uid, `socket_owner_uid`, the logged-in console user, or a
 /// uid listed in `control_uids`. `SetObserving` is exempt from the *acting*
 /// gate, not from authorisation. Both gates are applied in exactly one place,
-/// `observerd::api::control_request`. Acting NEVER happens automatically — only
+/// `net-observerd::api::control_request`. Acting NEVER happens automatically — only
 /// on an explicit `Request::Control`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActingCfg {
@@ -167,18 +167,18 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load defaults, then an optional TOML file, then `OBSERVER_*` env vars.
+    /// Load defaults, then an optional TOML file, then `NET_OBSERVER_*` env vars.
     ///
     /// When `path` is `Some`, the file **must exist and be a readable regular
     /// file**: figment treats a missing file as an empty provider, so a typo'd
     /// `--config` would otherwise silently yield defaults for every setting —
-    /// which for `observerd` means binding a socket and opening a database
+    /// which for `net-observerd` means binding a socket and opening a database
     /// nobody asked for. The merge also uses `Toml::file_exact`, not
     /// `Toml::file`, which walks up parent directories looking for the name: a
     /// relative `--config` must resolve where the operator pointed, never at an
     /// ancestor's file they never named.
     ///
-    /// `observer-bar` deliberately treats this error as non-fatal — a GUI that
+    /// `net-observer-bar` deliberately treats this error as non-fatal — a GUI that
     /// refuses to start leaves the user with nothing — and surfaces the reason
     /// in its panel and on stderr instead.
     // Signature is a fixed cross-crate interface (see plan Task 3), so the
@@ -209,7 +209,7 @@ impl Config {
             // search, so a named path can never resolve to a file nobody named.
             fig = fig.merge(Toml::string(&body));
         }
-        fig.merge(Env::prefixed("OBSERVER_").split("__")).extract()
+        fig.merge(Env::prefixed("NET_OBSERVER_").split("__")).extract()
     }
 }
 
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn acting_disabled_by_default() {
         // Asserts the default value only: `acting.enabled` ships off. What that
-        // switch gates lives in `observerd::api::control_response`.
+        // switch gates lives in `net-observerd::api::control_response`.
         let c = Config::load(None).unwrap();
         assert!(!c.acting.enabled);
         assert_eq!(c.acting.singbox_service, "system/sing-box");

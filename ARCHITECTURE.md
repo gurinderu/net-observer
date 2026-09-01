@@ -1,7 +1,7 @@
 # Architecture
 
-`observer` is a Rust network-forensics collector for macOS. It replaces a
-hand-rolled ~470-line `bash` LaunchDaemon (`net-observer`) with a structured,
+`net-observer` is a Rust network-forensics collector for macOS. It supersedes a
+hand-rolled ~470-line `bash` LaunchDaemon of the same name with a structured,
 queryable pipeline whose north star is **incident forensics**: a rich, SQL-able
 snapshot of network/system state *around outages*, so post-incident analysis is
 a query ("что было в 17:26") instead of grepping a columnar text log.
@@ -66,8 +66,8 @@ flowchart LR
     freeze -->|blob_ref| store
 
     snap --> apisrv{{"api::ApiServer::serve\nUnixListener socket"}}
-    bar["observer-bar\n(unprivileged socket client)"] <-->|"Request/Response\n(observer-ipc)"| apisrv
-    cli["observer-cli\n(status/incidents: socket;\nquery <SQL>: offline DB)"] <-->|"Request/Response\n(observer-ipc)"| apisrv
+    bar["net-observer-bar\n(unprivileged socket client)"] <-->|"Request/Response\n(net-observer-ipc)"| apisrv
+    cli["net-observer-cli\n(status/incidents: socket;\nquery <SQL>: offline DB)"] <-->|"Request/Response\n(net-observer-ipc)"| apisrv
     cli -->|"query <SQL>\n(offline, read-only)"| store
 ```
 
@@ -82,7 +82,7 @@ flowchart LR
   dedicated OS thread (`std::thread::spawn`, bridged to the async stream via
   `blocking_send`), forwarding samples as the kernel announces interface/route
   changes. See [Async collectors](#async-collectors) below.
-- **Consumer** (`bin/observerd/src/pipeline.rs::run`) — drains the stream,
+- **Consumer** (`bin/net-observerd/src/pipeline.rs::run`) — drains the stream,
   writes each sample to the store (a write error is *logged as a gap*, never
   silently dropped), mirrors the sample into the live `StatusSnapshot`, pushes
   into the `RecentWindow`, and evaluates the engine.
@@ -93,26 +93,26 @@ flowchart LR
 - **Live snapshot + local socket API** — the consumer keeps an in-memory
   `StatusSnapshot` (the latest sample per collector + `generated_us`) current on
   every tick, and a passive `SnapshotHandler` mirrors each fired incident into a
-  bounded ring (newest first). `observerd` serves this snapshot over a
-  Unix-domain socket (`bin/observerd/src/api.rs`, `ApiServer::serve` — a tokio
+  bounded ring (newest first). `net-observerd` serves this snapshot over a
+  Unix-domain socket (`bin/net-observerd/src/api.rs`, `ApiServer::serve` — a tokio
   `UnixListener`),
   answering entirely from memory — no DB read on the request path, zero contention
   with the writer. See [Local socket API](#local-socket-api) below.
-- **observerd** — the root LaunchDaemon: load config → open the store → spawn the
+- **net-observerd** — the root LaunchDaemon: load config → open the store → spawn the
   socket API server → build enabled collectors as an `AnyCollector` **enum**
   (static dispatch — see [Async collectors](#async-collectors)) → filter by
   `meta().supports(Os::current())` then `preflight().await` → spawn survivors →
   run the consumer → clean SIGTERM/SIGINT shutdown (the API task is aborted
   alongside the collectors).
-- **observer-cli** — unprivileged; `status` / `incidents` read the daemon's live
-  `StatusSnapshot` over the socket (`observer_ipc::query`), so they work *while the
+- **net-observer-cli** — unprivileged; `status` / `incidents` read the daemon's live
+  `StatusSnapshot` over the socket (`net_observer_ipc::query`), so they work *while the
   daemon runs* with zero DB contention. `query <SQL>` is the only DB path: it opens
   the DuckDB file read-only for ad-hoc forensics, which succeeds only when no daemon
   holds the store (the file lock otherwise blocks the open — reported as a clear
   message, never a panic).
-- **observer-bar** — unprivileged **menu-bar** app and a *pure socket client*: it
+- **net-observer-bar** — unprivileged **menu-bar** app and a *pure socket client*: it
   never opens the DB, fetching the live `StatusSnapshot` from the daemon over the
-  socket via `observer_ipc::query`.
+  socket via `net_observer_ipc::query`.
 
 ### Collector capability model
 
@@ -145,7 +145,7 @@ Collectors and their probe ports are **native `async fn`** (Rust ≥ 1.75), not 
   `build_proxy_samples`, …) stays synchronous, so the mapping unit tests remain
   trivial (fakes are `async fn` under `#[tokio::test]`).
 - **Enum dispatch, not `dyn`.** A native-`async fn` trait is not
-  `dyn`-compatible, so `observerd` drives its heterogeneous collector set through
+  `dyn`-compatible, so `net-observerd` drives its heterogeneous collector set through
   an `enum AnyCollector { Link, Proxy, Dns, Route, Host }` whose inherent methods
   delegate by `match` and `.await` the concrete arm. Every arm is a concrete
   type, so the composed `collect` future is `Send` and spawns onto the runtime
@@ -246,7 +246,7 @@ means adding a crate that depends on `collector-core`, never touching the others
 ```mermaid
 graph TD
     types["types\nSample, verdicts, Incident"]
-    ipc["observer-ipc\nRequest/Response, StatusSnapshot,\nnewline-JSON framing (query/serve)"]
+    ipc["net-observer-ipc\nRequest/Response, StatusSnapshot,\nnewline-JSON framing (query/serve)"]
     store["store\nStore trait + DuckDB"]
     ccore["collector-core\nCollector, Pinger/TcpProber,\nOs, CollectorMeta, Readiness, Source"]
     clink["collector-link\nLinkFacts, build_link_sample,\nLinkCollector, META"]
@@ -257,9 +257,9 @@ graph TD
     triggers["triggers\nCondition/Handler/Trigger, engine"]
     config["config\nfigment per-subsystem toggles"]
     macos["macos\nreal adapters: ICMP, IP_BOUND_IF,\nClash API, DHCP/ARP, pcap ring,\nDNS resolve, PF_ROUTE, loadavg"]
-    observerd["bin/observerd\nroot LaunchDaemon"]
-    cli["bin/observer-cli\nstatus/incidents via socket;\nquery <SQL> via offline DB"]
-    bar["bin/observer-bar\ngpui menu-bar (NSStatusItem\n+ panel); socket client (no DB)"]
+    net-observerd["bin/net-observerd\nroot LaunchDaemon"]
+    cli["bin/net-observer-cli\nstatus/incidents via socket;\nquery <SQL> via offline DB"]
+    bar["bin/net-observer-bar\ngpui menu-bar (NSStatusItem\n+ panel); socket client (no DB)"]
 
     types --> ccore
     types --> store
@@ -285,18 +285,18 @@ graph TD
 
     store --> triggers
 
-    ccore --> observerd
-    clink --> observerd
-    cproxy --> observerd
-    cdns --> observerd
-    croute --> observerd
-    chost --> observerd
-    macos --> observerd
-    store --> observerd
-    triggers --> observerd
-    config --> observerd
-    types --> observerd
-    ipc --> observerd
+    ccore --> net-observerd
+    clink --> net-observerd
+    cproxy --> net-observerd
+    cdns --> net-observerd
+    croute --> net-observerd
+    chost --> net-observerd
+    macos --> net-observerd
+    store --> net-observerd
+    triggers --> net-observerd
+    config --> net-observerd
+    types --> net-observerd
+    ipc --> net-observerd
 
     store --> cli
     types --> cli
@@ -310,7 +310,7 @@ graph TD
 
 - `collector-core` depends on `types` only — and **not** on tokio: native
   `async fn` traits need no runtime crate, and `Source` / `EventSource` keep the
-  crate runtime-agnostic. The async driving of both cadences lives in `observerd`.
+  crate runtime-agnostic. The async driving of both cadences lives in `net-observerd`.
 - `collector-link` / `collector-proxy` / `collector-dns` / `collector-host` are
   `Interval` collectors; each depends on `types` + `collector-core` and holds its
   port trait (`LinkFacts` / `ProxyFacts` / `DnsFacts` / `HostFacts`), the pure
@@ -318,7 +318,7 @@ graph TD
   `Collector` impl.
 - `collector-route` is the first **Event**-cadence collector: it wraps a
   `Box<dyn EventSource>` (the real PF_ROUTE source lives in `macos`) and reports
-  `Source::Event`; `observerd` drives its blocking `next()` loop on a dedicated
+  `Source::Event`; `net-observerd` drives its blocking `next()` loop on a dedicated
   OS thread (not the async runtime — its `read(2)` cannot be interrupted).
 - `macos` implements every port trait with the real adapters, all on
   **async-native I/O** on the daemon's tokio runtime: `surge-ping` (raw ICMP),
@@ -330,26 +330,26 @@ graph TD
   favour of `reqwest` async — the earlier `reqwest::blocking`-inside-tokio
   startup panic cannot recur. `macos` also carries the per-collector
   `preflight()` checks.
-- `observer-ipc` is the shared local-socket protocol crate: the wire types
+- `net-observer-ipc` is the shared local-socket protocol crate: the wire types
   (`Request`, `Response`, `StatusSnapshot`, `IncidentSummary`, and the
   subscription envelope `StreamFrame` with its `Ready` / `Gap` / `StreamError`
   payloads), the newline-delimited JSON framing (`write_frame` / `read_frame`),
   the serialise-once bus payload `EncodedFrame` (which also owns the single
   filter rule, `passes`), and the blocking `query` / `subscribe` clients. It
   depends on `types` + serde only and is deliberately **runtime-agnostic** — no
-  tokio — so both the async server in `observerd` and the blocking clients in
-  `observer-bar` / `observer-cli` share one definition of the format, and one
+  tokio — so both the async server in `net-observerd` and the blocking clients in
+  `net-observer-bar` / `net-observer-cli` share one definition of the format, and one
   rendering (`StreamFrame::label` / `detail`) of every frame.
-- `bin/observerd` wires everything and owns the DuckDB store; `bin/observer-cli`
-  reads `store` read-only, while `bin/observer-bar` reads live status over the
-  socket via `observer-ipc` and **never touches the DB**. `bin/observer-bar` is a
+- `bin/net-observerd` wires everything and owns the DuckDB store; `bin/net-observer-cli`
+  reads `store` read-only, while `bin/net-observer-bar` reads live status over the
+  socket via `net-observer-ipc` and **never touches the DB**. `bin/net-observer-bar` is a
   macOS **menu-bar app**: a dockless (`.accessory`) `NSStatusItem` (AppKit interop
   via `objc2` / `objc2-app-kit`) whose icon-only health dot shows the latest
   link/proxy health and whose click toggles an anchored **gpui** popup (a
   Tailscale-style dropdown — `WindowKind::PopUp`, anchored under the icon,
   dismissed on click-away) rendering the full `StatusSnapshot`
   (latest link/proxy tick + recent incidents), re-queried on a ~3s timer; a down
-  daemon / absent socket degrades to a graceful "observer offline" state. The
+  daemon / absent socket degrades to a graceful "net-observer offline" state. The
   popup is a **Tailscale-style** panel: it reads the window's
   `WindowAppearance` and picks a LIGHT or DARK token set (never hardcoded dark),
   laid out as a clean list — a header row with the app name and an
@@ -363,7 +363,7 @@ graph TD
   shows a muted "paused" state (grey dot) while collection is off. gpui's
   build script needs the macOS **Metal Toolchain**, so the crate is a full
   workspace member but is excluded from `default-members` — a bare `cargo build`
-  needs no GUI toolchain; build the bar with `--workspace` / `-p observer-bar` on
+  needs no GUI toolchain; build the bar with `--workspace` / `-p net-observer-bar` on
   a machine that has the Metal Toolchain installed.
 
 ## Data model (DuckDB)
@@ -429,7 +429,7 @@ The daemon exposes live status over a Unix-domain socket so unprivileged clients
 DuckDB open cannot serve, because the daemon holds the file lock. The DB stays
 the durable record; the socket is the live, low-latency read path.
 
-- **Wire protocol** (`crates/observer-ipc`) — a request/response pair framed as
+- **Wire protocol** (`crates/net-observer-ipc`) — a request/response pair framed as
   newline-delimited JSON:
   - `Request::Status` → `Response::Status(StatusSnapshot)`
   - `Request::Incidents { limit }` → `Response::Incidents(Vec<IncidentSummary>)`
@@ -477,7 +477,7 @@ the durable record; the socket is the live, low-latency read path.
   (`serde_json` + `'\n'`); the crate is runtime-agnostic (no tokio) so the async
   server and the blocking client share one format definition.
 
-- **Server** (`bin/observerd/src/api.rs`, `ApiServer::serve`) — a tokio
+- **Server** (`bin/net-observerd/src/api.rs`, `ApiServer::serve`) — a tokio
   `UnixListener`. Everything the server needs (paths, modes, the acting config,
   the `ControlPolicy`, the `observing` flag and `resume_at_us`, the snapshot, the
   store and the event bus) is bundled into one `ApiServer` the accept loop clones
@@ -510,25 +510,25 @@ the durable record; the socket is the live, low-latency read path.
   bind failure is logged but never takes the daemon down (no API, still
   collecting).
 
-- **Client** (`observer_ipc::query`, used by `bin/observer-bar` and by
-  `observer-cli`'s `status` / `incidents`) — a *blocking* round-trip: connect, write
+- **Client** (`net_observer_ipc::query`, used by `bin/net-observer-bar` and by
+  `net-observer-cli`'s `status` / `incidents`) — a *blocking* round-trip: connect, write
   one request frame, read one response frame. A missing socket / connection-refused
   (daemon down) / protocol error all map to an `Err`, which the bar renders as the
-  "observer offline" state and retries on its next ~3s tick, and which the CLI turns
-  into a clear "observerd not running" message with a non-zero exit. Neither client
+  "net-observer offline" state and retries on its next ~3s tick, and which the CLI turns
+  into a clear "net-observerd not running" message with a non-zero exit. Neither client
   links an async runtime for this.
 
 ```mermaid
 sequenceDiagram
-    participant Bar as observer-bar (client)
+    participant Bar as net-observer-bar (client)
     participant Sock as observer.sock
-    participant Srv as observerd api::serve
+    participant Srv as net-observerd api::serve
     participant Snap as StatusSnapshot (in-memory)
     Bar->>Sock: connect + write Request::Status\n
     Sock->>Srv: accept -> per-conn task
     Srv->>Snap: lock, clone snapshot, unlock
     Srv-->>Bar: Response::Status(..)\n ; close
-    Note over Bar: on connect/read error -> "observer offline"
+    Note over Bar: on connect/read error -> "net-observer offline"
 ```
 
 ### Event bus and live subscriptions
@@ -537,13 +537,13 @@ The **realtime pub/sub** path: the daemon *pushes* events as they happen, and
 clients *subscribe* — no polling. This backs the live event-log window in the bar
 and the CLI `events` tail.
 
-- **The bus.** `observerd::main` creates one process-wide
+- **The bus.** `net-observerd::main` creates one process-wide
   `tokio::sync::broadcast::channel::<EncodedFrame>(EVENT_BUS_CAP)` (1024) and
   threads the `Sender` into both the pipeline consumer and the `ApiServer`. An
   `Event` is the live sibling of a `Sample`:
   `Event::{Link,Proxy,Dns,Route,Host}(sample)` plus
   `Event::Incident(IncidentSummary)`, each carrying its own `kind()` and `ts_us()`
-  (defined in `crates/observer-ipc`); `StreamFrame` wraps it alongside the
+  (defined in `crates/net-observer-ipc`); `StreamFrame` wraps it alongside the
   stream-integrity frames.
 - **The bus payload is serialised once.** What travels on the channel is not a
   `StreamFrame` but an `EncodedFrame`: the frame already rendered to its exact
@@ -554,7 +554,7 @@ and the CLI `events` tail.
   affordable. The routing metadata is derived *from the frame* at encode time
   rather than passed alongside it, so a stream-integrity frame can never
   accidentally be filtered away and an event can never accidentally bypass a
-  filter: `EncodedFrame::passes` is the single rule, tested in `observer-ipc`
+  filter: `EncodedFrame::passes` is the single rule, tested in `net-observer-ipc`
   rather than in the server loop.
 
 - **Publishers (push).** In `pipeline::run`, every drained `Sample` is published
@@ -606,7 +606,7 @@ and the CLI `events` tail.
   delivered regardless of the `kinds` filter, because rendering a contiguous
   timeline across a real hole is, for a forensics tool, a lie.
 
-- **Client** (`observer_ipc::subscribe`) — the blocking counterpart to `query`:
+- **Client** (`net_observer_ipc::subscribe`) — the blocking counterpart to `query`:
   connect, write one `Subscribe` frame, then **complete the handshake** by reading
   the mandatory `Ready` ack before returning a `Subscription` that
   `impl Iterator<Item = io::Result<StreamFrame>>`. `Subscription::ready()` exposes
@@ -616,15 +616,15 @@ and the CLI `events` tail.
   strand a partial frame; use `Subscription::handle()` to wake a parked reader. A
   daemon-side refusal arrives as a decodable `StreamFrame::Error` and is mapped to
   an `io::Error` carrying the daemon's own message (deliberately *not*
-  `ConnectionRefused`, which both clients already render as "observerd is not
+  `ConnectionRefused`, which both clients already render as "net-observerd is not
   running"). Like `query`, it links no async runtime; a clean daemon close ends
   iteration.
 
-- **The event-log window** (`bin/observer-bar/src/events.rs`) — a resizable,
-  closable `WindowKind::Normal` window ("observer — events"), opened from the
+- **The event-log window** (`bin/net-observer-bar/src/events.rs`) — a resizable,
+  closable `WindowKind::Normal` window ("net-observer — events"), opened from the
   panel footer's **Events** action. It opens **one** persistent all-kinds
   subscription for its whole lifetime (never re-subscribes, never polls). Because
-  `observer_ipc` is blocking, a dedicated OS thread drives the `Subscription` and
+  `net_observer_ipc` is blocking, a dedicated OS thread drives the `Subscription` and
   forwards each frame down an `mpsc` channel; a gpui foreground task drains it into
   a shared `EventLog` model (a capped `VecDeque` of the last 1000 events) that the
   view observes and re-renders, autoscrolling to the tail. Every frame kind
@@ -639,7 +639,7 @@ and the CLI `events` tail.
   The window handle is stashed on the shared `Glance` so a second **Events** click
   focuses the existing window instead of spawning a duplicate subscription.
 
-- **CLI** (`observer-cli events [--kind K]`) — the pub/sub smoke test and a
+- **CLI** (`net-observer-cli events [--kind K]`) — the pub/sub smoke test and a
   terminal tail: one `Subscribe`, print the `Ready` ack (so the tail opens by
   stating the collection state) and then each frame live until Ctrl-C; `--kind`
   filters server-side, and stream-integrity frames arrive regardless of it. Every
@@ -648,7 +648,7 @@ and the CLI `events` tail.
   orderly daemon close or a closed output pipe is not a failure of the tail.
 
 - **One rendering of a frame, two clients.** `StreamFrame::label()` and
-  `StreamFrame::detail()` live on the wire type in `observer-ipc` and are pure
+  `StreamFrame::detail()` live on the wire type in `net-observer-ipc` and are pure
   over their input (no clock, no locale), so the CLI tail's
   `HH:MM:SS  label  detail` line and the bar's log row are the same words by
   construction rather than by two copies kept in sync.
@@ -657,7 +657,7 @@ and the CLI `events` tail.
 sequenceDiagram
     participant Pipe as pipeline::run + SnapshotHandler
     participant Bus as broadcast::Sender<EncodedFrame>
-    participant Srv as observerd stream_events
+    participant Srv as net-observerd stream_events
     participant Win as event-log window / cli events
     Pipe->>Bus: send(EncodedFrame) — serialised ONCE\n per sample / on incident fire
     Win->>Srv: connect + write Request::Subscribe { kinds }\n
@@ -745,7 +745,7 @@ differently and dispatched in exactly one place, `api::control_response`:
    asks the daemon to restart the sing-box service via
    `launchctl kickstart -k <service>`. The client only *sends the request* — it
    never runs `launchctl` itself; the root daemon is the sole actor, and only when
-   acting is on. This capability lives in the CLI (`observer-cli kickstart`); it is
+   acting is on. This capability lives in the CLI (`net-observer-cli kickstart`); it is
    **not** surfaced in the bar (the bar has no "Restart sing-box" control).
 
 2. **Self-control — NOT gated by `acting.enabled`.** `ControlCmd::SetObserving(b)`
@@ -809,7 +809,7 @@ Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
 ```
 
 **Safety invariant:** `acting.enabled` defaults to `false` (`config::ActingCfg`),
-and no code path reaches the actuator (`bin/observerd/src/acting.rs`) unless a
+and no code path reaches the actuator (`bin/net-observerd/src/acting.rs`) unless a
 `KickstartProxy` request arrives from an **authorised peer** *and* acting is
 enabled. Acting is never triggered by the pipeline or a passive handler — only by
 an explicit operator request. `SetObserving` is exempt from the *acting* gate by
@@ -843,21 +843,21 @@ there.
 
 ## Privilege split
 
-`observerd` is a headless **root** LaunchDaemon (needs raw ICMP, PF_ROUTE,
+`net-observerd` is a headless **root** LaunchDaemon (needs raw ICMP, PF_ROUTE,
 `tcpdump`, reading the sing-box config) and is the **sole owner** of the DuckDB
 store. DuckDB 1.x takes a per-process file lock, so a second opener — even
 read-only — is blocked while the daemon runs.
 
-- `observer-cli` is **unprivileged**. Its `status` / `incidents` commands read the
-  daemon's live snapshot over the socket (`observer_ipc::query`), so they work while
+- `net-observer-cli` is **unprivileged**. Its `status` / `incidents` commands read the
+  daemon's live snapshot over the socket (`net_observer_ipc::query`), so they work while
   the daemon runs. Only `query <SQL>` opens the DuckDB file `read_only`, and that
-  open succeeds only when no `observerd` holds the store (offline forensics); while
+  open succeeds only when no `net-observerd` holds the store (offline forensics); while
   the daemon runs it holds the lock and the open fails with a clear message.
-- `observer-bar` is **unprivileged** and does **not** open the DB at all: it is a
+- `net-observer-bar` is **unprivileged** and does **not** open the DB at all: it is a
   pure client of the daemon's local socket (see [Local socket API](#local-socket-api)),
   so it reads *live* status while the daemon runs — the concurrent-live-access
   case the read-only open could never cover. A down daemon degrades to a graceful
-  "observer offline" dot, retried each tick.
+  "net-observer offline" dot, retried each tick.
 
 The menu-bar UI stays a separate unprivileged binary — never the daemon itself.
 The daemon relaxes the socket file's mode (config `socket_mode`, default `0666`)

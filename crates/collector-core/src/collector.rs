@@ -1,7 +1,7 @@
 //! The [`Collector`] abstraction: one trait every collector implements, plus its
 //! cadence ([`Source`]) and, for event-driven collectors, the blocking
 //! [`EventSource`] it hands off. `collector-core` stays runtime-agnostic (no
-//! tokio) — the async driving of both cadences lives in `observerd`.
+//! tokio) — the async driving of both cadences lives in `net-observerd`.
 
 use std::time::Duration;
 

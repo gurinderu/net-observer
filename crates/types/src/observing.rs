@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// The single value behind BOTH sinks of a transition: the durable
 /// `observing_edge` row (`store::Store::write_observing_edge`) and the realtime
-/// `observer_ipc::StreamFrame::Observing` frame. One struct, two sinks — the DB
+/// `net_observer_ipc::StreamFrame::Observing` frame. One struct, two sinks — the DB
 /// row and the wire frame cannot describe the same transition differently.
 ///
 /// Written once per real EDGE, never per tick: a paused daemon deliberately

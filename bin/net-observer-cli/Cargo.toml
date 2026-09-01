@@ -1,15 +1,15 @@
 [package]
-name = "observer-cli"
+name = "net-observer-cli"
 edition.workspace = true
 
 [dependencies]
 # LIVE `status` / `incidents` go through the daemon's Unix-domain socket
-# (`observer-ipc`), so `observerd` stays the sole DuckDB owner (its per-process
+# (`net-observer-ipc`), so `net-observerd` stays the sole DuckDB owner (its per-process
 # file lock blocks any second opener). `store`/`duckdb` is kept ONLY for the
 # offline `query <SQL>` forensics path, usable when the daemon is stopped.
 store.workspace = true
 config.workspace = true
-observer-ipc.workspace = true
+net-observer-ipc.workspace = true
 types.workspace = true
 clap.workspace = true
 anyhow.workspace = true
