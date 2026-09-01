@@ -151,6 +151,7 @@ Every step carries `--all`. Without it cargo uses `default-members`, which exclu
 ## What to update when
 - `AGENTS.md` — by the inverted default: **if it can be learned by reading a graph node, it is not here.** This file holds only what is needed BEFORE an agent reaches the graph: commands, the entry into orientation, code invariants no linter expresses, and forks that must stop you before you act.
 - `CLAUDE.md` — a symlink to `AGENTS.md`; never edited separately.
+- `docs/roadmap.{md,html}` — a **generated snapshot**, not a source. Regenerate with `iskron:product-roadmap`; never hand-edit, because a hand edit survives until the next regeneration and reads as current the whole time. Where it disagrees with the realm or the code, they are right.
 - The `net-observer` realm — every merge (see "Session lifecycle").
 
 ## Git workflow
