@@ -58,7 +58,9 @@ const CLICK_POLL: Duration = Duration::from_millis(100);
 /// Fixed size of the anchored panel (a compact dropdown, not a resizable
 /// workspace). Width/height in gpui logical pixels.
 const PANEL_W: f64 = 320.0;
-const PANEL_H: f64 = 460.0;
+// Grown by the height of the two sparklines (caption + 28pt plot each, plus their
+// separator) added above the status rows.
+const PANEL_H: f64 = 560.0;
 /// After a click-away dismissal, a status-item click that arrives within this
 /// window is treated as the gesture that *caused* the dismissal (so the panel
 /// stays closed) rather than a request to reopen it. It must comfortably cover
@@ -211,6 +213,10 @@ pub fn run(config: Option<String>, open: bool) {
                                 }
                                 Err(e) => g.error = Some(e),
                             }
+                            // One tick = one sparkline column. Recorded here and
+                            // only here, so the panel's history keeps the REFRESH
+                            // cadence (see `Glance::record_tick`).
+                            g.record_tick();
                             cx.notify();
                         });
                         apply_glyph(&button, model.read(app));
