@@ -79,6 +79,20 @@ pub enum ControlCmd {
     /// daemon stays alive and the socket keeps serving so the switch can turn
     /// collection back on.
     SetObserving(bool),
+    /// Copy the pcap ring out NOW, into a fresh freeze directory — the same
+    /// passive artifact the `gw-change` trigger produces, but operator-initiated.
+    /// **Self-control**: it touches only files the daemon already owns and sends
+    /// nothing on the network, so it is NOT gated by `acting.enabled`. Refused
+    /// (`ok: false`) when the ring is disabled or never started.
+    FreezePcap,
+    /// Turn "quiet" on (`true`) or off (`false`): while quiet the daemon
+    /// addresses NO packet AT the gateway — in this daemon that is the link
+    /// collector's ICMP echo, and only that. Passive facts (ARP table, DHCP
+    /// lease) keep being read, and the link collector keeps emitting one sample
+    /// per tick with `gw = SKIP` — quiet silences the wire, never the record.
+    /// **Self-control**, like [`ControlCmd::SetObserving`], and process-scoped:
+    /// a restart resumes normal probing.
+    SetQuiet(bool),
 }
 
 /// The outcome of a [`ControlCmd`]: whether the action ran successfully plus a
@@ -436,6 +450,16 @@ pub struct StatusSnapshot {
     /// would fail to decode — a live daemon rendered as "offline" by the bar.
     #[serde(default = "observing_default")]
     pub observing: bool,
+    /// Whether the daemon is in "quiet" mode: still collecting, but addressing no
+    /// packet at the gateway (the link collector's ICMP echo is suppressed and
+    /// its gateway verdict reads `SKIP`). Distinct from `observing == false`,
+    /// which stops collection altogether.
+    ///
+    /// `serde(default)` — `false` — for the same forward-compatibility reason as
+    /// `observing`: a pre-quiet daemon emits no such field and the bar must still
+    /// decode its answer.
+    #[serde(default)]
+    pub quiet: bool,
 }
 
 /// The serde/`Default` value for [`StatusSnapshot::observing`]: `true`, matching a
@@ -457,6 +481,7 @@ impl Default for StatusSnapshot {
             host: None,
             incidents: Vec::new(),
             observing: observing_default(),
+            quiet: false,
         }
     }
 }
@@ -700,6 +725,10 @@ mod tests {
                 signature: "sig".into(),
             }],
             observing: false,
+            // Deliberately `true`: `quiet` carries `serde(default)` = `false`, so
+            // a field that silently failed to serialize would still round-trip as
+            // `false` and the assertion below would pass on a broken wire format.
+            quiet: true,
         };
 
         let mut buf = Vec::new();
@@ -716,6 +745,7 @@ mod tests {
         assert_eq!(back.incidents[0].id, "inc-1");
         assert_eq!(back.incidents[0].closed_us, Some(2000));
         assert!(!back.observing);
+        assert!(back.quiet);
     }
 
     #[test]

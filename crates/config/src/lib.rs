@@ -209,7 +209,8 @@ impl Config {
             // search, so a named path can never resolve to a file nobody named.
             fig = fig.merge(Toml::string(&body));
         }
-        fig.merge(Env::prefixed("NET_OBSERVER_").split("__")).extract()
+        fig.merge(Env::prefixed("NET_OBSERVER_").split("__"))
+            .extract()
     }
 }
 

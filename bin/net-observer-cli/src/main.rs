@@ -265,7 +265,9 @@ impl TailEnd {
     /// is exactly what this type exists to prevent.
     fn message(&self) -> String {
         match self {
-            TailEnd::DaemonClosed => "event stream ended: net-observerd closed the connection".into(),
+            TailEnd::DaemonClosed => {
+                "event stream ended: net-observerd closed the connection".into()
+            }
             TailEnd::OutputClosed => "event stream ended: output pipe closed".into(),
             TailEnd::ServerError(m) => format!("event stream ended: net-observerd reported {m}"),
             TailEnd::Failed(m) => format!("event stream ended: {m}"),
@@ -623,6 +625,7 @@ mod tests {
                 incident("i2", "gw-drop", 60, Some(70)),
             ],
             observing,
+            quiet: false,
         }
     }
 

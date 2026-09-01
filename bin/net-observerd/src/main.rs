@@ -156,6 +156,13 @@ async fn run_daemon() -> anyhow::Result<()> {
     // the startup log below for why).
     let observing = Arc::new(AtomicBool::new(true));
 
+    // The operator's "quiet" flag: while set, the daemon addresses NO packet at
+    // the gateway (the link collector's ICMP echo is not sent; its tick still
+    // lands, carrying `gw = SKIP`). Shared with the link collector and the
+    // control socket exactly the way `observing` is. Process-scoped and, like
+    // `observing`, deliberately never persisted — a restart resumes probing.
+    let quiet = Arc::new(AtomicBool::new(false));
+
     // The observing state is process-scoped and deliberately NEVER persisted: a
     // root forensics collector silently staying blind across a restart nobody
     // noticed is the dangerous failure mode, whereas restart-resumes fails safe.
@@ -186,25 +193,6 @@ async fn run_daemon() -> anyhow::Result<()> {
     // is listening, and is ignored.
     let (events_tx, _) = tokio::sync::broadcast::channel::<EncodedFrame>(EVENT_BUS_CAP);
 
-    // Serve the read-only status socket for the unprivileged bar. Best-effort: a
-    // bind failure is logged but never takes the daemon down (no API, still
-    // collecting). Aborted on shutdown alongside the collectors.
-    let api_handle = {
-        let server = build_api_server(
-            &cfg,
-            snapshot.clone(),
-            observing.clone(),
-            resume_at_us.clone(),
-            store.clone(),
-            events_tx.clone(),
-        );
-        tokio::spawn(async move {
-            if let Err(e) = server.serve().await {
-                tracing::error!(error = %e, "status socket server exited");
-            }
-        })
-    };
-
     let (tx, rx) = mpsc::channel::<Sample>(CHANNEL_CAP);
 
     // Resolve the physical interface once, for the pcap ring. `phys_iface` is a
@@ -231,6 +219,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 cfg.collectors.link.phys_iface.clone(),
             ),
             cfg.collectors.link.interval,
+            quiet.clone(),
         )));
     }
     if cfg.collectors.proxy.enabled {
@@ -309,6 +298,32 @@ async fn run_daemon() -> anyhow::Result<()> {
     // Start the pcap ring (best-effort: needs root + tcpdump). On failure, the
     // gw-change trigger still records the incident, just without a pcap freeze.
     let freezer = maybe_start_pcap_ring(&cfg, phys_iface.as_deref());
+
+    // Serve the read-only status socket for the unprivileged bar. Best-effort: a
+    // bind failure is logged but never takes the daemon down (no API, still
+    // collecting). Aborted on shutdown alongside the collectors.
+    //
+    // Started AFTER the pcap ring on purpose: `ControlCmd::FreezePcap` must be
+    // handed the ring that is actually running, and a socket that answered a
+    // freeze with "not running" while the ring was moments from starting would
+    // be lying about the daemon's own state.
+    let api_handle = {
+        let server = build_api_server(
+            &cfg,
+            snapshot.clone(),
+            observing.clone(),
+            quiet.clone(),
+            freezer.clone(),
+            resume_at_us.clone(),
+            store.clone(),
+            events_tx.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = server.serve().await {
+                tracing::error!(error = %e, "status socket server exited");
+            }
+        })
+    };
 
     // Build the trigger engine with the starter rule set + passive handlers. The
     // event bus is threaded in so the `SnapshotHandler` publishes an
@@ -497,10 +512,19 @@ fn maybe_start_pcap_ring(cfg: &Config, phys_iface: Option<&str>) -> Option<Arc<d
 /// socket acking a pause no collector ever sees.
 ///
 /// Must stay the only place an [`api::ApiServer`] is built.
+// One argument over clippy's limit, deliberately. Every parameter here is one of
+// the daemon's shared handles, and the arity IS the seam's content: collapsing
+// them into a wrapper struct would add an indirection whose only purpose is to
+// satisfy the lint, while the `Arc::ptr_eq` assertions in the wiring test — which
+// is what actually keeps a handle from being silently copied — would have to
+// reach through it unchanged.
+#[allow(clippy::too_many_arguments)]
 fn build_api_server(
     cfg: &Config,
     snapshot: Arc<Mutex<StatusSnapshot>>,
     observing: Arc<AtomicBool>,
+    quiet: Arc<AtomicBool>,
+    freezer: Option<Arc<dyn PcapFreezer>>,
     resume_at_us: Arc<AtomicI64>,
     store: Arc<DuckdbStore>,
     events_tx: tokio::sync::broadcast::Sender<EncodedFrame>,
@@ -534,6 +558,12 @@ fn build_api_server(
         // `acting.enabled`, which only gates the acting *class* of commands.
         policy: api::ControlPolicy::from_config(cfg.socket_owner_uid, cfg.control_uids.clone()),
         observing,
+        // Shared, never fresh — for `quiet` the same reason as `observing`, and
+        // the ring handle so `FreezePcap` copies the ring that is actually
+        // running rather than refusing next to a live capture.
+        quiet,
+        freezer,
+        blob_dir: std::path::PathBuf::from(&cfg.blob_dir),
         resume_at_us,
         snapshot,
         // The durable sink for `observing_edge` boundary rows: the daemon
@@ -701,6 +731,7 @@ mod tests {
         let cfg = test_cfg();
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let observing = Arc::new(AtomicBool::new(true));
+        let quiet = Arc::new(AtomicBool::new(false));
         let resume_at_us = Arc::new(AtomicI64::new(0));
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         // A broadcast channel needs no runtime, so this whole test is a plain
@@ -711,6 +742,10 @@ mod tests {
             &cfg,
             snapshot.clone(),
             observing.clone(),
+            quiet.clone(),
+            // No pcap ring in this test: `FreezePcap` must refuse rather than
+            // panic, which is the `None` arm's whole job.
+            None,
             resume_at_us.clone(),
             store.clone(),
             events_tx.clone(),
@@ -797,6 +832,12 @@ mod tests {
             Arc::ptr_eq(&srv.observing, &observing),
             "a fresh `observing` leaves the control socket acking a pause every \
              collector keeps ignoring"
+        );
+        assert!(
+            Arc::ptr_eq(&srv.quiet, &quiet),
+            "a fresh `quiet` leaves the control socket acking a quiet mode the \
+             link collector never enters, so the gateway keeps being pinged \
+             while the capture is being gathered to prove it is not us"
         );
         assert!(
             Arc::ptr_eq(&srv.resume_at_us, &resume_at_us),

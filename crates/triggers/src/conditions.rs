@@ -48,7 +48,15 @@ impl Condition for Wedge {
     }
 }
 
+/// How far back `gw-change` looks for a comparable (non-`SKIP`) predecessor when
+/// the operator's quiet mode has suppressed the echo for a run of ticks.
+const GW_CHANGE_SCAN: usize = 64;
+
 /// Fires when the newest link sample's gateway verdict is `Fail` or `NoGw`.
+///
+/// `Skip` (quiet mode: the echo was deliberately not sent) is NOT a drop — it is
+/// the absence of a measurement — and the match is exhaustive over the verdict so
+/// a future token cannot join the fault set by accident.
 pub struct GwDrop;
 impl Condition for GwDrop {
     fn id(&self) -> &'static str {
@@ -56,7 +64,11 @@ impl Condition for GwDrop {
     }
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let last = w.last_link()?;
-        matches!(last.gw, GwVerdict::Fail | GwVerdict::NoGw).then(|| Fire {
+        match last.gw {
+            GwVerdict::Fail | GwVerdict::NoGw => true,
+            GwVerdict::Ok | GwVerdict::Skip => false,
+        }
+        .then(|| Fire {
             detail: format!("gateway {}", last.gw),
         })
     }
@@ -72,13 +84,41 @@ impl Condition for GwChange {
     }
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let last = w.last_link()?;
-        let (prev, provenance) = w.prev_link_with_provenance()?;
+        // A `SKIP` tick carries no measurement, so it can be neither side of a
+        // change: `OK -> SKIP` is the operator flipping quiet on, not the gateway
+        // moving, and firing on it would manufacture an incident out of a
+        // control-socket click.
+        if last.gw == GwVerdict::Skip {
+            return None;
+        }
+        // Reach back past a quiet run for the newest predecessor that actually
+        // measured something. Without this the change that quiet mode straddled
+        // (`OK` -> quiet -> `FAIL`) would be suppressed once and then never seen
+        // again — silence, exactly what the SKIP token exists to prevent.
+        let recent = w.recent_link(GW_CHANGE_SCAN);
+        let quiet_run = recent
+            .iter()
+            .skip(1)
+            .take_while(|l| l.gw == GwVerdict::Skip)
+            .count();
+        let (prev, provenance) = match recent.iter().skip(1).find(|l| l.gw != GwVerdict::Skip) {
+            Some(prev) => (*prev, LinkProvenance::Contiguous),
+            // Nothing comparable in the window: fall back to the basis carried
+            // across a pause, which must itself be a measurement.
+            None => match w.prev_link_with_provenance()? {
+                (prev, _) if prev.gw == GwVerdict::Skip => return None,
+                (prev, provenance) => (prev, provenance),
+            },
+        };
         // A change measured against the basis carried across a pause is real —
         // the oracle freezes on ANY gateway change — but it is not two
         // consecutive ticks, and the incident must not read as though it were.
-        let across = match provenance {
-            LinkProvenance::Contiguous => "",
-            LinkProvenance::AcrossGap => " (across an observation gap)",
+        // A change straddling a quiet run is real for the same reason, and is
+        // labelled for the same reason.
+        let across = match (provenance, quiet_run) {
+            (LinkProvenance::AcrossGap, _) => " (across an observation gap)".to_string(),
+            (LinkProvenance::Contiguous, 0) => String::new(),
+            (LinkProvenance::Contiguous, n) => format!(" (across {n} quiet tick(s))"),
         };
         (last.gw != prev.gw).then(|| Fire {
             detail: format!("gateway {} -> {}{}", prev.gw, last.gw, across),
@@ -318,6 +358,66 @@ mod tests {
         w.push(link_gw(2, GwVerdict::Fail));
         assert!(GwDrop.eval(&w).is_some());
         assert!(GwChange.eval(&w).is_some()); // Ok -> Fail
+    }
+
+    /// Quiet mode suppresses the echo, so the tick reports `SKIP`. That is the
+    /// absence of a measurement, not a dead gateway: it must not fire `gw-drop`,
+    /// and turning quiet on or off must not fire `gw-change` either.
+    #[test]
+    fn quiet_skip_ticks_are_neither_a_drop_nor_a_change() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_gw(1, GwVerdict::Ok));
+        // Quiet on: OK -> SKIP is the operator, not the network.
+        w.push(link_gw(2, GwVerdict::Skip));
+        assert!(GwDrop.eval(&w).is_none(), "SKIP is not a gateway drop");
+        assert!(
+            GwChange.eval(&w).is_none(),
+            "turning quiet on must not fire gw-change"
+        );
+        w.push(link_gw(3, GwVerdict::Skip));
+        assert!(GwChange.eval(&w).is_none());
+        // Quiet off with the gateway unchanged: SKIP -> OK is not a change either.
+        w.push(link_gw(4, GwVerdict::Ok));
+        assert!(
+            GwChange.eval(&w).is_none(),
+            "turning quiet off must not fire gw-change when nothing moved"
+        );
+    }
+
+    /// A gateway change that happened WHILE quiet was on is still a change: the
+    /// first measured tick after the quiet run is compared against the last
+    /// measured tick before it, and the detail says the run was straddled.
+    #[test]
+    fn gw_change_fires_across_a_quiet_run() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_gw(1, GwVerdict::Ok));
+        w.push(link_gw(2, GwVerdict::Skip));
+        w.push(link_gw(3, GwVerdict::Skip));
+        w.push(link_gw(4, GwVerdict::Fail));
+        let fire = GwChange
+            .eval(&w)
+            .expect("a change straddling a quiet run must still fire");
+        assert!(
+            fire.detail
+                .contains(&format!("{} -> {}", GwVerdict::Ok, GwVerdict::Fail)),
+            "detail must name both measured verdicts: {}",
+            fire.detail
+        );
+        assert!(
+            fire.detail.contains("quiet"),
+            "the detail must say the change straddled quiet ticks: {}",
+            fire.detail
+        );
+    }
+
+    /// With nothing measured before the quiet run there is no basis at all, so
+    /// the first real tick after it is not reported as a change.
+    #[test]
+    fn gw_change_silent_when_only_skips_precede() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_gw(1, GwVerdict::Skip));
+        w.push(link_gw(2, GwVerdict::Ok));
+        assert!(GwChange.eval(&w).is_none());
     }
 
     #[test]

@@ -23,7 +23,11 @@ macro_rules! token_enum {
 #[error("unknown verdict token: {0}")]
 pub struct ParseVerdictError(pub String);
 
-token_enum!(GwVerdict { Ok => "OK", Fail => "FAIL", NoGw => "NOGW" });
+// `Skip` is the quiet-mode token: the operator suppressed the gateway echo, so
+// the probe did not run. It is NOT a health verdict — neither healthy nor failed —
+// and the trigger conditions treat it as "no measurement" rather than as a state
+// (SKIP, never silence).
+token_enum!(GwVerdict { Ok => "OK", Fail => "FAIL", NoGw => "NOGW", Skip => "SKIP" });
 token_enum!(TcpVerdict { Ok => "OK", Fail => "FAIL", Skip => "SKIP" });
 token_enum!(DnsVerdict {
     Ok => "OK", FakeIp => "FAKEIP", Empty => "EMPTY", ServFail => "SERVFAIL",
@@ -40,6 +44,7 @@ mod tests {
             (GwVerdict::Ok, "OK"),
             (GwVerdict::Fail, "FAIL"),
             (GwVerdict::NoGw, "NOGW"),
+            (GwVerdict::Skip, "SKIP"),
         ] {
             assert_eq!(v.to_string(), s);
             assert_eq!(GwVerdict::from_str(s).unwrap(), v);

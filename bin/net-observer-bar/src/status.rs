@@ -74,13 +74,24 @@ pub enum Health {
 }
 
 /// Classify a [`StatusSnapshot`] into a [`Health`]: [`Health::NoData`] when there
-/// is no link *and* no proxy tick, [`Health::Ok`] when the gateway verdict is
+/// is no link *and* no proxy tick (and when the gateway verdict is `SKIP` — quiet
+/// mode — while the tun is healthy: nothing was measured at the gateway, so there
+/// is no verdict to give), [`Health::Ok`] when the gateway verdict is
 /// `OK` *and* the tun probe returned HTTP 204 (the healthy reachability code),
 /// and [`Health::Bad`] otherwise (gw or tun bad / degraded — e.g. tun `0` =
 /// wedge). Pure over its input, so it is unit-tested without a socket or a GUI.
 pub fn health(snap: &StatusSnapshot) -> Health {
     if snap.link.is_none() && snap.proxy.is_none() {
         return Health::NoData;
+    }
+    // A `SKIP` gateway is quiet mode: the echo was deliberately not sent, so
+    // there is no gateway verdict to judge. Calling that red would be a false
+    // alarm about the network and calling it green would be a claim we did not
+    // measure — so unless the tun is independently bad, the dot goes to
+    // `NoData`, the "no verdict" state.
+    if snap.link.as_ref().is_some_and(|l| l.gw == GwVerdict::Skip) {
+        let tun_ok = snap.proxy.as_ref().and_then(|p| p.tun_code) == Some(204);
+        return if tun_ok { Health::NoData } else { Health::Bad };
     }
     let gw_ok = snap.link.as_ref().is_some_and(|l| l.gw == GwVerdict::Ok);
     // The tun HTTP 204 probe: 204 means the tunnel path is reachable; anything
@@ -186,6 +197,28 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(status_glyph(&snap), "🟢 gw:OK tun:204");
+    }
+
+    /// Quiet mode (`gw = SKIP`) is not a fault: with the tun healthy the dot is
+    /// the "no verdict" one, not red — and not green either, since nothing at the
+    /// gateway was measured.
+    #[test]
+    fn skip_gateway_is_no_verdict_not_a_fault() {
+        let quiet = StatusSnapshot {
+            link: Some(link(GwVerdict::Skip)),
+            proxy: Some(proxy(Some(204), Some("auto"))),
+            quiet: true,
+            ..Default::default()
+        };
+        assert_eq!(health(&quiet), Health::NoData);
+        // A wedged tun is still a fault while quiet.
+        let wedged = StatusSnapshot {
+            link: Some(link(GwVerdict::Skip)),
+            proxy: Some(proxy(Some(0), None)),
+            quiet: true,
+            ..Default::default()
+        };
+        assert_eq!(health(&wedged), Health::Bad);
     }
 
     #[test]

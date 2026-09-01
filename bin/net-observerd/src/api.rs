@@ -20,6 +20,7 @@
 //! peer-credential gate in [`control_request`] — see [`ControlPolicy`].
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ use tokio::sync::broadcast;
 use types::ObservingEdge;
 
 use crate::acting;
+use crate::pipeline::PcapFreezer;
 
 /// The uid `root` runs as. Always authorised for control: root can already stop
 /// and reconfigure the daemon, so refusing it would be theatre.
@@ -296,7 +298,9 @@ fn authorize_control(
         }
         Some(uid) => Err(ControlResult {
             ok: false,
-            message: format!("control refused: uid {uid} is not authorised to control net-observerd"),
+            message: format!(
+                "control refused: uid {uid} is not authorised to control net-observerd"
+            ),
         }),
         None => Err(ControlResult {
             ok: false,
@@ -328,6 +332,11 @@ impl ControlAuthority {
     pub(crate) fn of(cmd: &ControlCmd) -> Self {
         match cmd {
             ControlCmd::SetObserving(_) => Self::SelfControl,
+            // Copying the daemon's OWN pcap ring into the daemon's OWN blob
+            // directory sends nothing and starts nothing: same class as a pause.
+            ControlCmd::FreezePcap => Self::SelfControl,
+            // Quiet only suppresses a probe this daemon would otherwise emit.
+            ControlCmd::SetQuiet(_) => Self::SelfControl,
             ControlCmd::KickstartProxy => Self::Acting,
         }
     }
@@ -376,6 +385,16 @@ pub struct ApiServer {
     pub policy: ControlPolicy,
     /// The collectors' pause flag; `SetObserving` is its only writer.
     pub observing: Arc<AtomicBool>,
+    /// The link collector's quiet flag; `SetQuiet` is its only writer. Shared
+    /// with the collector — a fresh `Arc` here would ack a quiet nobody honours.
+    pub quiet: Arc<AtomicBool>,
+    /// The live pcap ring, when one is running, for `ControlCmd::FreezePcap`.
+    /// `None` when the ring is disabled or failed to start — the command is then
+    /// refused with a message, never silently ignored.
+    pub freezer: Option<Arc<dyn PcapFreezer>>,
+    /// Where a manual freeze writes its copy: the daemon's blob directory, the
+    /// same root the `gw-change` freeze handler uses.
+    pub blob_dir: PathBuf,
     /// `ts_us` of the most recent RESUME edge, published here and consumed by
     /// `pipeline::run` to drop its pre-pause trigger window. `0` = never
     /// resumed.
@@ -627,6 +646,9 @@ async fn handle_conn(
                 policy: &srv.policy,
                 acting: &srv.acting,
                 observing: &srv.observing,
+                quiet: &srv.quiet,
+                freezer: srv.freezer.as_ref(),
+                blob_dir: &srv.blob_dir,
                 resume_at_us: &srv.resume_at_us,
                 snapshot: &srv.snapshot,
                 store: srv.store.as_ref(),
@@ -835,6 +857,9 @@ pub(crate) struct ControlCtx<'a> {
     pub policy: &'a ControlPolicy,
     pub acting: &'a ActingConfig,
     pub observing: &'a AtomicBool,
+    pub quiet: &'a AtomicBool,
+    pub freezer: Option<&'a Arc<dyn PcapFreezer>>,
+    pub blob_dir: &'a Path,
     pub resume_at_us: &'a AtomicI64,
     pub snapshot: &'a Mutex<StatusSnapshot>,
     pub store: &'a (dyn Store + Send + Sync),
@@ -989,10 +1014,62 @@ fn control_response(
                 message: format!("observing {label}{note}"),
             }
         }
+        ControlCmd::SetQuiet(b) => {
+            // The quiet flag has no boundary record by design: unlike a pause it
+            // produces no gap — the link collector keeps emitting one sample per
+            // tick, carrying `gw = SKIP`, so the suppression is already visible in
+            // the record it would otherwise have to bracket.
+            let was = cx.quiet.swap(b, Ordering::AcqRel);
+            cx.snapshot.lock().unwrap_or_else(|e| e.into_inner()).quiet = b;
+            let label = if b { "on" } else { "off" };
+            tracing::info!(
+                quiet = b,
+                changed = was != b,
+                peer_uid = authorized.uid(),
+                "quiet state set via control socket"
+            );
+            ControlResult {
+                ok: true,
+                message: format!("quiet {label}"),
+            }
+        }
+        ControlCmd::FreezePcap => freeze_now(cx),
         ControlCmd::KickstartProxy => match acting::kickstart_proxy(&cx.acting.singbox_service) {
             Ok(message) => ControlResult { ok: true, message },
             Err(message) => ControlResult { ok: false, message },
         },
+    }
+}
+
+/// Copy the pcap ring out on operator demand, into a timestamped freeze
+/// directory beside the trigger-driven ones.
+///
+/// A ring that is not running is a REFUSAL with a reason, never a silent no-op:
+/// the operator asked for an artifact and must learn that none exists. A ring
+/// that yields no file is also a failure — the command's whole product is the
+/// copied files — and both cases say so in the message.
+fn freeze_now(cx: &ControlCtx<'_>) -> ControlResult {
+    let Some(freezer) = cx.freezer else {
+        return ControlResult {
+            ok: false,
+            message: "pcap ring not running".to_string(),
+        };
+    };
+    let ts_us = types::now_us();
+    let dest = cx.blob_dir.join(format!("freeze-manual-{ts_us}"));
+    let paths = freezer.freeze(&dest);
+    let dest = dest.display();
+    if paths.is_empty() {
+        tracing::warn!(%dest, "manual pcap freeze copied no files");
+        return ControlResult {
+            ok: false,
+            message: format!("pcap ring froze no files into {dest}"),
+        };
+    }
+    tracing::info!(%dest, frozen = paths.len(), "froze pcap ring on operator request");
+    ControlResult {
+        ok: true,
+        message: format!("froze {} pcap file(s) into {dest}", paths.len()),
     }
 }
 
@@ -1162,6 +1239,9 @@ mod tests {
                 peer_uid: peer_uid_of,
             },
             observing: Arc::new(AtomicBool::new(true)),
+            quiet: Arc::new(AtomicBool::new(false)),
+            freezer: None,
+            blob_dir: std::env::temp_dir().join("net-observerd-test-blobs"),
             resume_at_us: Arc::new(AtomicI64::new(0)),
             snapshot: Arc::new(Mutex::new(StatusSnapshot::default())),
             store: Arc::new(store::DuckdbStore::in_memory().unwrap()),
@@ -1178,6 +1258,9 @@ mod tests {
             policy: &srv.policy,
             acting: &srv.acting,
             observing: &srv.observing,
+            quiet: &srv.quiet,
+            freezer: srv.freezer.as_ref(),
+            blob_dir: &srv.blob_dir,
             resume_at_us: &srv.resume_at_us,
             snapshot: &srv.snapshot,
             store: srv.store.as_ref(),
@@ -1188,7 +1271,8 @@ mod tests {
 
     /// A scratch directory for a socket-bound test.
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("net-observerd-{tag}-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("net-observerd-{tag}-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1353,19 +1437,30 @@ mod tests {
         );
     }
 
-    /// D2: EVERY control command is peer-gated, not just the acting-class one.
-    /// The `match` inside the loop is exhaustive on purpose — a third `ControlCmd`
-    /// variant fails to compile until it is added here and thus asserted.
+    /// D2: EVERY control command is peer-gated, not just the acting-class one —
+    /// the self-control commands (`SetObserving`, `SetQuiet`, `FreezePcap`) are
+    /// exempt from `acting.enabled`, never from the peer gate.
+    /// The `match` inside the loop is exhaustive on purpose — a further
+    /// `ControlCmd` variant fails to compile until it is added here and thus
+    /// asserted.
     #[test]
     fn every_control_cmd_is_refused_for_an_unauthorised_peer() {
         // No real account holds it, and `test_server` pins the console clause to
         // "no session", so nothing on any host can accidentally authorise it.
         let stranger = Some(NOT_A_REAL_UID);
 
-        for cmd in [ControlCmd::SetObserving(false), ControlCmd::KickstartProxy] {
+        for cmd in [
+            ControlCmd::SetObserving(false),
+            ControlCmd::SetQuiet(true),
+            ControlCmd::FreezePcap,
+            ControlCmd::KickstartProxy,
+        ] {
             // Exhaustive on purpose — a new variant breaks this arm list.
             match cmd {
-                ControlCmd::SetObserving(_) | ControlCmd::KickstartProxy => {}
+                ControlCmd::SetObserving(_)
+                | ControlCmd::SetQuiet(_)
+                | ControlCmd::FreezePcap
+                | ControlCmd::KickstartProxy => {}
             }
             // Acting is ENABLED, so a refusal here can only come from the peer
             // gate, never from the acting switch.
@@ -1444,6 +1539,8 @@ mod tests {
             // Exhaustive on purpose — a new variant breaks this arm list.
             let expected = match cmd {
                 ControlCmd::SetObserving(_) => ControlAuthority::SelfControl,
+                ControlCmd::SetQuiet(_) => ControlAuthority::SelfControl,
+                ControlCmd::FreezePcap => ControlAuthority::SelfControl,
                 ControlCmd::KickstartProxy => ControlAuthority::Acting,
             };
             assert_eq!(
@@ -1452,6 +1549,108 @@ mod tests {
                 "{cmd:?} declares the wrong authority class"
             );
         }
+    }
+
+    /// `SetQuiet` is benign self-control like `SetObserving`: ungated by
+    /// `acting.enabled`, it flips the flag the link collector reads and mirrors
+    /// the state into the live snapshot so the bar renders it. Unlike a pause it
+    /// writes NO boundary row — quiet produces no gap to bracket.
+    #[test]
+    fn set_quiet_not_gated_by_acting_and_writes_no_boundary_row() {
+        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
+
+        let on = control_request(ControlCmd::SetQuiet(true), Some(TEST_DAEMON_UID), &cx);
+        assert!(on.ok, "SetQuiet must not be gated by acting");
+        assert_eq!(on.message, "quiet on");
+        assert!(srv.quiet.load(Ordering::Acquire));
+        assert!(srv.snapshot.lock().unwrap().quiet);
+        // Quiet is orthogonal to the pause: the daemon keeps collecting.
+        assert!(srv.observing.load(Ordering::Acquire));
+
+        let off = control_request(ControlCmd::SetQuiet(false), Some(TEST_DAEMON_UID), &cx);
+        assert!(off.ok);
+        assert_eq!(off.message, "quiet off");
+        assert!(!srv.quiet.load(Ordering::Acquire));
+        assert!(!srv.snapshot.lock().unwrap().quiet);
+
+        assert_eq!(
+            srv.store
+                .as_ref()
+                .query_scalar_i64("SELECT count(*) FROM observing_edge")
+                .unwrap(),
+            0,
+            "quiet keeps emitting samples, so it must not write an observing edge"
+        );
+    }
+
+    /// With no ring running, `FreezePcap` is a REFUSAL with a reason — never a
+    /// silent success that would leave the operator believing an artifact exists.
+    #[test]
+    fn freeze_pcap_refuses_when_the_ring_is_not_running() {
+        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        assert!(srv.freezer.is_none());
+        let cx = test_ctx(&srv);
+        let res = control_request(ControlCmd::FreezePcap, Some(TEST_DAEMON_UID), &cx);
+        assert!(!res.ok);
+        assert_eq!(res.message, "pcap ring not running");
+    }
+
+    /// With a ring running, `FreezePcap` copies it — even with acting disabled,
+    /// because it is self-control — and the message names the destination and the
+    /// file count so the operator can find the artifact.
+    #[test]
+    fn freeze_pcap_copies_the_ring_and_names_the_destination() {
+        /// A freezer that records where it was asked to write and reports two files.
+        struct RecordingFreezer(Mutex<Option<std::path::PathBuf>>);
+        impl crate::pipeline::PcapFreezer for RecordingFreezer {
+            fn freeze(&self, dest_dir: &Path) -> Vec<std::path::PathBuf> {
+                *self.0.lock().unwrap() = Some(dest_dir.to_path_buf());
+                vec![dest_dir.join("ring.pcap0"), dest_dir.join("ring.pcap1")]
+            }
+        }
+
+        let mut srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let freezer = Arc::new(RecordingFreezer(Mutex::new(None)));
+        srv.freezer = Some(freezer.clone() as Arc<dyn crate::pipeline::PcapFreezer>);
+        srv.blob_dir = temp_dir("freeze-manual");
+        let blob_dir = srv.blob_dir.clone();
+        let cx = test_ctx(&srv);
+
+        let res = control_request(ControlCmd::FreezePcap, Some(TEST_DAEMON_UID), &cx);
+        assert!(
+            res.ok,
+            "a self-control freeze must run with acting disabled"
+        );
+        let dest = freezer.0.lock().unwrap().clone().expect("ring was frozen");
+        assert!(
+            dest.starts_with(&blob_dir),
+            "the freeze must land under the daemon's blob dir: {dest:?}"
+        );
+        assert!(
+            res.message.contains(&dest.display().to_string()),
+            "the message must name the destination: {}",
+            res.message
+        );
+        assert!(
+            res.message.contains('2'),
+            "the message must name the file count: {}",
+            res.message
+        );
+    }
+
+    /// An unauthorised peer cannot reach the new self-control commands either:
+    /// the peer gate runs before the class check, for every variant.
+    #[test]
+    fn new_self_control_commands_still_need_an_authorised_peer() {
+        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
+        for cmd in [ControlCmd::SetQuiet(true), ControlCmd::FreezePcap] {
+            let res = control_request(cmd.clone(), None, &cx);
+            assert!(!res.ok, "{cmd:?} must be refused without peer credentials");
+            assert!(res.message.contains("control refused"));
+        }
+        assert!(!srv.quiet.load(Ordering::Acquire), "the flag must not move");
     }
 
     /// The D1↔D3 anti-drift test: one real edge produces exactly ONE durable
@@ -2173,7 +2372,8 @@ mod tests {
         srv.policy.peer_uid = foreign_peer;
 
         let frame =
-            net_observer_ipc::encode_frame(&Request::Control(ControlCmd::SetObserving(false))).unwrap();
+            net_observer_ipc::encode_frame(&Request::Control(ControlCmd::SetObserving(false)))
+                .unwrap();
         client.write_all(&frame).await.unwrap();
         client.flush().await.unwrap();
 
@@ -2232,7 +2432,8 @@ mod tests {
         srv.policy.control_uids = vec![FOREIGN_UID];
 
         let frame =
-            net_observer_ipc::encode_frame(&Request::Control(ControlCmd::SetObserving(false))).unwrap();
+            net_observer_ipc::encode_frame(&Request::Control(ControlCmd::SetObserving(false)))
+                .unwrap();
         client.write_all(&frame).await.unwrap();
         client.flush().await.unwrap();
 

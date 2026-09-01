@@ -42,7 +42,9 @@ use gpui::{
     div, px, rgb,
 };
 
-use net_observer_ipc::{ControlCmd, ControlResult, IncidentSummary, Request, Response, StatusSnapshot};
+use net_observer_ipc::{
+    ControlCmd, ControlResult, IncidentSummary, Request, Response, StatusSnapshot,
+};
 
 use crate::status::{Health, health};
 
@@ -207,13 +209,40 @@ pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, GlanceError> {
 /// connection-refused (daemon down) or a protocol error maps to `Err(String)` so
 /// the panel can surface it as a transient line instead of crashing — never a
 /// panic.
-pub fn send_set_observing(socket_path: &str, on: bool) -> Result<ControlResult, String> {
-    match net_observer_ipc::query(socket_path, &Request::Control(ControlCmd::SetObserving(on))) {
+/// Ask `net-observerd` to enter (`true`) or leave (`false`) **quiet** mode over
+/// the local socket (`Control(SetQuiet(on))`).
+///
+/// Quiet is not a pause: the daemon keeps collecting and keeps emitting one link
+/// sample per tick — it just addresses no packet at the gateway, so the gateway
+/// verdict reads `SKIP`. Benign **self-control**, not gated by `acting.enabled`.
+/// Transport failures map to `Err(String)` for the panel to surface, never a panic.
+pub fn send_set_quiet(socket_path: &str, on: bool) -> Result<ControlResult, String> {
+    control_query(socket_path, ControlCmd::SetQuiet(on))
+}
+
+/// Ask `net-observerd` to copy its pcap ring out NOW
+/// (`Control(FreezePcap)`) — the same passive artifact the `gw-change` trigger
+/// produces, on operator demand. A daemon with no ring running answers
+/// `ok: false` with a reason, which the panel shows like any other control
+/// outcome; a daemon that is not there maps to `Err(String)`.
+pub fn send_freeze_pcap(socket_path: &str) -> Result<ControlResult, String> {
+    control_query(socket_path, ControlCmd::FreezePcap)
+}
+
+/// The one blocking control round-trip every control action goes through, so the
+/// bar has exactly one socket client (`net_observer_ipc::query`) and one mapping
+/// from its answers to a `Result`.
+fn control_query(socket_path: &str, cmd: ControlCmd) -> Result<ControlResult, String> {
+    match net_observer_ipc::query(socket_path, &Request::Control(cmd)) {
         Ok(Response::Control(result)) => Ok(result),
         Ok(Response::Error(msg)) => Err(msg),
         Ok(_) => Err("unexpected response from net-observerd".to_string()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+pub fn send_set_observing(socket_path: &str, on: bool) -> Result<ControlResult, String> {
+    control_query(socket_path, ControlCmd::SetObserving(on))
 }
 
 /// Shared, app-scoped model: the latest snapshot the UI renders.
@@ -326,6 +355,38 @@ pub fn toggle_round_trip(
     (control, read_fresh(socket_path))
 }
 
+/// The blocking half of the quiet toggle, built exactly like
+/// [`toggle_round_trip`] and for the same reason: `SetQuiet(bool)` is absolute on
+/// the wire, so the target is derived from a freshly-read state rather than from a
+/// snapshot up to one refresh tick old. Never call it on the gpui main thread.
+pub fn quiet_round_trip(
+    socket_path: &str,
+) -> (
+    Result<ControlResult, String>,
+    Result<StatusSnapshot, GlanceError>,
+) {
+    let before = match read_fresh(socket_path) {
+        Ok(s) => s,
+        Err(e) => return (Err(e.to_string()), Err(e)),
+    };
+    let control = send_set_quiet(socket_path, !before.quiet);
+    (control, read_fresh(socket_path))
+}
+
+/// The blocking half of the "Freeze pcap now" action: send the command, then
+/// re-read the snapshot so the panel's freshness/offline state stays truthful.
+/// No leading read — unlike the two toggles this command carries no state to
+/// derive. Never call it on the gpui main thread.
+pub fn freeze_round_trip(
+    socket_path: &str,
+) -> (
+    Result<ControlResult, String>,
+    Result<StatusSnapshot, GlanceError>,
+) {
+    let control = send_freeze_pcap(socket_path);
+    (control, read_fresh(socket_path))
+}
+
 /// The root view of the panel window. Holds a handle to the shared [`Glance`]
 /// and re-renders whenever it changes.
 pub struct PanelView {
@@ -422,10 +483,14 @@ fn header_row(
         );
     // Only a muted "paused" label when the daemon is up but collection is off.
     // Offline is conveyed by a warning glyph next to the (disabled) toggle — no text.
-    let sub = if online && !snapshot.observing {
-        Some("paused")
-    } else {
-        None
+    // Paused and quiet are DIFFERENT states and must never be rendered as one: a
+    // paused daemon collects nothing, a quiet daemon is still collecting and still
+    // recording — it just sends nothing at the gateway. Paused wins the label when
+    // both hold, because it is the stronger claim about what is being recorded.
+    let sub = match (online, snapshot.observing, snapshot.quiet) {
+        (true, false, _) => Some("paused"),
+        (true, true, true) => Some("quiet"),
+        _ => None,
     };
     if let Some(label) = sub {
         left = left.child(
@@ -707,6 +772,44 @@ fn footer(
             });
         }));
 
+    // "Freeze pcap now" and the quiet toggle: the two operator control actions
+    // besides pause/resume. Both are benign self-control — the freeze copies files
+    // the daemon already owns, quiet only suppresses a probe the daemon itself
+    // sends — so neither is gated by `acting.enabled`, and both run their socket
+    // round-trips on the background executor for the same reason the header
+    // toggle does: a daemon that accepts but never answers must not park the bar.
+    let freeze = div()
+        .id("freeze-pcap")
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        .text_color(rgb(theme.accent))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme.hover)))
+        .child("Freeze pcap")
+        .on_click(cx.listener(|this, _, _window, cx| {
+            spawn_control(this, cx, freeze_round_trip);
+        }));
+
+    // The label states what the click will DO, and the color states which state
+    // the daemon is in now: warn-colored while quiet, because a suppressed probe
+    // is a deliberate hole in the measurement and should not look routine.
+    let quiet_on = snapshot.quiet;
+    let quiet = div()
+        .id("quiet-toggle")
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        .text_color(rgb(if quiet_on { theme.warn } else { theme.accent }))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme.hover)))
+        .child(if quiet_on { "Unquiet" } else { "Quiet" })
+        .on_click(cx.listener(|this, _, _window, cx| {
+            spawn_control(this, cx, quiet_round_trip);
+        }));
+
     let quit = div()
         .id("quit")
         .px_2()
@@ -723,7 +826,15 @@ fn footer(
         .flex()
         .items_center()
         .justify_between()
-        .child(events)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(events)
+                .child(freeze)
+                .child(quiet),
+        )
         .child(
             div()
                 .flex()
@@ -764,6 +875,39 @@ fn footer(
         .py_2()
         .child(actions)
         .child(meta)
+}
+
+/// Run one blocking control round-trip on the background executor and apply its
+/// outcome to the shared model on the foreground.
+///
+/// The single place the panel's control actions touch the socket, so "never block
+/// the gpui main thread" and "a daemon that is not there is a message, not a
+/// crash" are decided once rather than per button. The model is held weakly, so a
+/// shut-down app just drops the result.
+fn spawn_control(
+    view: &PanelView,
+    cx: &mut Context<PanelView>,
+    round_trip: fn(
+        &str,
+    ) -> (
+        Result<ControlResult, String>,
+        Result<StatusSnapshot, GlanceError>,
+    ),
+) {
+    let model = view.model.downgrade();
+    let socket = view.model.read(cx).socket_path.clone();
+    cx.spawn(async move |_view, acx: &mut AsyncApp| {
+        let (control, fresh) = acx
+            .background_spawn(async move { round_trip(&socket) })
+            .await;
+        model
+            .update(acx, |g, cx| {
+                g.apply_toggle_result(control, fresh);
+                cx.notify();
+            })
+            .ok();
+    })
+    .detach();
 }
 
 // ---- small element helpers -------------------------------------------------
@@ -809,10 +953,12 @@ fn tcp_verdict_color(v: types::TcpVerdict, theme: Theme) -> Rgba {
 }
 
 /// Semantic color for a [`types::GwVerdict`]. Exhaustive for the same reason as
-/// [`tcp_verdict_color`]; this enum has no skip token today.
+/// [`tcp_verdict_color`]: a probe that did not run (`SKIP`, quiet mode) reads as
+/// muted rather than as a failure.
 fn gw_verdict_color(v: types::GwVerdict, theme: Theme) -> Rgba {
     match v {
         types::GwVerdict::Ok => rgb(theme.ok),
+        types::GwVerdict::Skip => rgb(theme.muted),
         types::GwVerdict::Fail | types::GwVerdict::NoGw => rgb(theme.bad),
     }
 }
