@@ -1,104 +1,141 @@
-# AGENTS.md
+# `net-observer`
+Rust-демон сетевой форензики для macOS: пишет послойную телеметрию в DuckDB, чтобы после падения сети можно было доказать, какой слой отказал.
 
-Guidance for coding agents (and humans) working in this repo. `CLAUDE.md` is a
-symlink to this file.
+## Что это за проект
+- **Nature**: не согласовано — прогони `iskron:iskronify` полным проходом. До тех пор действуй по полной production-дисциплине: послаблений не объявлено, значит их нет.
+- **Граф**: `net-observer` (`r210`) — каждая сессия начинается с `iskron_orient` здесь.
+- **Фокус-контур**: `#1 «🛰 Контур сетевой форензики мака»`.
+- **Роль агента**: `#2 «🔧 Сопровождающий демона net-observer»` — adhikarin, стюард фокус-контура. Твой инбокс: `iskron_orient(realm="r210", focus="#2")` на старте сессии.
+- **Роль владельца**: `#3 «🧭 Владелец расследования»` (svatantra 主) — вопросы вне мандата идут сюда `posed_to`-вимаршами.
+- **Стек**: Rust edition 2024 (тулчейн пинён в `rust-toolchain.toml`), tokio, DuckDB (`bundled`), figment, thiserror/anyhow, tracing, gpui для меню-бара.
+- **Production statement**: не согласовано — прогони `iskron:iskronify` полным проходом.
 
-## What this is
+## Правила персистентности
+Состояние живёт в **репо** или в **графе** — больше нигде. Встроенная память харнесса (пер-проектная директория памяти, сводки разговоров, `/tmp`, машинно-локальные файлы) **запрещена целиком, не по категориям**: туда не идёт ни проектный факт, ни предпочтение пользователя, ни заметка о стиле работы. (why: локальная память невидима любому другому агенту и любой другой машине, поэтому дрейфует молча — и ломает воспроизводимость.)
+- **Репо**: код, конфиги, конвенции, код-готчи, состояние веток.
+- **Граф**: методология, проектные решения, открытые вопросы (вимарши), планы, передачи, уроки. Не пересказывай содержимое графа в репо; линкуй вимаршу или контур.
+- **Доставай состояние; никогда не восстанавливай из памяти.** Нет источника у «мы решили…»? Остановись и прочти граф или репо, прежде чем действовать.
+- **Файлы под `docs/superpowers/` — черновики на впуск**, не запись: решения держит граф, такой файл — их вид. Датированные планы в `docs/superpowers/plans/` — исторический след; не правь их под текущее состояние.
+- **Это переопределяет собственную инструкцию памяти харнесса**, которая приглашает категорию `project`. Маршрутизируй, спрашивая **чей это факт?** Конвенция репо, факт о коде, процедуры и датированные долги этого проекта → этот файл или узел в графе `net-observer`; состояние работы, решение, открытый вопрос → вимарша в графе. Факт, который собственный пользователя и не служит одному проекту (личные машины, сроки, люди, кросс-проектные уроки) → его личный граф `@nick/mind`; факт о другом проекте → граф того проекта. Стоячие предпочтения — инструкции, не факты: проектные сюда, кросс-проектные в глобальный файл инструкций.
+- Перед завершением задачи проверь, что каждый долгий факт из контекста персистирован по этой маршрутизации: неперсистированный факт — провал задачи, не мелочь.
 
-`net-observer` — a Rust network-forensics collector daemon for macOS. It writes
-queryable telemetry into DuckDB, superseding the hand-rolled `bash` LaunchDaemon
-of the same name (still the behavioral oracle — see below). Read `ARCHITECTURE.md` for the pipeline,
-crate graph, and data model; `README.md` for a quick start; and the design +
-plan under `docs/superpowers/` for the full rationale.
+## Жизненный цикл сессии
+Граф = работа (структура, открытые вопросы, что дальше). Git = как сюда пришли (SHA, ветки, PR). **Git-ссылки не попадают в граф** — ни SHA, ни имён веток, ни номеров PR.
+- **Старт сессии:** ориентация в графе `net-observer`, фокус `#1`; карта ACTIVE BIANHUA (`lens="bianhua"`). Протокол гонит скилл `iskron:entry`. Затем открой повестку: `iskron_orient(realm="r210", focus="#2")` — входящие `posed_to`-вимарши суть инбокс; каждую возьми или явно отложи.
+- **Начало работы: сперва граф, потом проект, потом код.** Три такта: разведка графа (что записано о месте изменения, что решено и что отвергнуто) → поле интеграции (`iskron:integrity`) → проектирование (`iskron:design`) → код. Исключение только явное: человек сказал «работай сразу». Молчание — не «работай сразу».
+- **Решение записывается в момент принятия, а не по исполнении** — с модусами, которые оно имеет прямо сейчас: epistemic не выше `anumita`, ontic `anagata`, volitive `chanda`/`adhimoksha`. (why: решение, оставшееся в разговоре, умирает с этим разговором.)
+- **Каждая задача описана прежде, чем начата, — и записана тем, что она есть.** Разовое деяние — anga-вимаршей на превращении; **крией — только повторяемый переход**, у которого всякий прогон ест ту же ahara и производит ту же utpatti.
+- **Каждый мерж → обнови граф.** Пуш, лишь открывший PR, не отгрузил ничего. На мерже: сверь с реальностью (задеплоенный артефакт, не дифф), продвинь карту превращений, закрывай по оси (`addressed_by` записывает ответ; отпускание — отдельный акт), промети отгруженный контур, отработай инбокс, прогони `iskron:reconcile`.
+- **Словарный проход.** Перечитай приземляемое на заимствованные проектно-менеджерские слова (ticket, backlog, sprint, epic, story, done, blocker). Сам не подменяй: назови каждое пользователю и спроси, как это зовётся в проекте.
+- **Утверждение, которое ты сделал, — не утверждение, которое ты принимаешь.** Поведенческие утверждения («фикс работает», «демон пишет строку») закрываются вердиктом холодного проверяющего, никогда твоим перечитыванием. Ролевые суб-агенты ещё не заведены — прогони `iskron:iskronify` полным проходом; до тех пор бери наблюдение сам против носителя, никогда по исходнику, который должен был его произвести.
+- **Держи этот файл честным.** Сверь число контракта в штампе внизу с первым словом описания установленного скилла `iskron:iskronify` — оно лежит в контексте каждой сессии, сверка не стоит ни вызова. Расходится — прогон `iskron:iskronify` и есть первый ход сессии.
 
-## Workspace layout
+### После зелёного пуша: самопроверка
+Гейт зелёный и итерация закончена → перечитай свой дифф на баги, хрупкие места, слабую обработку ошибок, нарушения DRY, недостающие тесты, бог-юниты. Чини в той же ветке — или прямо скажи, что ничего не всплыло. Находок не выдумывай. По этапу, а не только в конце.
 
-A Cargo workspace (`edition = "2024"`, toolchain pinned in `rust-toolchain.toml`).
+### Дисциплина веток
+Одна ветка до своего мержа — фоллоу-апы коммить в неё. После мержа: `git checkout main && git pull`, удали смерженную ветку, вплети отгруженное в контур, подтверди уборку до следующей задачи.
+
+## Рабочие принципы
+1. **Думай до кода.** Называй допущения; спрашивай при неуверенности — называя, *что именно* неясно. **Вопрос человеку задаётся текстом**; инструмент интерактивного выбора вариантов не используется никогда. Проверь репо + граф до письма. Вопросы вне мандата — вимаршами `posed_to` к `#3`.
+2. **Сначала простота.** Минимум кода под задачу. Без спекулятивных фич и абстракций для одноразового кода. Валидируй на границах; внутренним инвариантам доверяй.
+3. **Оставайся в границе репо.** Не выходи из рабочей директории. Изменение, принадлежащее другому контуру (например shell-демону в `nix-config`), — вимарша на узле того контура в его графе, не правка через границу.
+4. **Вторая имплементация — событие для доклада.** Собираешься написать то, что уже есть, — назови оба места и предложи воссоединение либо именованную развилку.
+5. **Хирургические изменения.** Трогай только нужное задаче. Не переформатируй соседний код. Удаляй только мёртвый код, порождённый твоим изменением.
+6. **Исполнение от цели.** Баги — падающим тестом до патча. Назови фальсификатор до взгляда и наблюдай сам носитель, не исходник.
+7. **Прочти, прежде чем отвечать на открытый вопрос.** Задачи в рамке «обсудить / продумать / спроектировать» отвечаются из записанного мышления, не из training data: сначала спроси граф. Гонит `iskron:entry`.
+8. **Думай в графе, говори на языке проекта.** Структурный словарь (крия, феномен, контур, вимарша, модусы) — для рассуждения; в сказанном пользователю не появляется, пока он не употребил первым.
+
+## Общие поверхности
+Ещё не устоялось: прогони интервью (скажи `iskron:iskronify`), прежде чем принимать здесь любую поведенческую заявку. До тех пор Рабочий принцип 4 исполняется вручную — обходом графа от `#1`.
+
+## Внешние поверхности — то, чем пользуешься и чем не владеешь
+Здесь их много и они недокументированы: macOS-приватные утилиты и логи (`wdutil`, `ipconfig getpacket`, `scutil --nwi`, CoreCapture, `symptomsd netepochs`), Clash API sing-box, DuckDB.
+- **Прежде работы зафиксируй ту часть поверхности, с которой работа будет** — узлом в графе, с версией macOS / крейта, на которой смотрел.
+- **Источник берётся по старшинству — пратьякша прежде шабды.** Наблюдение своими руками (реальный вывод команды на этой машине) старше документации; документация старше памяти; **память источником не является вовсе**. `pratyakshita` — только на наблюдённое своими руками.
+- **Проткай связь.** Узел внешней поверхности — `upadhi` к крие, которая через него действует. Без ребра он ярлык-сирота.
+- **Референс работает в обе стороны.** Исходник, работающий с внешней поверхностью, несёт `(граф net-observer, узел #N)` — и ты этот узел читаешь перед работой.
+
+## Reality — против чего проверяется заявка
+Ещё не устоялось: прогони интервью (скажи `iskron:iskronify`), прежде чем принимать здесь любую поведенческую заявку. Пока таблицы нет, поведенческое утверждение закрывается только наблюдением, которое ты назвал вслух до того, как посмотрел.
+
+## Граф ↔ репо: где что живёт
+| Забота | Репо | Граф |
+|---|---|---|
+| Код, конфиги, локфайлы | ✓ | |
+| Команды, конвенции, готчи, стек | ✓ (AGENTS.md) | |
+| Состояние ветки, что в полёте | git + тело PR | ✓ (`genre=hint` — работа без PR) |
+| Методология, онтология | | ✓ |
+| Проектные решения, открытые вопросы | | ✓ (вимарши) |
+| Планы, передачи сессий | | ✓ |
+| История коммитов, PR, SHA | git | (никогда в графе) |
+
+**`HANDOVER.md` не заводится — это решение, а не упущение.** Ветка и что в полёте — `git branch`/`log` и открытый PR; почему так решено и что открыто — граф; работа без PR — семя `genre=hint`. (why: рукописную прозу обязан обновлять тот, кто занят другим, и «ветка съехала» — единственное событие, о котором он узнаёт последним.)
+
+## Структура проекта
+Cargo-workspace. Каждый коллектор — свой крейт, зависящий от `collector-core`; добавление подсистемы означает добавление крейта, а не правку соседних.
 
 ```
 bin/
   net-observerd/        # headless root LaunchDaemon: config → collectors → store + triggers
-  net-observer-cli/     # unprivileged reader: status / incidents (live via socket), query <SQL> (offline DB)
+  net-observer-cli/     # непривилегированный читатель: status / incidents (сокет), query <SQL> (offline DB)
+  net-observer-bar/     # gpui меню-бар; чистый сокет-клиент, БД не трогает
 crates/
-  types/            # Sample, verdict enums, Incident, BlobRef, TriggerFired
-  store/            # Store trait + DuckDB backend, schema, QueryTable
-  collector-core/   # ABSTRACTIONS ONLY: Collector trait, Pinger/TcpProber ports,
-                    #   Os, CollectorMeta, Readiness, Source/EventSource. No tokio.
-  collector-link/   # link collector: LinkFacts port, build_link_sample, LinkCollector, META
-  collector-proxy/  # proxy collector: ProxyFacts port, build_proxy_samples, ProxyCollector, META
-  triggers/         # Condition/Handler/Trigger + engine (re-arm/backoff)
-  config/           # figment: per-subsystem toggles (a constructor, not a verbosity dial)
-  macos/            # real adapters: raw ICMP, IP_BOUND_IF, Clash API, DHCP/ARP, pcap ring
+  types/                # Sample, verdict enums, Incident, BlobRef, TriggerFired
+  store/                # Store trait + DuckDB backend, схема, QueryTable
+  collector-core/       # ТОЛЬКО абстракции: Collector, Pinger/TcpProber, Os, Readiness. Без tokio.
+  collector-{link,proxy,dns,route,host}/   # по коллектору на крейт
+  triggers/             # Condition/Handler/Trigger + движок (re-arm/backoff)
+  config/               # figment: пер-подсистемные тумблеры
+  macos/                # реальные адаптеры: raw ICMP, IP_BOUND_IF, Clash API, DHCP/ARP, pcap ring
+  net-observer-ipc/     # протокол локального сокета: Request/Response, StreamFrame
 ```
 
-Each collector is its own crate depending on `collector-core`. Adding a subsystem
-(`dns`, `route`, `host`) means adding a crate — never editing the others.
+`ARCHITECTURE.md` — конвейер, граф крейтов, модель данных. `README.md` — быстрый старт.
 
-## Just recipes
+## Команды
+| Что | Команда |
+|---|---|
+| build | `cargo build --all` |
+| test | `just test` → `cargo test --all` |
+| lint | `just clippy` → `cargo clippy --all-targets --all-features -- -D warnings` |
+| format | `cargo fmt --all` |
+| run | `just run ARGS` → `cargo run -p net-observerd -- ARGS` |
 
-```
-just clippy   # cargo clippy --all-targets --all-features -- -D warnings
-just test     # cargo test --all
-just run ARGS # cargo run -p net-observerd -- ARGS
-```
+Зелёным считается последовательность `cargo fmt --all` → `cargo build --all` → `cargo test --all` → `cargo clippy --all-targets --all-features -- -D warnings`.
 
-Before finishing any change, keep it green:
-`cargo fmt --all` → `cargo build --all` → `cargo test --all` →
-`cargo clippy --all-targets --all-features -- -D warnings`.
-Note: the `duckdb` crate builds its C++ engine from source (`bundled`), so a cold
-build can take up to ~10 minutes — use generous timeouts.
+## Конвенции кода
+- **Смысл живёт в графе, код референсирует.** Комментарий, несущий обоснование решения или отброшенные альтернативы, — узел графа: перенеси смысл в граф, в коде оставь `(граф net-observer, узел #N)`. Механика шага — словами в комментарии; обоснование и поле интеграции — в графе. Сославшись, проверь, что узел и правда это говорит.
+- **Максимум Rust.** Для каждого компонента предпочитай чисто-Rust крейт. Нативные (C/C++) зависимости допустимы только там, где адекватного эквивалента нет, и каждое исключение названо в дизайн-доке. Текущие исключения: **DuckDB** (нет чисто-Rust БД с нативным `ASOF JOIN`) и, только для v1, **дочерний `tcpdump`** за pcap-рингом. Любой будущий GUI — `gpui`.
+- **v1 = наблюдать и обнаруживать, никогда не действовать.** Ни `launchctl kickstart`, ни watchdog, ни уведомлений. Триггеры запускают только *пассивные* хендлеры (записать инцидент, заморозить pcap-ринг). Действующие хендлеры — за тем же интерфейсом `Condition → Handler`, но не в v1.
+- **SKIP, а не тишина.** Проба, которая не может выполниться, отдаёт вердикт `SKIP`, а не молчит: отсутствие сигнала само по себе диагностично. Единственное санкционированное исключение — операторская пауза (`ControlCmd::SetObserving`): приостановленный демон перестаёт собирать вместо синтетических `SKIP` каждый тик. Эта тишина *обрамлена*: каждый край паузы/резюма пишет durable-строку `observing_edge` через `Store` и публикует `StreamFrame::Observing` на шину, так что разрыв ограничен и атрибутируем (к `ts_us` и `peer_uid` управляющего сокета). Необрамлённая тишина — баг. Сэмплы, которые ограниченный пост-резюм drain держит вне триггерного окна, вторым исключением не являются: каждый пишется в DuckDB и публикуется на шину, а сам drain ограничен монотонным дедлайном и потолком сброса и отчитывается итогами. Состояние наблюдения процесс-скоупно и намеренно не персистится — рестарт всегда возобновляет сбор.
+- **Изоляция.** Падение одного коллектора не должно ронять остальные; каждый — супервизируемая задача (лог и дальше тикать). Отказ записи в стор логируется как разрыв, а не глотается.
+- **Ошибки:** `thiserror` в библиотечных крейтах, `anyhow` в бинарях. **Конфиг:** `figment` (файл + `NET_OBSERVER_*`). **Async:** `tokio`, держится вне `collector-core`. **Логи:** `tracing`.
+- **Тестовая дисциплина**: юнит-тесты по крейтам; `store` тестируется против in-memory DuckDB; чистая маппинг-логика (`build_link_sample` / `build_proxy_samples`) — на фейковых портах, без сети и рута. Правила триггеров тестируются проигрыванием реальных записанных сигнатур инцидентов как синтетических потоков `Sample`. Новое поведение покрывай.
+- **Готчи**:
+  - Крейт `duckdb` собирает свой C++-движок из исходников (`bundled`): холодная сборка доходит до ~10 минут. Ставь щедрые таймауты; не считай долгую сборку зависанием.
+  - `net-observer-bar` намеренно исключён из `default-members`: build script gpui требует macOS Metal Toolchain, которого нет на каждой машине. `cargo build` собирает демон без GUI-тулчейна; бар — явно через `-p net-observer-bar` или `--workspace`.
+  - Рантайм-пути демона остаются на `/var/lib/observer/*`, хотя проект зовётся `net-observer`: shell-демон-оракул держит `/var/lib/net-observer` и `/var/log/net-observer.log` и по решению владельца работает параллельно во время миграции. Переезд на общие пути — только после снятия shell-демона; иначе два демона дерутся за pcap-ринг и drop-box.
+  - Поведенческий оракул переписывания — shell-демон `~/projects/nix-config/hosts/mac_aarch64/net-observer.nix`. Его словарь вердиктов и поведение захвата инцидента (тайминг заморозки, нюанс DHCP-vs-unicast DNS, сигнатура шлюза коворкинга, «отсутствие свежего CoreCapture само по себе диагностично») — ground truth, от которого переписывание не должно молча дрейфовать. Он же — единственное текущее авто-восстановление (watchdog kickstart); не теряй его прежде, чем действующий хендлер его заменит.
 
-## Design rules
+## Что обновлять когда
+- `AGENTS.md` — по перевёрнутому умолчанию: **если это можно узнать, прочитав узел графа, — здесь этого нет.** Файл держит только нужное ДО того, как агент дотянется до графа: команды, вход в ориентацию, инварианты кода, которых не выразит линтер, развилки, обязанные остановить до действия.
+- `CLAUDE.md` — симлинк на `AGENTS.md`; отдельно не редактируется.
+- Граф `net-observer` — каждый мерж (см. «Жизненный цикл сессии»).
 
-- **Maximize Rust.** Prefer a pure-Rust crate for every component where a viable
-  one exists. Native (C/C++) deps are allowed only where there is no adequate
-  pure-Rust equivalent, and each exception is named and justified in the design
-  doc. Current exceptions: **DuckDB** (C++; the one core engine — no pure-Rust DB
-  offers native `ASOF JOIN`) and, for v1 only, the **`tcpdump` child** behind the
-  pcap ring (the pure-Rust target is in-process capture via the `pcap` crate /
-  BPF). Any future GUI is `gpui`.
-- **v1 = observe + detect, never act.** No `launchctl kickstart`, no watchdog, no
-  notifications. Triggers fire *passive* handlers only (record an incident,
-  freeze the pcap ring). Acting/notifying are later handlers behind the same
-  `Condition → Handler` interface — do not add them to v1.
-- **SKIP, never silence.** A probe that cannot run emits a `SKIP` verdict rather
-  than going quiet — absence of a signal is itself diagnostic. Preserve this and
-  the verdict vocabulary (see `ARCHITECTURE.md`). The **one** sanctioned
-  exception is an operator pause (`ControlCmd::SetObserving`): a paused daemon
-  stops collecting outright instead of emitting per-tick synthetic `SKIP`
-  samples. That silence is *bracketed*, never bare — each pause/resume **edge**
-  writes a durable `observing_edge` boundary row through the `Store` and
-  publishes the same transition as a `StreamFrame::Observing` frame on the
-  realtime bus, so the gap is bounded and attributable (to a `ts_us` and a
-  control-socket `peer_uid`) offline and after the fact. Silence that is *not*
-  bracketed by those records is a bug. Samples the bounded post-resume drain keeps
-  out of the trigger window are **not** a second exception: each is still written
-  to DuckDB and still published on the bus, and the drain itself is bounded by a
-  monotonic deadline and a drop cap and reports its totals, so "filtered from the
-  trigger window" never becomes "dropped from the record". The observing state
-  itself is process-scoped and deliberately never persisted — a restart always
-  resumes collecting.
-- **Isolation.** One collector failing must never take down the others; each runs
-  as a supervised task (log + keep ticking). Store write failures are logged as a
-  gap, not silently dropped.
-- **Errors:** `thiserror` in library crates, `anyhow` in binaries. **Config:**
-  `figment` (file + `NET_OBSERVER_*` env). **Async:** `tokio` (kept out of
-  `collector-core`). **Logging:** `tracing`.
+## Git-воркфлоу
+- **Conventional commits** (`feat:`/`fix:`/`chore:`/`refactor:`/`docs:`/`test:`). Ветки `feat/…`, `fix/…`, `chore/…`.
+- **Без co-author-трейлера и без атрибуции Claude** — ни в коммитах, ни в телах PR.
+- **Форжа**: GitHub, `origin` = `git@github.com:gurinderu/net-observer.git`. CLI — `gh` (установлен, аутентифицирован как `gurinderu`); наблюдение за проверками: `gh pr checks <n> --watch`.
+- **Локальный гейт**: pre-commit-хука в репо нет — прогоняй `cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all` руками до пуша.
+- **CI**: два workflow на `macos-latest`, оба гейтят и PR, и push в `main` — `lints` (`cargo fmt --all --check`, clippy с `-D warnings`, `RUSTFLAGS: -D warnings`) и `tests` (`cargo build --all`, `cargo test --all`). Пост-мерж-эксклюзивных джобов нет, паритет PR↔main полный. `net-observer-bar` в CI не собирается: он вне `default-members`, а `--workspace` там не передаётся — GUI ломается только локально.
+- **Definition of done**: не согласовано — прогони `iskron:iskronify` полным проходом. До тех пор мерж объявляет владелец, а «Дисциплина веток» ждёт этого объявления.
+- **Никогда** `--no-verify`, `--force`, `--no-gpg-sign`, `git reset --hard` без явной инструкции пользователя. Стейджить только явные пути — никогда `git add -A` / `.` / `-u`.
 
-## Behavioral oracle
+*(iskronify: контракт `5`, штамп `2026-09-01` — перезапусти, когда описание
+установленного iskronify называет контракт выше или когда источники, из которых
+выведен этот файл, сдвинулись после этой даты.)*
 
-The shell `net-observer` LaunchDaemon is the behavioral oracle for this rewrite:
-`~/projects/nix-config/hosts/mac_aarch64/net-observer.nix`. Its verdict
-vocabulary and incident-capture behavior (freeze timing, DHCP-vs-unicast DNS
-nuance, the coworking gateway signature, "absence of a fresh CoreCapture is
-itself the diagnostic") are the ground truth the Rust rewrite must not silently
-drift from. Keep the shell daemon running alongside during migration — its
-watchdog kickstart is the only current auto-recovery and must not be lost before
-an acting handler replaces it. Trigger rules are tested by replaying real
-recorded incident signatures as synthetic `Sample` streams.
-
-## Testing
-
-Unit tests live per crate; `store` is tested against an in-memory DuckDB. The
-pure mapping logic (`build_link_sample` / `build_proxy_samples`) is tested with
-fake port impls, so no live network or root is needed. Keep new behavior covered.
+Отложено быстрым режимом первого контакта: гейт качества, хуки харнесса,
+ролевые суб-агенты и авторское интервью (Nature, Production statement, Reality,
+Общие поверхности, Definition of done) — скажи `iskron:iskronify` ещё раз для полного прохода.
