@@ -56,7 +56,7 @@ One surface here has more than one consumer, and it is derived from the code, no
 |---|---|---|
 | `net-observer-ipc` — `Request`/`Response`, `ControlCmd`, `StatusSnapshot`, `StreamFrame` | holon `#7` «Подсистема чтения» in realm `r210` | `context` edges into `#7` reach the readers; the writing side is `bin/net-observerd` (`api.rs`), which serves the same types |
 
-Do not keep a consumer list in this file — walk the graph. Three consumers exist today (`net-observerd` serves, `net-observer-cli` and `net-observer-bar` call), and the bar is the one that breaks *silently*: it is not built here or in CI, so a field added to `StatusSnapshot` without updating the bar compiles everywhere you can look. `serde(default)` on new fields is the standing mitigation — it kept a pre-quiet daemon decodable — but it does not save a *sender* that forgot a field.
+Do not keep a consumer list in this file — walk the graph. Three consumers exist today: `net-observerd` serves, `net-observer-cli` and `net-observer-bar` call. The bar is the one that used to break silently, because nothing built it; `cargo build --all` inside `nix develop` now covers it, and CI has a step for it whose outcome on a GitHub runner is still unproven. Run the `--all` gate when you touch these types, or the bar is back to breaking out of sight. `serde(default)` on new fields is the standing mitigation — it kept a pre-quiet daemon decodable — but it does not save a *sender* that forgot a field.
 
 Touching this surface obliges the walk; adding a consumer obliges the edge, or the next walk will not know it exists.
 
@@ -74,10 +74,10 @@ Only the rows below are settled; the owner has not yet named carriers for the re
 |---|---|---|---|
 | Pure logic (sample mapping, trigger conditions, wire round-trip) | the test binaries of the default members | `cargo test` — read its own exit code, never a pipeline's | agent |
 | Compiles and lints clean | the default-member build | `cargo build` then `cargo clippy --all-targets --all-features -- -D warnings`, each exit code read separately | agent |
-| Anything about the menu bar | a compiled `net-observer-bar` | **unreachable** — see *Ceiling* | — |
+| The menu bar compiles and lints | a compiled `net-observer-bar` | inside `nix develop`: `cargo build -p net-observer-bar`, `cargo clippy -p net-observer-bar --all-targets -- -D warnings` | agent |
 
 **Ceiling** — claim classes with no reachable observation, and why:
-- **The menu bar renders / its buttons work.** `gpui` needs the macOS Metal Toolchain. `xcode-select` here points at the nix `apple-sdk`, which has no shader compiler; pointing `DEVELOPER_DIR` at Xcode finds `metal` but then breaks linking against the nix toolchain. CI does not build the bar either (`--workspace` is not passed). Any claim about the bar is `unreachable`, never confirmed from the source.
+- **The menu bar actually renders / a click does what it says.** Compiling it is reachable (row above); *running* it and seeing the panel is not something the agent can observe. A claim that the bar builds is confirmable; a claim about what the operator sees is not.
 - **The daemon's live behavior** (it really writes that row, the ring really freezes, quiet really silences the wire). Needs a root run on this Mac against a real network, and the owner has not named how he wants that observed. Until he does, such a claim is closed only by an observation named aloud *before* looking — never by re-reading the diff.
 
 **The table grows by use.** The moment a session learns a carrier this table does not hold, write the row then — in that session, before the work that taught it closes.
@@ -125,7 +125,7 @@ crates/
 | format | `cargo fmt --all` |
 | run | `just run ARGS` → `cargo run -p net-observerd -- ARGS` |
 
-Green means the sequence `cargo fmt --all` → `cargo build --all` → `cargo test --all` → `cargo clippy --all-targets --all-features -- -D warnings`.
+Green means the sequence `cargo fmt --all` → `cargo build --all` → `cargo test --all` → `cargo clippy --all-targets --all-features -- -D warnings`, **run from inside `nix develop`** — the `--all` steps include the menu bar, which only compiles there (see the gotcha below).
 
 Run each step so its **own** exit code is visible. Piping cargo into `tail`/`head` makes the pipeline exit status that of the pager, so a failing build reports success — this has already produced a false "green" in this repo.
 
@@ -141,7 +141,8 @@ Run each step so its **own** exit code is visible. Piping cargo into `tail`/`hea
 - **Test discipline**: unit tests per crate; `store` is tested against an in-memory DuckDB; the pure mapping logic (`build_link_sample` / `build_proxy_samples`) uses fake port impls, so no live network or root is needed. Trigger rules are tested by replaying real recorded incident signatures as synthetic `Sample` streams. Keep new behavior covered.
 - **Gotchas**:
   - The `duckdb` crate builds its C++ engine from source (`bundled`): a cold build reaches ~10 minutes. Use generous timeouts; a long build is not a hang.
-  - `net-observer-bar` is deliberately outside `default-members`: gpui's build script needs the macOS Metal Toolchain, absent on some machines. `cargo build` builds the daemon without it; build the bar explicitly with `-p net-observer-bar` or `--workspace`.
+  - `net-observer-bar` is outside `default-members`, so a plain `cargo build` / `cargo test` never sees it — a break there is invisible until someone asks for it by name. Use `--all` (or `-p net-observer-bar`) when your change touches the socket types.
+  - Building the bar needs Apple's Metal shader compiler, which nixpkgs cannot redistribute. The `xcrun` nix puts on PATH is xcbuild's reimplementation and has no `metal`, so gpui's build script fails with "missing Metal Toolchain" even where Xcode ships one. The dev shell shims **only** `xcrun` (see `flake.nix`): exporting `DEVELOPER_DIR` for the whole shell finds `metal` but repoints `cc`/`ld` at Xcode's SDK and linking against the nix toolchain then fails. **Build the bar from inside `nix develop`**; outside it, expect the Metal error.
   - The daemon's runtime paths stay under `/var/lib/observer/*` even though the project is called `net-observer`: the shell oracle daemon owns `/var/lib/net-observer` and `/var/log/net-observer.log` and, by the owner's decision, keeps running alongside during the migration. Move onto shared paths only once the shell daemon is retired, or the two fight over the pcap ring and the request drop-box.
   - The behavioral oracle for this rewrite is the shell daemon at `~/projects/nix-config/hosts/mac_aarch64/net-observer.nix`. Its verdict vocabulary and incident-capture behavior (freeze timing, the DHCP-vs-unicast DNS nuance, the coworking gateway signature, "absence of a fresh CoreCapture is itself the diagnostic") are the ground truth this rewrite must not silently drift from. It is also the only current auto-recovery (watchdog kickstart) — do not lose it before an acting handler replaces it.
 

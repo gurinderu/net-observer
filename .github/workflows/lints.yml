@@ -30,3 +30,8 @@ jobs:
 
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Same reasoning as the bar build step in tests.yml: clippy over the
+      # default members never sees the menu bar. UNVERIFIED on CI until it runs.
+      - name: clippy the menu bar (unverified on CI — see tests.yml)
+        run: cargo clippy -p net-observer-bar --all-targets -- -D warnings

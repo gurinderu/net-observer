@@ -30,3 +30,14 @@ jobs:
 
       - name: test
         run: cargo test --all
+
+      # The gpui menu bar is outside `default-members` because its build script
+      # needs Apple's Metal shader compiler, so `cargo build`/`test` skip it and
+      # a break in it is invisible until someone runs the GUI. `--all` above does
+      # cover it, but only if the runner actually has the Metal Toolchain: recent
+      # Xcode ships it as a separate downloadable component. Kept as its own step
+      # so the daemon's verdict stays readable when this one is the thing that
+      # failed, and named honestly: whether a GitHub runner carries the toolchain
+      # is UNVERIFIED here — the first run of this job is what answers it.
+      - name: build the menu bar (unverified on CI — see comment)
+        run: cargo build -p net-observer-bar
