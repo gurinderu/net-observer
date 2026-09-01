@@ -34,6 +34,7 @@
 //! by `acting.enabled`. While paused the header shows a muted "paused" state and the
 //! daemon stays alive so the switch can turn collection back on.
 
+use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
@@ -272,6 +273,63 @@ pub fn send_set_observing(socket_path: &str, on: bool) -> Result<ControlResult, 
     control_query(socket_path, ControlCmd::SetObserving(on))
 }
 
+/// How many refresh ticks the panel's own sparkline history keeps.
+///
+/// 120 points at the menu-bar's `REFRESH` cadence of 3s (see [`crate::menubar`])
+/// is a 6-minute window. That length is chosen against the failure this panel
+/// exists to catch: the coworking gateway does not drop, it *ramps* — the reply
+/// time climbs for roughly 40 seconds before the gateway stops answering at all.
+/// Six minutes shows that ramp with several minutes of quiet baseline in front of
+/// it, so the slope is legible as a departure rather than filling the whole chart;
+/// it is also short enough that 120 one-pixel columns fit the 320pt panel width
+/// without downsampling, so every point drawn is a point measured.
+///
+/// **This history is the bar's own, and it is not a record.** It starts empty when
+/// the bar launches and dies with the process — the daemon's DuckDB store is the
+/// record, and the bar never opens it (the daemon is the sole DB owner). A short
+/// line after a restart means "the bar just started", never "the network was
+/// fine".
+pub const HISTORY_LEN: usize = 120;
+
+/// One refresh tick's worth of plottable values.
+///
+/// Both fields are `Option` on purpose. A tick where the measurement did not
+/// happen — no sample yet, a paused daemon, quiet mode (`gw = SKIP`), a gateway
+/// that failed or is absent, or an unreachable daemon — is a **gap**, and a gap is
+/// not a zero. Plotting a missing measurement as a value on the floor is the same
+/// lie the `SKIP` verdict exists to prevent (see `AGENTS.md`, "SKIP, never
+/// silence"): it would draw a flat healthy-looking 0ms line for a gateway that was
+/// never asked.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HistoryPoint {
+    /// Gateway round-trip time, `None` when nothing was measured this tick.
+    pub gw_rtt_ms: Option<f64>,
+    /// Host 1-minute load average, `None` when there is no host sample.
+    pub load1: Option<f64>,
+}
+
+/// Reduce a snapshot to the one plottable point for this tick.
+///
+/// Pure over its inputs, so the gap rules above are directly testable. `online` is
+/// [`Glance::online`]: an unreachable daemon measured nothing, whatever the stale
+/// snapshot still says.
+pub fn history_point(snapshot: &StatusSnapshot, online: bool) -> HistoryPoint {
+    if !online || !snapshot.observing {
+        // Offline or paused: collection is not running. Nothing was measured.
+        return HistoryPoint::default();
+    }
+    let gw_rtt_ms = snapshot.link.as_ref().and_then(|l| match l.gw {
+        // Only an answered echo carries a time. FAIL/NOGW have no RTT to plot and
+        // SKIP means quiet mode — the echo was deliberately not sent.
+        types::GwVerdict::Ok => l.gw_rtt_ms,
+        types::GwVerdict::Fail | types::GwVerdict::NoGw | types::GwVerdict::Skip => None,
+    });
+    HistoryPoint {
+        gw_rtt_ms,
+        load1: snapshot.host.as_ref().map(|h| h.load1),
+    }
+}
+
 /// Shared, app-scoped model: the latest snapshot the UI renders.
 pub struct Glance {
     pub snapshot: StatusSnapshot,
@@ -289,6 +347,11 @@ pub struct Glance {
     /// panel re-opens) so a second "Events" click focuses the existing window
     /// instead of opening a duplicate subscription; a stale handle re-opens.
     pub events_window: Option<gpui::AnyWindowHandle>,
+    /// The panel's own bounded history of the last [`HISTORY_LEN`] refresh ticks,
+    /// oldest first — the series behind the sparklines. Appended by
+    /// [`Glance::record_tick`] from the refresh timer *only*, so one column is one
+    /// `REFRESH` interval and the window length is a real duration.
+    pub history: VecDeque<HistoryPoint>,
 }
 
 impl Glance {
@@ -299,7 +362,24 @@ impl Glance {
             socket_path,
             control_msg: None,
             events_window: None,
+            history: VecDeque::with_capacity(HISTORY_LEN),
         }
+    }
+
+    /// Append the current state as one sparkline point, evicting the oldest once
+    /// [`HISTORY_LEN`] is reached — the ring never grows past that bound.
+    ///
+    /// Called from the refresh timer after it has applied the tick's read, and
+    /// from nowhere else: the manual "Refresh" button and the observing toggle
+    /// also re-read the daemon, but appending there would compress the time axis
+    /// (two columns a second apart drawn as one interval), so they update the
+    /// snapshot without adding a column.
+    pub fn record_tick(&mut self) {
+        if self.history.len() == HISTORY_LEN {
+            self.history.pop_front();
+        }
+        self.history
+            .push_back(history_point(&self.snapshot, self.online()));
     }
 
     /// Re-query the daemon into this model. Used by the manual refresh button; the
@@ -441,6 +521,7 @@ impl Render for PanelView {
         let glance = self.model.read(cx);
         let snapshot = glance.snapshot.clone();
         let control_msg = glance.control_msg.clone();
+        let history = glance.history.clone();
         let now_us = now_us();
         // Offline (daemon down / socket absent) ⇒ we cannot be observing, so the
         // switch reads OFF and is non-interactive regardless of the stale snapshot.
@@ -470,6 +551,10 @@ impl Render for PanelView {
             .rounded_lg()
             .overflow_hidden()
             .child(header_row(&snapshot, online, offline_msg, theme, cx))
+            .child(separator(theme))
+            // Trend before state: the gateway fails as a ramp, so the slope is
+            // read first and the current verdicts underneath it.
+            .child(sparklines_section(&history, theme))
             .child(separator(theme))
             .child(status_rows(&snapshot, now_us, theme))
             .child(separator(theme))
@@ -946,6 +1031,171 @@ fn spawn_control(view: &PanelView, cx: &mut Context<PanelView>, round_trip: Cont
     .detach();
 }
 
+// ---- sparklines ------------------------------------------------------------
+
+/// Gateway RTT, in ms, above which the panel calls the gateway slow. The
+/// coworking gateway's failure is a ramp, not a drop: crossing this line while
+/// still answering is the early warning a single current number hides.
+const RTT_THRESHOLD_MS: f64 = 300.0;
+
+/// Host 1-minute load above which the panel calls the host starved — the same
+/// number the daemon's `Starvation` condition uses (`STARVATION_LOAD`,
+/// `bin/net-observerd/src/main.rs`), so the line the operator watches and the
+/// line the trigger fires on are one line.
+///
+/// 16 belongs to a different daemon: the shell LaunchDaemon this project
+/// replaces gates its watchdog at `load1 < 16`. Reading that number off the
+/// oracle and drawing it here would put the panel a whole failure-band away from
+/// the trigger it is supposed to preview.
+const LOAD_THRESHOLD: f64 = 10.0;
+
+/// Height of a sparkline's plot area, in gpui logical pixels.
+const SPARK_H: f32 = 28.0;
+/// Width of one column, and of the gap after it. One point is 1px of ink plus 1px
+/// of air, so [`HISTORY_LEN`] columns occupy 240pt and fit the 320pt panel's
+/// content width without downsampling.
+const SPARK_COL_W: f32 = 1.0;
+const SPARK_GAP: f32 = 1.0;
+
+/// The scale a sparkline is drawn against: the largest of the observed values and
+/// the threshold, so the threshold rule is always on-screen and no bar ever
+/// overflows the plot area. Pure, and tested.
+fn spark_scale(values: &[Option<f64>], threshold: f64) -> f64 {
+    values
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .fold(threshold, f64::max)
+}
+
+/// The two stacked sparklines — gateway RTT over host load — drawn from the
+/// panel's own bounded history (see [`HISTORY_LEN`]: this is the bar's window, not
+/// the daemon's record).
+fn sparklines_section(history: &VecDeque<HistoryPoint>, theme: Theme) -> impl IntoElement {
+    let rtt: Vec<Option<f64>> = history.iter().map(|p| p.gw_rtt_ms).collect();
+    let load: Vec<Option<f64>> = history.iter().map(|p| p.load1).collect();
+    div()
+        .flex()
+        .flex_col()
+        .px_3()
+        .py_1()
+        .gap_1()
+        .child(sparkline("gw rtt", "ms", &rtt, RTT_THRESHOLD_MS, theme))
+        .child(sparkline("load", "", &load, LOAD_THRESHOLD, theme))
+}
+
+/// One labelled sparkline: a caption row (name, latest value) over a plot area.
+///
+/// gpui 0.2.2 has no chart primitive, so the plot is literally a row of thin
+/// `div`s whose heights encode the values, newest on the right, with a 1px
+/// `separator` hairline sitting at the threshold — subordinate to the data, which
+/// is the only thing carrying colour.
+///
+/// A `None` entry renders as an **empty column**, not a zero-height bar on the
+/// baseline: a tick that measured nothing must read as a gap in the line.
+fn sparkline(
+    label: &'static str,
+    unit: &'static str,
+    values: &[Option<f64>],
+    threshold: f64,
+    theme: Theme,
+) -> impl IntoElement {
+    let scale = spark_scale(values, threshold);
+    let latest = values.iter().rev().flatten().next().copied();
+    let (latest_text, latest_color) = match latest {
+        Some(v) => (
+            format!("{v:.1}{}{unit}", if unit.is_empty() { "" } else { " " }),
+            spark_color(v, threshold, theme),
+        ),
+        // Nothing measured in the whole window — say so, do not show a stale value.
+        None => ("no data".to_string(), rgb(theme.muted)),
+    };
+
+    // The threshold hairline, positioned by the same scale as the bars.
+    let rule_bottom = px((threshold / scale) as f32 * SPARK_H);
+
+    let bars = values.iter().map(move |v| {
+        let col = div()
+            .w(px(SPARK_COL_W))
+            .h_full()
+            .flex()
+            .flex_col()
+            .justify_end();
+        match v {
+            // A measured value: a bar at least 1px tall, so a real near-zero
+            // reading is still visible as ink rather than as a gap.
+            Some(value) => col.child(
+                div()
+                    .w_full()
+                    .h(px((((value / scale) as f32) * SPARK_H).clamp(1.0, SPARK_H)))
+                    .bg(spark_color(*value, threshold, theme)),
+            ),
+            // A gap: the column stays empty.
+            None => col,
+        }
+    });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(theme.muted))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(latest_color)
+                        .child(latest_text),
+                ),
+        )
+        .child(
+            div()
+                .relative()
+                .h(px(SPARK_H))
+                .w_full()
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .bottom(rule_bottom)
+                        .w_full()
+                        .h(px(1.0))
+                        .bg(rgb(theme.separator)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_end()
+                        .h_full()
+                        .gap(px(SPARK_GAP))
+                        .children(bars),
+                ),
+        )
+}
+
+/// Colour for one plotted value, using the panel's existing health tokens: over
+/// the threshold is `bad`, the approach to it (from 60% up) is `warn`, below that
+/// is `ok`. No new palette — the sparkline agrees with the rows beneath it.
+fn spark_color(value: f64, threshold: f64, theme: Theme) -> Rgba {
+    if value >= threshold {
+        rgb(theme.bad)
+    } else if value >= threshold * 0.6 {
+        rgb(theme.warn)
+    } else {
+        rgb(theme.ok)
+    }
+}
+
 // ---- small element helpers -------------------------------------------------
 
 /// A hairline separator between sections — a 1px full-width rule, no borders.
@@ -1044,6 +1294,140 @@ fn freshness_line(snapshot: &StatusSnapshot, now_us: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn link(gw: types::GwVerdict, rtt: Option<f64>) -> types::LinkSample {
+        types::LinkSample {
+            ts_us: 1_000_000,
+            gw,
+            gw_rtt_ms: rtt,
+            direct: types::TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+        }
+    }
+
+    fn glance() -> Glance {
+        Glance::new(StatusSnapshot::default(), None, "/nonexistent.sock".into())
+    }
+
+    /// The ring is bounded: it never exceeds `HISTORY_LEN`, and it evicts the
+    /// oldest column rather than the newest — the sparkline must keep showing the
+    /// present, not freeze on the first six minutes after launch.
+    #[test]
+    fn history_ring_stays_bounded_and_drops_the_oldest() {
+        let mut g = glance();
+        for i in 0..(HISTORY_LEN * 2) {
+            g.snapshot.host = Some(types::HostSample {
+                ts_us: i as i64,
+                load1: i as f64,
+                load5: 0.0,
+                load15: 0.0,
+            });
+            g.record_tick();
+            assert!(
+                g.history.len() <= HISTORY_LEN,
+                "ring grew past its bound at tick {i}"
+            );
+        }
+        assert_eq!(g.history.len(), HISTORY_LEN);
+        // The window holds the LAST HISTORY_LEN ticks, oldest first.
+        assert_eq!(
+            g.history.front().unwrap().load1,
+            Some(HISTORY_LEN as f64),
+            "oldest retained column must be the (2N - N)th tick"
+        );
+        assert_eq!(
+            g.history.back().unwrap().load1,
+            Some((HISTORY_LEN * 2 - 1) as f64),
+            "newest column must be the most recent tick"
+        );
+    }
+
+    /// A gap is not a zero. Every way a measurement can fail to happen must land
+    /// as `None`, never as a value on the floor.
+    #[test]
+    fn unmeasured_ticks_stay_gaps() {
+        // No sample at all.
+        let empty = StatusSnapshot::default();
+        assert_eq!(history_point(&empty, true), HistoryPoint::default());
+
+        // Gateway verdicts that carry no measured reply time. SKIP is quiet mode:
+        // the echo was deliberately never sent.
+        for gw in [
+            types::GwVerdict::Fail,
+            types::GwVerdict::NoGw,
+            types::GwVerdict::Skip,
+        ] {
+            // Even with an RTT field set, a non-OK verdict is not a measurement.
+            let s = StatusSnapshot {
+                link: Some(link(gw, Some(42.0))),
+                ..Default::default()
+            };
+            assert_eq!(
+                history_point(&s, true).gw_rtt_ms,
+                None,
+                "{gw} must be a gap, not a plotted value"
+            );
+        }
+
+        // An OK verdict with no time is still a gap.
+        let s = StatusSnapshot {
+            link: Some(link(types::GwVerdict::Ok, None)),
+            ..Default::default()
+        };
+        assert_eq!(history_point(&s, true).gw_rtt_ms, None);
+
+        // A paused daemon collects nothing, however healthy the retained snapshot
+        // looks; and an unreachable daemon measured nothing at all.
+        let live = StatusSnapshot {
+            link: Some(link(types::GwVerdict::Ok, Some(12.0))),
+            host: Some(types::HostSample {
+                ts_us: 1,
+                load1: 3.0,
+                load5: 0.0,
+                load15: 0.0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            history_point(&live, true),
+            HistoryPoint {
+                gw_rtt_ms: Some(12.0),
+                load1: Some(3.0)
+            },
+            "a live, observing daemon plots both series"
+        );
+        let mut paused = live.clone();
+        paused.observing = false;
+        assert_eq!(history_point(&paused, true), HistoryPoint::default());
+        assert_eq!(history_point(&live, false), HistoryPoint::default());
+    }
+
+    /// The bar's own reachability, not the stale snapshot, decides: a `Glance`
+    /// holding an `Unreachable` error records a gap.
+    #[test]
+    fn offline_glance_records_a_gap() {
+        let mut g = glance();
+        g.snapshot.link = Some(link(types::GwVerdict::Ok, Some(99.0)));
+        g.error = Some(GlanceError::Unreachable("no socket".into()));
+        g.record_tick();
+        assert_eq!(g.history.back().copied(), Some(HistoryPoint::default()));
+    }
+
+    /// The plot scale never falls below the threshold (so the rule is always
+    /// visible) and never below the data (so no bar overflows the plot area).
+    #[test]
+    fn spark_scale_covers_threshold_and_data() {
+        assert_eq!(spark_scale(&[], 300.0), 300.0);
+        assert_eq!(spark_scale(&[Some(10.0), None], 300.0), 300.0);
+        assert_eq!(spark_scale(&[Some(10.0), Some(900.0)], 300.0), 900.0);
+        // Gaps and non-finite readings must not poison the scale.
+        assert_eq!(spark_scale(&[None, Some(f64::NAN)], 16.0), 16.0);
+    }
 
     #[test]
     fn age_str_buckets() {
