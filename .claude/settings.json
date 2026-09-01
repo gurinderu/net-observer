@@ -1,5 +1,39 @@
 {
   "enabledPlugins": {
     "iskron@iskron": true
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Orient in the graph before acting: realm net-observer (r210), focus holon #1 «Контур сетевой форензики мака». Read the ACTIVE BIANHUA map with iskron_orient(realm=\\\"r210\\\", lens=\\\"bianhua\\\"). Then open your agenda: iskron_orient(realm=\\\"r210\\\", focus=\\\"#2\\\") — the agent role is #2; incoming posed_to vimarshas are this session inbox, take each or defer it explicitly. Protocol: iskron:entry.\"}}'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.command // \"\"' | grep -q 'git push' && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"A push happened. First ask WHICH push: a push that only opened or updated a change shipped nothing — record the answer where it actually stands and leave bodies and modes describing what the trunk carries. After a MERGE: update the graph from fresh artifact evidence only (check against reality, advance the bianhua map), close along the axis (addressed_by records the answer; release is a separate act), sweep the whole shipped holon (not only touched nodes), work the posed_to inbox, run the post-green self-review, and open a COLD review with the reviewer subagent — give it the branch diff, the repository and the graph framing node, never your own retelling; walk the trace from that node to affected neighbours first and fix the graph if it breaks. Re-read the diff and the nodes for borrowed project-management words (ticket, backlog, sprint, epic, story, done, blocker, committed): name each to the user and ask what it is called in this project — do not substitute on your own. Also: git fetch -q origin main && git merge-base --is-ancestor origin/main HEAD || say the branch is behind main.\"}}' || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // \"\"' | grep -Eq '\\.claude/projects/.*/memory/' && { echo 'BLOCKED: local agent memory is forbidden entirely, not by category (AGENTS.md, Persistence rules). Route the fact: repo conventions / code facts -> AGENTS.md; project state, this project servers and dated duties -> the net-observer realm (r210); a user-scoped fact no project owns -> the personal realm @nick/mind (minding skill). This dir stays frozen at its prohibition stub.' >&2; exit 2; } || exit 0"
+          }
+        ]
+      }
+    ]
   }
 }

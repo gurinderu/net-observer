@@ -19,6 +19,7 @@ State lives in the **repo** or in the **graph** — nowhere else. The harness's 
 - **Design and spec drafts written in this repo are a view, not the record**: the graph (realm `net-observer`, `r210`) holds the decisions, and such a file is one rendering of them. A dated plan is a historical trace of what was decided then — do not edit it to match current state.
 - **This overrides the harness's own memory instruction**, which invites a `project` category. Route instead, asking **whose fact is this?** Repo convention, code fact, this project's procedures and dated debts → this file or a node in the `net-observer` realm; work state, decision, open question → a vimarsha in the graph. A fact that is the user's own and serves no single project (personal machines, deadlines, people, cross-project lessons) → their personal realm `@nick/mind`; a fact about another project → that project's realm. Standing preferences are instructions, not facts: project-scoped ones here, cross-project ones in the user's global instruction file.
 - Before finishing a task, check that every durable fact from context is persisted by this routing: an unpersisted fact is a failed task, not a nicety.
+- The local memory directory is **evacuated and frozen**: its `MEMORY.md` is a one-line prohibition stub, and the `PreToolUse` memory-guard hook blocks any write there with exit 2.
 
 ## Session lifecycle
 Graph = the work (structure, open questions, what is next). Git = how we got here (SHAs, branches, PRs). **Git references never enter the graph** — no SHAs, no branch names, no PR numbers.
@@ -28,7 +29,8 @@ Graph = the work (structure, open questions, what is next). Git = how we got her
 - **Every task is described before it is begun, and recorded as what it is.** A one-off act is an anga vimarsha on the transformation it moves; **a kriya is only a repeatable transition**, where every run eats the same ahara and produces the same utpatti.
 - **Every merge → update the graph.** A push that only opened a PR shipped nothing. On merge: check against reality (the deployed artifact, not the diff), advance the transformation map, close along the axis (`addressed_by` records the answer; release is a separate act), sweep the shipped holon, work the inbox, run `iskron:reconcile`.
 - **Vocabulary pass.** Re-read what you are about to land for borrowed project-management words (ticket, backlog, sprint, epic, story, done, blocker). Do not substitute on your own: name each to the user and ask what it is called in this project.
-- **A claim you made is not a claim you accept.** Behavioral claims ("the fix works", "the daemon writes that line") are closed by a cold verifier's verdict, never by your own re-reading. Delegation subagents are not set up yet — run `iskron:iskronify` for the full pass; until then take the observation yourself against the carrier, never from the source that was supposed to produce it.
+- **A claim you made is not a claim you accept.** Behavioral claims ("the fix works", "the daemon writes that line") are closed by the cold `verifier` subagent's verdict, never by your own re-reading — give it the claim, the carrier and the falsifier, and wait for the verdict. Review of an open change goes to `reviewer` the same way. Role files live in `.claude/agents/`; their descriptions say when to call each and what not to trust.
+- **The rituals above are wired as hooks** in `.claude/settings.json`: session-start orientation, a post-`git push` reminder, and a blocking memory-guard. The `Stop` anti-freeze hook is NOT wired — its decision-block format was not specified well enough to write without guessing.
 - **Keep this file honest.** Compare the contract number in the stamp below with the first word of the installed `iskron:iskronify` skill description — it sits in every session's context, so the check costs no call. If they differ, running `iskron:iskronify` is the session's first move.
 
 ### After a green push: self-review
@@ -105,11 +107,15 @@ crates/
 
 Green means the sequence `cargo fmt --all` → `cargo build --all` → `cargo test --all` → `cargo clippy --all-targets --all-features -- -D warnings`.
 
+Run each step so its **own** exit code is visible. Piping cargo into `tail`/`head` makes the pipeline exit status that of the pager, so a failing build reports success — this has already produced a false "green" in this repo.
+
+`clippy::pedantic` is deliberately NOT enabled: measured on 2026-09-01 it raises **215** warnings (largest groups `doc_markdown`, `must_use_candidate`, `cast_possible_truncation`, `map_unwrap_or`). Turning it on is a refactoring commitment, not a flag — it needs an explicit decision, not a bootstrap.
+
 ## Code conventions
 - **Meaning lives in the graph, code references it.** A comment carrying the rationale for a decision or the alternatives rejected is a graph node: move the meaning into the graph and leave `(realm net-observer, node #N)` in the code. Step mechanics belong in the comment; rationale and integration field belong in the graph. Having cited a node, check that it really says what you cited it for.
 - **Maximize Rust.** Prefer a pure-Rust crate for every component. Native (C/C++) deps are allowed only where no adequate equivalent exists, and each exception is named here. Current exceptions: **DuckDB** (no pure-Rust DB offers native `ASOF JOIN`) and, for v1 only, the **`tcpdump` child** behind the pcap ring. Any future GUI is `gpui`.
 - **v1 = observe + detect, never act.** No `launchctl kickstart`, no watchdog, no notifications. Triggers fire *passive* handlers only (record an incident, freeze the pcap ring). Acting handlers sit behind the same `Condition → Handler` interface but are not in v1.
-- **SKIP, never silence.** A probe that cannot run emits a `SKIP` verdict rather than going quiet — absence of a signal is itself diagnostic. The one sanctioned exception is an operator pause (`ControlCmd::SetObserving`): a paused daemon stops collecting outright instead of emitting per-tick synthetic `SKIP` samples. That silence is *bracketed*: each pause/resume edge writes a durable `observing_edge` row through the `Store` and publishes a `StreamFrame::Observing` on the realtime bus, so the gap is bounded and attributable (to a `ts_us` and a control-socket `peer_uid`). Unbracketed silence is a bug. Samples the bounded post-resume drain keeps out of the trigger window are not a second exception: each is still written to DuckDB and published on the bus, and the drain is bounded by a monotonic deadline and a drop cap and reports its totals. The observing state is process-scoped and deliberately never persisted — a restart always resumes collecting.
+- **SKIP, never silence.** A probe that cannot run emits a `SKIP` verdict rather than going quiet — absence of a signal is itself diagnostic. Quiet mode is not an exception to this: `SetQuiet(true)` withholds the gateway echo but the link collector keeps emitting one sample per tick with `gw = SKIP`, and the triggers read that as no measurement — never as a healthy gateway, never as a drop. The one sanctioned exception is an operator pause (`ControlCmd::SetObserving`): a paused daemon stops collecting outright instead of emitting per-tick synthetic `SKIP` samples. That silence is *bracketed*: each pause/resume edge writes a durable `observing_edge` row through the `Store` and publishes a `StreamFrame::Observing` on the realtime bus, so the gap is bounded and attributable (to a `ts_us` and a control-socket `peer_uid`). Unbracketed silence is a bug. Samples the bounded post-resume drain keeps out of the trigger window are not a second exception: each is still written to DuckDB and published on the bus, and the drain is bounded by a monotonic deadline and a drop cap and reports its totals. The observing state is process-scoped and deliberately never persisted — a restart always resumes collecting.
 - **Isolation.** One collector failing must never take down the others; each runs as a supervised task (log and keep ticking). Store write failures are logged as a gap, never swallowed.
 - **Errors:** `thiserror` in library crates, `anyhow` in binaries. **Config:** `figment` (file + `NET_OBSERVER_*`). **Async:** `tokio`, kept out of `collector-core`. **Logging:** `tracing`.
 - **Test discipline**: unit tests per crate; `store` is tested against an in-memory DuckDB; the pure mapping logic (`build_link_sample` / `build_proxy_samples`) uses fake port impls, so no live network or root is needed. Trigger rules are tested by replaying real recorded incident signatures as synthetic `Sample` streams. Keep new behavior covered.
@@ -133,11 +139,10 @@ Green means the sequence `cargo fmt --all` → `cargo build --all` → `cargo te
 - **Definition of done**: not agreed — run `iskron:iskronify` for the full pass. Until then the owner declares a merge, and branch discipline waits for that declaration.
 - **Never** `--no-verify`, `--force`, `--no-gpg-sign`, or `git reset --hard` without an explicit instruction from the user. Stage explicit paths only — never `git add -A` / `.` / `-u`.
 
-*(iskronify: contract `5`, stamp `2026-09-01` — re-run when the installed
+*(iskronify: contract `5`, stamp `2026-09-01` (full pass) — re-run when the installed
 iskronify's description names a higher contract, or when the sources this file
 was derived from have moved since that date.)*
 
-Deferred by the first-contact quick pass: the quality gate, harness hooks,
-delegation subagents, and the authored slots (Nature, production statement,
-Reality, shared surfaces, definition of done) — say `iskron:iskronify` again for
-the full pass.
+Still not agreed, and named rather than guessed: Nature, the production
+statement, the *Reality* table, shared surfaces, and the definition of done.
+Everything derivable has been re-projected from its source in this pass.
