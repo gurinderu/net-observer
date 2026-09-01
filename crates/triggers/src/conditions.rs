@@ -57,6 +57,7 @@ const GW_CHANGE_SCAN: usize = 64;
 /// `Skip` (quiet mode: the echo was deliberately not sent) is NOT a drop — it is
 /// the absence of a measurement — and the match is exhaustive over the verdict so
 /// a future token cannot join the fault set by accident.
+/// The rule this obeys: realm `net-observer`, node #25.
 pub struct GwDrop;
 impl Condition for GwDrop {
     fn id(&self) -> &'static str {

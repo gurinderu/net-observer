@@ -25,8 +25,9 @@ pub struct ParseVerdictError(pub String);
 
 // `Skip` is the quiet-mode token: the operator suppressed the gateway echo, so
 // the probe did not run. It is NOT a health verdict — neither healthy nor failed —
-// and the trigger conditions treat it as "no measurement" rather than as a state
-// (SKIP, never silence).
+// and the trigger conditions treat it as "no measurement" rather than as a state.
+// What that obliges every reader to do, and why a change that happened *under*
+// quiet must still be seen: realm `net-observer`, node #25.
 token_enum!(GwVerdict { Ok => "OK", Fail => "FAIL", NoGw => "NOGW", Skip => "SKIP" });
 token_enum!(TcpVerdict { Ok => "OK", Fail => "FAIL", Skip => "SKIP" });
 token_enum!(DnsVerdict {

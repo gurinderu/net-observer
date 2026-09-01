@@ -32,6 +32,8 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       # Same reasoning as the bar build step in tests.yml: clippy over the
-      # default members never sees the menu bar. UNVERIFIED on CI until it runs.
-      - name: clippy the menu bar (unverified on CI — see tests.yml)
+      # default members never sees the menu bar. This step is why a
+      # `type_complexity` error in the GUI was caught at all — the local gate
+      # was missing `--all` and never checked it.
+      - name: clippy the menu bar
         run: cargo clippy -p net-observer-bar --all-targets -- -D warnings
