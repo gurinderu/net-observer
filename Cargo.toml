@@ -12,6 +12,7 @@ members = [
     "crates/collector-route",
     "crates/collector-host",
     "crates/collector-wifi",
+    "crates/collector-neighbors",
     "crates/triggers",
     "crates/macos",
     "bin/net-observerd",
@@ -36,6 +37,7 @@ default-members = [
     "crates/collector-route",
     "crates/collector-host",
     "crates/collector-wifi",
+    "crates/collector-neighbors",
     "crates/triggers",
     "crates/macos",
     "bin/net-observerd",
@@ -83,5 +85,6 @@ collector-dns = { path = "crates/collector-dns" }
 collector-route = { path = "crates/collector-route" }
 collector-host = { path = "crates/collector-host" }
 collector-wifi = { path = "crates/collector-wifi" }
+collector-neighbors = { path = "crates/collector-neighbors" }
 triggers = { path = "crates/triggers" }
 macos = { path = "crates/macos" }

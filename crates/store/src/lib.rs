@@ -2,7 +2,7 @@ pub mod diagnosis;
 mod duckdb_store;
 mod schema;
 
-pub use duckdb_store::{DuckdbStore, QueryTable, StoreError};
+pub use duckdb_store::{DuckdbStore, NeighborScan, QueryTable, StoreError};
 use types::{BlobRef, Incident, ObservingEdge, Sample, TriggerFired};
 
 pub trait Store {

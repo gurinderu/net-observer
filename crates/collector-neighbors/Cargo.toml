@@ -1,0 +1,10 @@
+[package]
+name = "collector-neighbors"
+edition.workspace = true
+
+[dependencies]
+types.workspace = true
+collector-core.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

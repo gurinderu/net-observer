@@ -3,6 +3,26 @@ use duckdb::{Connection, params};
 use std::sync::Mutex;
 use types::{BlobRef, Incident, ObservingEdge, Sample, TriggerFired};
 
+/// `network_key` for a segment whose gateway MAC could not be read. Neighbours
+/// still get recorded — under a key that says plainly the network was not
+/// identified, rather than being silently merged into someone else's.
+const UNKNOWN_NETWORK: &str = "unknown";
+
+/// One operator-pressed neighbour scan, as written to `neighbor_scan`.
+#[derive(Debug, Clone)]
+pub struct NeighborScan {
+    pub ts_us: i64,
+    pub network_key: Option<String>,
+    pub iface: Option<String>,
+    /// "sweep" | "mdns".
+    pub method: String,
+    /// What was probed: the subnet in CIDR form, or the mDNS service type.
+    pub target: String,
+    pub found: i32,
+    pub duration_ms: i64,
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct StoreError(#[from] pub duckdb::Error);
@@ -73,6 +93,24 @@ impl DuckdbStore {
             columns,
             rows: out_rows,
         })
+    }
+
+    /// Record one operator-pressed scan (see the `neighbor_scan` table).
+    pub fn write_neighbor_scan(&self, s: &NeighborScan) -> Result<(), StoreError> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO neighbor_scan VALUES (?,?,?,?,?,?,?,?)",
+            params![
+                s.ts_us,
+                s.network_key,
+                s.iface,
+                s.method,
+                s.target,
+                s.found,
+                s.duration_ms,
+                s.detail
+            ],
+        )?;
+        Ok(())
     }
 }
 
@@ -162,9 +200,53 @@ impl Store for DuckdbStore {
                     w.channel_band
                 ],
             )?,
+            // Two writes, not one: the tick's own row (so a SKIP leaves a trace)
+            // and an upsert per neighbour into the long-lived entity table.
+            Sample::Neighbors(n) => {
+                c.execute(
+                    "INSERT INTO neighbor_sample VALUES (?,?,?,?,?,?)",
+                    params![
+                        n.ts_us,
+                        n.network_key,
+                        n.iface,
+                        n.verdict.to_string(),
+                        n.reason,
+                        i32::try_from(n.neighbors.len()).unwrap_or(i32::MAX)
+                    ],
+                )?;
+                let key = n.network_key.as_deref().unwrap_or(UNKNOWN_NETWORK);
+                for nb in &n.neighbors {
+                    c.execute(
+                        // `first_seen_us` is never overwritten — it is the whole
+                        // point of the row. A hostname already known is kept when
+                        // the new sighting carries none (a passive ARP read never
+                        // has one, and must not erase what a scan learned).
+                        "INSERT INTO neighbor VALUES (?,?,?,?,?,?,?,?,?)
+                         ON CONFLICT (network_key, mac) DO UPDATE SET
+                           ip = excluded.ip,
+                           iface = excluded.iface,
+                           hostname = coalesce(excluded.hostname, neighbor.hostname),
+                           source = excluded.source,
+                           last_seen_us = excluded.last_seen_us",
+                        params![
+                            key,
+                            nb.mac,
+                            nb.ip,
+                            n.iface,
+                            nb.oui(),
+                            nb.hostname,
+                            nb.source.to_string(),
+                            n.ts_us,
+                            n.ts_us
+                        ],
+                    )?;
+                }
+                0
+            }
         };
         Ok(())
     }
+
     fn open_incident(&self, i: &Incident) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO incident VALUES (?,?,?,?,?)",
@@ -214,7 +296,151 @@ impl Store for DuckdbStore {
 mod tests {
     use super::*;
     use crate::Store;
-    use types::{GwVerdict, LinkSample, Sample, TcpVerdict};
+    use types::{
+        GwVerdict, LinkSample, NeighborObs, NeighborSource, NeighborsSample, NeighborsVerdict,
+        Sample, TcpVerdict,
+    };
+
+    /// A neighbours tick for one device, so the upsert rules can be driven.
+    fn neighbors_tick(
+        ts_us: i64,
+        mac: &str,
+        ip: &str,
+        hostname: Option<&str>,
+        source: NeighborSource,
+    ) -> Sample {
+        Sample::Neighbors(NeighborsSample {
+            ts_us,
+            verdict: NeighborsVerdict::Ok,
+            reason: None,
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            iface: Some("en0".into()),
+            neighbors: vec![NeighborObs {
+                mac: mac.into(),
+                ip: ip.into(),
+                source,
+                hostname: hostname.map(str::to_string),
+            }],
+        })
+    }
+
+    /// The whole reason `neighbor` is not a per-tick table: a device seen twice
+    /// is ONE row, keeping the moment it was first seen while its address and
+    /// last sighting move forward.
+    #[test]
+    fn a_neighbour_seen_twice_is_one_row_that_keeps_its_first_sighting() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&neighbors_tick(
+            1000,
+            "11:22:33:44:55:66",
+            "192.168.1.5",
+            None,
+            NeighborSource::Arp,
+        ))
+        .unwrap();
+        s.write_sample(&neighbors_tick(
+            2000,
+            "11:22:33:44:55:66",
+            "192.168.1.9",
+            None,
+            NeighborSource::Arp,
+        ))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM neighbor").unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT first_seen_us FROM neighbor")
+                .unwrap(),
+            1000
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT last_seen_us FROM neighbor")
+                .unwrap(),
+            2000
+        );
+        let t = s.query_table("SELECT ip, oui FROM neighbor").unwrap();
+        assert_eq!(t.rows[0], vec!["192.168.1.9", "11:22:33"]);
+        // Both ticks are still individually visible as readings.
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM neighbor_sample")
+                .unwrap(),
+            2
+        );
+    }
+
+    /// A passive ARP read carries no name; it must not erase the name a scan
+    /// learned earlier.
+    #[test]
+    fn a_nameless_sighting_does_not_erase_a_known_hostname() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&neighbors_tick(
+            1000,
+            "11:22:33:44:55:66",
+            "192.168.1.5",
+            Some("printer.local"),
+            NeighborSource::Mdns,
+        ))
+        .unwrap();
+        s.write_sample(&neighbors_tick(
+            2000,
+            "11:22:33:44:55:66",
+            "192.168.1.5",
+            None,
+            NeighborSource::Arp,
+        ))
+        .unwrap();
+        let t = s
+            .query_table("SELECT hostname, source FROM neighbor")
+            .unwrap();
+        assert_eq!(t.rows[0], vec!["printer.local", "arp"]);
+    }
+
+    /// A SKIP tick writes its row and no neighbours — the gap stays visible.
+    #[test]
+    fn a_skip_tick_records_the_reading_without_neighbours() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Neighbors(NeighborsSample {
+            ts_us: 1000,
+            verdict: NeighborsVerdict::Skip,
+            reason: Some("arp(8) unavailable".into()),
+            network_key: None,
+            iface: None,
+            neighbors: Vec::new(),
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM neighbor").unwrap(),
+            0
+        );
+        let t = s
+            .query_table("SELECT verdict, reason, neighbor_count FROM neighbor_sample")
+            .unwrap();
+        assert_eq!(t.rows[0], vec!["SKIP", "arp(8) unavailable", "0"]);
+    }
+
+    /// An operator scan leaves its own durable trace, separate from the entities
+    /// it discovered.
+    #[test]
+    fn a_scan_is_recorded_as_its_own_row() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_neighbor_scan(&NeighborScan {
+            ts_us: 1000,
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            iface: Some("en0".into()),
+            method: "sweep".into(),
+            target: "192.168.1.0/24".into(),
+            found: 7,
+            duration_ms: 2500,
+            detail: None,
+        })
+        .unwrap();
+        let t = s
+            .query_table("SELECT method, target, found FROM neighbor_scan")
+            .unwrap();
+        assert_eq!(t.rows[0], vec!["sweep", "192.168.1.0/24", "7"]);
+    }
 
     #[test]
     fn write_and_count_link_sample() {

@@ -296,6 +296,7 @@ pub async fn run(
                 Sample::Dns(d) => snap.dns = Some(d.clone()),
                 Sample::Host(h) => snap.host = Some(h.clone()),
                 Sample::Wifi(w) => snap.wifi = Some(w.clone()),
+                Sample::Neighbors(n) => snap.neighbors = Some(n.clone()),
                 // Route events are a stream, not a "latest sample" field of the
                 // snapshot; they still bump `generated_us` above.
                 Sample::Route(_) => {}
@@ -313,6 +314,7 @@ pub async fn run(
                 Sample::Dns(d) => Event::Dns(d.clone()),
                 Sample::Host(h) => Event::Host(h.clone()),
                 Sample::Wifi(w) => Event::Wifi(w.clone()),
+                Sample::Neighbors(n) => Event::Neighbors(n.clone()),
                 Sample::Route(r) => Event::Route(r.clone()),
             };
             // Serialise ONCE here; every subscriber then clones an Arc, not a
