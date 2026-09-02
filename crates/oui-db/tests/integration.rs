@@ -15,9 +15,9 @@ fn load() -> OuiDb {
 #[test]
 fn indexes_only_the_two_valid_ma_l_entries() {
     let db = load();
-    // 00:1A:2B and 00:AA:BB are valid; the comment, the /28 sub-block and the
-    // malformed line are all skipped.
-    assert_eq!(db.len(), 2);
+    // 00:1A:2B, 00:AA:BB and the explicitly /24-stamped AA:BB:CC are valid; the
+    // comment, the /28 sub-block and the malformed line are all skipped.
+    assert_eq!(db.len(), 3);
 }
 
 #[test]
@@ -79,4 +79,15 @@ fn universally_administered_miss_is_unknown() {
 fn missing_file_is_an_error() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/does-not-exist");
     assert!(OuiDb::load_from_file(path).is_err());
+}
+
+#[test]
+fn an_explicitly_slash24_masked_ma_l_entry_is_indexed() {
+    // Some manuf snapshots stamp MA-L with an explicit /24; it must resolve, not
+    // silently drop to Unknown (which would empty a differently-formatted DB).
+    let db = load();
+    match db.lookup("A8:BB:CC:11:22:33") {
+        VendorLookup::Vendor { name, .. } => assert_eq!(name, "Masked Company Inc"),
+        other => panic!("expected a vendor for a /24-stamped MA-L, got {other:?}"),
+    }
 }

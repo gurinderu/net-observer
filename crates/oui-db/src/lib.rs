@@ -117,7 +117,8 @@ impl OuiDb {
             return VendorLookup::Unknown;
         };
 
-        // The locally-administered bit is decisive: no real owner exists.
+        // The locally-administered bit is decisive: no real owner exists, so a
+        // randomized MAC must never report a vendor. (realm net-observer, node #36)
         if first_octet & 0x02 != 0 {
             return VendorLookup::Randomized;
         }
@@ -134,8 +135,9 @@ impl OuiDb {
 
 /// Parse one `manuf`-format line into `(oui, entry)`, or `None` to skip it.
 ///
-/// Skips blank lines, `#` comments, and any first field that is not exactly a
-/// 24-bit OUI (three hex octets, no `/mask`).
+/// Skips blank lines, `#` comments, and any first field that is not a 24-bit OUI
+/// (a bare three-octet OUI, or one stamped with an explicit `/24`; sub-blocks are
+/// skipped — see [`parse_plain_oui`]).
 fn parse_line(line: &str) -> Option<(String, VendorEntry)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
@@ -145,8 +147,8 @@ fn parse_line(line: &str) -> Option<(String, VendorEntry)> {
     let mut fields = line.split('\t').map(str::trim);
     let prefix = fields.next()?;
 
-    // A longer-prefix line (MA-M/MA-S, e.g. `AA:BB:CC:D0:00:00/28`) or anything
-    // that is not a clean 24-bit OUI is skipped rather than mis-parsed.
+    // A sub-block line (MA-M/MA-S, e.g. `AA:BB:CC:D0:00:00/28`) or anything that
+    // is not a 24-bit OUI is skipped rather than mis-parsed.
     let (_first_octet, oui) = parse_plain_oui(prefix)?;
 
     let short = fields.next().filter(|s| !s.is_empty());
@@ -168,20 +170,30 @@ fn parse_line(line: &str) -> Option<(String, VendorEntry)> {
     Some((oui, entry))
 }
 
-/// Parse a token that must be exactly a 24-bit OUI (three hex octets separated
-/// by `:` or `-`, with no CIDR-style `/mask`). Returns `(first_octet,
-/// "aa:bb:cc")`, or `None` if it is anything else.
+/// Parse a `manuf` first field into a 24-bit OUI `(first_octet, "aa:bb:cc")`, or
+/// `None` to skip it.
+///
+/// A real Wireshark MA-L entry is a bare three-octet OUI, but some snapshots
+/// stamp the `/24` explicitly — accept BOTH, so a differently-formatted registry
+/// cannot ingest to a silently empty index (a missed-incident failure worse than
+/// no data). Genuine sub-blocks (MA-M `/28`, MA-S `/36`) whose owner a 24-bit key
+/// cannot represent are skipped. (realm net-observer, node #36)
 fn parse_plain_oui(token: &str) -> Option<(u8, String)> {
-    // Reject sub-block prefixes outright.
-    if token.contains('/') {
+    let (addr, mask) = match token.split_once('/') {
+        Some((a, m)) => (a, Some(m.trim().parse::<u8>().ok()?)),
+        None => (token, None),
+    };
+    // Only a full 24-bit assignment keys on three octets; any other explicit mask
+    // is a sub-block we cannot represent, so skip it rather than mis-index it.
+    if mask.is_some_and(|m| m != 24) {
         return None;
     }
-    let parts: Vec<&str> = token.split([':', '-']).collect();
-    if parts.len() != 3 {
+    let parts: Vec<&str> = addr.split([':', '-']).collect();
+    if parts.len() < 3 {
         return None;
     }
     let mut octets = [0u8; 3];
-    for (slot, p) in octets.iter_mut().zip(parts) {
+    for (slot, p) in octets.iter_mut().zip(&parts[..3]) {
         *slot = u8::from_str_radix(p, 16).ok()?;
     }
     let oui = format!("{:02x}:{:02x}:{:02x}", octets[0], octets[1], octets[2]);
