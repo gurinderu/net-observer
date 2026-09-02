@@ -14,16 +14,36 @@
 //! under the nodes, and each node is an absolutely-positioned chip. The geometry
 //! (ring angles, node centres) is computed by the pure helpers below so it is
 //! testable without a window.
+//!
+//! ## Its own window
+//!
+//! The map opens as its **own** normal, resizable window (from the panel's "Map"
+//! footer control), exactly like the event-log window opens from "Events" (see
+//! [`crate::events`]). [`MapView`] is the root view; [`open_or_focus`] stashes the
+//! live handle on the shared [`Glance`] so a second click focuses the open window
+//! instead of duplicating it. Its live-update wiring is the panel's own transport,
+//! not a new one: the map reads `snapshot.neighbors` off the shared [`Glance`],
+//! which the menu-bar refresh timer re-reads every ~3s (see [`crate::menubar`]).
+//! [`MapView`] observes that model and re-renders on every tick — no socket, no
+//! subscription of its own.
 
 use std::f32::consts::PI;
 
 use gpui::prelude::*;
-use gpui::{Bounds, Pixels, Rgba, canvas, div, point, px, rgb, rgba};
+use gpui::{
+    AnyWindowHandle, App, Bounds, Context, Entity, Pixels, Rgba, SharedString, Subscription,
+    TitlebarOptions, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions, canvas, div,
+    point, px, rgb, rgba, size,
+};
 
 use net_observer_ipc::StatusSnapshot;
 use types::{NeighborObs, NeighborSource, NeighborsSample};
 
-use crate::ui::Theme;
+use crate::ui::{Glance, Theme};
+
+/// Initial size of the network-map window (resizable afterwards), gpui logical px.
+const WIN_W: f32 = 360.0;
+const WIN_H: f32 = 320.0;
 
 /// The upper ceiling on ring nodes. The ACTUAL cap is whichever is smaller, this
 /// or [`ring_capacity`] for the current radius, so the ring never overlaps; the
@@ -387,6 +407,115 @@ fn empty_state(
             .child(message.into()),
     )
     .into_any_element()
+}
+
+/// A hairline separator — a 1px full-width rule, matching the event window.
+fn separator(theme: Theme) -> impl IntoElement {
+    div().h(px(1.0)).w_full().bg(rgb(theme.separator))
+}
+
+/// The root view of the **network-map window**. Holds a handle to the shared
+/// [`Glance`] and re-renders whenever it changes — the same live-update path the
+/// panel uses (the menu-bar refresh timer writes the snapshot every ~3s; see
+/// [`crate::menubar`]), so this window carries no socket and no subscription of its
+/// own. It only reshapes `snapshot.neighbors` into the star (see
+/// [`network_map_section`]).
+pub(crate) struct MapView {
+    model: Entity<Glance>,
+    _observe: Subscription,
+}
+
+impl MapView {
+    fn new(model: Entity<Glance>, cx: &mut Context<Self>) -> Self {
+        // Re-render this view whenever the shared model is notified (timer tick or
+        // manual refresh) — the same observation the panel registers.
+        let observe = cx.observe(&model, |_, _, cx| cx.notify());
+        Self {
+            model,
+            _observe: observe,
+        }
+    }
+}
+
+impl Render for MapView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::for_appearance(window.appearance());
+        let snapshot = self.model.read(cx).snapshot.clone();
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(theme.bg))
+            .text_color(rgb(theme.fg))
+            .font_family(".SystemUIFont")
+            .text_size(px(13.0))
+            .child(separator(theme))
+            .child(network_map_section(&snapshot, theme))
+    }
+}
+
+/// Open the network-map window, or bring the already-open one to the front.
+///
+/// The live window handle is stashed on the shared [`Glance`] so a second click
+/// focuses the existing window instead of opening a duplicate. A stale handle
+/// (window since closed) falls through to a fresh open. Modeled exactly on
+/// [`crate::events::open_or_focus`]; never panics — a failed open is logged, not
+/// fatal.
+pub(crate) fn open_or_focus(cx: &mut App, glance: &Entity<Glance>) {
+    if let Some(existing) = glance.read(cx).map_window {
+        // `update` succeeds only while the window is still open.
+        if existing
+            .update(cx, |_view, window, _cx| window.activate_window())
+            .is_ok()
+        {
+            cx.activate(true);
+            return;
+        }
+    }
+
+    if let Some(handle) = open_window(cx, glance.clone()) {
+        let any: AnyWindowHandle = handle.into();
+        glance.update(cx, |g, _| g.map_window = Some(any));
+        // Accessory apps don't get key focus for free; bring the new window forward.
+        cx.activate(true);
+    }
+}
+
+/// Create the network-map window over the shared [`Glance`]. Returns the window
+/// handle, or `None` if the window failed to open.
+fn open_window(cx: &mut App, model: Entity<Glance>) -> Option<WindowHandle<MapView>> {
+    let options = window_options(cx);
+    match cx.open_window(options, move |_window, cx| {
+        cx.new(|cx| MapView::new(model, cx))
+    }) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            eprintln!("net-observer-bar: failed to open map window: {e}");
+            None
+        }
+    }
+}
+
+/// Window options for the network map: a normal, resizable, closable window with a
+/// native titlebar ("net-observer — map"), centered on the primary display —
+/// mirroring the event-log window's options.
+fn window_options(cx: &App) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(WIN_W), px(WIN_H)), cx)),
+        titlebar: Some(TitlebarOptions {
+            title: Some(SharedString::from("net-observer — map")),
+            appears_transparent: false,
+            traffic_light_position: None,
+        }),
+        kind: WindowKind::Normal,
+        is_movable: true,
+        is_resizable: true,
+        is_minimizable: true,
+        focus: true,
+        show: true,
+        window_min_size: Some(size(px(320.0), px(260.0))),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
