@@ -38,6 +38,7 @@
 //! tested surface stays the data/render layer.
 
 mod events;
+mod map;
 mod menubar;
 mod status;
 mod ui;
