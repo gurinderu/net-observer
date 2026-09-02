@@ -98,12 +98,18 @@ flowchart LR
   `UnixListener`),
   answering entirely from memory — no DB read on the request path, zero contention
   with the writer. See [Local socket API](#local-socket-api) below.
-- **net-observerd** — the root LaunchDaemon: load config → open the store → spawn the
-  socket API server → build enabled collectors as an `AnyCollector` **enum**
-  (static dispatch — see [Async collectors](#async-collectors)) → filter by
-  `meta().supports(Os::current())` then `preflight().await` → spawn survivors →
-  run the consumer → clean SIGTERM/SIGINT shutdown (the API task is aborted
-  alongside the collectors).
+- **net-observerd** — the root LaunchDaemon: load config → open the store →
+  record the **startup observing edge** (`record_startup_edge`, before any
+  collector can produce a sample) → build enabled collectors as an
+  `AnyCollector` **enum** (static dispatch — see
+  [Async collectors](#async-collectors)) → filter by
+  `meta().supports(Os::current())` → spawn them → start the pcap ring → spawn
+  the socket API server (after the ring, so a `FreezePcap` request is answered
+  by the ring that is actually running) → run the consumer → clean
+  SIGTERM/SIGINT shutdown (the API task is aborted alongside the collectors).
+  `preflight()` is consulted at startup too, but for an **interval** collector
+  it only logs context — it no longer decides whether the collector runs (see
+  [Collector capability model](#collector-capability-model)).
 - **net-observer-cli** — unprivileged; `status` / `incidents` read the daemon's live
   `StatusSnapshot` over the socket (`net_observer_ipc::query`), so they work *while the
   daemon runs* with zero DB contention. `query <SQL>` is the only DB path: it opens
@@ -122,11 +128,37 @@ collector, whether to run it at all:
 - **Static OS metadata** — `CollectorMeta { name, supported_os }`; v1 collectors
   declare `&[Os::MacOs]`. A collector whose meta does not `supports(Os::current())`
   is skipped.
-- **Runtime preflight** — `async fn preflight() -> Readiness` (`Ready` /
-  `Unavailable(String)`), delegated to the port facts: `link` is Ready iff a
-  physical interface resolves; `proxy` iff the sing-box config exists or the
-  Clash API is set. A failing preflight is logged (absence of a signal is itself
-  diagnostic) and the collector is not spawned.
+- **Runtime preflight — a per-tick CONDITION, not a startup gate.**
+  `async fn preflight() -> Readiness` (`Ready` / `Unavailable(String)`),
+  delegated to the port facts: `link` is Ready iff a physical interface
+  resolves; `proxy` iff the sing-box config exists or the Clash API is set. For
+  an **interval** collector the daemon spawns it regardless of the startup
+  verdict, and `spawn_interval_collector` re-runs `preflight()` on **every**
+  tick: `Ready` → `collect(ts_us)`; `Unavailable(reason)` → the collector's own
+  `skip(ts_us)` samples for that tick, and the very next tick re-probes. A
+  prerequisite missing at boot — `RunAtLoad` starts the daemon before any
+  interface is up — used to disable the collector for the life of the process
+  with nothing in the record saying why, which is bare silence: the exact
+  failure this project exists to catch. Now the record carries `SKIP` rows until
+  the prerequisite appears and real samples the moment it does, with no restart.
+  The log is rate-limited around the durable record: the first unready tick and
+  every **change** of reason log at `warn`, the rest at `debug`, and the
+  recovery logs the number of skipped ticks — the `SKIP` samples are the record,
+  the log is only its narration.
+- **Two things stay one-shot, both deliberately.** The **event** cadence: the
+  `route` collector's PF_ROUTE socket is opened by `PfRouteSource::open()`
+  *before* construction and moved into the collector, so there is nothing left
+  to re-probe per tick and no tick to re-probe on — an `Unavailable` event
+  collector is logged and skipped for the life of the process ("event cadence:
+  not retried"), and retrying it means a supervisor around
+  `spawn_event_collector` that reopens the socket. And the **pcap ring**: it is
+  a `tcpdump` child started once by `maybe_start_pcap_ring` and handed to the
+  API server, so `FreezePcap` can answer about the ring that is actually
+  running; a boot that resolves no physical interface leaves the daemon with no
+  ring for its lifetime, logged as `"no physical interface resolved; pcap ring
+  disabled (not retried)"` and marked in the source as a known gap. Both are
+  named here rather than papered over: they are the two places where a missing
+  prerequisite is still permanent.
 
 ### Async collectors
 
@@ -353,18 +385,46 @@ graph TD
   popup is a **Tailscale-style** panel: it reads the window's
   `WindowAppearance` and picks a LIGHT or DARK token set (never hardcoded dark),
   laid out as a clean list — a header row with the app name and an
-  **observing on/off toggle switch** on the right, hairline dividers, label→value
-  rows (gw / direct / tun / selector), an incidents line, and a footer of subtle
-  text actions (**Events** — opens the live event-log window — / Refresh / Quit;
-  the "Restart sing-box" control has been removed from the bar). The toggle is a
+  **observing on/off toggle switch** on the right, hairline dividers, two
+  **sparklines**, label→value rows (gw / direct / tun / selector), an incidents
+  line, and a footer of subtle text actions (**Events** — opens the live
+  event-log window — / Refresh / **Freeze pcap** / **Quiet**|**Unquiet** / Quit;
+  the "Restart sing-box" control has been removed from the bar). The panel window
+  is opened `WindowBackgroundAppearance::Blurred`, which puts an
+  `NSVisualEffectView` behind it, so the surface token is deliberately
+  translucent (`0xRRGGBBAA`) and the base colour lighter than instinct suggests —
+  an opaque fill would cover the very material that makes a popover read as part
+  of the menu bar — with a faint rim (`edge`) and rounded corners, which need the
+  window to be non-opaque to be visible at all.
+  **The sparklines are the bar's own history, not the daemon's record.** The
+  refresh timer — and *only* the refresh timer, so one column is one `REFRESH`
+  interval — appends one `HistoryPoint { gw_rtt_ms, load1 }` per tick to a
+  bounded `VecDeque` of `HISTORY_LEN` = 120 points: at the bar's 3 s cadence, a
+  6-minute window, which is chosen against the failure the panel exists to catch
+  (the coworking gateway does not drop, it *ramps* for ~40 s) and is short enough
+  that 120 one-pixel columns fit the 320pt panel without downsampling, so every
+  point drawn is a point measured. Both fields are `Option`, and a tick that
+  measured nothing — no sample yet, a paused daemon, quiet mode (`gw = SKIP`), a
+  failed or absent gateway, an unreachable daemon — renders as an **empty
+  column**, never a zero-height bar on the baseline: plotting a missing
+  measurement as a value on the floor is the same lie `SKIP` exists to prevent.
+  The plot is a row of thin `div`s (gpui 0.2.2 has no chart primitive) with a
+  hairline at the threshold — `RTT_THRESHOLD_MS` = 300 ms, and `LOAD_THRESHOLD` =
+  10.0, the same number the daemon's `Starvation` condition uses, so the line the
+  operator watches and the line the trigger fires on are one line. The series
+  starts empty at bar launch and dies with the process: a short line after a
+  restart means "the bar just started", never "the network was fine". The
+  daemon's DuckDB store is the record, and the bar never opens it. The toggle is a
   gpui-drawn pill (green track + knob-right when `snapshot.observing`, grey +
   knob-left when paused); clicking it sends `Control(SetObserving(!observing))`
   over the socket (`send_set_observing`) and refreshes, and the header
   shows a muted "paused" state (grey dot) while collection is off. gpui's
-  build script needs the macOS **Metal Toolchain**, so the crate is a full
+  build script needs Apple's **Metal shader compiler**, so the crate is a full
   workspace member but is excluded from `default-members` — a bare `cargo build`
-  needs no GUI toolchain; build the bar with `--workspace` / `-p net-observer-bar` on
-  a machine that has the Metal Toolchain installed.
+  needs no GUI toolchain. Build the bar with `--all` / `-p net-observer-bar`
+  **from inside `nix develop`**, whose `xcrun` shim is what finds `metal`; the
+  bar is for that reason the one binary the flake cannot package (see
+  [Packaging (nix)](#packaging-nix)).
 
 ## Data model (DuckDB)
 
@@ -383,18 +443,90 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `incident` | `id PK, opened_us, closed_us, trigger_id, signature` | Open incident ⇒ `closed_us IS NULL`. |
 | `blob_ref` | `id, incident_id, ts_us, kind, path` | On-disk forensics blobs (pcap freeze, dumps) referenced by path. |
 | `trigger_fired` | `ts_us, trigger_id, incident_id, detail` | One row per trigger fire. |
-| `observing_edge` | `ts_us, observing, peer_uid` | One row per collection pause/resume edge — the one sanctioned gap in "SKIP, never silence"; `observing` is the state entered, so `false` opens a gap and `true` closes one, and `peer_uid` attributes it to the control-socket peer that asked. |
+| `observing_edge` | `ts_us, observing, peer_uid, cause` | One row per collection boundary — the one sanctioned gap in "SKIP, never silence"; `observing` is the state entered, so `false` opens a gap and `true` closes one. `peer_uid` attributes it to the control-socket peer that asked (SQL `NULL` when nobody did), and `cause` (`control` / `startup`) says what produced it. |
 
 `dns_sample`, `route_event`, and `host_sample` are created by the v1.1 `dns`,
 `route-events`, and `host-metrics` collectors respectively.
 
 `observing_edge` is empty for any database written before the pause switch
-landed, and by any daemon nobody ever paused — an empty table means "never
-paused", not "no record". A daemon killed while paused leaves a `false` row with
-no closing edge: the observing state is never persisted, so the next start simply
-resumes collecting. Read a dangling `false` as **"the process died while
-paused"**, not "still paused"; the gap it opens is closed by the first sample of
-the next run, not by a `true` row.
+landed — an empty table means "nothing was ever recorded", not "never paused".
+Every *running* daemon writes at least one row, because a start is itself a
+boundary: `ObservingCause::Startup`, `observing = true`, `peer_uid` NULL (nobody
+asked — the process booted). The observing **state** is still never persisted;
+only the **transition** is, and that distinction is the whole point. A daemon
+killed while paused writes no resume edge, so before the startup edge existed a
+dangling `false` row had to be read as "the process died while paused" and the
+end of the silence had to be *inferred* from the first sample of the next run.
+It is now a recorded fact: the next start's `startup` row says where collection
+resumed. The `cause` column was added after the first daemon shipped rows
+without it, so `schema.rs` runs
+`ALTER TABLE observing_edge ADD COLUMN IF NOT EXISTS cause VARCHAR` on open (the
+CLI's offline `query` opens whatever file it is handed); rows written by that
+daemon read back with a `NULL` cause, which the gap derivation treats as
+`control` — which is what they in fact were.
+
+### Diagnosis queries
+
+`crates/store/src/diagnosis.rs` is the read side: the canned SQL that turns the
+record into *which layer failed*, so the reading of an outage is reproducible
+instead of re-derived by hand. Each is a `*_sql()` builder plus a `DuckdbStore`
+method that runs it with the defaults (`DEFAULT_STARVATION_LOAD` = 10.0, matching
+the daemon's `STARVATION_LOAD`; `DEFAULT_EPISODE_GAP_US` = 30 s;
+`DEFAULT_RAMP_WINDOW_US` = 120 s). Correlation across cadences is by `ASOF JOIN`
+— the join the whole storage choice was made for.
+
+| Query | Answers |
+| --- | --- |
+| `verdict_at(ts_us)` | every layer's state at a moment, plus the `layer` the record blames |
+| `incident_context()` | for each incident, the layer state at or just before it opened |
+| `wedge_vs_starvation()` | contiguous `tun=000` episodes, each named `link` / `vless` / `starvation` / `wedge` / `unknown` |
+| `gw_drops()` | the first link sample of each run of `FAIL`/`NOGW` (`SKIP` ticks removed first, so a quiet run cannot manufacture an edge) |
+| `gateway_ramp(drop_ts_us)` | gateway RTT over the window before a drop, with a least-squares `slope_ms_per_s` over the answered ticks — the ~40 s coworking climb as data |
+| `fakeip_bugs()` | `FAKEIP` on a `.ru` name, which is always a bug |
+| `observation_gaps()` | one row per interval the daemon deliberately collected nothing |
+
+The `layer` vocabulary is `link` / `vless` / `proxy` / `host` / `healthy` /
+`unknown` / `gap`. **The refusals are the point.** No query counts a `SKIP` as
+health or as fault, and two situations make a query decline outright rather than
+answer:
+
+- **A dead tun with no `load1`.** `tun_code = 0` is a wedge if the host was idle
+  and starvation if it was not, and without a host sample the record cannot tell
+  them apart — so the layer is `unknown`, never a guess at `proxy`. The
+  distinction is the one the project paid nine hours to learn on 2026-07-27: a
+  restart cures a wedge and *tears down live flows* under starvation.
+- **A moment inside an observation gap.** An `ASOF JOIN` would honestly hand back
+  the newest sample from *before* a pause as though it were a reading taken at
+  the moment asked about, with nothing in the row saying otherwise — a gap that
+  is written but never read is indistinguishable from data, the same failure
+  class `SKIP` exists to prevent one level up. So the queries **decline rather
+  than flag**: a flag a caller must remember to check is a bare answer for
+  everyone who forgets, while a withheld measurement cannot be misread.
+  `verdict_at` returns a single row with `layer = 'gap'`, every measurement
+  column `NULL`, and the gap's bounds in `gap_opened_us` / `gap_closed_us`;
+  `incident_context` blanks the context of an incident that opened inside a gap
+  the same way. `gateway_ramp` refuses where the lie would live — its *slope*: a
+  least-squares fit across an interval that was never sampled is a line drawn
+  through absent data and reads exactly like a measured climb, so
+  `slope_ms_per_s` and `fitted_samples` come back `NULL` whenever the window
+  overlaps a gap and `observation_gap_us` says by how many microseconds. The
+  window's rows are real samples and are still listed; only the number is
+  withheld. `wedge_vs_starvation` is deliberately untouched: its episodes are
+  built from ticks that exist, so it never passes off a pre-pause reading as a
+  measurement.
+
+**Gaps are derived, not stored.** `observation_gap` opens a half-open interval
+`[gap_opened_us, gap_closed_us)` at each `observing = false` edge and closes it at
+the earliest of three candidates, with `gap_closed_by` naming which one it took:
+`resume` (an operator `observing = true` edge), `startup` (a recorded startup
+edge — this process began collecting), or `sample` (no edge at all: the first
+sample of any stream, `SAMPLE_TS_CTE` over every table, an inference). A recorded
+edge **wins a tie** with a sample at the same instant, because it is the fact and
+the sample is only evidence of it. `gap_closed_us` is `NULL` only when nothing at
+all follows the pause — the record ends inside it, which is the truth. The edge
+sequence is not assumed to be well-formed pairs: a resume with no preceding pause
+opens no gap, and databases written before the startup edge existed still close
+their gaps by the `sample` inference.
 
 ### Verdict vocabulary
 
@@ -404,9 +536,15 @@ Ported from the oracle and cross-checked against recorded log excerpts:
 - Gateway: `OK / FAIL / NOGW`
 - TCP: `OK / FAIL / SKIP`
 
-`FAKEIP` on a `.ru` name is always a bug. **`SKIP` means a prerequisite was
-missing — it is recorded explicitly, never omitted**: absence of a signal is
-itself diagnostic.
+`FAKEIP` on a `.ru` name is always a bug. **`SKIP` means a probe did not run —
+it is recorded explicitly, never omitted**: absence of a signal is itself
+diagnostic. Two routine producers of `SKIP`, neither an exception to the rule: a
+collector whose per-tick `preflight()` is `Unavailable` (see
+[Collector capability model](#collector-capability-model)), and **quiet mode**
+(`ControlCmd::SetQuiet(true)`), where the link collector withholds the gateway
+echo but still emits one sample per tick carrying `gw = SKIP` — quiet silences
+the wire, never the record, and the triggers read that as *no measurement*, never
+as a healthy gateway and never as a drop.
 
 **The one sanctioned exception: an operator pause.** When collection is paused
 (`ControlCmd::SetObserving(false)`) the collectors stop probing entirely rather
@@ -435,9 +573,10 @@ the durable record; the socket is the live, low-latency read path.
   - `Request::Incidents { limit }` → `Response::Incidents(Vec<IncidentSummary>)`
   - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
     write/control path (see [Control path](#control-path) below); the only
-    non-read request. Two commands today: `ControlCmd::KickstartProxy`
-    (acting-class, gated) and `ControlCmd::SetObserving(bool)` (self-control,
-    ungated).
+    non-read request. Four commands today, one acting-class and three
+    self-control: `ControlCmd::KickstartProxy` (acting-class, gated) and
+    `SetObserving(bool)` / `SetQuiet(bool)` / `FreezePcap` (self-control,
+    ungated by `acting.enabled` — never by the peer check).
   - `Request::Subscribe { kinds }` → a **held-open stream** of newline-JSON
     `StreamFrame`s (not a single `Response`, and not bare `Event`s) — the
     realtime pub/sub path (see [Event bus and live
@@ -471,9 +610,11 @@ the durable record; the socket is the live, low-latency read path.
 
   `StatusSnapshot` is the latest sample per collector (`link` / `proxy` / `dns` /
   `host`), a `generated_us` stamp, an `observing: bool` (whether collection is
-  live or paused — hand-written `Default` so a fresh snapshot reads `true`, never
-  misreporting a healthy daemon as paused), and a bounded, newest-first ring of
-  recent `IncidentSummary`s. `write_frame` / `read_frame` pin the exact framing
+  live or paused — `serde(default)` via `observing_default()` so a fresh
+  snapshot, and a frame from a pre-pause daemon, read `true`, never misreporting
+  a healthy daemon as paused), a `quiet: bool` (`serde(default)` `false` —
+  collecting but addressing no packet at the gateway, which is a different state
+  from paused), and a bounded, newest-first ring of recent `IncidentSummary`s. `write_frame` / `read_frame` pin the exact framing
   (`serde_json` + `'\n'`); the crate is runtime-agnostic (no tokio) so the async
   server and the blocking client share one format definition.
 
@@ -777,6 +918,27 @@ differently and dispatched in exactly one place, `api::control_response`:
    `SetObserving` that does **not** change the state is not an edge: no row, no
    frame, because a no-op click must not manufacture a gap in the record.
 
+3. **Self-control — `ControlCmd::SetQuiet(b)`.** While quiet the daemon
+   addresses **no packet at the gateway** — in this daemon that is the link
+   collector's ICMP echo, and only that. Passive facts (ARP table, DHCP lease)
+   keep being read and the link collector keeps emitting one sample per tick with
+   `gw = SKIP`, so quiet silences the wire, never the record — which is why it
+   writes **no** `observing_edge` row: there is no gap to bracket. Like
+   `observing` it is a shared `AtomicBool` mirrored into `snapshot.quiet`, is
+   process-scoped, and is never persisted. Client: the bar footer's
+   **Quiet**/**Unquiet** action.
+
+4. **Self-control — `ControlCmd::FreezePcap`.** Copy the pcap ring out now, into
+   a fresh freeze directory — the same passive artifact the `gw-change` trigger
+   produces, but operator-initiated. It touches only files the daemon already
+   owns and sends nothing on the network. With no ring running it is a refusal
+   with a reason (`ok: false`), never a silent success that would leave the
+   operator believing an artifact exists. Client: the bar footer's **Freeze
+   pcap** action.
+
+`ControlAuthority::of` is the one exhaustive match that classifies all four, so a
+fifth command fails to compile until someone classifies it.
+
 ```
 Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
                               │
@@ -801,6 +963,16 @@ Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
                                     │             events_tx.send(StreamFrame::Observing(edge))
                                     │         └─► ControlResult { ok: true, "observing on|off" }
                                     │             (never touches sing-box or the network)
+                                    │
+                                    ├─ SetQuiet(b)      — SelfControl, ungated by acting
+                                    │     └─► quiet.store(b) + snapshot.quiet = b
+                                    │         (NO observing_edge row: the record keeps
+                                    │          receiving one SKIP-gw sample per tick)
+                                    │
+                                    ├─ FreezePcap       — SelfControl, ungated by acting
+                                    │     └─► freeze_now(cx) → freezer.freeze(dir)
+                                    │         — or ok: false with a
+                                    │         reason when no ring is running
                                     │
                                     └─ KickstartProxy   — Acting-class, gated above
                                           └─► acting::kickstart_proxy(&singbox_service)
@@ -840,6 +1012,49 @@ the mode removes the attempt as well as the effect), and `socket_owner_uid` is
 through that clause). On a host with no console session, `control_uids` is the
 way to authorise an administrator, since the console-user rule admits nobody
 there.
+
+## Packaging (nix)
+
+The flake ships the daemon and the CLI, and owns the launchd job that runs them.
+
+- **`packages`** (per system, via `flake-utils.lib.eachDefaultSystem`) — one
+  `rustPlatform.buildRustPackage` named `net-observer`, exposed also as
+  `net-observerd`, `net-observer-cli` and `default`. The platform is built with
+  `makeRustPlatform` over the channel `rust-toolchain.toml` pins, because
+  `buildRustPackage` would otherwise take nixpkgs' rustc and "works in the dev
+  shell" would stop meaning anything. `cargoBuildFlags` names the two binaries
+  explicitly; `auditable = false` (the default `cargo-auditable` wrapper is built
+  against *nixpkgs'* rustc and drags a second toolchain — sometimes a rustc built
+  from source — into the build); `DUCKDB_LIB_DIR` is deliberately unset, so the
+  `duckdb` crate builds its own engine (nixpkgs carries 1.5.2 where
+  `libduckdb-sys` wants 1.5.5); `doCheck = false`, because testing is the dev
+  shell's job — `cargo test --all` covers the bar, which this derivation cannot
+  build at all.
+- **`darwinModules.default`** — a nix-darwin module (`nix/darwin-module.nix`),
+  deliberately **top-level, not** inside `eachDefaultSystem`: a darwin module
+  takes no `system`, and nesting it would bury it under `aarch64-darwin` and force
+  every importer to name the system. `services.net-observer.enable` defines
+  `launchd.daemons.net-observerd` with `RunAtLoad`, `KeepAlive` and
+  `ThrottleInterval = 5`, launched through
+  `/bin/wait4path /nix/store && exec …` — at boot launchd can exec a store path
+  before the nix volume is mounted, and a daemon that dies there dies exactly
+  when the machine most needs to be observed. `package` defaults through `self`
+  (the version the consumer's `flake.lock` pins, not an overlay's), `configFile`
+  becomes `--config`, and `logFile` defaults to `/var/log/net-observerd.log` —
+  named after the binary, **not** `net-observer.log`, because the shell
+  LaunchDaemon this project replaces owns that file and two launchd jobs sharing a
+  `StandardOutPath` would interleave into, and corrupt, the behavioural oracle.
+  The activation script creates `/var/lib/observer` (root-owned, `755`).
+- **The menu bar is not packageable.** gpui compiles its Metal shaders by calling
+  `xcrun -sdk macosx metal`, and Apple does not permit redistributing that
+  compiler, so it cannot enter a nix closure. The `xcrun` nix puts on PATH is
+  xcbuild's reimplementation and has no `metal`. The dev shell therefore shims
+  **only** `xcrun` (`metalXcrun`, first on PATH) to export `DEVELOPER_DIR` when
+  Xcode is present and exec `/usr/bin/xcrun` — exporting `DEVELOPER_DIR` for the
+  whole shell would find `metal` but repoint `cc`/`ld` at Xcode's SDK, and
+  linking against the nix toolchain would then fail. It falls through untouched
+  when Xcode is absent, so the shell still works on a machine that simply cannot
+  build the GUI. Build the bar from inside `nix develop`.
 
 ## Privilege split
 
