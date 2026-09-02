@@ -96,6 +96,15 @@ pub enum ControlCmd {
     /// **Self-control**, like [`ControlCmd::SetObserving`], and process-scoped:
     /// a restart resumes normal probing.
     SetQuiet(bool),
+    /// Go and find out who else is on this segment NOW: sweep the local IPv4
+    /// subnet so the kernel resolves every address, and browse mDNS for names.
+    ///
+    /// The one command in this daemon that deliberately addresses machines that
+    /// are not this one, which is why it is **acting-class** and refused unless
+    /// `acting.enabled` is set — and why every run writes a `neighbor_scan` row
+    /// saying what was probed. The passive `neighbors` collector needs none of
+    /// this: it only ever reads caches the OS already filled.
+    ScanNeighbors,
 }
 
 /// The outcome of a [`ControlCmd`]: whether the action ran successfully plus a

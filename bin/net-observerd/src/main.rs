@@ -33,6 +33,7 @@ use macos::{
     BoundTcpProber, CoreWlanFacts, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource,
     ProxySystemFacts, SystemFacts, SystemNeighbors,
 };
+use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{EncodedFrame, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{FakeIp, GwChange, GwDrop, Starvation, Wedge};
@@ -41,8 +42,8 @@ use triggers::handlers::{Handler, RecordHandler};
 use types::Sample;
 
 use pipeline::{
-    FreezePcapHandler, PcapFreezer, PcapRingSlot, SnapshotHandler, run, spawn_event_collector,
-    spawn_interval_collector,
+    FreezePcapHandler, NeighborScanner, PcapFreezer, PcapRingSlot, ScanReport, SnapshotHandler,
+    run, spawn_event_collector, spawn_interval_collector,
 };
 
 /// How often the pcap supervisor re-checks the ring. Bounded on purpose: every
@@ -626,6 +627,114 @@ impl AnyCollector {
     }
 }
 
+/// The production [`NeighborScanner`]: sweep this machine's IPv4 subnet, browse
+/// mDNS for names, and report both as one scan.
+///
+/// Shares the link collector's [`SystemFacts`], so the interface it sweeps and
+/// the gateway it keys the results by are the same ones every other collector
+/// talks about — including any config override.
+pub(crate) struct SystemScanner {
+    facts: SystemFacts,
+}
+
+impl SystemScanner {
+    pub(crate) fn new(facts: SystemFacts) -> Self {
+        Self { facts }
+    }
+}
+
+impl NeighborScanner for SystemScanner {
+    /// Blocking work (UDP sends, a settle sleep, an mDNS budget — several
+    /// seconds) inside an async request handler, so it runs under
+    /// `block_in_place`: the worker thread is handed back to the runtime for the
+    /// duration instead of stalling every other connection behind one scan.
+    fn scan(&self) -> Option<ScanReport> {
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            let iface = rt.block_on(self.facts.phys_iface())?;
+            let ipv4 = rt.block_on(neighbor_scan::iface_ipv4(&iface))?;
+            let network_key = rt.block_on(async {
+                match self.facts.default_gw().await {
+                    Some(gw) => self.facts.gw_arp_mac(&gw).await,
+                    None => None,
+                }
+            });
+
+            let sweep = neighbor_scan::sweep_probe_blocking(&ipv4);
+            // Read the cache the sweep just filled. Everything it now holds for
+            // this interface counts as found: an entry the kernel resolved
+            // because of our probe is indistinguishable from one that was
+            // already there, and claiming otherwise would be a guess.
+            let mut found: Vec<types::NeighborObs> = rt
+                .block_on(neighbors::read_arp(Some(&iface)))
+                .unwrap_or_default();
+            for n in &mut found {
+                n.source = types::NeighborSource::Sweep;
+            }
+
+            let names = neighbor_scan::mdns_names_blocking();
+            let named = neighbor_scan::join_names_onto_arp(&found, &names);
+            for n in &mut found {
+                if let Some(m) = named.iter().find(|m| m.mac == n.mac) {
+                    n.hostname.clone_from(&m.hostname);
+                    n.source = types::NeighborSource::Mdns;
+                }
+            }
+
+            let ts_us = types::now_us();
+            let scans = vec![
+                store::NeighborScan {
+                    ts_us,
+                    network_key: network_key.clone(),
+                    iface: Some(iface.clone()),
+                    method: "sweep".to_string(),
+                    target: sweep.target.clone(),
+                    found: i32::try_from(found.len()).unwrap_or(i32::MAX),
+                    duration_ms: sweep.duration_ms,
+                    detail: sweep
+                        .refused
+                        .clone()
+                        .map(|r| format!("refused: {r}"))
+                        .or_else(|| Some(format!("{}/{} probed", sweep.sent, sweep.total))),
+                },
+                store::NeighborScan {
+                    ts_us,
+                    network_key: network_key.clone(),
+                    iface: Some(iface.clone()),
+                    method: "mdns".to_string(),
+                    target: neighbor_scan::MDNS_TARGET.to_string(),
+                    found: i32::try_from(named.len()).unwrap_or(i32::MAX),
+                    duration_ms: 0,
+                    detail: None,
+                },
+            ];
+            let message = match &sweep.refused {
+                Some(r) => format!(
+                    "sweep refused ({r}); {} neighbours known, {} named",
+                    found.len(),
+                    named.len()
+                ),
+                None => format!(
+                    "swept {} ({}/{} probed): {} neighbours, {} named",
+                    sweep.target,
+                    sweep.sent,
+                    sweep.total,
+                    found.len(),
+                    named.len()
+                ),
+            };
+            Some(ScanReport {
+                ts_us,
+                network_key,
+                iface: Some(iface),
+                found,
+                scans,
+                message,
+            })
+        })
+    }
+}
+
 /// A test-only interval collector whose readiness the test flips at will, so the
 /// per-tick preflight retry in `spawn_interval_collector` can be driven directly.
 /// Every real collector in `AnyCollector` is a concrete type wired to real ports
@@ -877,6 +986,12 @@ fn build_api_server(
         // running rather than refusing next to a live capture.
         quiet,
         freezer,
+        // Built unconditionally: whether there is anything to scan is decided
+        // per request (an interface with an IPv4 subnet), not once at boot.
+        scanner: Some(Arc::new(SystemScanner::new(SystemFacts::new(
+            cfg.collectors.link.gw.clone(),
+            cfg.collectors.link.phys_iface.clone(),
+        ))) as Arc<dyn NeighborScanner>),
         blob_dir: std::path::PathBuf::from(&cfg.blob_dir),
         resume_at_us,
         snapshot,

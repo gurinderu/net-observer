@@ -107,7 +107,7 @@ crates/
   types/                # Sample, verdict enums, Incident, BlobRef, TriggerFired
   store/                # Store trait + DuckDB backend, schema, QueryTable
   collector-core/       # ABSTRACTIONS ONLY: Collector, Pinger/TcpProber, Os, Readiness. No tokio.
-  collector-{link,proxy,dns,route,host,wifi}/   # one collector per crate
+  collector-{link,proxy,dns,route,host,wifi,neighbors}/   # one collector per crate
   triggers/             # Condition/Handler/Trigger + engine (re-arm/backoff)
   config/               # figment: per-subsystem toggles
   macos/                # real adapters: raw ICMP, IP_BOUND_IF, Clash API, DHCP/ARP, pcap ring

@@ -9,7 +9,7 @@ use types::{BlobRef, Incident, ObservingEdge, Sample, TriggerFired};
 const UNKNOWN_NETWORK: &str = "unknown";
 
 /// One operator-pressed neighbour scan, as written to `neighbor_scan`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NeighborScan {
     pub ts_us: i64,
     pub network_key: Option<String>,
@@ -93,24 +93,6 @@ impl DuckdbStore {
             columns,
             rows: out_rows,
         })
-    }
-
-    /// Record one operator-pressed scan (see the `neighbor_scan` table).
-    pub fn write_neighbor_scan(&self, s: &NeighborScan) -> Result<(), StoreError> {
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO neighbor_scan VALUES (?,?,?,?,?,?,?,?)",
-            params![
-                s.ts_us,
-                s.network_key,
-                s.iface,
-                s.method,
-                s.target,
-                s.found,
-                s.duration_ms,
-                s.detail
-            ],
-        )?;
-        Ok(())
     }
 }
 
@@ -247,6 +229,22 @@ impl Store for DuckdbStore {
         Ok(())
     }
 
+    fn write_neighbor_scan(&self, s: &NeighborScan) -> Result<(), StoreError> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO neighbor_scan VALUES (?,?,?,?,?,?,?,?)",
+            params![
+                s.ts_us,
+                s.network_key,
+                s.iface,
+                s.method,
+                s.target,
+                s.found,
+                s.duration_ms,
+                s.detail
+            ],
+        )?;
+        Ok(())
+    }
     fn open_incident(&self, i: &Incident) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO incident VALUES (?,?,?,?,?)",

@@ -19,6 +19,7 @@ pub mod corewlan;
 pub mod dhcp_arp;
 pub mod dns;
 pub mod host;
+pub mod neighbor_scan;
 pub mod neighbors;
 pub mod net;
 pub mod pcap;

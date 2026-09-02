@@ -103,6 +103,25 @@ enum Command {
         #[arg(value_enum)]
         state: ObserveState,
     },
+    /// Ask the running daemon to go and find out who is on this segment NOW:
+    /// sweep the local IPv4 subnet and browse mDNS for names, sent as a
+    /// `Control(ScanNeighbors)` request over the socket.
+    ///
+    /// Unlike the passive `neighbors` collector, this **speaks on the network**
+    /// — it addresses every host of the subnet — so it is acting-class and the
+    /// daemon refuses it unless `acting.enabled` is set. Every run that does
+    /// happen leaves a `neighbor_scan` row saying what was probed. Exits
+    /// non-zero if the scan was refused/failed or the daemon is unreachable.
+    ScanNeighbors,
+    /// The neighbours the record knows on each segment, newest sighting first
+    /// (offline): MAC, address, vendor OUI, name if one was ever learned, and
+    /// how it came to be known.
+    Neighbors {
+        /// Restrict to one segment, by its gateway MAC. Omit for every segment
+        /// this machine has recorded.
+        #[arg(long)]
+        network: Option<String>,
+    },
     /// Run an arbitrary SQL query directly against the DuckDB file (offline
     /// forensics — only works while `net-observerd` is stopped).
     Query {
@@ -250,6 +269,18 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
+        }
+        Command::ScanNeighbors => {
+            let cfg = load_config(cli)?;
+            let result = fetch_scan_neighbors(&cfg.socket_path)?;
+            print!("{}", format_control(&result));
+            if !result.ok {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Neighbors { network } => {
+            let table = run_query(&cli.db, &diagnosis::neighbors_sql(network.as_deref()))?;
+            print!("{}", format_table(&table));
         }
         Command::Query { sql } => {
             let table = run_query(&cli.db, sql)?;
@@ -497,6 +528,15 @@ fn fetch_set_observing(socket_path: &str, observing: bool) -> Result<ControlResu
         socket_path,
         &Request::Control(ControlCmd::SetObserving(observing)),
     )? {
+        Response::Control(result) => Ok(result),
+        Response::Error(e) => Err(anyhow!("net-observerd returned an error: {e}")),
+        other => Err(anyhow!("unexpected daemon response to Control: {other:?}")),
+    }
+}
+
+/// Send `Control(ScanNeighbors)` and return the daemon's verdict.
+fn fetch_scan_neighbors(socket_path: &str) -> Result<ControlResult> {
+    match daemon_query(socket_path, &Request::Control(ControlCmd::ScanNeighbors))? {
         Response::Control(result) => Ok(result),
         Response::Error(e) => Err(anyhow!("net-observerd returned an error: {e}")),
         other => Err(anyhow!("unexpected daemon response to Control: {other:?}")),

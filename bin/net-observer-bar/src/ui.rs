@@ -257,6 +257,17 @@ pub fn send_freeze_pcap(socket_path: &str) -> Result<ControlResult, String> {
     control_query(socket_path, ControlCmd::FreezePcap)
 }
 
+/// Ask `net-observerd` to go and find who is on this segment NOW
+/// (`Control(ScanNeighbors)`): a sweep of the local subnet plus an mDNS browse.
+///
+/// The one control action in the panel that puts packets on the wire towards
+/// machines that are not this one, so it is **acting-class** — a daemon without
+/// `acting.enabled` answers `ok: false` with a reason, shown like any other
+/// control outcome.
+pub fn send_scan_neighbors(socket_path: &str) -> Result<ControlResult, String> {
+    control_query(socket_path, ControlCmd::ScanNeighbors)
+}
+
 /// The one blocking control round-trip every control action goes through, so the
 /// bar has exactly one socket client (`net_observer_ipc::query`) and one mapping
 /// from its answers to a `Result`.
@@ -491,6 +502,20 @@ pub fn freeze_round_trip(
     Result<StatusSnapshot, GlanceError>,
 ) {
     let control = send_freeze_pcap(socket_path);
+    (control, read_fresh(socket_path))
+}
+
+/// The blocking half of the "Scan" action: send the command, then re-read the
+/// snapshot so the neighbour count the panel shows is the one the scan just
+/// produced. Never call it on the gpui main thread — the scan takes seconds by
+/// design (a settle wait plus an mDNS budget).
+pub fn scan_round_trip(
+    socket_path: &str,
+) -> (
+    Result<ControlResult, String>,
+    Result<StatusSnapshot, GlanceError>,
+) {
+    let control = send_scan_neighbors(socket_path);
     (control, read_fresh(socket_path))
 }
 
@@ -928,6 +953,24 @@ fn footer(
             spawn_control(this, cx, quiet_round_trip);
         }));
 
+    // Scan sits apart from the two above: it is the only button here that
+    // addresses other machines, so it is acting-class and refused by default.
+    // Warn-colored for the same reason the quiet toggle is — this one is not
+    // routine either.
+    let scan = div()
+        .id("scan-neighbors")
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        .text_color(rgb(theme.warn))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme.hover)))
+        .child("Scan")
+        .on_click(cx.listener(|this, _, _window, cx| {
+            spawn_control(this, cx, scan_round_trip);
+        }));
+
     let quit = div()
         .id("quit")
         .px_2()
@@ -951,7 +994,8 @@ fn footer(
                 .gap_1()
                 .child(events)
                 .child(freeze)
-                .child(quiet),
+                .child(quiet)
+                .child(scan),
         )
         .child(
             div()

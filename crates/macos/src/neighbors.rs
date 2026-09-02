@@ -91,6 +91,12 @@ impl NeighborFacts for SystemNeighbors {
     }
 }
 
+/// Read the ARP cache now and parse it: the post-sweep re-read, and the one
+/// place outside the collector that needs the table on demand.
+pub async fn read_arp(iface: Option<&str>) -> Option<Vec<NeighborObs>> {
+    Some(parse_arp_table(&run("arp", &["-an"]).await?, iface))
+}
+
 /// Parse `arp -an` output into observations, keeping only entries on `iface`
 /// (when known) that carry a real unicast MAC.
 #[must_use]
