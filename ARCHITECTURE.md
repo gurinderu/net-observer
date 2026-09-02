@@ -254,6 +254,7 @@ graph TD
     cdns["collector-dns\nDnsFacts, build_dns_samples,\nDnsCollector, META (Interval)"]
     croute["collector-route\nRouteCollector, META (Event);\nEventSource-driven"]
     chost["collector-host\nHostFacts, build_host_sample,\nHostCollector, META (Interval)"]
+    cwifi["collector-wifi\nWifiFacts, build_wifi_sample,\nWifiCollector, META (Interval)"]
     triggers["triggers\nCondition/Handler/Trigger, engine"]
     config["config\nfigment per-subsystem toggles"]
     macos["macos\nreal adapters: ICMP, IP_BOUND_IF,\nClash API, DHCP/ARP, pcap ring,\nDNS resolve, PF_ROUTE, loadavg"]
@@ -270,6 +271,7 @@ graph TD
     ccore --> cdns
     ccore --> croute
     ccore --> chost
+    ccore --> cwifi
     types --> clink
     types --> cproxy
     types --> cdns
@@ -311,9 +313,10 @@ graph TD
 - `collector-core` depends on `types` only — and **not** on tokio: native
   `async fn` traits need no runtime crate, and `Source` / `EventSource` keep the
   crate runtime-agnostic. The async driving of both cadences lives in `net-observerd`.
-- `collector-link` / `collector-proxy` / `collector-dns` / `collector-host` are
-  `Interval` collectors; each depends on `types` + `collector-core` and holds its
-  port trait (`LinkFacts` / `ProxyFacts` / `DnsFacts` / `HostFacts`), the pure
+- `collector-link` / `collector-proxy` / `collector-dns` / `collector-host` /
+  `collector-wifi` are `Interval` collectors; each depends on `types` +
+  `collector-core` and holds its port trait (`LinkFacts` / `ProxyFacts` /
+  `DnsFacts` / `HostFacts` / `WifiFacts`), the pure
   `build_*` mapping logic (unit-tested with fakes), a static `META`, and the
   `Collector` impl.
 - `collector-route` is the first **Event**-cadence collector: it wraps a
@@ -325,7 +328,9 @@ graph TD
   `socket2` + `tokio::net::TcpStream` with `IP_BOUND_IF` (bound TCP probes),
   `reqwest`'s **async** client (Clash API, TUN 204 probe, DoH), and
   `tokio::process::Command` (DHCP/ARP + Wi-Fi subprocesses); `getloadavg` stays
-  an inline syscall inside its `async fn`. The blocking PF_ROUTE `EventSource`
+  an inline syscall inside its `async fn`, as does the CoreWLAN read behind
+  `WifiFacts` (hand-declared `objc2` message sends — no subprocess and no text
+  parsing; see `macos::corewlan`). The blocking PF_ROUTE `EventSource`
   and the pcap ring are the only non-async pieces. **`ureq` was dropped** in
   favour of `reqwest` async — the earlier `reqwest::blocking`-inside-tokio
   startup panic cannot recur. `macos` also carries the per-collector
@@ -380,6 +385,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `dns_sample` | `ts_us, probe, server, verdict, ip, rtt_ms` | One row per resolver probe (name label × resolver path); `verdict` drives the `fakeip` trigger. |
 | `route_event` | `ts_us, kind, iface, detail` | PF_ROUTE event stream (`kind` = `iface` / `addr` / `route`): iface up/down, addr add/loss, default-route change. |
 | `host_sample` | `ts_us, load1, load5, load15` | Host load averages — the `starvation` discriminator. |
+| `wifi_sample` | `ts_us, wifi, reason, rssi_dbm, noise_dbm, snr_db, tx_rate_mbps, phy_mode, channel, channel_width_mhz, channel_band` | Wi-Fi air quality from CoreWLAN. `rssi_dbm`/`noise_dbm` are the raw pair and `snr_db` is derived (`rssi - noise`), so the derivation can be revisited from the columns actually measured. `wifi = SKIP` with a `reason` when the radio could not be read (no interface, powered off, not associated) — a row every tick, never an absent one. No SSID/BSSID: macOS gates them behind Location Services, which a LaunchDaemon cannot obtain. |
 | `incident` | `id PK, opened_us, closed_us, trigger_id, signature` | Open incident ⇒ `closed_us IS NULL`. |
 | `blob_ref` | `id, incident_id, ts_us, kind, path` | On-disk forensics blobs (pcap freeze, dumps) referenced by path. |
 | `trigger_fired` | `ts_us, trigger_id, incident_id, detail` | One row per trigger fire. |

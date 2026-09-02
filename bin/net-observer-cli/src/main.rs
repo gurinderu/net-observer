@@ -117,7 +117,7 @@ impl ObserveState {
 }
 
 /// The event kind accepted by `events --kind`. A thin CLI mirror of
-/// [`EventKind`] so `clap` renders `<link|proxy|dns|route|host|incident>` in the
+/// [`EventKind`] so `clap` renders `<link|proxy|dns|route|host|wifi|incident>` in the
 /// help without leaking the wire type into the argument surface.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum EventKindArg {
@@ -126,6 +126,7 @@ enum EventKindArg {
     Dns,
     Route,
     Host,
+    Wifi,
     Incident,
 }
 
@@ -138,6 +139,7 @@ impl EventKindArg {
             EventKindArg::Dns => EventKind::Dns,
             EventKindArg::Route => EventKind::Route,
             EventKindArg::Host => EventKind::Host,
+            EventKindArg::Wifi => EventKind::Wifi,
             EventKindArg::Incident => EventKind::Incident,
         }
     }
@@ -620,6 +622,7 @@ mod tests {
             }),
             dns: None,
             host: None,
+            wifi: None,
             incidents: vec![
                 incident("i1", "wedge", 80, None),
                 incident("i2", "gw-drop", 60, Some(70)),
@@ -723,6 +726,7 @@ mod tests {
         assert_eq!(EventKindArg::Dns.to_kind(), EventKind::Dns);
         assert_eq!(EventKindArg::Route.to_kind(), EventKind::Route);
         assert_eq!(EventKindArg::Host.to_kind(), EventKind::Host);
+        assert_eq!(EventKindArg::Wifi.to_kind(), EventKind::Wifi);
         assert_eq!(EventKindArg::Incident.to_kind(), EventKind::Incident);
     }
 

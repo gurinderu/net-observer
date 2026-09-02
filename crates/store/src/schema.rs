@@ -16,6 +16,13 @@ CREATE TABLE IF NOT EXISTS route_event (
   ts_us BIGINT, kind VARCHAR, iface VARCHAR, detail VARCHAR);
 CREATE TABLE IF NOT EXISTS host_sample (
   ts_us BIGINT, load1 DOUBLE, load5 DOUBLE, load15 DOUBLE);
+-- Wi-Fi air quality. `rssi_dbm`/`noise_dbm` are the raw pair as CoreWLAN reported
+-- them and `snr_db` is derived from them, so a later change of derivation can be
+-- recomputed from the columns that were actually measured.
+CREATE TABLE IF NOT EXISTS wifi_sample (
+  ts_us BIGINT, wifi VARCHAR, reason VARCHAR, rssi_dbm INTEGER, noise_dbm INTEGER,
+  snr_db INTEGER, tx_rate_mbps DOUBLE, phy_mode VARCHAR, channel INTEGER,
+  channel_width_mhz INTEGER, channel_band VARCHAR);
 CREATE TABLE IF NOT EXISTS observing_edge (
   ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT, cause VARCHAR);
 -- `cause` was added after the first daemon shipped rows without it. A database

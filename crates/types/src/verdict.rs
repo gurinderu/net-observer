@@ -30,6 +30,14 @@ pub struct ParseVerdictError(pub String);
 // quiet must still be seen: realm `net-observer`, node #25.
 token_enum!(GwVerdict { Ok => "OK", Fail => "FAIL", NoGw => "NOGW", Skip => "SKIP" });
 token_enum!(TcpVerdict { Ok => "OK", Fail => "FAIL", Skip => "SKIP" });
+// The `wifi` collector's verdict. `Ok` = the radio was associated and the tick
+// carries a real reading; `Skip` = the probe could not run at all (no Wi-Fi
+// interface, radio off, not associated) and `WifiSample::reason` says which.
+// There is deliberately no `Fail`: a saturated channel is not a failed probe but
+// a measurement — the numbers, not the verdict, carry that diagnosis. An
+// individual field the API declined to give is `None` inside an `OK` sample, not
+// a whole-sample SKIP.
+token_enum!(WifiVerdict { Ok => "OK", Skip => "SKIP" });
 token_enum!(DnsVerdict {
     Ok => "OK", FakeIp => "FAKEIP", Empty => "EMPTY", ServFail => "SERVFAIL",
     NxDomain => "NXDOMAIN", Timeout => "TIMEOUT", Skip => "SKIP",
@@ -77,6 +85,14 @@ mod tests {
         ] {
             assert_eq!(v.to_string(), s);
             assert_eq!(DnsVerdict::from_str(s).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn wifi_roundtrip() {
+        for (v, s) in [(WifiVerdict::Ok, "OK"), (WifiVerdict::Skip, "SKIP")] {
+            assert_eq!(v.to_string(), s);
+            assert_eq!(WifiVerdict::from_str(s).unwrap(), v);
         }
     }
 

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::verdict::{DnsVerdict, GwVerdict, TcpVerdict};
+use crate::verdict::{DnsVerdict, GwVerdict, TcpVerdict, WifiVerdict};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkSample {
@@ -56,6 +56,51 @@ pub struct HostSample {
     pub load15: f64,
 }
 
+/// Wi-Fi air quality for one tick, read from CoreWLAN.
+///
+/// The gateway going quiet and the *air* going quiet are different failures: in a
+/// saturated coworking channel the link stays associated and the signal looks
+/// fine while the transmit window never arrives. Nothing else the daemon collects
+/// sees that.
+///
+/// `rssi_dbm` and `noise_dbm` are kept as the **raw pair** and `snr_db` is derived
+/// from them (`rssi - noise`), never the other way round: RSSI alone barely moves
+/// until the link is already gone, while the margin over the noise floor degrades
+/// earlier — and keeping both means the derivation can be revisited without
+/// losing the measurement.
+///
+/// Every field is independently optional: an API that declines one value yields
+/// `None` for it inside an otherwise `OK` sample. When the probe could not run at
+/// all, `wifi` is [`WifiVerdict::Skip`] and `reason` says why — a SKIP row every
+/// tick, never an absent one.
+///
+/// SSID/BSSID are deliberately absent. macOS gates them behind Location Services,
+/// which a LaunchDaemon cannot obtain; the SSID is collected by the `link`
+/// collector instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WifiSample {
+    pub ts_us: i64,
+    pub wifi: WifiVerdict,
+    /// Why the probe could not run. `Some` iff `wifi == Skip`.
+    pub reason: Option<String>,
+    /// Received signal strength, dBm (negative).
+    pub rssi_dbm: Option<i32>,
+    /// Noise floor, dBm (negative).
+    pub noise_dbm: Option<i32>,
+    /// Derived: `rssi_dbm - noise_dbm`, `Some` only when both raw values are.
+    pub snr_db: Option<i32>,
+    /// Negotiated transmit rate, Mbps.
+    pub tx_rate_mbps: Option<f64>,
+    /// Active PHY mode label ("11a"/"11b"/"11g"/"11n"/"11ac"/"11ax").
+    pub phy_mode: Option<String>,
+    /// Channel number (e.g. 48).
+    pub channel: Option<i32>,
+    /// Channel width in MHz (20/40/80/160).
+    pub channel_width_mhz: Option<i32>,
+    /// Band label ("2ghz"/"5ghz"/"6ghz").
+    pub channel_band: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Sample {
     Link(LinkSample),
@@ -63,6 +108,7 @@ pub enum Sample {
     Dns(DnsSample),
     Route(RouteEvent),
     Host(HostSample),
+    Wifi(WifiSample),
 }
 
 impl Sample {
@@ -73,6 +119,7 @@ impl Sample {
             Sample::Dns(d) => d.ts_us,
             Sample::Route(r) => r.ts_us,
             Sample::Host(h) => h.ts_us,
+            Sample::Wifi(w) => w.ts_us,
         }
     }
 }
@@ -138,6 +185,21 @@ mod tests {
             load15: 3.0,
         });
         assert_eq!(h.ts_us(), 23);
+
+        let w = Sample::Wifi(WifiSample {
+            ts_us: 31,
+            wifi: crate::WifiVerdict::Ok,
+            reason: None,
+            rssi_dbm: Some(-53),
+            noise_dbm: Some(-96),
+            snr_db: Some(43),
+            tx_rate_mbps: Some(270.0),
+            phy_mode: Some("11ax".into()),
+            channel: Some(48),
+            channel_width_mhz: Some(20),
+            channel_band: Some("5ghz".into()),
+        });
+        assert_eq!(w.ts_us(), 31);
     }
 
     #[test]
