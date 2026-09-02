@@ -110,6 +110,27 @@ pub struct NeighborsCfg {
     pub enabled: bool,
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
+    /// What an operator-pressed scan is PERMITTED to do. The ceiling, not the
+    /// switch: every capability is off by default, and the bar's checkboxes pick
+    /// which permitted capabilities a given manual run includes. A run never
+    /// exceeds this — a requested-but-unpermitted capability is dropped and the
+    /// scan says so. The passive collector above needs none of this; it only
+    /// ever reads caches the OS filled.
+    #[serde(default)]
+    pub scan: ScanCfg,
+}
+
+/// Per-capability permission for the active neighbour scan, each off by default.
+/// The rungs escalate in how loud they are on the wire; a host turns on exactly
+/// what it is willing to emit into the networks it visits. Reading order matches
+/// the ladder: sweep/mDNS are the base (always run when scanning); the rungs
+/// below are the additions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScanCfg {
+    /// TCP-connect probes to discovered neighbours' ports — the daemon opening
+    /// connections to other machines, so off by default and gated by acting.
+    #[serde(default)]
+    pub ports: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +208,7 @@ impl Default for Config {
                 neighbors: NeighborsCfg {
                     enabled: true,
                     interval: Duration::from_secs(120),
+                    scan: ScanCfg::default(),
                 },
                 pcap_ring: PcapCfg {
                     enabled: true,
@@ -294,6 +316,22 @@ mod tests {
         assert!(!c.collectors.wifi.enabled);
         assert_eq!(c.collectors.wifi.interval.as_secs(), 30);
     }
+    #[test]
+    fn scan_capabilities_are_all_off_by_default_and_toggle_from_toml() {
+        let c = Config::load(None).unwrap();
+        assert!(
+            !c.collectors.neighbors.scan.ports,
+            "an active scan capability must be off until explicitly permitted"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        std::fs::write(&p, "[collectors.neighbors.scan]\nports = true\n").unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert!(c.collectors.neighbors.scan.ports);
+        // The rest of the neighbors config keeps its defaults.
+        assert!(c.collectors.neighbors.enabled);
+    }
+
     #[test]
     fn neighbors_defaults_apply_and_can_be_disabled() {
         let c = Config::load(None).unwrap();

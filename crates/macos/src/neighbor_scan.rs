@@ -18,8 +18,9 @@
 //!   the ARP cache by address, so a name lands on the device that owns it.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use types::{NeighborObs, NeighborSource};
@@ -305,9 +306,153 @@ pub fn mdns_names_blocking() -> MdnsOutcome {
     done(names, browsed.len(), started)
 }
 
+/// A common-service port list. Deliberately short: the scan is meant to profile
+/// what a device leaves open, not to enumerate all 65535 ports — a full sweep is
+/// neither quick nor a good neighbour on a shared segment. Extend consciously.
+pub const COMMON_PORTS: &[u16] = &[
+    21, 22, 23, 25, 53, 80, 110, 139, 143, 443, 445, 465, 587, 993, 995, 1433, 1883, 3306, 3389,
+    5432, 5900, 6379, 8000, 8080, 8443, 9000, 9200,
+];
+
+/// How long to wait for a single TCP connect before calling the port closed.
+/// Short: a stalled connect is itself a "no" for a scan on a local segment.
+const PORT_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// How many connects are in flight at once. Bounded so the scan stays a good
+/// citizen on a shared segment (rate-limiting to not disrupt the network — NOT
+/// stealth) and cannot exhaust file descriptors.
+const PORT_SCAN_CONCURRENCY: usize = 64;
+
+/// One open port found on a neighbour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortFinding {
+    pub ip: IpAddr,
+    pub port: u16,
+}
+
+/// What the port scan did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortScanOutcome {
+    pub open: Vec<PortFinding>,
+    /// (hosts, ports-per-host) actually probed — the recorded reach.
+    pub hosts: usize,
+    pub ports_per_host: usize,
+    pub duration_ms: i64,
+}
+
+/// TCP-connect-scan `ports` on each of `targets`, pinning every connect to
+/// `iface_name` with `IP_BOUND_IF` so the tunnel cannot answer for the segment
+/// (the same invariant the sweep and the underlay TCP prober hold). Bounded
+/// concurrency, short per-connect timeout; blocking, driven on the blocking pool.
+///
+/// A closed or filtered port is simply absent from the result — absence is the
+/// signal, no per-port "closed" row.
+pub fn port_scan_blocking(targets: &[IpAddr], ports: &[u16], iface_name: &str) -> PortScanOutcome {
+    let started = Instant::now();
+    // Flatten to a work list of (ip, port); a shared cursor hands each worker the
+    // next item, so a slow host does not idle the others.
+    let work: Vec<(IpAddr, u16)> = targets
+        .iter()
+        .flat_map(|ip| ports.iter().map(move |p| (*ip, *p)))
+        .collect();
+    let cursor = AtomicUsize::new(0);
+    let workers = PORT_SCAN_CONCURRENCY.min(work.len().max(1));
+
+    let open: Vec<PortFinding> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut found = Vec::new();
+                    loop {
+                        let i = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(ip, port)) = work.get(i) else {
+                            break;
+                        };
+                        if connect_open(ip, port, iface_name) {
+                            found.push(PortFinding { ip, port });
+                        }
+                    }
+                    found
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+
+    let mut open = open;
+    open.sort_by_key(|a| (a.ip, a.port));
+    PortScanOutcome {
+        open,
+        hosts: targets.len(),
+        ports_per_host: ports.len(),
+        duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+    }
+}
+
+/// One bound TCP connect with a deadline. `true` iff the port accepted.
+fn connect_open(ip: IpAddr, port: u16, iface_name: &str) -> bool {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let addr = SocketAddr::new(ip, port);
+    let domain = if ip.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let Ok(socket) = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)) else {
+        return false;
+    };
+    // Pin IPv4 connects to the physical interface, like every other probe here;
+    // a v6 link-local neighbour is already scoped by its address.
+    if ip.is_ipv4() {
+        let _ = crate::net::bind_to_iface_v4(socket.as_raw_fd(), iface_name);
+    }
+    if socket
+        .connect_timeout(&addr.into(), PORT_CONNECT_TIMEOUT)
+        .is_err()
+    {
+        return false;
+    }
+    // A completed connect that we hand straight back to the OS: the profile is
+    // "the port accepts", nothing is sent.
+    let _stream: TcpStream = socket.into();
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_port_scan_finds_an_open_local_port_and_misses_a_closed_one() {
+        use std::net::{Ipv4Addr, TcpListener};
+        // A real listener on loopback: its port is open, an adjacent one is not.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let open_port = listener.local_addr().unwrap().port();
+        // A port nothing listens on. Bind-then-drop frees it, so a connect is
+        // refused fast rather than timing out.
+        let scratch = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let closed_port = scratch.local_addr().unwrap().port();
+        drop(scratch);
+
+        let target = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        // Empty iface name: bind_to_iface is skipped on loopback (if_nametoindex
+        // of "" fails, the connect proceeds unpinned — fine for a loopback test).
+        let out = port_scan_blocking(&[target], &[open_port, closed_port], "");
+        assert!(
+            out.open.iter().any(|f| f.port == open_port),
+            "the listening port must be found: {:?}",
+            out.open
+        );
+        assert!(
+            !out.open.iter().any(|f| f.port == closed_port),
+            "a closed port must not appear"
+        );
+        assert_eq!(out.hosts, 1);
+        assert_eq!(out.ports_per_host, 2);
+    }
 
     #[test]
     fn parses_a_slash_24_from_ifconfig() {

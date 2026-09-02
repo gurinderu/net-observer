@@ -21,8 +21,8 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::Config;
 use net_observer_ipc::{
-    ControlCmd, ControlResult, EventKind, IncidentSummary, Request, Response, StatusSnapshot,
-    StreamFrame,
+    ControlCmd, ControlResult, EventKind, IncidentSummary, Request, Response, ScanOptions,
+    StatusSnapshot, StreamFrame,
 };
 use std::io::Write;
 use std::process::ExitCode;
@@ -112,7 +112,13 @@ enum Command {
     /// daemon refuses it unless `acting.enabled` is set. Every run that does
     /// happen leaves a `neighbor_scan` row saying what was probed. Exits
     /// non-zero if the scan was refused/failed or the daemon is unreachable.
-    ScanNeighbors,
+    ScanNeighbors {
+        /// Also TCP-connect-scan discovered neighbours' common ports. Only runs
+        /// if `collectors.neighbors.scan.ports` permits it in the daemon config;
+        /// otherwise the daemon drops it and says so. Off unless given.
+        #[arg(long)]
+        ports: bool,
+    },
     /// The neighbours the record knows on each segment, newest sighting first
     /// (offline): MAC, address, vendor OUI, name if one was ever learned, and
     /// how it came to be known.
@@ -270,9 +276,9 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
-        Command::ScanNeighbors => {
+        Command::ScanNeighbors { ports } => {
             let cfg = load_config(cli)?;
-            let result = fetch_scan_neighbors(&cfg.socket_path)?;
+            let result = fetch_scan_neighbors(&cfg.socket_path, ScanOptions { ports: *ports })?;
             print!("{}", format_control(&result));
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
@@ -536,8 +542,11 @@ fn fetch_set_observing(socket_path: &str, observing: bool) -> Result<ControlResu
 }
 
 /// Send `Control(ScanNeighbors)` and return the daemon's verdict.
-fn fetch_scan_neighbors(socket_path: &str) -> Result<ControlResult> {
-    match daemon_query(socket_path, &Request::Control(ControlCmd::ScanNeighbors))? {
+fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
+    match daemon_query(
+        socket_path,
+        &Request::Control(ControlCmd::ScanNeighbors(opts)),
+    )? {
         Response::Control(result) => Ok(result),
         Response::Error(e) => Err(anyhow!("net-observerd returned an error: {e}")),
         other => Err(anyhow!("unexpected daemon response to Control: {other:?}")),

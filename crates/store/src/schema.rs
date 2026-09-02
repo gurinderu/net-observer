@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS neighbor (
 CREATE TABLE IF NOT EXISTS neighbor_scan (
   ts_us BIGINT, network_key VARCHAR, iface VARCHAR, method VARCHAR, target VARCHAR,
   found INTEGER, duration_ms BIGINT, detail VARCHAR);
+-- Open ports found on a neighbour by an operator-pressed port scan. Keyed by
+-- (network_key, mac, port) with first/last seen, like `neighbor`: "445 has been
+-- open on this device since X" is the queryable fact. A port is attributed to a
+-- device by joining the finding's IP to the neighbour that owns it; a port on an
+-- address no neighbour claims is dropped, because the row is keyed by MAC.
+CREATE TABLE IF NOT EXISTS neighbor_port (
+  network_key VARCHAR, mac VARCHAR, ip VARCHAR, port INTEGER,
+  first_seen_us BIGINT, last_seen_us BIGINT,
+  PRIMARY KEY (network_key, mac, port));
 CREATE TABLE IF NOT EXISTS observing_edge (
   ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT, cause VARCHAR);
 -- `cause` was added after the first daemon shipped rows without it. A database

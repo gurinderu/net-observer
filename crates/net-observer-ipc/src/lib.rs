@@ -104,7 +104,24 @@ pub enum ControlCmd {
     /// `acting.enabled` is set — and why every run writes a `neighbor_scan` row
     /// saying what was probed. The passive `neighbors` collector needs none of
     /// this: it only ever reads caches the OS already filled.
-    ScanNeighbors,
+    ///
+    /// Carries [`ScanOptions`]: which rungs of the scan this run should include.
+    /// The daemon runs a rung only when it is BOTH requested here and permitted
+    /// by config; a requested-but-unpermitted rung is dropped and the result
+    /// message says so.
+    ScanNeighbors(ScanOptions),
+}
+
+/// Which rungs of an operator-pressed scan a single run should include.
+///
+/// The base scan (subnet sweep + mDNS) always runs; these are the additions,
+/// each defaulting to `false`, so an older client or an omitted field asks for
+/// the base scan alone. Grows one field per rung of the ladder.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScanOptions {
+    /// Probe discovered neighbours' TCP ports.
+    #[serde(default)]
+    pub ports: bool,
 }
 
 /// The outcome of a [`ControlCmd`]: whether the action ran successfully plus a

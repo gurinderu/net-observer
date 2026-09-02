@@ -8,6 +8,16 @@ use types::{BlobRef, Incident, ObservingEdge, Sample, TriggerFired};
 /// identified, rather than being silently merged into someone else's.
 const UNKNOWN_NETWORK: &str = "unknown";
 
+/// One open port found on a neighbour, as written to `neighbor_port`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeighborPort {
+    pub network_key: Option<String>,
+    pub mac: String,
+    pub ip: String,
+    pub port: u16,
+    pub ts_us: i64,
+}
+
 /// One operator-pressed neighbour scan, as written to `neighbor_scan`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NeighborScan {
@@ -245,6 +255,20 @@ impl Store for DuckdbStore {
         )?;
         Ok(())
     }
+
+    fn write_neighbor_port(&self, p: &NeighborPort) -> Result<(), StoreError> {
+        let key = p.network_key.as_deref().unwrap_or(UNKNOWN_NETWORK);
+        self.conn.lock().unwrap().execute(
+            // `first_seen_us` preserved, like `neighbor`: the point of the row is
+            // since-when a port has been open on this device.
+            "INSERT INTO neighbor_port VALUES (?,?,?,?,?,?)
+             ON CONFLICT (network_key, mac, port) DO UPDATE SET
+               ip = excluded.ip,
+               last_seen_us = excluded.last_seen_us",
+            params![key, p.mac, p.ip, p.port, p.ts_us, p.ts_us],
+        )?;
+        Ok(())
+    }
     fn open_incident(&self, i: &Incident) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO incident VALUES (?,?,?,?,?)",
@@ -416,6 +440,32 @@ mod tests {
             .query_table("SELECT verdict, reason, neighbor_count FROM neighbor_sample")
             .unwrap();
         assert_eq!(t.rows[0], vec!["SKIP", "arp(8) unavailable", "0"]);
+    }
+
+    /// A port sighting is one row per (network_key, mac, port), keeping the
+    /// moment it was first seen open while its last sighting moves forward.
+    #[test]
+    fn a_port_seen_twice_is_one_row_that_keeps_its_first_sighting() {
+        let s = DuckdbStore::in_memory().unwrap();
+        for ts in [1000, 2000] {
+            s.write_neighbor_port(&NeighborPort {
+                network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+                mac: "11:22:33:44:55:66".into(),
+                ip: "192.168.1.5".into(),
+                port: 445,
+                ts_us: ts,
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM neighbor_port")
+                .unwrap(),
+            1
+        );
+        let t = s
+            .query_table("SELECT first_seen_us, last_seen_us, port FROM neighbor_port")
+            .unwrap();
+        assert_eq!(t.rows[0], vec!["1000", "2000", "445"]);
     }
 
     /// An operator scan leaves its own durable trace, separate from the entities
