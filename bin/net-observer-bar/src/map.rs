@@ -25,9 +25,11 @@ use types::{NeighborObs, NeighborSource, NeighborsSample};
 
 use crate::ui::Theme;
 
-/// The most neighbours the ring will draw. Beyond this the star turns into an
-/// unreadable tangle, so the extras are summarised as a "+N more" note rather than
-/// crammed in. A first-version cap, not a hard limit on what the daemon records.
+/// The upper ceiling on ring nodes. The ACTUAL cap is whichever is smaller, this
+/// or [`ring_capacity`] for the current radius, so the ring never overlaps; the
+/// rest are summarised as "+N more". A first-version ceiling, not a limit on what
+/// the daemon records. The map decision and gateway derivation: (realm
+/// net-observer, node #34, #36).
 const MAX_RING: usize = 12;
 
 /// The fixed height of the map's plot area, in gpui logical pixels. Tall enough
@@ -41,14 +43,20 @@ const CHIP_W: f32 = 84.0;
 const CHIP_H: f32 = 24.0;
 
 /// Ring radius from the gateway at the centre to each neighbour chip's centre.
-const RING_R: f32 = 74.0;
+/// Sized to the available [`MAP_H`] (diameter plus a chip still fits the plot).
+const RING_R: f32 = 88.0;
+
+/// Minimum clear gap between adjacent chips on the ring.
+const CHIP_GAP: f32 = 8.0;
 
 /// A neighbour reduced to what the map draws: a stable identity, a short label and
 /// which reading produced it. Derived purely from a [`NeighborObs`] so the render
 /// carries no parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MapNode {
-    /// The neighbour's MAC — the stable key, and what decides the gateway.
+    /// The neighbour's MAC — the stable node identity the later accent seam keys
+    /// on. The gateway is decided from the raw `NeighborObs` before a `MapNode` is
+    /// built, so this field is not itself the discriminator.
     mac: String,
     /// The short on-chip identity (hostname, else vendor OUI, else last IP octet,
     /// else a short MAC).
@@ -69,10 +77,13 @@ impl MapNode {
 
 /// The short identity drawn on a node chip.
 ///
-/// Order of preference: a known hostname (only mDNS supplies one), then the vendor
-/// OUI, then the last octet of the IPv4 address, then the last two MAC octets. The
-/// point is to name the device by the most human handle available without ever
-/// showing a blank chip.
+/// Order of preference: a known hostname (only mDNS supplies one), then the raw
+/// OUI prefix, then the last octet of the IPv4 address, then the last two MAC
+/// octets. The OUI here is the raw first-three-octets hex, NOT a vendor name:
+/// mapping OUI→vendor through the offline IEEE registry (and treating a
+/// randomized/locally-administered MAC as "unknown", never a guess) is a later
+/// increment, (realm net-observer, node #36). The point is a human handle without
+/// a blank chip.
 fn node_label(obs: &NeighborObs) -> String {
     if let Some(host) = obs.hostname.as_deref().filter(|h| !h.is_empty()) {
         return host.to_string();
@@ -122,9 +133,27 @@ fn partition(sample: &NeighborsSample) -> (Option<MapNode>, Vec<MapNode>, usize)
             ring.push(MapNode::from_obs(obs));
         }
     }
-    let dropped = ring.len().saturating_sub(MAX_RING);
-    ring.truncate(MAX_RING);
+    // Cap by what the ring can actually hold without overlap, never above the
+    // first-version ceiling; the remainder is summarised as "+N more".
+    let cap = ring_capacity(RING_R).min(MAX_RING);
+    let dropped = ring.len().saturating_sub(cap);
+    ring.truncate(cap);
     (gateway, ring, dropped)
+}
+
+/// How many chips fit on a ring of radius `r` without their footprints
+/// overlapping. Adjacent centres are `2·r·sin(π/n)` apart, so the largest `n`
+/// that keeps that at least `CHIP_W + CHIP_GAP` is `π / asin((CHIP_W+CHIP_GAP)/(2r))`.
+/// This is why the ring is capped by geometry, not by a guessed constant: a fixed
+/// cap of 12 packed a narrow panel into a pile of overlapping chips (the star only
+/// holds a handful at a legible size — a busy segment shows "+N more" instead).
+fn ring_capacity(r: f32) -> usize {
+    let arg = (CHIP_W + CHIP_GAP) / (2.0 * r);
+    if arg >= 1.0 {
+        // Even two chips would touch: show at most one.
+        return 1;
+    }
+    (PI / arg.asin()).floor().max(1.0) as usize
 }
 
 /// The centre points of `n` evenly-spaced nodes on a ring of radius `r` around
@@ -147,7 +176,8 @@ fn ring_positions(n: usize, cx: f32, cy: f32, r: f32) -> Vec<(f32, f32)> {
 /// operator-scanned one (muted): a scanned host was reached by putting packets on
 /// the wire, so it reads as less load-bearing than one the kernel already knew. A
 /// future increment will colour each node by its security findings — attach that
-/// here, keyed on the node's identity, without touching the layout.
+/// here, keyed on the node's identity, without touching the layout. The coloring
+/// belongs to the maps decision: (realm net-observer, node #34).
 fn node_accent(node: &MapNode, is_gateway: bool, theme: Theme) -> Rgba {
     if is_gateway {
         return rgb(theme.accent);
@@ -458,21 +488,49 @@ mod tests {
     }
 
     #[test]
-    fn ring_is_capped_and_reports_the_overflow() {
-        let neighbors: Vec<NeighborObs> = (0..(MAX_RING + 5))
+    fn ring_is_capped_by_geometry_and_reports_the_overflow() {
+        // Far more neighbours than a legible ring can hold.
+        let big = MAX_RING + 40;
+        let neighbors: Vec<NeighborObs> = (0..big)
             .map(|i| {
                 obs(
-                    &format!("11:11:11:11:11:{i:02x}"),
-                    "10.0.0.1",
-                    NeighborSource::Sweep,
+                    &format!("{i:02x}:{i:02x}:{i:02x}:{i:02x}:{i:02x}:{i:02x}"),
+                    "1.2.3.4",
+                    NeighborSource::Arp,
                     None,
                 )
             })
             .collect();
-        let s = sample(Some("gg:gg:gg:gg:gg:gg"), neighbors);
-        let (_, ring, dropped) = partition(&s);
-        assert_eq!(ring.len(), MAX_RING);
-        assert_eq!(dropped, 5);
+        let (_gw, ring, dropped) = partition(&sample(None, neighbors));
+        let cap = ring_capacity(RING_R).min(MAX_RING);
+        assert_eq!(
+            ring.len(),
+            cap,
+            "the ring is capped by what fits without overlap"
+        );
+        assert_eq!(
+            dropped,
+            big - cap,
+            "everything past the cap is reported as dropped"
+        );
+    }
+
+    /// The whole point of the geometry cap: at the chosen capacity, adjacent chip
+    /// centres are at least a chip-plus-gap apart, so nothing overlaps.
+    #[test]
+    fn the_ring_capacity_never_lets_chips_overlap() {
+        let n = ring_capacity(RING_R);
+        assert!(n >= 1);
+        if n >= 2 {
+            let p = ring_positions(n, 0.0, 0.0, RING_R);
+            let (dx, dy) = (p[1].0 - p[0].0, p[1].1 - p[0].1);
+            let spacing = (dx * dx + dy * dy).sqrt();
+            assert!(
+                spacing >= CHIP_W + CHIP_GAP - 0.01,
+                "adjacent centres {spacing} must clear a chip+gap of {}",
+                CHIP_W + CHIP_GAP
+            );
+        }
     }
 
     #[test]
