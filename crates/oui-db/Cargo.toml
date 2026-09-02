@@ -1,0 +1,6 @@
+[package]
+name = "oui-db"
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
