@@ -1,0 +1,12 @@
+# `target-cpu=native`: this daemon is built on the very Mac it runs on (one
+# machine, via nix-config), so tuning for the host CPU sacrifices a portability
+# nothing depends on. Read by both the local cargo build and the flake's
+# `buildRustPackage` (which sets no RUSTFLAGS of its own to override it); it does
+# make the nix output builder-CPU-dependent, a reproducibility cost accepted for
+# a single-host artifact.
+#
+# Note: an environment `RUSTFLAGS` REPLACES (does not merge with) this, so a
+# context that sets it — CI's `-D warnings` lint job — silently drops the flag.
+# That is harmless there: linting needs no host tuning.
+[build]
+rustflags = ["-C", "target-cpu=native"]
