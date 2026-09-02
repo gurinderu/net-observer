@@ -55,12 +55,12 @@ const MAX_RING: usize = 12;
 /// The fixed height of the map's plot area, in gpui logical pixels. Tall enough
 /// for a ring of chips around a centred gateway without the corner chips colliding
 /// with the section padding.
-const MAP_H: f32 = 210.0;
+const MAP_H: f32 = 232.0;
 
 /// Chip footprint. Nodes are positioned by their centre, so these are used to
 /// convert a centre into a top-left inset.
 const CHIP_W: f32 = 84.0;
-const CHIP_H: f32 = 24.0;
+const CHIP_H: f32 = 34.0;
 
 /// Ring radius from the gateway at the centre to each neighbour chip's centre.
 /// Sized to the available [`MAP_H`] (diameter plus a chip still fits the plot).
@@ -81,6 +81,9 @@ struct MapNode {
     /// The short on-chip identity (hostname, else vendor OUI, else last IP octet,
     /// else a short MAC).
     label: String,
+    /// The neighbour's address, shown under the identity so a node is not only a
+    /// MAC-derived handle. Empty only if the observation carried no address.
+    ip: String,
     /// Which reading produced this observation (passive cache vs operator scan).
     source: NeighborSource,
 }
@@ -90,6 +93,7 @@ impl MapNode {
         Self {
             mac: obs.mac.clone(),
             label: node_label(obs),
+            ip: obs.ip.clone(),
             source: obs.source,
         }
     }
@@ -232,6 +236,13 @@ fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement
             .text_color(rgb(theme.fg));
     }
     let dot_color = if is_gateway { rgb(theme.knob) } else { dot };
+    // A subdued IP colour that stays legible on both the plain and the accented
+    // (gateway) chip background.
+    let ip_color = if is_gateway {
+        rgb(theme.knob)
+    } else {
+        rgb(theme.muted)
+    };
     chip.child(
         div()
             .text_size(px(8.0))
@@ -239,12 +250,28 @@ fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement
             .child("\u{25CF}"),
     )
     .child(
+        // Identity on top, address beneath — the node is named AND addressed.
         div()
             .flex_1()
             .overflow_hidden()
-            .text_size(px(11.0))
-            .when(is_gateway, |d| d.font_weight(gpui::FontWeight::BOLD))
-            .child(node.label.clone()),
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .overflow_hidden()
+                    .text_size(px(11.0))
+                    .when(is_gateway, |d| d.font_weight(gpui::FontWeight::BOLD))
+                    .child(node.label.clone()),
+            )
+            .when(!node.ip.is_empty(), |d| {
+                d.child(
+                    div()
+                        .overflow_hidden()
+                        .text_size(px(9.0))
+                        .text_color(ip_color)
+                        .child(node.ip.clone()),
+                )
+            }),
     )
 }
 
@@ -332,6 +359,7 @@ pub fn network_map_section(snapshot: &StatusSnapshot, theme: Theme) -> impl Into
                         &MapNode {
                             mac: String::new(),
                             label: "gateway ?".to_string(),
+                            ip: String::new(),
                             source: NeighborSource::Arp,
                         },
                         true,
