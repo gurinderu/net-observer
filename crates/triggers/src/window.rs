@@ -106,7 +106,11 @@ impl RecentWindow {
             .rev()
             .filter_map(|s| match s {
                 Sample::Link(l) => Some(l),
-                Sample::Proxy(_) | Sample::Dns(_) | Sample::Route(_) | Sample::Host(_) => None,
+                Sample::Proxy(_)
+                | Sample::Dns(_)
+                | Sample::Route(_)
+                | Sample::Host(_)
+                | Sample::Wifi(_) => None,
             })
             .take(n)
             .collect()
@@ -119,7 +123,11 @@ impl RecentWindow {
             .rev()
             .filter_map(|s| match s {
                 Sample::Proxy(p) => Some(p),
-                Sample::Link(_) | Sample::Dns(_) | Sample::Route(_) | Sample::Host(_) => None,
+                Sample::Link(_)
+                | Sample::Dns(_)
+                | Sample::Route(_)
+                | Sample::Host(_)
+                | Sample::Wifi(_) => None,
             })
             .take(n)
             .collect()
@@ -129,7 +137,11 @@ impl RecentWindow {
     pub fn last_link(&self) -> Option<&LinkSample> {
         self.buf.iter().rev().find_map(|s| match s {
             Sample::Link(l) => Some(l),
-            Sample::Proxy(_) | Sample::Dns(_) | Sample::Route(_) | Sample::Host(_) => None,
+            Sample::Proxy(_)
+            | Sample::Dns(_)
+            | Sample::Route(_)
+            | Sample::Host(_)
+            | Sample::Wifi(_) => None,
         })
     }
 
@@ -137,7 +149,11 @@ impl RecentWindow {
     pub fn last_proxy(&self) -> Option<&ProxySample> {
         self.buf.iter().rev().find_map(|s| match s {
             Sample::Proxy(p) => Some(p),
-            Sample::Link(_) | Sample::Dns(_) | Sample::Route(_) | Sample::Host(_) => None,
+            Sample::Link(_)
+            | Sample::Dns(_)
+            | Sample::Route(_)
+            | Sample::Host(_)
+            | Sample::Wifi(_) => None,
         })
     }
 
@@ -148,7 +164,11 @@ impl RecentWindow {
             .rev()
             .filter_map(|s| match s {
                 Sample::Dns(d) => Some(d),
-                Sample::Link(_) | Sample::Proxy(_) | Sample::Route(_) | Sample::Host(_) => None,
+                Sample::Link(_)
+                | Sample::Proxy(_)
+                | Sample::Route(_)
+                | Sample::Host(_)
+                | Sample::Wifi(_) => None,
             })
             .take(n)
             .collect()
@@ -158,7 +178,11 @@ impl RecentWindow {
     pub fn last_dns(&self) -> Option<&DnsSample> {
         self.buf.iter().rev().find_map(|s| match s {
             Sample::Dns(d) => Some(d),
-            Sample::Link(_) | Sample::Proxy(_) | Sample::Route(_) | Sample::Host(_) => None,
+            Sample::Link(_)
+            | Sample::Proxy(_)
+            | Sample::Route(_)
+            | Sample::Host(_)
+            | Sample::Wifi(_) => None,
         })
     }
 
@@ -166,7 +190,11 @@ impl RecentWindow {
     pub fn last_host(&self) -> Option<&HostSample> {
         self.buf.iter().rev().find_map(|s| match s {
             Sample::Host(h) => Some(h),
-            Sample::Link(_) | Sample::Proxy(_) | Sample::Dns(_) | Sample::Route(_) => None,
+            Sample::Link(_)
+            | Sample::Proxy(_)
+            | Sample::Dns(_)
+            | Sample::Route(_)
+            | Sample::Wifi(_) => None,
         })
     }
 
@@ -184,7 +212,11 @@ impl RecentWindow {
     pub fn prev_link_with_provenance(&self) -> Option<(&LinkSample, LinkProvenance)> {
         let mut links = self.buf.iter().rev().filter_map(|s| match s {
             Sample::Link(l) => Some(l),
-            Sample::Proxy(_) | Sample::Dns(_) | Sample::Route(_) | Sample::Host(_) => None,
+            Sample::Proxy(_)
+            | Sample::Dns(_)
+            | Sample::Route(_)
+            | Sample::Host(_)
+            | Sample::Wifi(_) => None,
         });
         links.next()?;
         match links.next() {

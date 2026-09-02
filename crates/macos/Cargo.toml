@@ -10,6 +10,11 @@ collector-proxy.workspace = true
 collector-dns.workspace = true
 collector-route.workspace = true
 collector-host.workspace = true
+collector-wifi.workspace = true
+# CoreWLAN is reached by hand-declared message sends against the Objective-C
+# runtime (`objc2` alone — no `objc2-foundation`, since the adapter passes and
+# returns only scalars and untyped objects). See `src/corewlan.rs`.
+objc2.workspace = true
 surge-ping.workspace = true
 socket2.workspace = true
 reqwest.workspace = true

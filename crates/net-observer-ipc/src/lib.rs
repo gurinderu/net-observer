@@ -38,7 +38,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
-use types::{DnsSample, HostSample, LinkSample, ObservingEdge, ProxySample, RouteEvent};
+use types::{
+    DnsSample, HostSample, LinkSample, ObservingEdge, ProxySample, RouteEvent, WifiSample,
+};
 
 /// A request from a client (the bar or cli) to the daemon.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -127,6 +129,7 @@ pub enum EventKind {
     Dns,
     Route,
     Host,
+    Wifi,
     Incident,
 }
 
@@ -141,6 +144,7 @@ impl EventKind {
             EventKind::Dns => "dns",
             EventKind::Route => "route",
             EventKind::Host => "host",
+            EventKind::Wifi => "wifi",
             EventKind::Incident => "incident",
         }
     }
@@ -161,6 +165,7 @@ pub enum Event {
     Dns(DnsSample),
     Route(RouteEvent),
     Host(HostSample),
+    Wifi(WifiSample),
     Incident(IncidentSummary),
 }
 
@@ -174,6 +179,7 @@ impl Event {
             Event::Dns(_) => EventKind::Dns,
             Event::Route(_) => EventKind::Route,
             Event::Host(_) => EventKind::Host,
+            Event::Wifi(_) => EventKind::Wifi,
             Event::Incident(_) => EventKind::Incident,
         }
     }
@@ -187,6 +193,7 @@ impl Event {
             Event::Dns(d) => d.ts_us,
             Event::Route(r) => r.ts_us,
             Event::Host(h) => h.ts_us,
+            Event::Wifi(w) => w.ts_us,
             Event::Incident(i) => i.opened_us,
         }
     }
@@ -215,6 +222,30 @@ impl Event {
                 format!("{} {} {}", r.kind, iface, r.detail)
             }
             Event::Host(h) => format!("load {:.2}/{:.2}/{:.2}", h.load1, h.load5, h.load15),
+            // A SKIP renders as its reason, so a reader never sees a row of
+            // dashes with no explanation for them.
+            Event::Wifi(w) => match w.wifi {
+                types::WifiVerdict::Skip => {
+                    format!("SKIP {}", w.reason.as_deref().unwrap_or("-"))
+                }
+                types::WifiVerdict::Ok => {
+                    let fmt_i = |v: Option<i32>| {
+                        v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string())
+                    };
+                    let rate = w
+                        .tx_rate_mbps
+                        .map(|r| format!("{r:.0}"))
+                        .unwrap_or_else(|| "-".to_string());
+                    format!(
+                        "rssi={} noise={} snr={} tx={}Mbps {}",
+                        fmt_i(w.rssi_dbm),
+                        fmt_i(w.noise_dbm),
+                        fmt_i(w.snr_db),
+                        rate,
+                        w.phy_mode.as_deref().unwrap_or("-")
+                    )
+                }
+            },
             Event::Incident(i) => format!("{} {}", i.trigger_id, i.signature),
         }
     }
@@ -440,6 +471,13 @@ pub struct StatusSnapshot {
     pub proxy: Option<ProxySample>,
     pub dns: Option<DnsSample>,
     pub host: Option<HostSample>,
+    /// The latest Wi-Fi air-quality reading.
+    ///
+    /// `serde(default)` for the same forward-compatibility reason as `observing`:
+    /// a pre-wifi daemon emits no such field, and without the default the whole
+    /// `Response` would fail to decode — a live daemon rendered as "offline".
+    #[serde(default)]
+    pub wifi: Option<WifiSample>,
     pub incidents: Vec<IncidentSummary>,
     /// Whether the daemon is actively collecting. `true` (the default) = collectors
     /// run and samples flow; `false` = collection is paused (the daemon stays alive
@@ -479,6 +517,7 @@ impl Default for StatusSnapshot {
             proxy: None,
             dns: None,
             host: None,
+            wifi: None,
             incidents: Vec::new(),
             observing: observing_default(),
             quiet: false,
@@ -717,6 +756,7 @@ mod tests {
             proxy: None,
             dns: None,
             host: None,
+            wifi: None,
             incidents: vec![IncidentSummary {
                 id: "inc-1".into(),
                 opened_us: 1000,

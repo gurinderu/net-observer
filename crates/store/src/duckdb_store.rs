@@ -146,6 +146,22 @@ impl Store for DuckdbStore {
                 "INSERT INTO host_sample VALUES (?,?,?,?)",
                 params![h.ts_us, h.load1, h.load5, h.load15],
             )?,
+            Sample::Wifi(w) => c.execute(
+                "INSERT INTO wifi_sample VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    w.ts_us,
+                    w.wifi.to_string(),
+                    w.reason,
+                    w.rssi_dbm,
+                    w.noise_dbm,
+                    w.snr_db,
+                    w.tx_rate_mbps,
+                    w.phy_mode,
+                    w.channel,
+                    w.channel_width_mhz,
+                    w.channel_band
+                ],
+            )?,
         };
         Ok(())
     }
@@ -237,6 +253,58 @@ mod tests {
         assert_eq!(
             s.query_scalar_i64("SELECT count(*) FROM host_sample WHERE load1 > 10")
                 .unwrap(),
+            1
+        );
+    }
+
+    /// The raw pair and the derived margin all reach their own columns, and a
+    /// SKIP tick lands as a row with its reason — never as a missing row.
+    #[test]
+    fn write_and_read_back_wifi_sample() {
+        use types::{Sample, WifiSample, WifiVerdict};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Wifi(WifiSample {
+            ts_us: 6000,
+            wifi: WifiVerdict::Ok,
+            reason: None,
+            rssi_dbm: Some(-53),
+            noise_dbm: Some(-96),
+            snr_db: Some(43),
+            tx_rate_mbps: Some(270.0),
+            phy_mode: Some("11ax".into()),
+            channel: Some(48),
+            channel_width_mhz: Some(20),
+            channel_band: Some("5ghz".into()),
+        }))
+        .unwrap();
+        s.write_sample(&Sample::Wifi(WifiSample {
+            ts_us: 6100,
+            wifi: WifiVerdict::Skip,
+            reason: Some("not associated".into()),
+            rssi_dbm: None,
+            noise_dbm: None,
+            snr_db: None,
+            tx_rate_mbps: None,
+            phy_mode: None,
+            channel: None,
+            channel_width_mhz: None,
+            channel_band: None,
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM wifi_sample \
+                 WHERE wifi='OK' AND rssi_dbm=-53 AND noise_dbm=-96 AND snr_db=43 \
+                 AND phy_mode='11ax' AND channel=48 AND channel_width_mhz=20"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM wifi_sample WHERE wifi='SKIP' AND reason='not associated'"
+            )
+            .unwrap(),
             1
         );
     }

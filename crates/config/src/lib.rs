@@ -37,6 +37,7 @@ pub struct Collectors {
     pub dns: DnsCfg,
     pub route: RouteCfg,
     pub host: HostCfg,
+    pub wifi: WifiCfg,
     pub pcap_ring: PcapCfg,
 }
 
@@ -79,6 +80,17 @@ pub struct RouteCfg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostCfg {
+    pub enabled: bool,
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+}
+
+/// The `wifi` collector: passive CoreWLAN air-quality readings (RSSI, noise,
+/// transmit rate, PHY, channel). Reading the radio's own statistics sends
+/// nothing and never scans, so it is on by default like the other passive
+/// collectors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WifiCfg {
     pub enabled: bool,
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
@@ -149,6 +161,10 @@ impl Default for Config {
                 },
                 route: RouteCfg { enabled: true },
                 host: HostCfg {
+                    enabled: true,
+                    interval: Duration::from_secs(15),
+                },
+                wifi: WifiCfg {
                     enabled: true,
                     interval: Duration::from_secs(15),
                 },
@@ -240,6 +256,23 @@ mod tests {
         assert!(c.collectors.route.enabled);
         assert!(c.collectors.host.enabled);
         assert_eq!(c.collectors.host.interval.as_secs(), 15);
+    }
+    #[test]
+    fn wifi_defaults_apply_and_can_be_disabled() {
+        let c = Config::load(None).unwrap();
+        assert!(c.collectors.wifi.enabled);
+        assert_eq!(c.collectors.wifi.interval.as_secs(), 15);
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        std::fs::write(
+            &p,
+            "[collectors.wifi]\nenabled = false\ninterval = \"30s\"\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert!(!c.collectors.wifi.enabled);
+        assert_eq!(c.collectors.wifi.interval.as_secs(), 30);
     }
     #[test]
     fn toml_overrides_defaults() {

@@ -26,10 +26,11 @@ use collector_host::HostCollector;
 use collector_link::{LinkCollector, LinkFacts};
 use collector_proxy::ProxyCollector;
 use collector_route::RouteCollector;
+use collector_wifi::WifiCollector;
 use config::Config;
 use macos::{
-    BoundTcpProber, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource, ProxySystemFacts,
-    SystemFacts,
+    BoundTcpProber, CoreWlanFacts, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource,
+    ProxySystemFacts, SystemFacts,
 };
 use net_observer_ipc::{EncodedFrame, StatusSnapshot};
 use store::DuckdbStore;
@@ -303,6 +304,12 @@ async fn run_daemon() -> anyhow::Result<()> {
             cfg.collectors.host.interval,
         )));
     }
+    if cfg.collectors.wifi.enabled {
+        collectors.push(AnyCollector::Wifi(WifiCollector::new(
+            Arc::new(CoreWlanFacts::new()),
+            cfg.collectors.wifi.interval,
+        )));
+    }
     if cfg.collectors.route.enabled {
         // The route collector is Event-cadence, driven by a persistent PF_ROUTE
         // socket. Opening it here decides its readiness; if it cannot open, the
@@ -502,6 +509,7 @@ pub(crate) enum AnyCollector {
     Dns(DnsCollector<DnsResolver>),
     Route(RouteCollector),
     Host(HostCollector<HostLoad>),
+    Wifi(WifiCollector<CoreWlanFacts>),
     /// Test-only: an interval collector with a flippable preflight (see
     /// [`FakeCollector`]).
     #[cfg(test)]
@@ -517,6 +525,7 @@ impl AnyCollector {
             Self::Dns(c) => c.meta(),
             Self::Route(c) => c.meta(),
             Self::Host(c) => c.meta(),
+            Self::Wifi(c) => c.meta(),
             #[cfg(test)]
             Self::Fake(c) => c.meta(),
         }
@@ -530,6 +539,7 @@ impl AnyCollector {
             Self::Dns(c) => c.source(),
             Self::Route(c) => c.source(),
             Self::Host(c) => c.source(),
+            Self::Wifi(c) => c.source(),
             #[cfg(test)]
             Self::Fake(c) => c.source(),
         }
@@ -543,6 +553,7 @@ impl AnyCollector {
             Self::Dns(c) => c.preflight().await,
             Self::Route(c) => c.preflight().await,
             Self::Host(c) => c.preflight().await,
+            Self::Wifi(c) => c.preflight().await,
             #[cfg(test)]
             Self::Fake(c) => c.preflight().await,
         }
@@ -558,6 +569,7 @@ impl AnyCollector {
             Self::Dns(c) => c.collect(ts_us).await,
             Self::Route(c) => c.collect(ts_us).await,
             Self::Host(c) => c.collect(ts_us).await,
+            Self::Wifi(c) => c.collect(ts_us).await,
             #[cfg(test)]
             Self::Fake(c) => c.collect(ts_us).await,
         }
@@ -572,6 +584,7 @@ impl AnyCollector {
             Self::Dns(c) => c.skip(ts_us),
             Self::Route(c) => c.skip(ts_us),
             Self::Host(c) => c.skip(ts_us),
+            Self::Wifi(c) => c.skip(ts_us),
             #[cfg(test)]
             Self::Fake(c) => c.skip(ts_us),
         }
@@ -586,6 +599,7 @@ impl AnyCollector {
             Self::Dns(c) => Box::new(c).into_event_source(),
             Self::Route(c) => Box::new(c).into_event_source(),
             Self::Host(c) => Box::new(c).into_event_source(),
+            Self::Wifi(c) => Box::new(c).into_event_source(),
             #[cfg(test)]
             Self::Fake(c) => Box::new(c).into_event_source(),
         }
