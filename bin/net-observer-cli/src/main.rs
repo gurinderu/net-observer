@@ -8,9 +8,14 @@
 //!   over its Unix-domain socket (`net-observer-ipc`). No DB is opened, so there is
 //!   zero contention with the running daemon.
 //! - **OFFLINE** — `query <SQL>` opens the DuckDB file directly for ad-hoc
-//!   forensics. This only works while the daemon is stopped; if `net-observerd` is
-//!   running it holds the lock and the open fails with a clear message rather
-//!   than a panic.
+//!   forensics, and the `diagnose` commands (`why`, `incident-context`,
+//!   `wedge-or-starvation`, `gateway-ramp`, `gaps`) run the canned
+//!   `store::diagnosis` queries over the same path, so "which layer failed" is
+//!   reachable without writing SQL. This only works while the daemon is stopped;
+//!   if `net-observerd` is running it holds the lock and the open fails with a
+//!   clear message rather than a panic.
+
+mod diagnose;
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -21,7 +26,13 @@ use net_observer_ipc::{
 };
 use std::io::Write;
 use std::process::ExitCode;
-use store::{DuckdbStore, QueryTable};
+use store::{DuckdbStore, QueryTable, diagnosis};
+
+/// The `load1` above which a dead tun reads as host starvation rather than a
+/// proxy wedge. The CLI reads the record with the same threshold the daemon
+/// judges it by, rather than offering a dial that would let two readings of one
+/// record disagree.
+const LOAD_THRESHOLD: f64 = diagnosis::DEFAULT_STARVATION_LOAD;
 
 #[derive(Parser)]
 #[command(
@@ -98,6 +109,46 @@ enum Command {
         /// The SQL statement to run against the store.
         sql: String,
     },
+    /// Which layer failed at a moment: the state of link, proxy server, tun and
+    /// host load as the record has it, plus the layer it blames (offline).
+    ///
+    /// A moment the daemon was paused for is reported as a refusal — the gap and
+    /// its bounds — not as a row of blank measurements.
+    Why {
+        /// The moment to read, defaulting to now. Accepts `now`, raw epoch
+        /// microseconds (`ts_us`), `YYYY-MM-DD[T ]HH:MM[:SS]` in local time, an
+        /// ISO instant with an offset (`2026-09-01T14:05:00Z`), or `HH:MM[:SS]`
+        /// for that time today.
+        #[arg(long, default_value = "now")]
+        at: String,
+    },
+    /// Every incident with the layer state just before it opened (offline).
+    ///
+    /// An incident that opened inside an observation gap gets no context: the
+    /// state from before the pause is not context for it, and is marked withheld.
+    IncidentContext,
+    /// The wedge-vs-starvation verdict over each recent `tun=000` episode
+    /// (offline) — the discriminator that decides whether a restart is the cure.
+    ///
+    /// An episode the record cannot classify is reported `unknown`, not guessed.
+    WedgeOrStarvation,
+    /// The gateway RTT series before a drop, with its least-squares slope, so a
+    /// coworking-gateway ramp is visible as data (offline).
+    ///
+    /// The slope is refused — "not computed" — when the window crosses an
+    /// observation gap.
+    GatewayRamp {
+        /// The drop to look back from, in any form `why --at` accepts. Defaults
+        /// to the most recent gateway drop in the record.
+        #[arg(long)]
+        drop: Option<String>,
+        /// How far back to plot, in microseconds.
+        #[arg(long, default_value_t = store::diagnosis::DEFAULT_RAMP_WINDOW_US)]
+        window_us: i64,
+    },
+    /// The observation gaps the record contains — every interval the daemon
+    /// deliberately collected nothing for, and what closed each (offline).
+    Gaps,
 }
 
 /// The desired observation state for the `observe` subcommand.
@@ -199,6 +250,41 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Query { sql } => {
             let table = run_query(&cli.db, sql)?;
             print!("{}", format_table(&table));
+        }
+        Command::Why { at } => {
+            let ts_us = diagnose::parse_at(at)?;
+            let table = run_query(&cli.db, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))?;
+            print!("{}", diagnose::format_verdict_at(&table, ts_us)?);
+        }
+        Command::IncidentContext => {
+            let table = run_query(&cli.db, &diagnosis::incident_context_sql(LOAD_THRESHOLD))?;
+            print!("{}", diagnose::format_incident_context(&table)?);
+        }
+        Command::WedgeOrStarvation => {
+            let sql = diagnosis::wedge_vs_starvation_sql(
+                LOAD_THRESHOLD,
+                diagnosis::DEFAULT_EPISODE_GAP_US,
+            );
+            let table = run_query(&cli.db, &sql)?;
+            print!("{}", diagnose::format_wedge_vs_starvation(&table)?);
+        }
+        Command::GatewayRamp { drop, window_us } => {
+            let drop_ts_us = match drop {
+                Some(d) => diagnose::parse_at(d)?,
+                None => latest_gw_drop(&cli.db)?,
+            };
+            let table = run_query(
+                &cli.db,
+                &diagnosis::gateway_ramp_sql(drop_ts_us, *window_us),
+            )?;
+            print!(
+                "{}",
+                diagnose::format_gateway_ramp(&table, drop_ts_us, *window_us)?
+            );
+        }
+        Command::Gaps => {
+            let table = run_query(&cli.db, &diagnosis::observation_gaps_sql())?;
+            print!("{}", diagnose::format_observation_gaps(&table)?);
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -371,9 +457,11 @@ fn format_frame_line(f: &StreamFrame) -> String {
 
 /// Format an epoch-microsecond timestamp as a `HH:MM:SS` wall clock in **UTC**.
 ///
-/// `net-observer-cli` does not depend on a timezone crate (only the gpui bar does, via
-/// `jiff`), so this uses pure integer math over `ts_us` — deterministic, never
-/// panics (Euclidean division handles any `i64`, including negatives).
+/// The tail deliberately stays on pure integer math over `ts_us` — deterministic
+/// and never panicking (Euclidean division handles any `i64`, including
+/// negatives) — so a streaming clock cannot depend on tz-database lookups. Local
+/// time is used only where a human types one, in the offline `diagnose`
+/// commands (see [`diagnose`], which resolves `--at` via `jiff`).
 fn clock(ts_us: i64) -> String {
     let secs = ts_us.div_euclid(1_000_000);
     let tod = secs.rem_euclid(86_400); // seconds within the UTC day
@@ -438,6 +526,19 @@ fn run_query(db_path: &str, sql: &str) -> Result<QueryTable> {
     store
         .query_table(sql)
         .map_err(|e| anyhow!("query failed: {e}"))
+}
+
+/// The `ts_us` of the newest gateway drop in the record, used when
+/// `gateway-ramp` is invoked without `--drop`. An empty record is an error
+/// naming the flag rather than a ramp plotted around an arbitrary instant.
+fn latest_gw_drop(db_path: &str) -> Result<i64> {
+    let table = run_query(db_path, diagnosis::GW_DROPS_SQL)?;
+    let last =
+        table.rows.last().and_then(|r| r.first()).ok_or_else(|| {
+            anyhow!("no gateway drop in the record; pass --drop <time> to pick one")
+        })?;
+    last.parse::<i64>()
+        .map_err(|_| anyhow!("gateway drop has an unreadable ts_us: {last:?}"))
 }
 
 /// Heuristic over a DuckDB open error: does it indicate the file is locked by
