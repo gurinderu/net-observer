@@ -128,6 +128,11 @@ pub struct ScanOptions {
     /// Probe discovered neighbours' TCP ports.
     #[serde(default)]
     pub ports: bool,
+    /// Grab banners from the open ports the port scan found. Needs `ports` in
+    /// the same run to have anything to grab from; the daemon enforces the
+    /// effective intersection.
+    #[serde(default)]
+    pub banners: bool,
 }
 
 /// The outcome of a [`ControlCmd`]: whether the action ran successfully plus a

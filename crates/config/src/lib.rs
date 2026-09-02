@@ -131,6 +131,11 @@ pub struct ScanCfg {
     /// connections to other machines, so off by default and gated by acting.
     #[serde(default)]
     pub ports: bool,
+    /// Banner grabs on the open ports the port scan found — reading what each
+    /// service volunteers about itself. Louder than a bare connect (it exchanges
+    /// bytes) and needs `ports` to have anything to grab from, so off by default.
+    #[serde(default)]
+    pub banners: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,8 +333,15 @@ mod tests {
         std::fs::write(&p, "[collectors.neighbors.scan]\nports = true\n").unwrap();
         let c = Config::load(Some(p.to_str().unwrap())).unwrap();
         assert!(c.collectors.neighbors.scan.ports);
+        // A rung not named in the toml stays off.
+        assert!(!c.collectors.neighbors.scan.banners);
         // The rest of the neighbors config keeps its defaults.
         assert!(c.collectors.neighbors.enabled);
+
+        let p = dir.path().join("b.toml");
+        std::fs::write(&p, "[collectors.neighbors.scan]\nbanners = true\n").unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert!(c.collectors.neighbors.scan.banners);
     }
 
     #[test]

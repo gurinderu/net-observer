@@ -16,6 +16,9 @@ pub struct NeighborPort {
     pub ip: String,
     pub port: u16,
     pub ts_us: i64,
+    /// Raw text the service volunteered when the banner rung grabbed it; `None`
+    /// when that rung did not run or nothing readable came back.
+    pub banner: Option<String>,
 }
 
 /// One operator-pressed neighbour scan, as written to `neighbor_scan`.
@@ -261,11 +264,16 @@ impl Store for DuckdbStore {
         self.conn.lock().unwrap().execute(
             // `first_seen_us` preserved, like `neighbor`: the point of the row is
             // since-when a port has been open on this device.
-            "INSERT INTO neighbor_port VALUES (?,?,?,?,?,?)
+            "INSERT INTO neighbor_port
+               (network_key, mac, ip, port, first_seen_us, last_seen_us, banner)
+             VALUES (?,?,?,?,?,?,?)
              ON CONFLICT (network_key, mac, port) DO UPDATE SET
                ip = excluded.ip,
-               last_seen_us = excluded.last_seen_us",
-            params![key, p.mac, p.ip, p.port, p.ts_us, p.ts_us],
+               last_seen_us = excluded.last_seen_us,
+               -- A run that grabbed no banner (NULL) must not erase one an
+               -- earlier grab learned; a fresh banner overwrites the old.
+               banner = COALESCE(excluded.banner, neighbor_port.banner)",
+            params![key, p.mac, p.ip, p.port, p.ts_us, p.ts_us, p.banner],
         )?;
         Ok(())
     }
@@ -454,6 +462,7 @@ mod tests {
                 ip: "192.168.1.5".into(),
                 port: 445,
                 ts_us: ts,
+                banner: None,
             })
             .unwrap();
         }
@@ -466,6 +475,42 @@ mod tests {
             .query_table("SELECT first_seen_us, last_seen_us, port FROM neighbor_port")
             .unwrap();
         assert_eq!(t.rows[0], vec!["1000", "2000", "445"]);
+    }
+
+    /// The banner rung's grab lands on the port row, upserting the banner text
+    /// while keeping the first sighting; a later grab that finds nothing keeps
+    /// the banner already learned rather than erasing it.
+    #[test]
+    fn a_banner_upserts_onto_the_port_and_survives_a_later_empty_grab() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let mut row = NeighborPort {
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            mac: "11:22:33:44:55:66".into(),
+            ip: "192.168.1.5".into(),
+            port: 22,
+            ts_us: 1000,
+            banner: None,
+        };
+        // First: a bare port sighting, no banner yet.
+        s.write_neighbor_port(&row).unwrap();
+        // Then: the banner rung grabs a banner for the same port.
+        row.ts_us = 2000;
+        row.banner = Some("SSH-2.0-OpenSSH_9.6".into());
+        s.write_neighbor_port(&row).unwrap();
+        // Later: a grab that reads nothing must not wipe the stored banner.
+        row.ts_us = 3000;
+        row.banner = None;
+        s.write_neighbor_port(&row).unwrap();
+
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM neighbor_port")
+                .unwrap(),
+            1
+        );
+        let t = s
+            .query_table("SELECT first_seen_us, last_seen_us, banner FROM neighbor_port")
+            .unwrap();
+        assert_eq!(t.rows[0], vec!["1000", "3000", "SSH-2.0-OpenSSH_9.6"]);
     }
 
     /// An operator scan leaves its own durable trace, separate from the entities

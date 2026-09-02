@@ -610,6 +610,10 @@ pub struct ScanReport {
 /// * The mDNS row carries the browse's own elapsed time and how many service
 ///   types it reached, so "found no names" and "never got to look" are different
 ///   rows.
+// One input per scan method plus the shared identity of the run; each rung the
+// ladder adds is another optional outcome. Grouping them into a struct would only
+// move the same fields behind one name for a pure, single-call composer.
+#[allow(clippy::too_many_arguments)]
 pub fn compose_scan_report(
     ts_us: i64,
     network_key: Option<String>,
@@ -618,6 +622,7 @@ pub fn compose_scan_report(
     arp: Vec<types::NeighborObs>,
     mdns: &macos::neighbor_scan::MdnsOutcome,
     port_scan: Option<&macos::neighbor_scan::PortScanOutcome>,
+    banner_grab: Option<&macos::neighbor_scan::BannerGrabOutcome>,
 ) -> ScanReport {
     let swept = sweep.refused.is_none();
     let mut found = arp;
@@ -643,12 +648,22 @@ pub fn compose_scan_report(
                 .filter_map(|f| {
                     let ip = f.ip.to_string();
                     let owner = found.iter().find(|n| n.ip == ip)?;
+                    // Attach the banner the grab read for this (ip, port), if the
+                    // banner rung ran and found one. No grab, or nothing readable,
+                    // leaves it None — never a guess.
+                    let banner = banner_grab.and_then(|bg| {
+                        bg.banners
+                            .iter()
+                            .find(|b| b.ip == f.ip && b.port == f.port)
+                            .map(|b| b.banner.clone())
+                    });
                     Some(store::NeighborPort {
                         network_key: network_key.clone(),
                         mac: owner.mac.clone(),
                         ip,
                         port: f.port,
                         ts_us,
+                        banner,
                     })
                 })
                 .collect()
@@ -694,6 +709,19 @@ pub fn compose_scan_report(
             detail: Some(format!("{} open", ports.len())),
         });
     }
+    let grabbed = ports.iter().filter(|p| p.banner.is_some()).count();
+    if let Some(bg) = banner_grab {
+        scans.push(store::NeighborScan {
+            ts_us,
+            network_key: network_key.clone(),
+            iface: Some(iface.clone()),
+            method: "banners".to_string(),
+            target: format!("{} open ports", bg.probed),
+            found: count(grabbed),
+            duration_ms: bg.duration_ms,
+            detail: Some(format!("{grabbed} banners")),
+        });
+    }
     let message = if swept {
         format!(
             "swept {} ({}/{} probed): {} neighbours, {} named",
@@ -713,6 +741,11 @@ pub fn compose_scan_report(
     };
     let message = if port_scan.is_some() {
         format!("{message}; {} open ports", ports.len())
+    } else {
+        message
+    };
+    let message = if banner_grab.is_some() {
+        format!("{message}, {grabbed} banners")
     } else {
         message
     };
@@ -943,6 +976,7 @@ mod tests {
             vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
             &MdnsOutcome::default(),
             None,
+            None,
         );
         assert_eq!(r.found[0].source, types::NeighborSource::Arp);
         let sweep_row = r.scans.iter().find(|s| s.method == "sweep").unwrap();
@@ -963,6 +997,7 @@ mod tests {
             &sweep_stats(None),
             vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
             &MdnsOutcome::default(),
+            None,
             None,
         );
         assert_eq!(r.found[0].source, types::NeighborSource::Sweep);
@@ -991,6 +1026,7 @@ mod tests {
                 types_browsed: 4,
                 duration_ms: 3900,
             },
+            None,
             None,
         );
         let row = r.scans.iter().find(|s| s.method == "mdns").unwrap();
@@ -1030,14 +1066,64 @@ mod tests {
             vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
             &MdnsOutcome::default(),
             Some(&ps),
+            None,
         );
         assert_eq!(r.ports.len(), 1, "the orphan port on .99 must drop");
         assert_eq!(r.ports[0].mac, "11:22:33:44:55:66");
         assert_eq!(r.ports[0].port, 445);
+        assert!(r.ports[0].banner.is_none(), "no banner rung ran");
         let row = r.scans.iter().find(|s| s.method == "ports").unwrap();
         assert_eq!(row.found, 1);
         assert_eq!(row.target, "2 hosts x 27 ports");
         assert!(r.message.contains("open ports"), "{}", r.message);
+        assert!(
+            r.scans.iter().all(|s| s.method != "banners"),
+            "no banners row without the banner rung"
+        );
+    }
+
+    /// The banner rung attaches a grabbed banner to the owning port and records
+    /// its own row; a banner for a port that did not survive attribution is not
+    /// invented.
+    #[test]
+    fn banners_attach_to_the_owning_port_and_record_their_own_row() {
+        use macos::neighbor_scan::{
+            BannerFinding, BannerGrabOutcome, PortFinding, PortScanOutcome,
+        };
+        let ps = PortScanOutcome {
+            open: vec![PortFinding {
+                ip: "192.168.1.5".parse().unwrap(),
+                port: 22,
+            }],
+            hosts: 1,
+            ports_per_host: 27,
+            duration_ms: 1200,
+        };
+        let bg = BannerGrabOutcome {
+            banners: vec![BannerFinding {
+                ip: "192.168.1.5".parse().unwrap(),
+                port: 22,
+                banner: "SSH-2.0-OpenSSH_9.6".into(),
+            }],
+            probed: 1,
+            duration_ms: 300,
+        };
+        let r = compose_scan_report(
+            42,
+            Some("aa:bb:cc:dd:ee:ff".into()),
+            "en0".into(),
+            &sweep_stats(None),
+            vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
+            &MdnsOutcome::default(),
+            Some(&ps),
+            Some(&bg),
+        );
+        assert_eq!(r.ports.len(), 1);
+        assert_eq!(r.ports[0].banner.as_deref(), Some("SSH-2.0-OpenSSH_9.6"));
+        let row = r.scans.iter().find(|s| s.method == "banners").unwrap();
+        assert_eq!(row.found, 1);
+        assert_eq!(row.target, "1 open ports");
+        assert!(r.message.contains("1 banners"), "{}", r.message);
     }
     use super::*;
     use collector_core::Readiness;
