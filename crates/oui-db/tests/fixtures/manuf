@@ -1,0 +1,10 @@
+# A tiny hand-written stand-in for the Wireshark `manuf` registry.
+# Fields are TAB-separated: OUI<TAB>ShortName<TAB>Long name (long optional).
+
+00:1A:2B	Acme	Acme Corporation
+00:AA:BB	ShortOnly
+# The next line is a longer-prefix MA-M sub-block: it must NOT be indexed as the
+# 24-bit OUI 3c:5a:b4.
+3C:5A:B4:D0:00:00/28	GoogleSub	Google Sub Block
+# A malformed line (non-hex octet) is skipped, never fatal.
+ZZ:ZZ:ZZ	Garbage	Should Be Skipped

@@ -16,6 +16,7 @@ members = [
     "crates/triggers",
     "crates/macos",
     "crates/vuln-db",
+    "crates/oui-db",
     "bin/net-observerd",
     "bin/net-observer-cli",
     "bin/net-observer-bar",
@@ -42,6 +43,7 @@ default-members = [
     "crates/triggers",
     "crates/macos",
     "crates/vuln-db",
+    "crates/oui-db",
     "bin/net-observerd",
     "bin/net-observer-cli",
 ]
