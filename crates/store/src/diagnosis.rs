@@ -473,6 +473,36 @@ ORDER BY last_seen_us DESC, mac"
     ))
 }
 
+/// **The CVEs the record hypothesises for open ports** — newest sighting first.
+///
+/// Reads `neighbor_vuln`, joined to `neighbor_port` for the address the port was
+/// found on, so the operator sees mac, ip, port, cve, and how much to trust it
+/// without writing SQL. `network` filters to one segment by its `network_key`.
+///
+/// Every row is a HYPOTHESIS, not an asserted fact: `confidence`
+/// (low|medium|high) and `known_exploited` say how much to weigh it, `cvss` the
+/// severity when the record carried one.
+///
+/// Returns `Err` for a key that cannot exist rather than a query that matches
+/// nothing, exactly like [`neighbors_sql`].
+pub fn vulns_sql(network: Option<&str>) -> Result<String, BadNetworkKey> {
+    let filter = match network {
+        None => String::new(),
+        Some(n) => {
+            validate_network_key(n)?;
+            format!("WHERE v.network_key = '{n}'")
+        }
+    };
+    Ok(format!(
+        "SELECT v.mac, p.ip, v.port, v.cve_id, v.confidence, v.known_exploited, v.cvss
+FROM neighbor_vuln v
+LEFT JOIN neighbor_port p
+  ON v.network_key = p.network_key AND v.mac = p.mac AND v.port = p.port
+{filter}
+ORDER BY v.last_seen_us DESC, v.mac, v.port, v.cve_id"
+    ))
+}
+
 /// A `network_key` the store could never have written.
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -542,6 +572,11 @@ impl DuckdbStore {
         self.query_table(&neighbors_sql(None).expect("no filter cannot be invalid"))
     }
 
+    /// Run [`vulns_sql`] for every segment.
+    pub fn vulns(&self) -> Result<QueryTable, StoreError> {
+        self.query_table(&vulns_sql(None).expect("no filter cannot be invalid"))
+    }
+
     /// Run [`observation_gaps_sql`].
     pub fn observation_gaps(&self) -> Result<QueryTable, StoreError> {
         self.query_table(&observation_gaps_sql())
@@ -575,6 +610,19 @@ mod tests {
     fn no_filter_selects_every_segment() {
         let sql = neighbors_sql(None).unwrap();
         assert!(!sql.contains("WHERE"), "{sql}");
+    }
+
+    #[test]
+    fn vulns_sql_validates_the_network_key_like_neighbors() {
+        assert!(!vulns_sql(None).unwrap().contains("WHERE"));
+        assert!(vulns_sql(Some("a4:83:e7:1b:2c:3d")).is_ok());
+        assert!(vulns_sql(Some("unknown")).is_ok());
+        for bad in ["'; DROP TABLE neighbor_vuln; --", "a4:83", ""] {
+            assert!(
+                vulns_sql(Some(bad)).is_err(),
+                "{bad:?} must be an error, not a query that matches nothing"
+            );
+        }
     }
     use super::*;
     use crate::Store;

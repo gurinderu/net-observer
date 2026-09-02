@@ -118,6 +118,14 @@ pub struct NeighborsCfg {
     /// ever reads caches the OS filled.
     #[serde(default)]
     pub scan: ScanCfg,
+    /// Directory holding the local CVE snapshot the `cve` rung matches banners
+    /// against (a cvelistV5 tree under `cves/` plus an optional `kev.json`).
+    /// `None` by default, and the operator provisions the data out-of-band. The
+    /// `cve` rung is UNAVAILABLE - and honestly reported as dropped - whenever
+    /// this is `None` or the directory is absent: no snapshot, no matching, and
+    /// never a pretence of one.
+    #[serde(default)]
+    pub cve_snapshot_dir: Option<String>,
 }
 
 /// Per-capability permission for the active neighbour scan, each off by default.
@@ -136,6 +144,13 @@ pub struct ScanCfg {
     /// bytes) and needs `ports` to have anything to grab from, so off by default.
     #[serde(default)]
     pub banners: bool,
+    /// Match grabbed banners against the local CVE snapshot, the loudest rung in
+    /// diagnostic terms though it emits nothing new on the wire: it needs the
+    /// `banners` rung to have parsed a service and a provisioned snapshot to
+    /// match against. Off by default; every match it stores is a hypothesis,
+    /// never an asserted fact.
+    #[serde(default)]
+    pub cve: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +229,7 @@ impl Default for Config {
                     enabled: true,
                     interval: Duration::from_secs(120),
                     scan: ScanCfg::default(),
+                    cve_snapshot_dir: None,
                 },
                 pcap_ring: PcapCfg {
                     enabled: true,
@@ -342,6 +358,37 @@ mod tests {
         std::fs::write(&p, "[collectors.neighbors.scan]\nbanners = true\n").unwrap();
         let c = Config::load(Some(p.to_str().unwrap())).unwrap();
         assert!(c.collectors.neighbors.scan.banners);
+    }
+
+    #[test]
+    fn cve_rung_is_off_and_snapshot_dir_absent_by_default() {
+        let c = Config::load(None).unwrap();
+        assert!(
+            !c.collectors.neighbors.scan.cve,
+            "the cve rung must be off until explicitly permitted"
+        );
+        assert!(
+            c.collectors.neighbors.cve_snapshot_dir.is_none(),
+            "no snapshot directory until the operator provisions one"
+        );
+    }
+
+    #[test]
+    fn cve_rung_and_snapshot_dir_come_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        std::fs::write(
+            &p,
+            "[collectors.neighbors]\ncve_snapshot_dir = \"/var/lib/observer/cve\"\n\
+             [collectors.neighbors.scan]\ncve = true\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert!(c.collectors.neighbors.scan.cve);
+        assert_eq!(
+            c.collectors.neighbors.cve_snapshot_dir.as_deref(),
+            Some("/var/lib/observer/cve")
+        );
     }
 
     #[test]

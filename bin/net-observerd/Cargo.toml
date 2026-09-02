@@ -16,6 +16,7 @@ collector-wifi.workspace = true
 collector-neighbors.workspace = true
 triggers.workspace = true
 macos.workspace = true
+vuln-db.workspace = true
 net-observer-ipc.workspace = true
 tokio = { workspace = true, features = ["net", "io-util"] }
 # Only for `geteuid` in the control-path authorisation policy (`api::ControlPolicy`).
@@ -26,3 +27,6 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -124,11 +124,30 @@ enum Command {
         /// port scan the daemon drops it and says so. Off unless given.
         #[arg(long)]
         banners: bool,
+        /// Also match the grabbed banners against the daemon's local CVE
+        /// snapshot. Needs `--banners` (a match parses a banner), the daemon's
+        /// `collectors.neighbors.scan.cve` permission, and a provisioned
+        /// `collectors.neighbors.cve_snapshot_dir`; without all three the daemon
+        /// drops it and says so. Each stored match is a hypothesis, not a fact.
+        /// Off unless given. Read the findings back offline with `vulns`.
+        #[arg(long)]
+        cve: bool,
     },
     /// The neighbours the record knows on each segment, newest sighting first
     /// (offline): MAC, address, vendor OUI, name if one was ever learned, and
     /// how it came to be known.
     Neighbors {
+        /// Restrict to one segment, by its gateway MAC. Omit for every segment
+        /// this machine has recorded.
+        #[arg(long)]
+        network: Option<String>,
+    },
+    /// The CVEs the record hypothesises for open ports, newest sighting first
+    /// (offline): MAC, address, port, CVE id, confidence, whether it is
+    /// known-exploited, and CVSS. Each row is a HYPOTHESIS from matching a
+    /// grabbed banner against the local snapshot, never an asserted fact —
+    /// weigh it by its confidence and the KEV flag.
+    Vulns {
         /// Restrict to one segment, by its gateway MAC. Omit for every segment
         /// this machine has recorded.
         #[arg(long)]
@@ -282,13 +301,18 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
-        Command::ScanNeighbors { ports, banners } => {
+        Command::ScanNeighbors {
+            ports,
+            banners,
+            cve,
+        } => {
             let cfg = load_config(cli)?;
             let result = fetch_scan_neighbors(
                 &cfg.socket_path,
                 ScanOptions {
                     ports: *ports,
                     banners: *banners,
+                    cve: *cve,
                 },
             )?;
             print!("{}", format_control(&result));
@@ -298,6 +322,11 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
         Command::Neighbors { network } => {
             let sql = diagnosis::neighbors_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
+            let table = run_query(&cli.db, &sql)?;
+            print!("{}", format_table(&table));
+        }
+        Command::Vulns { network } => {
+            let sql = diagnosis::vulns_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
             let table = run_query(&cli.db, &sql)?;
             print!("{}", format_table(&table));
         }

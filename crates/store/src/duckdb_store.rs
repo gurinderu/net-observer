@@ -21,6 +21,25 @@ pub struct NeighborPort {
     pub banner: Option<String>,
 }
 
+/// One CVE hypothesised for an open port, as written to `neighbor_vuln`.
+///
+/// A match is never an asserted fact: `confidence` and `known_exploited` record
+/// how much to trust it. `confidence` is stored as its lowercase token
+/// (`low`/`medium`/`high`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeighborVuln {
+    pub network_key: Option<String>,
+    pub mac: String,
+    pub port: u16,
+    pub cve_id: String,
+    /// Lowercase confidence token: `low` | `medium` | `high`.
+    pub confidence: String,
+    pub known_exploited: bool,
+    /// CVSS base score when the record carried one; `None` otherwise.
+    pub cvss: Option<f64>,
+    pub ts_us: i64,
+}
+
 /// One operator-pressed neighbour scan, as written to `neighbor_scan`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NeighborScan {
@@ -277,6 +296,35 @@ impl Store for DuckdbStore {
         )?;
         Ok(())
     }
+    fn write_neighbor_vuln(&self, v: &NeighborVuln) -> Result<(), StoreError> {
+        let key = v.network_key.as_deref().unwrap_or(UNKNOWN_NETWORK);
+        self.conn.lock().unwrap().execute(
+            // `first_seen_us` preserved: the point of the row is since-when a CVE
+            // has been hypothesised for a port. The re-match's verdict wins —
+            // confidence, KEV flag and CVSS all reflect the current snapshot.
+            "INSERT INTO neighbor_vuln
+               (network_key, mac, port, cve_id, confidence, known_exploited, cvss,
+                first_seen_us, last_seen_us)
+             VALUES (?,?,?,?,?,?,?,?,?)
+             ON CONFLICT (network_key, mac, port, cve_id) DO UPDATE SET
+               confidence = excluded.confidence,
+               known_exploited = excluded.known_exploited,
+               cvss = excluded.cvss,
+               last_seen_us = excluded.last_seen_us",
+            params![
+                key,
+                v.mac,
+                v.port,
+                v.cve_id,
+                v.confidence,
+                v.known_exploited,
+                v.cvss,
+                v.ts_us,
+                v.ts_us
+            ],
+        )?;
+        Ok(())
+    }
     fn open_incident(&self, i: &Incident) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO incident VALUES (?,?,?,?,?)",
@@ -511,6 +559,48 @@ mod tests {
             .query_table("SELECT first_seen_us, last_seen_us, banner FROM neighbor_port")
             .unwrap();
         assert_eq!(t.rows[0], vec!["1000", "3000", "SSH-2.0-OpenSSH_9.6"]);
+    }
+
+    /// A CVE hypothesis upserts onto its port keeping the first sighting; a later
+    /// match with a sharper verdict updates confidence/KEV/CVSS in place, and the
+    /// lowercase confidence token round-trips.
+    #[test]
+    fn a_vuln_upserts_preserving_first_seen_and_round_trips_the_confidence_token() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let mut row = NeighborVuln {
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            mac: "11:22:33:44:55:66".into(),
+            port: 22,
+            cve_id: "CVE-2016-6210".into(),
+            confidence: "low".into(),
+            known_exploited: false,
+            cvss: None,
+            ts_us: 1000,
+        };
+        s.write_neighbor_vuln(&row).unwrap();
+        // A later run matches the same (port, cve) with more to say.
+        row.ts_us = 2000;
+        row.confidence = "high".into();
+        row.known_exploited = true;
+        row.cvss = Some(5.9);
+        s.write_neighbor_vuln(&row).unwrap();
+
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM neighbor_vuln")
+                .unwrap(),
+            1
+        );
+        let t = s
+            .query_table(
+                "SELECT first_seen_us, last_seen_us, confidence, known_exploited, cvss \
+                 FROM neighbor_vuln",
+            )
+            .unwrap();
+        assert_eq!(
+            t.rows[0],
+            vec!["1000", "2000", "high", "true", "5.9"],
+            "first_seen preserved, latest verdict wins, confidence token intact"
+        );
     }
 
     /// An operator scan leaves its own durable trace, separate from the entities

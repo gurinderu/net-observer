@@ -4022,11 +4022,13 @@ dependencies = [
  "net-observer-ipc",
  "serde_json",
  "store",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "triggers",
  "types",
+ "vuln-db",
 ]
 
 [[package]]

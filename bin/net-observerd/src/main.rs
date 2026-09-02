@@ -635,11 +635,19 @@ impl AnyCollector {
 /// talks about — including any config override.
 pub(crate) struct SystemScanner {
     facts: SystemFacts,
+    /// The CVE snapshot directory the `cve` rung matches against, when one is
+    /// configured. `None`, or a directory that will not load, means the rung
+    /// produces no findings — the honest refusal is decided in `api::scan_now`
+    /// before the scan runs; this is the loader for a run that got that far.
+    cve_snapshot_dir: Option<std::path::PathBuf>,
 }
 
 impl SystemScanner {
-    pub(crate) fn new(facts: SystemFacts) -> Self {
-        Self { facts }
+    pub(crate) fn new(facts: SystemFacts, cve_snapshot_dir: Option<std::path::PathBuf>) -> Self {
+        Self {
+            facts,
+            cve_snapshot_dir,
+        }
     }
 }
 
@@ -700,8 +708,9 @@ impl NeighborScanner for SystemScanner {
                 _ => None,
             };
 
-            Some(pipeline::compose_scan_report(
-                types::now_us(),
+            let ts_us = types::now_us();
+            let mut report = pipeline::compose_scan_report(
+                ts_us,
                 network_key,
                 iface,
                 &sweep,
@@ -709,7 +718,32 @@ impl NeighborScanner for SystemScanner {
                 &mdns,
                 ports.as_ref(),
                 banners.as_ref(),
-            ))
+            );
+
+            // The `cve` rung: match the banners the report already carries
+            // against the local snapshot. `api::scan_now` only sets `opts.cve`
+            // when banners are effective AND a snapshot directory exists, so a
+            // load failure here is an anomaly (a directory that vanished or is
+            // corrupt mid-run) — log it and record no findings rather than a
+            // guess; the ports and their banners are already recorded.
+            if opts.cve {
+                match &self.cve_snapshot_dir {
+                    Some(dir) => match vuln_db::VulnDb::load_from_dir(dir) {
+                        Ok(db) => {
+                            report.vulns = pipeline::match_vulns(&db, &report.ports, ts_us);
+                        }
+                        Err(e) => tracing::error!(
+                            error = %e, dir = %dir.display(),
+                            "cve rung: snapshot failed to load; no findings recorded"
+                        ),
+                    },
+                    None => tracing::error!(
+                        "cve rung ran without a snapshot directory; no findings recorded"
+                    ),
+                }
+            }
+
+            Some(report)
         })
     }
 }
@@ -967,15 +1001,31 @@ fn build_api_server(
         freezer,
         // Built unconditionally: whether there is anything to scan is decided
         // per request (an interface with an IPv4 subnet), not once at boot.
-        scanner: Some(Arc::new(SystemScanner::new(SystemFacts::new(
-            cfg.collectors.link.gw.clone(),
-            cfg.collectors.link.phys_iface.clone(),
-        ))) as Arc<dyn NeighborScanner>),
+        scanner: Some(Arc::new(SystemScanner::new(
+            SystemFacts::new(
+                cfg.collectors.link.gw.clone(),
+                cfg.collectors.link.phys_iface.clone(),
+            ),
+            cfg.collectors
+                .neighbors
+                .cve_snapshot_dir
+                .as_ref()
+                .map(std::path::PathBuf::from),
+        )) as Arc<dyn NeighborScanner>),
         // The config permission ceiling for the active scan.
         scan_permission: net_observer_ipc::ScanOptions {
             ports: cfg.collectors.neighbors.scan.ports,
             banners: cfg.collectors.neighbors.scan.banners,
+            cve: cfg.collectors.neighbors.scan.cve,
         },
+        // Where the `cve` rung loads its snapshot; the availability check in
+        // `scan_now` decides whether the rung is effective this run.
+        scan_cve_snapshot: cfg
+            .collectors
+            .neighbors
+            .cve_snapshot_dir
+            .as_ref()
+            .map(std::path::PathBuf::from),
         blob_dir: std::path::PathBuf::from(&cfg.blob_dir),
         resume_at_us,
         snapshot,

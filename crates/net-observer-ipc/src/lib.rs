@@ -133,6 +133,12 @@ pub struct ScanOptions {
     /// effective intersection.
     #[serde(default)]
     pub banners: bool,
+    /// Match the grabbed banners against the daemon's local CVE snapshot. Needs
+    /// `banners` in the same run (a match parses a banner) and a provisioned
+    /// snapshot; without either the daemon drops it and says so. Each stored
+    /// match is a hypothesis carrying its confidence, never an asserted fact.
+    #[serde(default)]
+    pub cve: bool,
 }
 
 /// The outcome of a [`ControlCmd`]: whether the action ran successfully plus a
