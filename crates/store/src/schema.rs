@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS neighbor_port (
 -- the port table first shipped, so an older database file keeps its column set
 -- until this ALTER runs on open, exactly like `observing_edge.cause` below.
 ALTER TABLE neighbor_port ADD COLUMN IF NOT EXISTS banner VARCHAR;
+-- A CVE the `cve` rung hypothesised for an open port, from matching its grabbed
+-- banner against the local snapshot. Keyed by (network_key, mac, port, cve_id)
+-- with first/last seen, like `neighbor_port`: "this CVE has been hypothesised
+-- for 22 on this device since X". Every row is a HYPOTHESIS, not an asserted
+-- fact -- `confidence` (low|medium|high) and `known_exploited` say how much to
+-- trust it, and `cvss` its severity when the record carried one (NULL otherwise).
+CREATE TABLE IF NOT EXISTS neighbor_vuln (
+  network_key VARCHAR, mac VARCHAR, port INTEGER, cve_id VARCHAR,
+  confidence VARCHAR, known_exploited BOOLEAN, cvss DOUBLE,
+  first_seen_us BIGINT, last_seen_us BIGINT,
+  PRIMARY KEY (network_key, mac, port, cve_id));
 CREATE TABLE IF NOT EXISTS observing_edge (
   ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT, cause VARCHAR);
 -- `cause` was added after the first daemon shipped rows without it. A database

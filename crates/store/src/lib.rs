@@ -2,7 +2,9 @@ pub mod diagnosis;
 mod duckdb_store;
 mod schema;
 
-pub use duckdb_store::{DuckdbStore, NeighborPort, NeighborScan, QueryTable, StoreError};
+pub use duckdb_store::{
+    DuckdbStore, NeighborPort, NeighborScan, NeighborVuln, QueryTable, StoreError,
+};
 use types::{BlobRef, Incident, ObservingEdge, Sample, TriggerFired};
 
 pub trait Store {
@@ -30,5 +32,9 @@ pub trait Store {
     /// Record one open port found on a neighbour (see the `neighbor_port`
     /// table). Upserts on `(network_key, mac, port)`, preserving `first_seen_us`.
     fn write_neighbor_port(&self, p: &NeighborPort) -> Result<(), StoreError>;
+    /// Record one CVE hypothesised for an open port (see the `neighbor_vuln`
+    /// table). Upserts on `(network_key, mac, port, cve_id)`, preserving
+    /// `first_seen_us`. Every row is a hypothesis, never an asserted fact.
+    fn write_neighbor_vuln(&self, v: &NeighborVuln) -> Result<(), StoreError>;
     fn query_scalar_i64(&self, sql: &str) -> Result<i64, StoreError>;
 }

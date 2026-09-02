@@ -582,7 +582,7 @@ pub trait NeighborScanner: Send + Sync {
 
 /// What one scan did and found, in the shape the control path needs: the
 /// entities to upsert, and the durable rows saying the daemon spoke.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScanReport {
     pub ts_us: i64,
     pub network_key: Option<String>,
@@ -594,8 +594,61 @@ pub struct ScanReport {
     /// Open ports found, already attributed to the neighbour that owns the
     /// address. Empty unless the run included the `ports` rung.
     pub ports: Vec<store::NeighborPort>,
+    /// CVEs hypothesised from the grabbed banners. Empty unless the run included
+    /// the `cve` rung and a snapshot matched something; filled by the scanner
+    /// after composition, because matching needs a loaded [`vuln_db::VulnDb`]
+    /// and this composer is pure.
+    pub vulns: Vec<store::NeighborVuln>,
+    /// Set by the scanner when the `cve` rung was ATTEMPTED but its snapshot
+    /// could not be used — an existing-but-empty or wrong-layout directory, or a
+    /// load error. It carries the reason, so an empty `vulns` from an unusable
+    /// snapshot is never read as a clean "no vulnerabilities found" (SKIP is not
+    /// silence). `None` when cve did not run, or ran against a usable snapshot.
+    pub cve_note: Option<String>,
     /// The line the operator sees.
     pub message: String,
+}
+
+/// The lowercase token a [`vuln_db::Confidence`] is stored as.
+fn confidence_token(c: vuln_db::Confidence) -> &'static str {
+    match c {
+        vuln_db::Confidence::Low => "low",
+        vuln_db::Confidence::Medium => "medium",
+        vuln_db::Confidence::High => "high",
+    }
+}
+
+/// Match the grabbed banners against a loaded CVE snapshot, turning each open
+/// port that volunteered a parseable banner into zero or more CVE hypotheses.
+///
+/// Pure over its inputs (the db and the port rows), so the glue is tested
+/// without a live network: a port carrying no banner, or one whose banner does
+/// not parse to a product, yields nothing — never a guess. Every match keeps its
+/// [`vuln_db::Confidence`] and `known_exploited` flag, because a match is a
+/// hypothesis the reader must be able to weigh, not an asserted fact.
+pub fn match_vulns(
+    db: &vuln_db::VulnDb,
+    ports: &[store::NeighborPort],
+    ts_us: i64,
+) -> Vec<store::NeighborVuln> {
+    ports
+        .iter()
+        .filter_map(|p| Some((p, vuln_db::parse_banner(p.banner.as_deref()?)?)))
+        .flat_map(|(p, cpe)| {
+            db.match_product(&cpe)
+                .into_iter()
+                .map(move |m| store::NeighborVuln {
+                    network_key: p.network_key.clone(),
+                    mac: p.mac.clone(),
+                    port: p.port,
+                    cve_id: m.cve_id,
+                    confidence: confidence_token(m.confidence).to_string(),
+                    known_exploited: m.known_exploited,
+                    cvss: m.cvss.map(f64::from),
+                    ts_us,
+                })
+        })
+        .collect()
 }
 
 /// Compose the durable account of one scan out of what each method ACTUALLY did.
@@ -756,6 +809,10 @@ pub fn compose_scan_report(
         found,
         scans,
         ports,
+        cve_note: None,
+        // Filled by the scanner after this pure composition, if the `cve` rung
+        // ran and a snapshot matched — matching needs I/O this composer avoids.
+        vulns: Vec::new(),
         message,
     }
 }
@@ -1125,6 +1182,92 @@ mod tests {
         assert_eq!(row.target, "1 open ports");
         assert!(r.message.contains("1 banners"), "{}", r.message);
     }
+
+    /// Write a minimal CVE snapshot (one matching record plus a KEV flag) into a
+    /// fresh temp directory, in exactly the layout `VulnDb::load_from_dir`
+    /// expects. Kept in the test so the glue is exercised without provisioning
+    /// the real, out-of-band dataset.
+    fn write_fixture_snapshot() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let cve_dir = dir.path().join("cves/2016/6xxx");
+        std::fs::create_dir_all(&cve_dir).unwrap();
+        std::fs::write(
+            cve_dir.join("CVE-2016-6210.json"),
+            r#"{
+  "cveMetadata": { "cveId": "CVE-2016-6210", "state": "PUBLISHED" },
+  "containers": { "cna": {
+    "title": "OpenSSH user enumeration",
+    "affected": [ { "vendor": "openbsd", "product": "openssh",
+      "versions": [ { "version": "7.2", "status": "affected", "lessThan": "7.4", "versionType": "custom" } ] } ],
+    "metrics": [ { "cvssV3_1": { "baseScore": 5.9 } } ]
+  } }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("kev.json"),
+            r#"{ "vulnerabilities": [ { "cveID": "CVE-2016-6210" } ] }"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn port_with_banner(port: u16, banner: Option<&str>) -> store::NeighborPort {
+        store::NeighborPort {
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            mac: "11:22:33:44:55:66".into(),
+            ip: "192.168.1.5".into(),
+            port,
+            ts_us: 42,
+            banner: banner.map(str::to_string),
+        }
+    }
+
+    /// The `cve` glue: a banner that parses to an affected product+version yields
+    /// a stored finding carrying the right confidence and the KEV flag; the row
+    /// is attributed to the port's owning neighbour.
+    #[test]
+    fn a_matching_banner_yields_a_cve_finding_with_confidence_and_kev() {
+        let dir = write_fixture_snapshot();
+        let db = vuln_db::VulnDb::load_from_dir(dir.path()).expect("fixture snapshot loads");
+        let ports = vec![port_with_banner(22, Some("SSH-2.0-OpenSSH_7.3"))];
+
+        let vulns = match_vulns(&db, &ports, 42);
+        assert_eq!(vulns.len(), 1, "the 7.3 banner falls inside <7.4");
+        let v = &vulns[0];
+        assert_eq!(v.cve_id, "CVE-2016-6210");
+        assert_eq!(
+            v.confidence, "high",
+            "an in-range version is high confidence"
+        );
+        assert!(v.known_exploited, "the fixture flags this CVE in KEV");
+        // CVSS arrives as f32 (5.9) and is stored/read as f64, so 5.9f32 widens
+        // to 5.900000095…; compare within tolerance rather than for bit equality.
+        let cvss = v.cvss.expect("cvss present");
+        assert!((cvss - 5.9).abs() < 0.001, "cvss ~= 5.9, got {cvss}");
+        assert_eq!(
+            v.mac, "11:22:33:44:55:66",
+            "attributed to the owning neighbour"
+        );
+        assert_eq!(v.port, 22);
+    }
+
+    /// A port with no banner, and one whose banner does not parse to a product,
+    /// yield nothing — never a guessed CVE.
+    #[test]
+    fn a_none_or_unparseable_banner_yields_no_findings() {
+        let dir = write_fixture_snapshot();
+        let db = vuln_db::VulnDb::load_from_dir(dir.path()).expect("fixture snapshot loads");
+        let ports = vec![
+            port_with_banner(139, None),
+            port_with_banner(4444, Some("\u{0}\u{1}\u{2} binary junk")),
+        ];
+        assert!(
+            match_vulns(&db, &ports, 42).is_empty(),
+            "no banner and an unparseable banner both yield nothing"
+        );
+    }
+
     use super::*;
     use collector_core::Readiness;
     use collector_host::HostCollector;

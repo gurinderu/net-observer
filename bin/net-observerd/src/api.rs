@@ -404,6 +404,11 @@ pub struct ApiServer {
     /// What the active scan is PERMITTED to do, from config. A run's requested
     /// options are intersected with this ceiling; every field is off by default.
     pub scan_permission: ScanOptions,
+    /// The configured CVE snapshot directory, when one is set. The `cve` rung is
+    /// UNAVAILABLE unless this is `Some` AND the directory exists — checked at
+    /// scan time so a snapshot removed after boot is honestly reported as
+    /// dropped, never pretended present.
+    pub scan_cve_snapshot: Option<PathBuf>,
     /// Where a manual freeze writes its copy: the daemon's blob directory, the
     /// same root the `gw-change` freeze handler uses.
     pub blob_dir: PathBuf,
@@ -662,6 +667,7 @@ async fn handle_conn(
                 freezer: &srv.freezer,
                 scanner: srv.scanner.as_deref(),
                 scan_permission: &srv.scan_permission,
+                scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
                 blob_dir: &srv.blob_dir,
                 resume_at_us: &srv.resume_at_us,
                 snapshot: &srv.snapshot,
@@ -877,6 +883,9 @@ pub(crate) struct ControlCtx<'a> {
     pub scanner: Option<&'a dyn NeighborScanner>,
     /// The config permission ceiling for the active scan.
     pub scan_permission: &'a ScanOptions,
+    /// The configured CVE snapshot directory, when one is set (see the field of
+    /// the same name on the server). Checked for existence at scan time.
+    pub scan_cve_snapshot: Option<&'a Path>,
     pub blob_dir: &'a Path,
     pub resume_at_us: &'a AtomicI64,
     pub snapshot: &'a Mutex<StatusSnapshot>,
@@ -1109,7 +1118,18 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
     // A banner grab needs an open port to read from, so it is effective only
     // when it is requested, permitted, AND the `ports` rung itself is effective.
     let banners = requested.banners && cx.scan_permission.banners && ports;
-    let effective = ScanOptions { ports, banners };
+    // The snapshot is available only when a directory is configured AND present:
+    // a path removed after boot is honestly reported as dropped, never faked.
+    let snapshot_available = cx.scan_cve_snapshot.is_some_and(|p| p.is_dir());
+    // The `cve` rung matches banners against the snapshot: effective only when
+    // requested, permitted, the `banners` rung is itself effective (a match
+    // parses a banner), AND a snapshot is present to match against.
+    let cve = requested.cve && cx.scan_permission.cve && banners && snapshot_available;
+    let effective = ScanOptions {
+        ports,
+        banners,
+        cve,
+    };
     let mut dropped = Vec::new();
     if requested.ports && !cx.scan_permission.ports {
         dropped.push("ports (not permitted; enable collectors.neighbors.scan.ports)".to_string());
@@ -1123,6 +1143,19 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
             "needs the ports rung, which is not effective this run"
         };
         dropped.push(format!("banners ({why})"));
+    }
+    if requested.cve && !cve {
+        // Say WHY, in the order the rung depends on things: permission, then an
+        // effective banner grab to parse, then a provisioned snapshot to match
+        // against. Each is an honest refusal, never a silent skip.
+        let why = if !cx.scan_permission.cve {
+            "not permitted; enable collectors.neighbors.scan.cve"
+        } else if !banners {
+            "needs the banners rung, which is not effective this run"
+        } else {
+            "no CVE snapshot; set collectors.neighbors.cve_snapshot_dir to a provisioned directory"
+        };
+        dropped.push(format!("cve ({why})"));
     }
     let Some(report) = scanner.scan(&effective) else {
         return ControlResult {
@@ -1146,8 +1179,20 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
             note = format!(" (port record failed: {e})");
         }
     }
+    for vuln in &report.vulns {
+        if let Err(e) = cx.store.write_neighbor_vuln(vuln) {
+            tracing::error!(error = %e, cve = %vuln.cve_id,
+                "store write failed; vuln row not recorded (gap logged)");
+            note = format!(" (vuln record failed: {e})");
+        }
+    }
     if !dropped.is_empty() {
         note = format!("{note} [dropped: {}]", dropped.join(", "));
+    }
+    // The cve rung ran but its snapshot was unusable: say so, so the operator
+    // never reads an empty vuln result as a clean "no vulnerabilities found".
+    if let Some(cve_note) = &report.cve_note {
+        note = format!("{note} [cve: {cve_note}]");
     }
 
     let sample = Sample::Neighbors(NeighborsSample {
@@ -1397,6 +1442,7 @@ mod tests {
             freezer: Arc::new(PcapRingSlot::empty()),
             scanner: None,
             scan_permission: ScanOptions::default(),
+            scan_cve_snapshot: None,
             blob_dir: std::env::temp_dir().join("net-observerd-test-blobs"),
             resume_at_us: Arc::new(AtomicI64::new(0)),
             snapshot: Arc::new(Mutex::new(StatusSnapshot::default())),
@@ -1418,6 +1464,7 @@ mod tests {
             freezer: &srv.freezer,
             scanner: srv.scanner.as_deref(),
             scan_permission: &srv.scan_permission,
+            scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
             blob_dir: &srv.blob_dir,
             resume_at_us: &srv.resume_at_us,
             snapshot: &srv.snapshot,
@@ -1757,6 +1804,8 @@ mod tests {
                 detail: None,
             }],
             ports: Vec::new(),
+            vulns: Vec::new(),
+            cve_note: None,
             message: "swept 192.168.1.0/24: 1 neighbours, 1 named".into(),
         }
     }
@@ -1811,6 +1860,29 @@ mod tests {
         // And the live snapshot shows what the operator just asked for.
         let snap = srv.snapshot.lock().unwrap();
         assert_eq!(snap.neighbors.as_ref().unwrap().neighbors.len(), 1);
+    }
+
+    /// An unusable cve snapshot (present-but-empty) must be SAID, so an empty
+    /// vuln result is never read as a clean "no vulnerabilities". The scanner
+    /// reports it via `cve_note`; `scan_now` must surface it in the message.
+    #[test]
+    fn an_unusable_cve_snapshot_is_surfaced_not_silent() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut report = fake_report();
+        report.cve_note = Some("snapshot at /tmp/x is empty or wrong layout".to_string());
+        srv.scanner = Some(Arc::new(FakeScanner(Some(report))));
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions::default()),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(
+            res.message.contains("[cve:") && res.message.contains("empty or wrong layout"),
+            "the operator must be told the snapshot was unusable: {}",
+            res.message
+        );
     }
 
     /// A paused daemon is inside a bracketed gap; a scan would write rows with a
@@ -1887,12 +1959,14 @@ mod tests {
         srv.scan_permission = ScanOptions {
             ports: true,
             banners: false,
+            cve: false,
         };
         let cx = test_ctx(&srv);
         let res = control_request(
             ControlCmd::ScanNeighbors(ScanOptions {
                 ports: true,
                 banners: true,
+                cve: false,
             }),
             Some(TEST_DAEMON_UID),
             &cx,
@@ -1916,12 +1990,14 @@ mod tests {
         srv.scan_permission = ScanOptions {
             ports: false,
             banners: true,
+            cve: false,
         };
         let cx = test_ctx(&srv);
         let res = control_request(
             ControlCmd::ScanNeighbors(ScanOptions {
                 ports: true,
                 banners: true,
+                cve: false,
             }),
             Some(TEST_DAEMON_UID),
             &cx,
@@ -1934,6 +2010,136 @@ mod tests {
             "banners needs an effective ports rung to do anything"
         );
         assert!(res.message.contains("banners"), "{}", res.message);
+    }
+
+    /// A requested `cve` rung that is not permitted is dropped with a note, and
+    /// the scanner is never handed an effective cve rung.
+    #[test]
+    fn a_requested_but_unpermitted_cve_rung_is_dropped_with_a_note() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        // ports+banners permitted with a snapshot present, but cve NOT permitted.
+        let snap = tempfile::tempdir().unwrap();
+        srv.scan_permission = ScanOptions {
+            ports: true,
+            banners: true,
+            cve: false,
+        };
+        srv.scan_cve_snapshot = Some(snap.path().to_path_buf());
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                ports: true,
+                banners: true,
+                cve: true,
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(res.message.contains("cve"), "{}", res.message);
+        assert!(res.message.contains("not permitted"), "{}", res.message);
+        let eff = seen.lock().unwrap().clone().expect("scanner ran");
+        assert!(!eff.cve, "an unpermitted cve rung must not run");
+    }
+
+    /// `cve` permitted and requested but with no effective `banners` rung does
+    /// nothing: a match needs a banner to parse.
+    #[test]
+    fn a_cve_rung_without_an_effective_banner_rung_does_nothing() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        // cve permitted and a snapshot present, but banners NOT permitted.
+        let snap = tempfile::tempdir().unwrap();
+        srv.scan_permission = ScanOptions {
+            ports: true,
+            banners: false,
+            cve: true,
+        };
+        srv.scan_cve_snapshot = Some(snap.path().to_path_buf());
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                ports: true,
+                banners: true,
+                cve: true,
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(res.message.contains("cve"), "{}", res.message);
+        assert!(res.message.contains("banners rung"), "{}", res.message);
+        let eff = seen.lock().unwrap().clone().expect("scanner ran");
+        assert!(
+            !eff.cve,
+            "cve needs an effective banners rung to do anything"
+        );
+    }
+
+    /// `cve` permitted, requested, and with an effective banner grab, but no CVE
+    /// snapshot configured, is dropped honestly rather than pretended present.
+    #[test]
+    fn a_cve_rung_without_a_snapshot_is_dropped_with_a_note() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        // Everything permitted, but no snapshot directory at all.
+        srv.scan_permission = ScanOptions {
+            ports: true,
+            banners: true,
+            cve: true,
+        };
+        srv.scan_cve_snapshot = None;
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                ports: true,
+                banners: true,
+                cve: true,
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(res.message.contains("cve"), "{}", res.message);
+        assert!(res.message.contains("no CVE snapshot"), "{}", res.message);
+        let eff = seen.lock().unwrap().clone().expect("scanner ran");
+        assert!(!eff.cve, "cve without a snapshot must not run");
+    }
+
+    /// A configured-but-absent snapshot directory is treated as unavailable: a
+    /// path that does not exist is not a snapshot, and the rung is dropped.
+    #[test]
+    fn a_cve_snapshot_path_that_does_not_exist_is_unavailable() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        srv.scan_permission = ScanOptions {
+            ports: true,
+            banners: true,
+            cve: true,
+        };
+        srv.scan_cve_snapshot = Some(std::path::PathBuf::from("/no/such/snapshot/dir"));
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                ports: true,
+                banners: true,
+                cve: true,
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(res.message.contains("no CVE snapshot"), "{}", res.message);
+        let eff = seen.lock().unwrap().clone().expect("scanner ran");
+        assert!(
+            !eff.cve,
+            "an absent snapshot directory means the rung is dropped"
+        );
     }
 
     /// `SetQuiet` is benign self-control like `SetObserving`: ungated by
