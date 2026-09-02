@@ -15,6 +15,7 @@ members = [
     "crates/collector-neighbors",
     "crates/triggers",
     "crates/macos",
+    "crates/vuln-db",
     "bin/net-observerd",
     "bin/net-observer-cli",
     "bin/net-observer-bar",
@@ -40,6 +41,7 @@ default-members = [
     "crates/collector-neighbors",
     "crates/triggers",
     "crates/macos",
+    "crates/vuln-db",
     "bin/net-observerd",
     "bin/net-observer-cli",
 ]
@@ -92,6 +94,7 @@ collector-wifi = { path = "crates/collector-wifi" }
 collector-neighbors = { path = "crates/collector-neighbors" }
 triggers = { path = "crates/triggers" }
 macos = { path = "crates/macos" }
+vuln-db = { path = "crates/vuln-db" }
 
 # Release tuning. This daemon is I/O-bound and idle between ~15s ticks, so the
 # aim is NOT steady-state speed (there is no hot path to speed up) — it is a
