@@ -151,7 +151,7 @@ async fn connect_bound_inner(host: &str, port: u16, iface: &str) -> Option<f64> 
 ///
 /// Returns `true` on success. Uses `if_nametoindex` to resolve the interface
 /// index and `setsockopt(IPPROTO_IP, IP_BOUND_IF, idx)`.
-fn bind_to_iface_v4(fd: RawFd, iface: &str) -> bool {
+pub(crate) fn bind_to_iface_v4(fd: RawFd, iface: &str) -> bool {
     let Ok(cstr) = CString::new(iface) else {
         return false;
     };

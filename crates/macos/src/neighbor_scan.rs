@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use types::{NeighborObs, NeighborSource};
@@ -37,6 +38,16 @@ const MAX_SWEEP_HOSTS: u32 = 1024;
 /// How long the kernel is given to finish resolving before the ARP cache is
 /// re-read.
 const SWEEP_SETTLE: Duration = Duration::from_secs(2);
+
+/// What the mDNS browse did and found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MdnsOutcome {
+    /// Hostname discovered per address.
+    pub names: HashMap<IpAddr, String>,
+    /// How many DNS-SD service types were browsed.
+    pub types_browsed: usize,
+    pub duration_ms: i64,
+}
 
 /// The DNS-SD meta-query, recorded as the mDNS scan's target.
 pub const MDNS_TARGET: &str = DNS_SD_META;
@@ -167,9 +178,15 @@ pub struct SweepStats {
 /// resolve them. The caller re-reads the ARP cache afterwards — the resolution
 /// this provokes is the entire product, so nothing here parses a reply.
 ///
+/// The socket is pinned to `iface_name` with `IP_BOUND_IF`, like every other
+/// outbound probe in this daemon. Without it a tunnel holding the default route
+/// swallows the datagrams: nothing is ARPed on the segment, yet the recorded row
+/// still names the segment's CIDR — a scan that reports covering ground it never
+/// touched. A failed bind is recorded in `refused` rather than probing anyway.
+///
 /// Blocking (a `UdpSocket` and a settle sleep); the daemon drives it on the
 /// blocking pool.
-pub fn sweep_probe_blocking(iface: &Ipv4Iface) -> SweepStats {
+pub fn sweep_probe_blocking(iface: &Ipv4Iface, iface_name: &str) -> SweepStats {
     let started = Instant::now();
     let target = iface.cidr();
     let refuse = |detail: String, started: Instant| SweepStats {
@@ -189,6 +206,12 @@ pub fn sweep_probe_blocking(iface: &Ipv4Iface) -> SweepStats {
         Ok(s) => s,
         Err(e) => return refuse(format!("no socket: {e}"), started),
     };
+    if !crate::net::bind_to_iface_v4(socket.as_raw_fd(), iface_name) {
+        return refuse(
+            format!("could not pin the sweep to {iface_name}; the tunnel would have taken it"),
+            started,
+        );
+    }
     let mut sent = 0usize;
     for a in &addrs {
         if socket
@@ -220,16 +243,22 @@ pub async fn iface_ipv4(iface: &str) -> Option<Ipv4Iface> {
 /// A responder that answers nothing within the budget simply yields no names —
 /// an empty result, not a failure.
 #[must_use]
-pub fn mdns_names_blocking() -> HashMap<IpAddr, String> {
+pub fn mdns_names_blocking() -> MdnsOutcome {
+    let started = Instant::now();
     let mut names = HashMap::new();
-    let Ok(daemon) = mdns_sd::ServiceDaemon::new() else {
-        return names;
+    let done = |names: HashMap<IpAddr, String>, types: usize, started: Instant| MdnsOutcome {
+        names,
+        types_browsed: types,
+        duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
     };
-    let deadline = Instant::now() + MDNS_BUDGET;
+    let Ok(daemon) = mdns_sd::ServiceDaemon::new() else {
+        return done(names, 0, started);
+    };
+    let deadline = started + MDNS_BUDGET;
     // The meta-query names the service types present; browsing each of those is
     // what actually resolves instances to a hostname and addresses.
     let Ok(meta) = daemon.browse(DNS_SD_META) else {
-        return names;
+        return done(names, 0, started);
     };
     let mut browsed: Vec<String> = Vec::new();
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
@@ -247,9 +276,18 @@ pub fn mdns_names_blocking() -> HashMap<IpAddr, String> {
             break;
         }
     }
-    for ty in &browsed {
+    // Each discovered type gets an EQUAL slice of what is left. Giving the first
+    // type the whole remainder — the obvious loop — means several types are
+    // discovered and exactly one is ever resolved, so names go missing with no
+    // signal telling that apart from a segment where nobody answers.
+    let types = browsed.len().max(1);
+    for (i, ty) in browsed.iter().enumerate() {
         let Ok(rx) = daemon.browse(ty) else { continue };
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let slice_deadline = Instant::now() + left / u32::try_from(types - i).unwrap_or(1).max(1);
+        while let Some(remaining) = slice_deadline.checked_duration_since(Instant::now()) {
             let Ok(event) = rx.recv_timeout(remaining) else {
                 break;
             };
@@ -264,7 +302,7 @@ pub fn mdns_names_blocking() -> HashMap<IpAddr, String> {
         }
     }
     let _ = daemon.shutdown();
-    names
+    done(names, browsed.len(), started)
 }
 
 #[cfg(test)]

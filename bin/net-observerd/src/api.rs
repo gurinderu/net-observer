@@ -1067,6 +1067,29 @@ fn control_response(
 /// but does not fail the command: the packets really did go out, and saying
 /// otherwise would be a false statement about what this daemon did.
 fn scan_now(cx: &ControlCtx<'_>, peer_uid: Option<u32>) -> ControlResult {
+    // Two refusals BEFORE anything is sent, because a scan is the one command
+    // that contradicts these two states outright.
+    //
+    // Paused: the pause is bracketed silence — `observing_edge` says the daemon
+    // deliberately collected nothing between two instants. A scan would drop
+    // rows and publish an event with a timestamp inside that bracket, so the gap
+    // record and the data would disagree about the same seconds.
+    //
+    // Quiet: quiet means this daemon addresses no packet at the gateway; a sweep
+    // addresses the whole subnet. Honouring the click would make quiet a lie the
+    // operator has no way to see.
+    if !cx.observing.load(Ordering::Acquire) {
+        return ControlResult {
+            ok: false,
+            message: "observation is paused; resume before scanning".to_string(),
+        };
+    }
+    if cx.quiet.load(Ordering::Acquire) {
+        return ControlResult {
+            ok: false,
+            message: "quiet is on; a scan would address the whole subnet".to_string(),
+        };
+    }
     let Some(scanner) = cx.scanner else {
         return ControlResult {
             ok: false,
@@ -1729,6 +1752,46 @@ mod tests {
         // And the live snapshot shows what the operator just asked for.
         let snap = srv.snapshot.lock().unwrap();
         assert_eq!(snap.neighbors.as_ref().unwrap().neighbors.len(), 1);
+    }
+
+    /// A paused daemon is inside a bracketed gap; a scan would write rows with a
+    /// timestamp inside it and make the bracket a false account of the silence.
+    #[test]
+    fn a_scan_is_refused_while_observation_is_paused() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
+        srv.observing.store(false, Ordering::Release);
+        let cx = test_ctx(&srv);
+        let res = control_request(ControlCmd::ScanNeighbors, Some(TEST_DAEMON_UID), &cx);
+        assert!(!res.ok, "a paused daemon must not scan");
+        assert!(res.message.contains("paused"), "{}", res.message);
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM neighbor_sample")
+                .unwrap(),
+            0,
+            "a refused scan must write nothing into the bracketed gap"
+        );
+    }
+
+    /// Quiet says this daemon addresses no packet at the gateway. A sweep
+    /// addresses the whole subnet, so the click is refused rather than silently
+    /// making quiet untrue.
+    #[test]
+    fn a_scan_is_refused_while_quiet_is_on() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
+        srv.quiet.store(true, Ordering::Release);
+        let cx = test_ctx(&srv);
+        let res = control_request(ControlCmd::ScanNeighbors, Some(TEST_DAEMON_UID), &cx);
+        assert!(!res.ok, "quiet must not be broken by a scan");
+        assert!(res.message.contains("quiet"), "{}", res.message);
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM neighbor")
+                .unwrap(),
+            0
+        );
     }
 
     /// Nothing to scan is a refusal with a reason, never a silent success.

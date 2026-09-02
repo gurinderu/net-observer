@@ -279,7 +279,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             }
         }
         Command::Neighbors { network } => {
-            let table = run_query(&cli.db, &diagnosis::neighbors_sql(network.as_deref()))?;
+            let sql = diagnosis::neighbors_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
+            let table = run_query(&cli.db, &sql)?;
             print!("{}", format_table(&table));
         }
         Command::Query { sql } => {
