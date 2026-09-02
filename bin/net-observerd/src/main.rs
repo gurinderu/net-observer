@@ -648,6 +648,11 @@ impl NeighborScanner for SystemScanner {
     /// seconds) inside an async request handler, so it runs under
     /// `block_in_place`: the worker thread is handed back to the runtime for the
     /// duration instead of stalling every other connection behind one scan.
+    ///
+    /// **Requires the multi-thread runtime** — `block_in_place` panics on a
+    /// current-thread one. The daemon's `#[tokio::main]` is multi-thread, and
+    /// every test drives the control path through a fake scanner instead of this
+    /// type, so nothing exercises it on a single-threaded runtime today.
     fn scan(&self) -> Option<ScanReport> {
         tokio::task::block_in_place(|| {
             let rt = tokio::runtime::Handle::current();
@@ -660,77 +665,25 @@ impl NeighborScanner for SystemScanner {
                 }
             });
 
-            let sweep = neighbor_scan::sweep_probe_blocking(&ipv4);
+            let sweep = neighbor_scan::sweep_probe_blocking(&ipv4, &iface);
             // Read the cache the sweep just filled. Everything it now holds for
             // this interface counts as found: an entry the kernel resolved
             // because of our probe is indistinguishable from one that was
-            // already there, and claiming otherwise would be a guess.
-            let mut found: Vec<types::NeighborObs> = rt
+            // already there, and claiming otherwise would be a guess. What is
+            // NOT guessed is attribution — a refused sweep leaves these entries
+            // marked `arp`, which `compose_scan_report` decides.
+            let arp = rt
                 .block_on(neighbors::read_arp(Some(&iface)))
                 .unwrap_or_default();
-            for n in &mut found {
-                n.source = types::NeighborSource::Sweep;
-            }
-
-            let names = neighbor_scan::mdns_names_blocking();
-            let named = neighbor_scan::join_names_onto_arp(&found, &names);
-            for n in &mut found {
-                if let Some(m) = named.iter().find(|m| m.mac == n.mac) {
-                    n.hostname.clone_from(&m.hostname);
-                    n.source = types::NeighborSource::Mdns;
-                }
-            }
-
-            let ts_us = types::now_us();
-            let scans = vec![
-                store::NeighborScan {
-                    ts_us,
-                    network_key: network_key.clone(),
-                    iface: Some(iface.clone()),
-                    method: "sweep".to_string(),
-                    target: sweep.target.clone(),
-                    found: i32::try_from(found.len()).unwrap_or(i32::MAX),
-                    duration_ms: sweep.duration_ms,
-                    detail: sweep
-                        .refused
-                        .clone()
-                        .map(|r| format!("refused: {r}"))
-                        .or_else(|| Some(format!("{}/{} probed", sweep.sent, sweep.total))),
-                },
-                store::NeighborScan {
-                    ts_us,
-                    network_key: network_key.clone(),
-                    iface: Some(iface.clone()),
-                    method: "mdns".to_string(),
-                    target: neighbor_scan::MDNS_TARGET.to_string(),
-                    found: i32::try_from(named.len()).unwrap_or(i32::MAX),
-                    duration_ms: 0,
-                    detail: None,
-                },
-            ];
-            let message = match &sweep.refused {
-                Some(r) => format!(
-                    "sweep refused ({r}); {} neighbours known, {} named",
-                    found.len(),
-                    named.len()
-                ),
-                None => format!(
-                    "swept {} ({}/{} probed): {} neighbours, {} named",
-                    sweep.target,
-                    sweep.sent,
-                    sweep.total,
-                    found.len(),
-                    named.len()
-                ),
-            };
-            Some(ScanReport {
-                ts_us,
+            let mdns = neighbor_scan::mdns_names_blocking();
+            Some(pipeline::compose_scan_report(
+                types::now_us(),
                 network_key,
-                iface: Some(iface),
-                found,
-                scans,
-                message,
-            })
+                iface,
+                &sweep,
+                arp,
+                &mdns,
+            ))
         })
     }
 }

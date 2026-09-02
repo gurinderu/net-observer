@@ -72,6 +72,13 @@ impl NeighborFacts for SystemNeighbors {
         if let Some(out) = &ndp {
             neighbors.extend(parse_ndp_table(out, iface.as_deref()));
         }
+        // One row per device, because `neighbor` is keyed by MAC. Sorting by
+        // (mac, ip) before the dedup makes the survivor deterministic rather than
+        // dependent on which table was read first, and the v4 address wins for a
+        // dual-stack device: digits sort before the hex letters and colons of a
+        // v6 literal. That is a deliberate choice of the address a human can act
+        // on — a v6-only neighbour still keeps its own address, since it has no
+        // v4 entry to lose to.
         neighbors.sort_by(|a, b| (&a.mac, &a.ip).cmp(&(&b.mac, &b.ip)));
         neighbors.dedup_by(|a, b| a.mac == b.mac);
 
@@ -253,6 +260,31 @@ fe80::5%en5                          12:22:33:44:55:66  en5   1m0s      S";
             normalize_mac("a4:83:E7:1b:2c:3d").as_deref(),
             Some("a4:83:e7:1b:2c:3d")
         );
+    }
+
+    /// The dual-stack rule the reading relies on: one row per MAC, and the v4
+    /// address is the survivor. Asserted on the ordering directly, since the
+    /// merge itself needs a live `arp`/`ndp`.
+    #[test]
+    fn a_dual_stack_device_keeps_its_v4_address() {
+        let mut v = vec![
+            NeighborObs {
+                mac: "a4:83:e7:1b:2c:3d".into(),
+                ip: "fe80::1".into(),
+                source: NeighborSource::Ndp,
+                hostname: None,
+            },
+            NeighborObs {
+                mac: "a4:83:e7:1b:2c:3d".into(),
+                ip: "192.168.1.1".into(),
+                source: NeighborSource::Arp,
+                hostname: None,
+            },
+        ];
+        v.sort_by(|a, b| (&a.mac, &a.ip).cmp(&(&b.mac, &b.ip)));
+        v.dedup_by(|a, b| a.mac == b.mac);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ip, "192.168.1.1");
     }
 
     #[test]

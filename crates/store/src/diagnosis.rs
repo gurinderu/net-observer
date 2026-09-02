@@ -449,27 +449,58 @@ ORDER BY ts_us";
 ///
 /// Reads the long-lived `neighbor` table, not the per-tick readings: the
 /// question is "who is here / who was here", and the answer is one row per
-/// device per segment. `network` filters to one segment by its gateway MAC.
+/// device per segment. `network` filters to one segment by its `network_key`.
 ///
 /// `source` is the honest part: `arp`/`ndp` means the daemon merely read a cache
 /// the OS had filled, `sweep`/`mdns` that an operator sent it looking.
-#[must_use]
-pub fn neighbors_sql(network: Option<&str>) -> String {
-    // The filter is a MAC, and a MAC is hex and colons — anything else cannot
-    // match a stored key, so it is rejected here rather than interpolated.
+///
+/// Returns `Err` for a key that cannot exist rather than a query that matches
+/// nothing: an empty table is the answer to "this segment has no neighbours",
+/// and a rejected filter must not borrow it.
+pub fn neighbors_sql(network: Option<&str>) -> Result<String, BadNetworkKey> {
     let filter = match network {
-        Some(n) if n.chars().all(|c| c.is_ascii_hexdigit() || c == ':') => {
+        None => String::new(),
+        Some(n) => {
+            validate_network_key(n)?;
             format!("WHERE network_key = '{n}'")
         }
-        Some(_) => "WHERE false".to_string(),
-        None => String::new(),
     };
-    format!(
+    Ok(format!(
         "SELECT network_key, mac, ip, oui, hostname, source, iface, first_seen_us, last_seen_us
 FROM neighbor
 {filter}
 ORDER BY last_seen_us DESC, mac"
-    )
+    ))
+}
+
+/// A `network_key` the store could never have written.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "not a segment key: {0} (expected a gateway MAC such as a4:83:e7:1b:2c:3d, or `unknown` for a segment whose gateway MAC was unreadable)"
+)]
+pub struct BadNetworkKey(pub String);
+
+/// Accept exactly what the store writes as a `network_key`: a MAC, or the
+/// literal sentinel it uses when the gateway's MAC could not be read.
+///
+/// That sentinel is the whole reason this is a named check rather than a
+/// character class. During an outage the gateway is often exactly what cannot be
+/// read, so `unknown` is the segment most likely to matter — and a filter that
+/// silently matched nothing would answer "no such segment" about the one
+/// recorded because identification failed.
+fn validate_network_key(n: &str) -> Result<(), BadNetworkKey> {
+    if n == "unknown" {
+        return Ok(());
+    }
+    let looks_like_mac = n.len() == 17
+        && n.split(':').count() == 6
+        && n.split(':')
+            .all(|o| o.len() == 2 && o.chars().all(|c| c.is_ascii_hexdigit()));
+    if looks_like_mac {
+        Ok(())
+    } else {
+        Err(BadNetworkKey(n.to_string()))
+    }
 }
 
 impl DuckdbStore {
@@ -508,7 +539,7 @@ impl DuckdbStore {
 
     /// Run [`neighbors_sql`] for every segment.
     pub fn neighbors(&self) -> Result<QueryTable, StoreError> {
-        self.query_table(&neighbors_sql(None))
+        self.query_table(&neighbors_sql(None).expect("no filter cannot be invalid"))
     }
 
     /// Run [`observation_gaps_sql`].
@@ -519,6 +550,32 @@ impl DuckdbStore {
 
 #[cfg(test)]
 mod tests {
+
+    /// The sentinel the store writes when the gateway MAC is unreadable must be
+    /// a reachable filter: during an outage that is often the interesting
+    /// segment, and it was silently rejected before.
+    #[test]
+    fn the_unknown_segment_is_reachable_by_name() {
+        let sql = neighbors_sql(Some("unknown")).expect("unknown is a real key");
+        assert!(sql.contains("WHERE network_key = 'unknown'"), "{sql}");
+    }
+
+    #[test]
+    fn a_gateway_mac_is_accepted_and_a_non_key_is_an_error() {
+        assert!(neighbors_sql(Some("a4:83:e7:1b:2c:3d")).is_ok());
+        for bad in ["'; DROP TABLE neighbor; --", "a4:83", "не мак", ""] {
+            assert!(
+                neighbors_sql(Some(bad)).is_err(),
+                "{bad:?} must be an error, not a query that matches nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn no_filter_selects_every_segment() {
+        let sql = neighbors_sql(None).unwrap();
+        assert!(!sql.contains("WHERE"), "{sql}");
+    }
     use super::*;
     use crate::Store;
     use types::{

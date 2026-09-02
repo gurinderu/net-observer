@@ -593,6 +593,95 @@ pub struct ScanReport {
     pub message: String,
 }
 
+/// Compose the durable account of one scan out of what each method ACTUALLY did.
+///
+/// Pure, so the honesty rules below are tested rather than trusted:
+///
+/// * A **refused** sweep sent nothing. The ARP cache was still re-read — that is
+///   worth keeping — but its entries stay attributed to `arp`, and the sweep row
+///   records `found = 0` with the refusal. Stamping them `sweep` would say the
+///   daemon addressed machines it never addressed, which is the one thing
+///   `neighbor_scan` exists to keep straight.
+/// * The mDNS row carries the browse's own elapsed time and how many service
+///   types it reached, so "found no names" and "never got to look" are different
+///   rows.
+pub fn compose_scan_report(
+    ts_us: i64,
+    network_key: Option<String>,
+    iface: String,
+    sweep: &macos::neighbor_scan::SweepStats,
+    arp: Vec<types::NeighborObs>,
+    mdns: &macos::neighbor_scan::MdnsOutcome,
+) -> ScanReport {
+    let swept = sweep.refused.is_none();
+    let mut found = arp;
+    if swept {
+        for n in &mut found {
+            n.source = types::NeighborSource::Sweep;
+        }
+    }
+    let named = macos::neighbor_scan::join_names_onto_arp(&found, &mdns.names);
+    for n in &mut found {
+        if let Some(m) = named.iter().find(|m| m.mac == n.mac) {
+            n.hostname.clone_from(&m.hostname);
+            n.source = types::NeighborSource::Mdns;
+        }
+    }
+
+    let count = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+    let scans = vec![
+        store::NeighborScan {
+            ts_us,
+            network_key: network_key.clone(),
+            iface: Some(iface.clone()),
+            method: "sweep".to_string(),
+            target: sweep.target.clone(),
+            // A refused sweep found nothing: what the cache holds was not its doing.
+            found: if swept { count(found.len()) } else { 0 },
+            duration_ms: sweep.duration_ms,
+            detail: Some(match &sweep.refused {
+                Some(r) => format!("refused: {r}"),
+                None => format!("{}/{} probed", sweep.sent, sweep.total),
+            }),
+        },
+        store::NeighborScan {
+            ts_us,
+            network_key: network_key.clone(),
+            iface: Some(iface.clone()),
+            method: "mdns".to_string(),
+            target: macos::neighbor_scan::MDNS_TARGET.to_string(),
+            found: count(named.len()),
+            duration_ms: mdns.duration_ms,
+            detail: Some(format!("{} service types browsed", mdns.types_browsed)),
+        },
+    ];
+    let message = if swept {
+        format!(
+            "swept {} ({}/{} probed): {} neighbours, {} named",
+            sweep.target,
+            sweep.sent,
+            sweep.total,
+            found.len(),
+            named.len()
+        )
+    } else {
+        format!(
+            "sweep refused ({}); nothing probed — {} neighbours from the cache, {} named",
+            sweep.refused.as_deref().unwrap_or("-"),
+            found.len(),
+            named.len()
+        )
+    };
+    ScanReport {
+        ts_us,
+        network_key,
+        iface: Some(iface),
+        found,
+        scans,
+        message,
+    }
+}
+
 /// A swappable slot holding the pcap ring that is *currently* running.
 ///
 /// The ring is not tick-driven — it is a `tcpdump` child — and at boot there may
@@ -774,6 +863,95 @@ impl Handler for SnapshotHandler {
 
 #[cfg(test)]
 mod tests {
+
+    use macos::neighbor_scan::{MdnsOutcome, SweepStats};
+
+    fn arp_obs(mac: &str, ip: &str) -> types::NeighborObs {
+        types::NeighborObs {
+            mac: mac.into(),
+            ip: ip.into(),
+            source: types::NeighborSource::Arp,
+            hostname: None,
+        }
+    }
+
+    fn sweep_stats(refused: Option<&str>) -> SweepStats {
+        SweepStats {
+            target: "192.168.1.0/24".into(),
+            sent: if refused.is_some() { 0 } else { 253 },
+            total: if refused.is_some() { 0 } else { 253 },
+            duration_ms: 2100,
+            refused: refused.map(str::to_string),
+        }
+    }
+
+    /// A sweep that sent nothing must not claim the cache as its findings: the
+    /// entries stay `arp`, and the sweep row records zero. Otherwise
+    /// `neighbor_scan` says the daemon addressed machines it never addressed.
+    #[test]
+    fn a_refused_sweep_claims_nothing_it_did_not_probe() {
+        let r = compose_scan_report(
+            42,
+            Some("aa:bb:cc:dd:ee:ff".into()),
+            "en0".into(),
+            &sweep_stats(Some("subnet too large")),
+            vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
+            &MdnsOutcome::default(),
+        );
+        assert_eq!(r.found[0].source, types::NeighborSource::Arp);
+        let sweep_row = r.scans.iter().find(|s| s.method == "sweep").unwrap();
+        assert_eq!(sweep_row.found, 0, "a refused sweep found nothing");
+        assert!(sweep_row.detail.as_deref().unwrap().starts_with("refused:"));
+        assert!(r.message.contains("refused"), "{}", r.message);
+        // The cache reading itself is still kept — it is a real observation.
+        assert_eq!(r.found.len(), 1);
+    }
+
+    /// A sweep that ran owns what the cache then held.
+    #[test]
+    fn a_sweep_that_ran_attributes_what_it_found() {
+        let r = compose_scan_report(
+            42,
+            None,
+            "en0".into(),
+            &sweep_stats(None),
+            vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
+            &MdnsOutcome::default(),
+        );
+        assert_eq!(r.found[0].source, types::NeighborSource::Sweep);
+        let sweep_row = r.scans.iter().find(|s| s.method == "sweep").unwrap();
+        assert_eq!(sweep_row.found, 1);
+        assert_eq!(sweep_row.detail.as_deref(), Some("253/253 probed"));
+    }
+
+    /// The mDNS row carries the browse's OWN elapsed time and reach, so "found
+    /// no names" and "never got to look" are different rows.
+    #[test]
+    fn the_mdns_row_reports_its_own_work() {
+        let mut names = std::collections::HashMap::new();
+        names.insert(
+            "192.168.1.5".parse::<std::net::IpAddr>().unwrap(),
+            "printer.local".to_string(),
+        );
+        let r = compose_scan_report(
+            42,
+            None,
+            "en0".into(),
+            &sweep_stats(None),
+            vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
+            &MdnsOutcome {
+                names,
+                types_browsed: 4,
+                duration_ms: 3900,
+            },
+        );
+        let row = r.scans.iter().find(|s| s.method == "mdns").unwrap();
+        assert_eq!(row.found, 1);
+        assert_eq!(row.duration_ms, 3900);
+        assert_eq!(row.detail.as_deref(), Some("4 service types browsed"));
+        assert_eq!(r.found[0].source, types::NeighborSource::Mdns);
+        assert_eq!(r.found[0].hostname.as_deref(), Some("printer.local"));
+    }
     use super::*;
     use collector_core::Readiness;
     use collector_host::HostCollector;
