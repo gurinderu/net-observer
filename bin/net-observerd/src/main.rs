@@ -323,12 +323,34 @@ async fn run_daemon() -> anyhow::Result<()> {
             tracing::warn!(collector = name, ?os, "unsupported OS; skipping");
             continue;
         }
-        let ready = c.preflight().await;
-        if !ready.is_ready() {
-            if let Readiness::Unavailable(reason) = ready {
-                tracing::warn!(collector = name, %reason, "preflight failed; skipping");
+        // Preflight is NOT a startup gate for interval collectors. A prerequisite
+        // that is missing at boot (RunAtLoad starts the daemon before any
+        // interface is up) would otherwise disable the collector for the life of
+        // the process, with nothing in the record saying why — bare silence, the
+        // exact failure this project exists to catch. Instead the collector is
+        // always spawned and re-runs preflight every tick, emitting SKIP samples
+        // while unavailable and real ones as soon as it can. Startup readiness is
+        // logged only as context.
+        //
+        // Event cadence is different and stays one-shot: the `route` collector's
+        // PF_ROUTE socket is opened once, before construction, and the source is
+        // moved into the collector — there is nothing left to re-probe per tick,
+        // and the blocking thread has no tick to re-probe on. Retrying it means
+        // reopening the socket, which is a different change (a supervisor around
+        // `spawn_event_collector`) than this one.
+        match (c.source(), c.preflight().await) {
+            (Source::Event, Readiness::Unavailable(reason)) => {
+                tracing::warn!(collector = name, %reason, "preflight failed; skipping (event cadence: not retried)");
+                continue;
             }
-            continue;
+            (Source::Interval(_), Readiness::Unavailable(reason)) => {
+                tracing::warn!(
+                    collector = name,
+                    %reason,
+                    "preflight unavailable at startup; scheduling anyway (SKIP per tick until it recovers)"
+                );
+            }
+            _ => {}
         }
         // Dispatch on cadence — timer vs event stream. Both spawners take the
         // shared `observing` flag: the interval loop skips its probe while paused,
@@ -444,6 +466,10 @@ pub(crate) enum AnyCollector {
     Dns(DnsCollector<DnsResolver>),
     Route(RouteCollector),
     Host(HostCollector<HostLoad>),
+    /// Test-only: an interval collector with a flippable preflight (see
+    /// [`FakeCollector`]).
+    #[cfg(test)]
+    Fake(FakeCollector),
 }
 
 impl AnyCollector {
@@ -455,6 +481,8 @@ impl AnyCollector {
             Self::Dns(c) => c.meta(),
             Self::Route(c) => c.meta(),
             Self::Host(c) => c.meta(),
+            #[cfg(test)]
+            Self::Fake(c) => c.meta(),
         }
     }
 
@@ -466,6 +494,8 @@ impl AnyCollector {
             Self::Dns(c) => c.source(),
             Self::Route(c) => c.source(),
             Self::Host(c) => c.source(),
+            #[cfg(test)]
+            Self::Fake(c) => c.source(),
         }
     }
 
@@ -477,6 +507,8 @@ impl AnyCollector {
             Self::Dns(c) => c.preflight().await,
             Self::Route(c) => c.preflight().await,
             Self::Host(c) => c.preflight().await,
+            #[cfg(test)]
+            Self::Fake(c) => c.preflight().await,
         }
     }
 
@@ -490,6 +522,22 @@ impl AnyCollector {
             Self::Dns(c) => c.collect(ts_us).await,
             Self::Route(c) => c.collect(ts_us).await,
             Self::Host(c) => c.collect(ts_us).await,
+            #[cfg(test)]
+            Self::Fake(c) => c.collect(ts_us).await,
+        }
+    }
+
+    /// The SKIP samples this collector emits on a tick whose preflight failed —
+    /// absence of a signal recorded as a verdict rather than as silence.
+    pub(crate) fn skip(&self, ts_us: i64) -> Vec<Sample> {
+        match self {
+            Self::Link(c) => c.skip(ts_us),
+            Self::Proxy(c) => c.skip(ts_us),
+            Self::Dns(c) => c.skip(ts_us),
+            Self::Route(c) => c.skip(ts_us),
+            Self::Host(c) => c.skip(ts_us),
+            #[cfg(test)]
+            Self::Fake(c) => c.skip(ts_us),
         }
     }
 
@@ -502,7 +550,71 @@ impl AnyCollector {
             Self::Dns(c) => Box::new(c).into_event_source(),
             Self::Route(c) => Box::new(c).into_event_source(),
             Self::Host(c) => Box::new(c).into_event_source(),
+            #[cfg(test)]
+            Self::Fake(c) => Box::new(c).into_event_source(),
         }
+    }
+}
+
+/// A test-only interval collector whose readiness the test flips at will, so the
+/// per-tick preflight retry in `spawn_interval_collector` can be driven directly.
+/// Every real collector in `AnyCollector` is a concrete type wired to real ports
+/// (`IcmpPinger`, `SystemFacts`, …), so there is no other way to present the
+/// spawner with a prerequisite that is missing and then appears.
+#[cfg(test)]
+pub(crate) struct FakeCollector {
+    pub(crate) meta: &'static CollectorMeta,
+    pub(crate) interval: std::time::Duration,
+    /// Flipped by the test to make preflight succeed.
+    pub(crate) ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Ticks on which `collect()` actually ran.
+    pub(crate) collects: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Collector for FakeCollector {
+    fn meta(&self) -> &'static CollectorMeta {
+        self.meta
+    }
+    fn source(&self) -> Source {
+        Source::Interval(self.interval)
+    }
+    async fn preflight(&self) -> Readiness {
+        if self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            Readiness::Ready
+        } else {
+            Readiness::Unavailable("no physical interface".into())
+        }
+    }
+    async fn collect(&self, ts_us: i64) -> Vec<Sample> {
+        self.collects
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        vec![Sample::Link(types::LinkSample {
+            ts_us,
+            gw: types::GwVerdict::Ok,
+            gw_rtt_ms: Some(1.0),
+            direct: types::TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+        })]
+    }
+    fn skip(&self, ts_us: i64) -> Vec<Sample> {
+        vec![Sample::Link(types::LinkSample {
+            ts_us,
+            gw: types::GwVerdict::NoGw,
+            gw_rtt_ms: None,
+            direct: types::TcpVerdict::Skip,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+        })]
     }
 }
 
@@ -531,7 +643,16 @@ fn maybe_start_pcap_ring(cfg: &Config, phys_iface: Option<&str>) -> Option<Arc<d
         return None;
     }
     let Some(iface) = phys_iface else {
-        tracing::warn!("no physical interface resolved; pcap ring disabled");
+        // KNOWN GAP, deliberately left one-shot. Unlike an interval collector,
+        // the ring is not driven by a tick: it is a `tcpdump` child started once
+        // and handed to the control socket by value, so `FreezePcap` can answer
+        // about the ring that is actually running. Making it retry means a
+        // supervisor task owning a swappable ring slot (shared with the API
+        // server) that re-resolves the interface and restarts the child when one
+        // appears — a wiring change to the API surface, not a loop tweak, and out
+        // of scope here. Until then a boot with no interface leaves the daemon
+        // with no ring for its lifetime; the warning below is the only record.
+        tracing::warn!("no physical interface resolved; pcap ring disabled (not retried)");
         return None;
     };
     let ring_dir = Path::new(&cfg.blob_dir).join("ring");

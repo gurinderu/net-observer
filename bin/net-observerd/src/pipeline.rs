@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use collector_core::Source;
+use collector_core::{Readiness, Source};
 
 use crate::AnyCollector;
 use net_observer_ipc::{EncodedFrame, Event, IncidentSummary, StatusSnapshot, StreamFrame};
@@ -367,7 +367,10 @@ pub async fn run(
 /// - each collector handles its own probe errors internally and returns SKIP
 ///   samples, so a failed probe is recorded as absence rather than crashing the
 ///   task — the loop keeps ticking regardless;
-/// - the task exits cleanly only once the receiver is gone (channel closed).
+/// - the task exits cleanly only once the receiver is gone (channel closed);
+/// - preflight runs EVERY tick, not once at startup: a collector whose
+///   prerequisite is missing stays scheduled and emits `skip()` samples with the
+///   reason logged, and recovers on its own when the prerequisite appears.
 ///
 /// While `observing` is `false` the loop keeps ticking but **skips the probe
 /// entirely** (`continue` before `collect()`), so paused collection produces no
@@ -389,6 +392,10 @@ pub(crate) fn spawn_interval_collector(
     tokio::spawn(async move {
         let mut ticker = time::interval(interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Consecutive ticks whose preflight was Unavailable, and the reason last
+        // logged — together they rate-limit the log without hiding a change.
+        let mut unready_ticks: u64 = 0;
+        let mut last_reason = String::new();
         loop {
             ticker.tick().await;
             // Paused: skip the probe entirely for this tick (no sample produced).
@@ -396,7 +403,45 @@ pub(crate) fn spawn_interval_collector(
                 continue;
             }
             let ts_us = types::now_us();
-            let samples = c.collect(ts_us).await;
+            // Preflight is a per-tick CONDITION, not a startup gate. A missing
+            // prerequisite (no interface up yet at boot, a config file not
+            // written yet) makes this tick emit the collector's SKIP samples
+            // instead of a measurement — never nothing — and the very next tick
+            // re-probes, so the collector starts producing real samples the
+            // moment the prerequisite appears, with no daemon restart.
+            let samples = match c.preflight().await {
+                Readiness::Ready => {
+                    if unready_ticks > 0 {
+                        tracing::info!(
+                            collector = name,
+                            skipped_ticks = unready_ticks,
+                            "preflight recovered; collecting again"
+                        );
+                        unready_ticks = 0;
+                        last_reason.clear();
+                    }
+                    c.collect(ts_us).await
+                }
+                Readiness::Unavailable(reason) => {
+                    // Rate-limited so a prerequisite that stays missing for hours
+                    // cannot flood the log: the first tick and every CHANGE of
+                    // reason logs at `warn`, the rest only at `debug`. The SKIP
+                    // samples themselves are the durable record.
+                    if unready_ticks == 0 || reason != last_reason {
+                        tracing::warn!(
+                            collector = name,
+                            %reason,
+                            "preflight unavailable; emitting SKIP this tick"
+                        );
+                        last_reason.clear();
+                        last_reason.push_str(&reason);
+                    } else {
+                        tracing::debug!(collector = name, %reason, "preflight still unavailable");
+                    }
+                    unready_ticks += 1;
+                    c.skip(ts_us)
+                }
+            };
             // Re-check after the probe: a pause that landed while `collect()` was
             // in flight is already acked, so this result must not be forwarded.
             if !observing.load(Ordering::Acquire) {
@@ -812,6 +857,109 @@ mod tests {
             .expect("resumed collector should forward a sample within 5s")
             .expect("channel should stay open while the collector runs");
         assert!(matches!(resumed, Sample::Host(_)));
+
+        drop(rx);
+        time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("collector task should exit after the receiver is dropped")
+            .expect("collector task should not panic");
+    }
+
+    /// Build the test collector whose preflight the test controls, plus handles on
+    /// its readiness flag and its `collect()` counter.
+    fn fake_collector(
+        ready: bool,
+    ) -> (
+        AnyCollector,
+        Arc<AtomicBool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let ready = Arc::new(AtomicBool::new(ready));
+        let collects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = AnyCollector::Fake(crate::FakeCollector {
+            meta: &collector_link::META,
+            interval: Duration::from_millis(5),
+            ready: ready.clone(),
+            collects: collects.clone(),
+        });
+        (c, ready, collects)
+    }
+
+    /// A collector whose prerequisite is missing is NOT disabled: it stays
+    /// scheduled and every tick emits its SKIP samples, so the record says why the
+    /// layer is absent instead of saying nothing. `collect()` is never called, so
+    /// nothing fabricates a healthy value either.
+    ///
+    /// This is the regression test for the live failure: a boot before any
+    /// interface was up left `link` reporting `(no data)` for the life of the
+    /// process, with only one startup WARN in the log — bare silence.
+    #[tokio::test]
+    async fn interval_collector_emits_skip_while_preflight_is_unavailable() {
+        let (c, _ready, collects) = fake_collector(false);
+        let (tx, mut rx) = mpsc::channel(8);
+        let handle = spawn_interval_collector(c, tx, Arc::new(AtomicBool::new(true)));
+
+        for _ in 0..3 {
+            let s = time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("an unready collector must still emit every tick")
+                .expect("channel should stay open while the collector runs");
+            let Sample::Link(l) = s else {
+                panic!("expected a link sample")
+            };
+            // The SKIP vocabulary, not a fabricated healthy value.
+            assert_eq!(l.gw, GwVerdict::NoGw);
+            assert_eq!(l.direct, TcpVerdict::Skip);
+            assert_eq!(l.gw_rtt_ms, None);
+        }
+        assert_eq!(
+            collects.load(Ordering::Acquire),
+            0,
+            "collect() must not run while preflight is unavailable"
+        );
+
+        drop(rx);
+        time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("collector task should exit after the receiver is dropped")
+            .expect("collector task should not panic");
+    }
+
+    /// The prerequisite appearing later (an interface comes up, a config file is
+    /// written) makes the SAME task produce real samples again — no restart, no
+    /// operator action. Deleting the per-tick preflight and gating at startup
+    /// instead leaves this test hanging on the first real sample.
+    #[tokio::test]
+    async fn interval_collector_recovers_when_preflight_becomes_ready() {
+        let (c, ready, collects) = fake_collector(false);
+        let (tx, mut rx) = mpsc::channel(8);
+        let handle = spawn_interval_collector(c, tx, Arc::new(AtomicBool::new(true)));
+
+        // N ticks with the prerequisite missing: SKIP, every one of them.
+        for _ in 0..3 {
+            let s = time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("an unready collector must still emit every tick")
+                .expect("channel should stay open");
+            assert!(matches!(s, Sample::Link(ref l) if l.gw == GwVerdict::NoGw));
+        }
+
+        // The prerequisite appears.
+        ready.store(true, Ordering::Release);
+        let real = time::timeout(Duration::from_secs(5), async {
+            loop {
+                let s = rx.recv().await.expect("channel should stay open");
+                if let Sample::Link(l) = s
+                    && l.gw == GwVerdict::Ok
+                {
+                    return l;
+                }
+            }
+        })
+        .await
+        .expect("a recovered collector must produce real samples without a restart");
+        assert_eq!(real.direct, TcpVerdict::Ok);
+        assert!(collects.load(Ordering::Acquire) >= 1);
 
         drop(rx);
         time::timeout(Duration::from_secs(5), handle)
