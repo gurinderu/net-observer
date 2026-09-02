@@ -118,6 +118,12 @@ enum Command {
         /// otherwise the daemon drops it and says so. Off unless given.
         #[arg(long)]
         ports: bool,
+        /// Also grab the banner each open port volunteers. Needs `--ports` (a
+        /// banner grab reads from an open port) and the daemon's
+        /// `collectors.neighbors.scan.banners` permission; without an effective
+        /// port scan the daemon drops it and says so. Off unless given.
+        #[arg(long)]
+        banners: bool,
     },
     /// The neighbours the record knows on each segment, newest sighting first
     /// (offline): MAC, address, vendor OUI, name if one was ever learned, and
@@ -276,9 +282,15 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
-        Command::ScanNeighbors { ports } => {
+        Command::ScanNeighbors { ports, banners } => {
             let cfg = load_config(cli)?;
-            let result = fetch_scan_neighbors(&cfg.socket_path, ScanOptions { ports: *ports })?;
+            let result = fetch_scan_neighbors(
+                &cfg.socket_path,
+                ScanOptions {
+                    ports: *ports,
+                    banners: *banners,
+                },
+            )?;
             print!("{}", format_control(&result));
             if !result.ok {
                 return Ok(ExitCode::FAILURE);

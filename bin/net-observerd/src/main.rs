@@ -692,6 +692,14 @@ impl NeighborScanner for SystemScanner {
                 None
             };
 
+            // The `banners` rung, only when this run asked for it AND the port
+            // scan actually ran (a banner grab needs an open port to read from).
+            // Grab from exactly the ports the scan found open.
+            let banners = match (opts.banners, ports.as_ref()) {
+                (true, Some(ps)) => Some(neighbor_scan::banner_grab_blocking(&ps.open, &iface)),
+                _ => None,
+            };
+
             Some(pipeline::compose_scan_report(
                 types::now_us(),
                 network_key,
@@ -700,6 +708,7 @@ impl NeighborScanner for SystemScanner {
                 arp,
                 &mdns,
                 ports.as_ref(),
+                banners.as_ref(),
             ))
         })
     }
@@ -965,6 +974,7 @@ fn build_api_server(
         // The config permission ceiling for the active scan.
         scan_permission: net_observer_ipc::ScanOptions {
             ports: cfg.collectors.neighbors.scan.ports,
+            banners: cfg.collectors.neighbors.scan.banners,
         },
         blob_dir: std::path::PathBuf::from(&cfg.blob_dir),
         resume_at_us,

@@ -18,6 +18,7 @@
 //!   the ARP cache by address, so a name lands on the device that owns it.
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -428,6 +429,157 @@ fn connect_open(ip: IpAddr, port: u16, iface_name: &str) -> bool {
     true
 }
 
+/// How long to wait for a service to volunteer its banner before giving up.
+/// Short: a service that says nothing quickly says nothing at all here.
+const BANNER_READ_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// Hard cap on how much of a banner is read. A banner is a greeting, not a
+/// payload; anything past the first kilobyte is not identifying and is not read.
+const BANNER_MAX_BYTES: usize = 1024;
+
+/// Cleartext HTTP ports where a bare connect volunteers nothing, so a minimal
+/// `HEAD` is sent to elicit the status/`Server:` line. TLS ports (443/8443) are
+/// deliberately absent: the bytes there are a handshake, not a readable banner.
+const HTTP_BANNER_PORTS: &[u16] = &[80, 8000, 8080];
+
+/// One banner grabbed from an open port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BannerFinding {
+    pub ip: IpAddr,
+    pub port: u16,
+    pub banner: String,
+}
+
+/// What the banner rung did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BannerGrabOutcome {
+    pub banners: Vec<BannerFinding>,
+    /// How many open ports were probed for a banner.
+    pub probed: usize,
+    pub duration_ms: i64,
+}
+
+/// Grab whatever each open port volunteers about itself, pinning every connect
+/// to `iface_name` exactly like [`port_scan_blocking`] so the tunnel cannot
+/// answer for the segment. Bounded concurrency, short per-connect and per-read
+/// timeouts, capped bytes. A port that says nothing readable yields no finding —
+/// silence stays silence, never a guessed banner.
+pub fn banner_grab_blocking(open: &[PortFinding], iface_name: &str) -> BannerGrabOutcome {
+    let started = Instant::now();
+    let cursor = AtomicUsize::new(0);
+    let workers = PORT_SCAN_CONCURRENCY.min(open.len().max(1));
+
+    let banners: Vec<BannerFinding> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut found = Vec::new();
+                    loop {
+                        let i = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some(f) = open.get(i) else {
+                            break;
+                        };
+                        if let Some(banner) = grab_banner(f.ip, f.port, iface_name) {
+                            found.push(BannerFinding {
+                                ip: f.ip,
+                                port: f.port,
+                                banner,
+                            });
+                        }
+                    }
+                    found
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+
+    let mut banners = banners;
+    banners.sort_by_key(|b| (b.ip, b.port));
+    BannerGrabOutcome {
+        banners,
+        probed: open.len(),
+        duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+    }
+}
+
+/// Open a bound connection to one open port and read the banner it volunteers.
+/// `None` when the bind fails (the probe must never fall through to the tunnel,
+/// just like [`connect_open`]), the connect fails, or nothing readable comes
+/// back. Sends only the minimal `HEAD` needed to elicit an HTTP banner; every
+/// other port is read passively.
+fn grab_banner(ip: IpAddr, port: u16, iface_name: &str) -> Option<String> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let addr = SocketAddr::new(ip, port);
+    let domain = if ip.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).ok()?;
+    // Same pinning discipline as the port scan: never let the probe fall through
+    // to the default route. An empty `iface_name` (the loopback test) is let
+    // through, as there is no interface to pin.
+    if ip.is_ipv4()
+        && !iface_name.is_empty()
+        && !crate::net::bind_to_iface_v4(socket.as_raw_fd(), iface_name)
+    {
+        return None;
+    }
+    socket
+        .connect_timeout(&addr.into(), PORT_CONNECT_TIMEOUT)
+        .ok()?;
+    // `connect_timeout` drove the socket non-blocking; the timed reads below need
+    // it blocking again, or every read returns `WouldBlock` at once.
+    socket.set_nonblocking(false).ok()?;
+    socket.set_read_timeout(Some(BANNER_READ_TIMEOUT)).ok()?;
+    socket.set_write_timeout(Some(BANNER_READ_TIMEOUT)).ok()?;
+    let mut stream: TcpStream = socket.into();
+
+    // HTTP ports volunteer nothing on a bare connect: send the minimal request
+    // that elicits a status/`Server:` line, and nothing more.
+    if HTTP_BANNER_PORTS.contains(&port) {
+        stream.write_all(b"HEAD / HTTP/1.0\r\n\r\n").ok()?;
+    }
+
+    // Read up to the byte cap, then take the first line as the banner.
+    let mut buf = [0u8; BANNER_MAX_BYTES];
+    let mut used = 0;
+    while used < buf.len() {
+        match stream.read(&mut buf[used..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                used += n;
+                // One line is enough to identify the service; stop at the first.
+                if buf[..used].contains(&b'\n') {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    first_line(&buf[..used])
+}
+
+/// The first line of a banner as trimmed, printable text — or `None` if there is
+/// nothing readable. Non-printable control bytes (a binary handshake, say) are
+/// dropped, so a TLS or binary service that slipped in stores no guessed banner.
+fn first_line(bytes: &[u8]) -> Option<String> {
+    let line_end = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(bytes.len());
+    let text: String = String::from_utf8_lossy(&bytes[..line_end])
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect();
+    let text = text.trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +611,88 @@ mod tests {
         );
         assert_eq!(out.hosts, 1);
         assert_eq!(out.ports_per_host, 2);
+    }
+
+    /// A service that announces itself on connect (SSH-style) has its greeting
+    /// read back as the banner; the byte cap and first-line rule keep it to the
+    /// greeting.
+    #[test]
+    fn a_banner_grab_reads_a_service_that_announces_on_connect() {
+        use std::io::Write;
+        use std::net::{Ipv4Addr, TcpListener};
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = sock.write_all(b"SSH-2.0-OpenSSH_9.6\r\nrest of protocol\r\n");
+            }
+        });
+
+        let finding = PortFinding {
+            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+        };
+        let out = banner_grab_blocking(std::slice::from_ref(&finding), "");
+        handle.join().unwrap();
+        assert_eq!(out.probed, 1);
+        assert_eq!(out.banners.len(), 1);
+        assert_eq!(out.banners[0].banner, "SSH-2.0-OpenSSH_9.6");
+    }
+
+    /// An HTTP-shaped port volunteers nothing on connect, so the grab sends a
+    /// minimal `HEAD` and the status line comes back as the banner.
+    #[test]
+    fn a_banner_grab_elicits_an_http_status_line_with_head() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        // Bind on an HTTP-listed port; if it is busy, the test still exercises the
+        // HEAD path only when we actually got one of them.
+        let listener = HTTP_BANNER_PORTS
+            .iter()
+            .find_map(|p| TcpListener::bind((Ipv4Addr::LOCALHOST, *p)).ok())
+            .expect("no HTTP-listed loopback port was free");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut scratch = [0u8; 64];
+                let _ = sock.read(&mut scratch); // consume the HEAD request
+                let _ = sock.write_all(b"HTTP/1.0 200 OK\r\nServer: tiny/1.0\r\n\r\n");
+            }
+        });
+
+        let finding = PortFinding {
+            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+        };
+        let out = banner_grab_blocking(std::slice::from_ref(&finding), "");
+        handle.join().unwrap();
+        assert_eq!(out.banners.len(), 1);
+        assert_eq!(out.banners[0].banner, "HTTP/1.0 200 OK");
+    }
+
+    /// A port that accepts but says nothing yields no banner — silence is never
+    /// turned into a guessed one.
+    #[test]
+    fn a_silent_port_yields_no_banner() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            // Accept, hold briefly so the grab's read times out, then close.
+            if let Ok((sock, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_millis(50));
+                drop(sock);
+            }
+        });
+
+        let finding = PortFinding {
+            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+        };
+        let out = banner_grab_blocking(std::slice::from_ref(&finding), "");
+        handle.join().unwrap();
+        assert_eq!(out.probed, 1);
+        assert!(out.banners.is_empty(), "silence must yield no banner");
     }
 
     #[test]

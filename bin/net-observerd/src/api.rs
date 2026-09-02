@@ -1105,12 +1105,24 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
     // A run does a rung only when it is BOTH requested and permitted. A
     // requested-but-unpermitted rung is dropped, and the operator is told —
     // never silently, never by running it anyway.
-    let effective = ScanOptions {
-        ports: requested.ports && cx.scan_permission.ports,
-    };
+    let ports = requested.ports && cx.scan_permission.ports;
+    // A banner grab needs an open port to read from, so it is effective only
+    // when it is requested, permitted, AND the `ports` rung itself is effective.
+    let banners = requested.banners && cx.scan_permission.banners && ports;
+    let effective = ScanOptions { ports, banners };
     let mut dropped = Vec::new();
     if requested.ports && !cx.scan_permission.ports {
-        dropped.push("ports (not permitted; enable collectors.neighbors.scan.ports)");
+        dropped.push("ports (not permitted; enable collectors.neighbors.scan.ports)".to_string());
+    }
+    if requested.banners && !banners {
+        // Say WHY it was dropped: no permission, or no effective port scan to
+        // grab from. Both are honest refusals the operator should see.
+        let why = if !cx.scan_permission.banners {
+            "not permitted; enable collectors.neighbors.scan.banners"
+        } else {
+            "needs the ports rung, which is not effective this run"
+        };
+        dropped.push(format!("banners ({why})"));
     }
     let Some(report) = scanner.scan(&effective) else {
         return ControlResult {
@@ -1713,6 +1725,16 @@ mod tests {
         }
     }
 
+    /// A scanner that records the EFFECTIVE options it was handed, so a test can
+    /// assert what the intersection in `scan_now` actually turned on.
+    struct RecordingScanner(Arc<Mutex<Option<ScanOptions>>>);
+    impl NeighborScanner for RecordingScanner {
+        fn scan(&self, opts: &ScanOptions) -> Option<ScanReport> {
+            *self.0.lock().unwrap() = Some(opts.clone());
+            Some(fake_report())
+        }
+    }
+
     fn fake_report() -> ScanReport {
         ScanReport {
             ts_us: 5000,
@@ -1852,6 +1874,66 @@ mod tests {
         );
         assert!(!res.ok);
         assert!(res.message.contains("no interface"), "{}", res.message);
+    }
+
+    /// A requested-but-unpermitted `banners` rung is dropped with a note, exactly
+    /// like `ports`, and the scanner is never handed an effective banner rung.
+    #[test]
+    fn a_requested_but_unpermitted_banner_rung_is_dropped_with_a_note() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        // ports permitted, banners NOT permitted.
+        srv.scan_permission = ScanOptions {
+            ports: true,
+            banners: false,
+        };
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                ports: true,
+                banners: true,
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(res.message.contains("dropped"), "{}", res.message);
+        assert!(res.message.contains("banners"), "{}", res.message);
+        let eff = seen.lock().unwrap().clone().expect("scanner ran");
+        assert!(eff.ports, "ports was permitted and requested");
+        assert!(!eff.banners, "an unpermitted banner rung must not run");
+    }
+
+    /// `banners` requested and permitted but with no effective `ports` rung does
+    /// nothing: a banner grab has no open port to read from.
+    #[test]
+    fn a_banner_rung_without_an_effective_port_rung_does_nothing() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        // banners permitted, ports NOT permitted.
+        srv.scan_permission = ScanOptions {
+            ports: false,
+            banners: true,
+        };
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                ports: true,
+                banners: true,
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        let eff = seen.lock().unwrap().clone().expect("scanner ran");
+        assert!(!eff.ports, "ports was not permitted");
+        assert!(
+            !eff.banners,
+            "banners needs an effective ports rung to do anything"
+        );
+        assert!(res.message.contains("banners"), "{}", res.message);
     }
 
     /// `SetQuiet` is benign self-control like `SetObserving`: ungated by

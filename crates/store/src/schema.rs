@@ -57,6 +57,11 @@ CREATE TABLE IF NOT EXISTS neighbor_port (
   network_key VARCHAR, mac VARCHAR, ip VARCHAR, port INTEGER,
   first_seen_us BIGINT, last_seen_us BIGINT,
   PRIMARY KEY (network_key, mac, port));
+-- `banner` is the raw text a service volunteered when the banner rung grabbed it
+-- (NULL when that rung did not run or nothing readable came back). Added after
+-- the port table first shipped, so an older database file keeps its column set
+-- until this ALTER runs on open, exactly like `observing_edge.cause` below.
+ALTER TABLE neighbor_port ADD COLUMN IF NOT EXISTS banner VARCHAR;
 CREATE TABLE IF NOT EXISTS observing_edge (
   ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT, cause VARCHAR);
 -- `cause` was added after the first daemon shipped rows without it. A database
