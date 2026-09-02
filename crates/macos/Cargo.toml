@@ -11,6 +11,7 @@ collector-dns.workspace = true
 collector-route.workspace = true
 collector-host.workspace = true
 collector-wifi.workspace = true
+collector-neighbors.workspace = true
 # CoreWLAN is reached by hand-declared message sends against the Objective-C
 # runtime (`objc2` alone — no `objc2-foundation`, since the adapter passes and
 # returns only scalars and untyped objects). See `src/corewlan.rs`.
@@ -20,6 +21,7 @@ socket2.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 libc.workspace = true
+mdns-sd.workspace = true
 # `net` (tokio::net::TcpStream / lookup_host) is added on top of the workspace
 # feature set; `time`, `process`, and the multi-thread runtime come from there.
 tokio = { workspace = true, features = ["net"] }

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::neighbor::NeighborsSample;
 use crate::verdict::{DnsVerdict, GwVerdict, TcpVerdict, WifiVerdict};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -109,6 +110,7 @@ pub enum Sample {
     Route(RouteEvent),
     Host(HostSample),
     Wifi(WifiSample),
+    Neighbors(NeighborsSample),
 }
 
 impl Sample {
@@ -120,6 +122,7 @@ impl Sample {
             Sample::Route(r) => r.ts_us,
             Sample::Host(h) => h.ts_us,
             Sample::Wifi(w) => w.ts_us,
+            Sample::Neighbors(n) => n.ts_us,
         }
     }
 }

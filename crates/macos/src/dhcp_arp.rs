@@ -106,7 +106,7 @@ impl LinkFacts for SystemFacts {
 
 /// Run `cmd args...` and return its stdout as a `String`, or `None` if the
 /// process could not be spawned or its output was not valid UTF-8.
-async fn run(cmd: &str, args: &[&str]) -> Option<String> {
+pub(crate) async fn run(cmd: &str, args: &[&str]) -> Option<String> {
     let out = match Command::new(cmd).args(args).output().await {
         Ok(o) => o,
         Err(e) => {

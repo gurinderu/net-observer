@@ -24,14 +24,16 @@ use collector_core::{Collector, CollectorMeta, EventSource, Os, Readiness, Sourc
 use collector_dns::DnsCollector;
 use collector_host::HostCollector;
 use collector_link::{LinkCollector, LinkFacts};
+use collector_neighbors::NeighborsCollector;
 use collector_proxy::ProxyCollector;
 use collector_route::RouteCollector;
 use collector_wifi::WifiCollector;
 use config::Config;
 use macos::{
     BoundTcpProber, CoreWlanFacts, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource,
-    ProxySystemFacts, SystemFacts,
+    ProxySystemFacts, SystemFacts, SystemNeighbors,
 };
+use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{EncodedFrame, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{FakeIp, GwChange, GwDrop, Starvation, Wedge};
@@ -40,8 +42,8 @@ use triggers::handlers::{Handler, RecordHandler};
 use types::Sample;
 
 use pipeline::{
-    FreezePcapHandler, PcapFreezer, PcapRingSlot, SnapshotHandler, run, spawn_event_collector,
-    spawn_interval_collector,
+    FreezePcapHandler, NeighborScanner, PcapFreezer, PcapRingSlot, ScanReport, SnapshotHandler,
+    run, spawn_event_collector, spawn_interval_collector,
 };
 
 /// How often the pcap supervisor re-checks the ring. Bounded on purpose: every
@@ -310,6 +312,18 @@ async fn run_daemon() -> anyhow::Result<()> {
             cfg.collectors.wifi.interval,
         )));
     }
+    if cfg.collectors.neighbors.enabled {
+        // Shares the link collector's `SystemFacts` so the gateway and interface
+        // it keys neighbours by are the same ones the link collector probes,
+        // including any config override.
+        collectors.push(AnyCollector::Neighbors(NeighborsCollector::new(
+            Arc::new(SystemNeighbors::new(SystemFacts::new(
+                cfg.collectors.link.gw.clone(),
+                cfg.collectors.link.phys_iface.clone(),
+            ))),
+            cfg.collectors.neighbors.interval,
+        )));
+    }
     if cfg.collectors.route.enabled {
         // The route collector is Event-cadence, driven by a persistent PF_ROUTE
         // socket. Opening it here decides its readiness; if it cannot open, the
@@ -510,6 +524,7 @@ pub(crate) enum AnyCollector {
     Route(RouteCollector),
     Host(HostCollector<HostLoad>),
     Wifi(WifiCollector<CoreWlanFacts>),
+    Neighbors(NeighborsCollector<SystemNeighbors>),
     /// Test-only: an interval collector with a flippable preflight (see
     /// [`FakeCollector`]).
     #[cfg(test)]
@@ -526,6 +541,7 @@ impl AnyCollector {
             Self::Route(c) => c.meta(),
             Self::Host(c) => c.meta(),
             Self::Wifi(c) => c.meta(),
+            Self::Neighbors(c) => c.meta(),
             #[cfg(test)]
             Self::Fake(c) => c.meta(),
         }
@@ -540,6 +556,7 @@ impl AnyCollector {
             Self::Route(c) => c.source(),
             Self::Host(c) => c.source(),
             Self::Wifi(c) => c.source(),
+            Self::Neighbors(c) => c.source(),
             #[cfg(test)]
             Self::Fake(c) => c.source(),
         }
@@ -554,6 +571,7 @@ impl AnyCollector {
             Self::Route(c) => c.preflight().await,
             Self::Host(c) => c.preflight().await,
             Self::Wifi(c) => c.preflight().await,
+            Self::Neighbors(c) => c.preflight().await,
             #[cfg(test)]
             Self::Fake(c) => c.preflight().await,
         }
@@ -570,6 +588,7 @@ impl AnyCollector {
             Self::Route(c) => c.collect(ts_us).await,
             Self::Host(c) => c.collect(ts_us).await,
             Self::Wifi(c) => c.collect(ts_us).await,
+            Self::Neighbors(c) => c.collect(ts_us).await,
             #[cfg(test)]
             Self::Fake(c) => c.collect(ts_us).await,
         }
@@ -585,6 +604,7 @@ impl AnyCollector {
             Self::Route(c) => c.skip(ts_us),
             Self::Host(c) => c.skip(ts_us),
             Self::Wifi(c) => c.skip(ts_us),
+            Self::Neighbors(c) => c.skip(ts_us),
             #[cfg(test)]
             Self::Fake(c) => c.skip(ts_us),
         }
@@ -600,9 +620,118 @@ impl AnyCollector {
             Self::Route(c) => Box::new(c).into_event_source(),
             Self::Host(c) => Box::new(c).into_event_source(),
             Self::Wifi(c) => Box::new(c).into_event_source(),
+            Self::Neighbors(c) => Box::new(c).into_event_source(),
             #[cfg(test)]
             Self::Fake(c) => Box::new(c).into_event_source(),
         }
+    }
+}
+
+/// The production [`NeighborScanner`]: sweep this machine's IPv4 subnet, browse
+/// mDNS for names, and report both as one scan.
+///
+/// Shares the link collector's [`SystemFacts`], so the interface it sweeps and
+/// the gateway it keys the results by are the same ones every other collector
+/// talks about — including any config override.
+pub(crate) struct SystemScanner {
+    facts: SystemFacts,
+}
+
+impl SystemScanner {
+    pub(crate) fn new(facts: SystemFacts) -> Self {
+        Self { facts }
+    }
+}
+
+impl NeighborScanner for SystemScanner {
+    /// Blocking work (UDP sends, a settle sleep, an mDNS budget — several
+    /// seconds) inside an async request handler, so it runs under
+    /// `block_in_place`: the worker thread is handed back to the runtime for the
+    /// duration instead of stalling every other connection behind one scan.
+    fn scan(&self) -> Option<ScanReport> {
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            let iface = rt.block_on(self.facts.phys_iface())?;
+            let ipv4 = rt.block_on(neighbor_scan::iface_ipv4(&iface))?;
+            let network_key = rt.block_on(async {
+                match self.facts.default_gw().await {
+                    Some(gw) => self.facts.gw_arp_mac(&gw).await,
+                    None => None,
+                }
+            });
+
+            let sweep = neighbor_scan::sweep_probe_blocking(&ipv4);
+            // Read the cache the sweep just filled. Everything it now holds for
+            // this interface counts as found: an entry the kernel resolved
+            // because of our probe is indistinguishable from one that was
+            // already there, and claiming otherwise would be a guess.
+            let mut found: Vec<types::NeighborObs> = rt
+                .block_on(neighbors::read_arp(Some(&iface)))
+                .unwrap_or_default();
+            for n in &mut found {
+                n.source = types::NeighborSource::Sweep;
+            }
+
+            let names = neighbor_scan::mdns_names_blocking();
+            let named = neighbor_scan::join_names_onto_arp(&found, &names);
+            for n in &mut found {
+                if let Some(m) = named.iter().find(|m| m.mac == n.mac) {
+                    n.hostname.clone_from(&m.hostname);
+                    n.source = types::NeighborSource::Mdns;
+                }
+            }
+
+            let ts_us = types::now_us();
+            let scans = vec![
+                store::NeighborScan {
+                    ts_us,
+                    network_key: network_key.clone(),
+                    iface: Some(iface.clone()),
+                    method: "sweep".to_string(),
+                    target: sweep.target.clone(),
+                    found: i32::try_from(found.len()).unwrap_or(i32::MAX),
+                    duration_ms: sweep.duration_ms,
+                    detail: sweep
+                        .refused
+                        .clone()
+                        .map(|r| format!("refused: {r}"))
+                        .or_else(|| Some(format!("{}/{} probed", sweep.sent, sweep.total))),
+                },
+                store::NeighborScan {
+                    ts_us,
+                    network_key: network_key.clone(),
+                    iface: Some(iface.clone()),
+                    method: "mdns".to_string(),
+                    target: neighbor_scan::MDNS_TARGET.to_string(),
+                    found: i32::try_from(named.len()).unwrap_or(i32::MAX),
+                    duration_ms: 0,
+                    detail: None,
+                },
+            ];
+            let message = match &sweep.refused {
+                Some(r) => format!(
+                    "sweep refused ({r}); {} neighbours known, {} named",
+                    found.len(),
+                    named.len()
+                ),
+                None => format!(
+                    "swept {} ({}/{} probed): {} neighbours, {} named",
+                    sweep.target,
+                    sweep.sent,
+                    sweep.total,
+                    found.len(),
+                    named.len()
+                ),
+            };
+            Some(ScanReport {
+                ts_us,
+                network_key,
+                iface: Some(iface),
+                found,
+                scans,
+                message,
+            })
+        })
     }
 }
 
@@ -857,6 +986,12 @@ fn build_api_server(
         // running rather than refusing next to a live capture.
         quiet,
         freezer,
+        // Built unconditionally: whether there is anything to scan is decided
+        // per request (an interface with an IPv4 subnet), not once at boot.
+        scanner: Some(Arc::new(SystemScanner::new(SystemFacts::new(
+            cfg.collectors.link.gw.clone(),
+            cfg.collectors.link.phys_iface.clone(),
+        ))) as Arc<dyn NeighborScanner>),
         blob_dir: std::path::PathBuf::from(&cfg.blob_dir),
         resume_at_us,
         snapshot,

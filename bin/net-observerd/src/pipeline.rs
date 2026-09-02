@@ -296,6 +296,7 @@ pub async fn run(
                 Sample::Dns(d) => snap.dns = Some(d.clone()),
                 Sample::Host(h) => snap.host = Some(h.clone()),
                 Sample::Wifi(w) => snap.wifi = Some(w.clone()),
+                Sample::Neighbors(n) => snap.neighbors = Some(n.clone()),
                 // Route events are a stream, not a "latest sample" field of the
                 // snapshot; they still bump `generated_us` above.
                 Sample::Route(_) => {}
@@ -313,6 +314,7 @@ pub async fn run(
                 Sample::Dns(d) => Event::Dns(d.clone()),
                 Sample::Host(h) => Event::Host(h.clone()),
                 Sample::Wifi(w) => Event::Wifi(w.clone()),
+                Sample::Neighbors(n) => Event::Neighbors(n.clone()),
                 Sample::Route(r) => Event::Route(r.clone()),
             };
             // Serialise ONCE here; every subscriber then clones an Arc, not a
@@ -564,6 +566,31 @@ impl PcapFreezer for macos::PcapRing {
     fn is_alive(&self) -> bool {
         macos::PcapRing::is_alive(self)
     }
+}
+
+/// One operator-pressed neighbour scan behind a trait, so `api` holds no
+/// platform code and the control path is testable without putting packets on a
+/// real segment. The production impl is [`crate::SystemScanner`].
+pub trait NeighborScanner: Send + Sync {
+    /// Run the scan, blocking for as long as its own budget allows. `None` when
+    /// there is nothing to scan (no interface, no IPv4 subnet) — a refusal the
+    /// caller reports, not an error it swallows.
+    fn scan(&self) -> Option<ScanReport>;
+}
+
+/// What one scan did and found, in the shape the control path needs: the
+/// entities to upsert, and the durable rows saying the daemon spoke.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanReport {
+    pub ts_us: i64,
+    pub network_key: Option<String>,
+    pub iface: Option<String>,
+    /// Everything the scan turned up, deduplicated by MAC.
+    pub found: Vec<types::NeighborObs>,
+    /// One row per method actually attempted.
+    pub scans: Vec<store::NeighborScan>,
+    /// The line the operator sees.
+    pub message: String,
 }
 
 /// A swappable slot holding the pcap ring that is *currently* running.

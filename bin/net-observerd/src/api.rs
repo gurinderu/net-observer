@@ -26,17 +26,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use net_observer_ipc::{
-    ControlCmd, ControlResult, EncodedFrame, EventKind, Gap, Ready, Request, Response,
+    ControlCmd, ControlResult, EncodedFrame, Event, EventKind, Gap, Ready, Request, Response,
     StatusSnapshot, StreamError, StreamErrorCode, StreamFrame,
 };
 use store::Store;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
-use types::{ObservingCause, ObservingEdge};
+use types::{NeighborsSample, NeighborsVerdict, ObservingCause, ObservingEdge, Sample};
 
 use crate::acting;
-use crate::pipeline::PcapRingSlot;
+use crate::pipeline::{NeighborScanner, PcapRingSlot};
 
 /// The uid `root` runs as. Always authorised for control: root can already stop
 /// and reconfigure the daemon, so refusing it would be theatre.
@@ -338,6 +338,11 @@ impl ControlAuthority {
             // Quiet only suppresses a probe this daemon would otherwise emit.
             ControlCmd::SetQuiet(_) => Self::SelfControl,
             ControlCmd::KickstartProxy => Self::Acting,
+            // A sweep addresses every host on the segment and an mDNS browse
+            // speaks to a multicast group: this is the daemon talking to
+            // machines that are not its own, so it takes the stronger gate even
+            // though it changes nothing.
+            ControlCmd::ScanNeighbors => Self::Acting,
         }
     }
 }
@@ -393,6 +398,9 @@ pub struct ApiServer {
     /// `FreezePcap` must answer about the ring that is running *now*. An empty
     /// slot makes the command a refusal with a message, never a silent success.
     pub freezer: Arc<PcapRingSlot>,
+    /// The neighbour scanner, when one could be built for this host. `None`
+    /// makes `ScanNeighbors` a refusal with a message, never a silent success.
+    pub scanner: Option<Arc<dyn NeighborScanner>>,
     /// Where a manual freeze writes its copy: the daemon's blob directory, the
     /// same root the `gw-change` freeze handler uses.
     pub blob_dir: PathBuf,
@@ -649,6 +657,7 @@ async fn handle_conn(
                 observing: &srv.observing,
                 quiet: &srv.quiet,
                 freezer: &srv.freezer,
+                scanner: srv.scanner.as_deref(),
                 blob_dir: &srv.blob_dir,
                 resume_at_us: &srv.resume_at_us,
                 snapshot: &srv.snapshot,
@@ -860,6 +869,8 @@ pub(crate) struct ControlCtx<'a> {
     pub observing: &'a AtomicBool,
     pub quiet: &'a AtomicBool,
     pub freezer: &'a PcapRingSlot,
+    /// The neighbour scanner, when one could be built for this host.
+    pub scanner: Option<&'a dyn NeighborScanner>,
     pub blob_dir: &'a Path,
     pub resume_at_us: &'a AtomicI64,
     pub snapshot: &'a Mutex<StatusSnapshot>,
@@ -1038,10 +1049,87 @@ fn control_response(
             }
         }
         ControlCmd::FreezePcap => freeze_now(cx),
+        ControlCmd::ScanNeighbors => scan_now(cx, Some(authorized.uid())),
         ControlCmd::KickstartProxy => match acting::kickstart_proxy(&cx.acting.singbox_service) {
             Ok(message) => ControlResult { ok: true, message },
             Err(message) => ControlResult { ok: false, message },
         },
+    }
+}
+
+/// Go and look for neighbours on operator demand.
+///
+/// Everything the scan learns is written through the same two sinks the passive
+/// collector uses — a `Sample::Neighbors` (which upserts the entities and
+/// publishes the live event) plus one `neighbor_scan` row per method — so a
+/// device found by a sweep is the same row as one seen passively, distinguished
+/// only by its `source`. A store failure is logged and reported in the message
+/// but does not fail the command: the packets really did go out, and saying
+/// otherwise would be a false statement about what this daemon did.
+fn scan_now(cx: &ControlCtx<'_>, peer_uid: Option<u32>) -> ControlResult {
+    let Some(scanner) = cx.scanner else {
+        return ControlResult {
+            ok: false,
+            message: "neighbour scanning not available".to_string(),
+        };
+    };
+    let Some(report) = scanner.scan() else {
+        return ControlResult {
+            ok: false,
+            message: "no interface with an IPv4 subnet to scan".to_string(),
+        };
+    };
+
+    let mut note = String::new();
+    for row in &report.scans {
+        if let Err(e) = cx.store.write_neighbor_scan(row) {
+            tracing::error!(error = %e, method = %row.method,
+                "store write failed; scan row not recorded (gap logged)");
+            note = format!(" (scan record failed: {e})");
+        }
+    }
+
+    let sample = Sample::Neighbors(NeighborsSample {
+        ts_us: report.ts_us,
+        verdict: NeighborsVerdict::Ok,
+        reason: None,
+        network_key: report.network_key.clone(),
+        iface: report.iface.clone(),
+        neighbors: report.found.clone(),
+    });
+    if let Err(e) = cx.store.write_sample(&sample) {
+        tracing::error!(error = %e, "store write failed; scan findings not recorded (gap logged)");
+        note = format!("{note} (findings not recorded: {e})");
+    }
+    {
+        let mut snap = cx.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        snap.generated_us = report.ts_us;
+        let Sample::Neighbors(n) = &sample else {
+            unreachable!("just constructed as Neighbors")
+        };
+        snap.neighbors = Some(n.clone());
+    }
+    if cx.events_tx.receiver_count() > 0 {
+        let Sample::Neighbors(n) = &sample else {
+            unreachable!("just constructed as Neighbors")
+        };
+        match EncodedFrame::encode(&StreamFrame::Event(Event::Neighbors(n.clone()))) {
+            Ok(frame) => {
+                let _ = cx.events_tx.send(frame);
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to encode scan event; not published"),
+        }
+    }
+
+    tracing::info!(
+        found = report.found.len(),
+        methods = report.scans.len(),
+        ?peer_uid,
+        "neighbour scan run via control socket"
+    );
+    ControlResult {
+        ok: true,
+        message: format!("{}{note}", report.message),
     }
 }
 
@@ -1085,6 +1173,7 @@ fn snapshot_clone(snapshot: &Mutex<StatusSnapshot>) -> StatusSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::ScanReport;
     use net_observer_ipc::{Event, IncidentSummary};
     use types::{GwVerdict, HostSample, LinkSample, RouteEvent, TcpVerdict};
 
@@ -1245,6 +1334,7 @@ mod tests {
             observing: Arc::new(AtomicBool::new(true)),
             quiet: Arc::new(AtomicBool::new(false)),
             freezer: Arc::new(PcapRingSlot::empty()),
+            scanner: None,
             blob_dir: std::env::temp_dir().join("net-observerd-test-blobs"),
             resume_at_us: Arc::new(AtomicI64::new(0)),
             snapshot: Arc::new(Mutex::new(StatusSnapshot::default())),
@@ -1264,6 +1354,7 @@ mod tests {
             observing: &srv.observing,
             quiet: &srv.quiet,
             freezer: &srv.freezer,
+            scanner: srv.scanner.as_deref(),
             blob_dir: &srv.blob_dir,
             resume_at_us: &srv.resume_at_us,
             snapshot: &srv.snapshot,
@@ -1458,13 +1549,15 @@ mod tests {
             ControlCmd::SetQuiet(true),
             ControlCmd::FreezePcap,
             ControlCmd::KickstartProxy,
+            ControlCmd::ScanNeighbors,
         ] {
             // Exhaustive on purpose — a new variant breaks this arm list.
             match cmd {
                 ControlCmd::SetObserving(_)
                 | ControlCmd::SetQuiet(_)
                 | ControlCmd::FreezePcap
-                | ControlCmd::KickstartProxy => {}
+                | ControlCmd::KickstartProxy
+                | ControlCmd::ScanNeighbors => {}
             }
             // Acting is ENABLED, so a refusal here can only come from the peer
             // gate, never from the acting switch.
@@ -1539,13 +1632,18 @@ mod tests {
     /// compile until someone decides its class.
     #[test]
     fn every_control_cmd_variant_declares_its_gating_class() {
-        for cmd in [ControlCmd::SetObserving(false), ControlCmd::KickstartProxy] {
+        for cmd in [
+            ControlCmd::SetObserving(false),
+            ControlCmd::KickstartProxy,
+            ControlCmd::ScanNeighbors,
+        ] {
             // Exhaustive on purpose — a new variant breaks this arm list.
             let expected = match cmd {
                 ControlCmd::SetObserving(_) => ControlAuthority::SelfControl,
                 ControlCmd::SetQuiet(_) => ControlAuthority::SelfControl,
                 ControlCmd::FreezePcap => ControlAuthority::SelfControl,
                 ControlCmd::KickstartProxy => ControlAuthority::Acting,
+                ControlCmd::ScanNeighbors => ControlAuthority::Acting,
             };
             assert_eq!(
                 ControlAuthority::of(&cmd),
@@ -1553,6 +1651,95 @@ mod tests {
                 "{cmd:?} declares the wrong authority class"
             );
         }
+    }
+
+    /// A fake scanner, so the control path is exercised without putting a single
+    /// packet on a real segment.
+    struct FakeScanner(Option<ScanReport>);
+    impl NeighborScanner for FakeScanner {
+        fn scan(&self) -> Option<ScanReport> {
+            self.0.clone()
+        }
+    }
+
+    fn fake_report() -> ScanReport {
+        ScanReport {
+            ts_us: 5000,
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            iface: Some("en0".into()),
+            found: vec![types::NeighborObs {
+                mac: "11:22:33:44:55:66".into(),
+                ip: "192.168.1.5".into(),
+                source: types::NeighborSource::Sweep,
+                hostname: Some("printer.local".into()),
+            }],
+            scans: vec![store::NeighborScan {
+                ts_us: 5000,
+                network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+                iface: Some("en0".into()),
+                method: "sweep".into(),
+                target: "192.168.1.0/24".into(),
+                found: 1,
+                duration_ms: 2100,
+                detail: None,
+            }],
+            message: "swept 192.168.1.0/24: 1 neighbours, 1 named".into(),
+        }
+    }
+
+    /// A scan speaks to machines that are not this one, so with acting disabled
+    /// it must be refused BEFORE the scanner is ever asked to run.
+    #[test]
+    fn scan_neighbours_is_refused_while_acting_is_disabled() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
+        let cx = test_ctx(&srv);
+        let res = control_request(ControlCmd::ScanNeighbors, Some(TEST_DAEMON_UID), &cx);
+        assert!(!res.ok, "an acting-class command must be refused");
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM neighbor")
+                .unwrap(),
+            0,
+            "a refused scan must leave no trace of having run"
+        );
+    }
+
+    /// A scan that runs records both halves: the entities it found AND the row
+    /// saying the daemon went looking.
+    #[test]
+    fn a_scan_records_its_findings_and_the_fact_that_it_ran() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
+        let cx = test_ctx(&srv);
+        let res = control_request(ControlCmd::ScanNeighbors, Some(TEST_DAEMON_UID), &cx);
+        assert!(res.ok, "{}", res.message);
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM neighbor")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM neighbor_scan WHERE method = 'sweep'")
+                .unwrap(),
+            1
+        );
+        // And the live snapshot shows what the operator just asked for.
+        let snap = srv.snapshot.lock().unwrap();
+        assert_eq!(snap.neighbors.as_ref().unwrap().neighbors.len(), 1);
+    }
+
+    /// Nothing to scan is a refusal with a reason, never a silent success.
+    #[test]
+    fn a_scanner_with_nothing_to_scan_refuses() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        srv.scanner = Some(Arc::new(FakeScanner(None)));
+        let cx = test_ctx(&srv);
+        let res = control_request(ControlCmd::ScanNeighbors, Some(TEST_DAEMON_UID), &cx);
+        assert!(!res.ok);
+        assert!(res.message.contains("no interface"), "{}", res.message);
     }
 
     /// `SetQuiet` is benign self-control like `SetObserving`: ungated by

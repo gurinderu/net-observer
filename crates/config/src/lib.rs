@@ -38,6 +38,7 @@ pub struct Collectors {
     pub route: RouteCfg,
     pub host: HostCfg,
     pub wifi: WifiCfg,
+    pub neighbors: NeighborsCfg,
     pub pcap_ring: PcapCfg,
 }
 
@@ -91,6 +92,21 @@ pub struct HostCfg {
 /// collectors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WifiCfg {
+    pub enabled: bool,
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+}
+
+/// The `neighbors` collector: who else is on the local segment, read from the
+/// kernel's ARP and NDP caches. Reading a cache the OS already filled sends
+/// nothing, so it is on by default like the other passive collectors — and the
+/// interval is minutes, not seconds, because a neighbour table changes on the
+/// timescale of devices joining a network, not of packets.
+///
+/// The *active* discovery (subnet sweep, mDNS) is deliberately NOT configurable
+/// here: it never runs on a timer, only on an explicit `ControlCmd::ScanNeighbors`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeighborsCfg {
     pub enabled: bool,
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
@@ -167,6 +183,10 @@ impl Default for Config {
                 wifi: WifiCfg {
                     enabled: true,
                     interval: Duration::from_secs(15),
+                },
+                neighbors: NeighborsCfg {
+                    enabled: true,
+                    interval: Duration::from_secs(120),
                 },
                 pcap_ring: PcapCfg {
                     enabled: true,
@@ -273,6 +293,22 @@ mod tests {
         let c = Config::load(Some(p.to_str().unwrap())).unwrap();
         assert!(!c.collectors.wifi.enabled);
         assert_eq!(c.collectors.wifi.interval.as_secs(), 30);
+    }
+    #[test]
+    fn neighbors_defaults_apply_and_can_be_disabled() {
+        let c = Config::load(None).unwrap();
+        assert!(c.collectors.neighbors.enabled);
+        assert_eq!(c.collectors.neighbors.interval.as_secs(), 120);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        std::fs::write(
+            &p,
+            "[collectors.neighbors]\nenabled = false\ninterval = \"5m\"\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert!(!c.collectors.neighbors.enabled);
+        assert_eq!(c.collectors.neighbors.interval.as_secs(), 300);
     }
     #[test]
     fn toml_overrides_defaults() {

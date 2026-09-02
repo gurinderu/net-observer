@@ -39,7 +39,8 @@ use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
 use types::{
-    DnsSample, HostSample, LinkSample, ObservingEdge, ProxySample, RouteEvent, WifiSample,
+    DnsSample, HostSample, LinkSample, NeighborsSample, ObservingEdge, ProxySample, RouteEvent,
+    WifiSample,
 };
 
 /// A request from a client (the bar or cli) to the daemon.
@@ -95,6 +96,15 @@ pub enum ControlCmd {
     /// **Self-control**, like [`ControlCmd::SetObserving`], and process-scoped:
     /// a restart resumes normal probing.
     SetQuiet(bool),
+    /// Go and find out who else is on this segment NOW: sweep the local IPv4
+    /// subnet so the kernel resolves every address, and browse mDNS for names.
+    ///
+    /// The one command in this daemon that deliberately addresses machines that
+    /// are not this one, which is why it is **acting-class** and refused unless
+    /// `acting.enabled` is set — and why every run writes a `neighbor_scan` row
+    /// saying what was probed. The passive `neighbors` collector needs none of
+    /// this: it only ever reads caches the OS already filled.
+    ScanNeighbors,
 }
 
 /// The outcome of a [`ControlCmd`]: whether the action ran successfully plus a
@@ -130,6 +140,7 @@ pub enum EventKind {
     Route,
     Host,
     Wifi,
+    Neighbors,
     Incident,
 }
 
@@ -145,6 +156,7 @@ impl EventKind {
             EventKind::Route => "route",
             EventKind::Host => "host",
             EventKind::Wifi => "wifi",
+            EventKind::Neighbors => "neighbors",
             EventKind::Incident => "incident",
         }
     }
@@ -166,6 +178,7 @@ pub enum Event {
     Route(RouteEvent),
     Host(HostSample),
     Wifi(WifiSample),
+    Neighbors(NeighborsSample),
     Incident(IncidentSummary),
 }
 
@@ -180,6 +193,7 @@ impl Event {
             Event::Route(_) => EventKind::Route,
             Event::Host(_) => EventKind::Host,
             Event::Wifi(_) => EventKind::Wifi,
+            Event::Neighbors(_) => EventKind::Neighbors,
             Event::Incident(_) => EventKind::Incident,
         }
     }
@@ -194,6 +208,7 @@ impl Event {
             Event::Route(r) => r.ts_us,
             Event::Host(h) => h.ts_us,
             Event::Wifi(w) => w.ts_us,
+            Event::Neighbors(n) => n.ts_us,
             Event::Incident(i) => i.opened_us,
         }
     }
@@ -245,6 +260,17 @@ impl Event {
                         w.phy_mode.as_deref().unwrap_or("-")
                     )
                 }
+            },
+            Event::Neighbors(n) => match n.verdict {
+                types::NeighborsVerdict::Skip => {
+                    format!("SKIP {}", n.reason.as_deref().unwrap_or("-"))
+                }
+                types::NeighborsVerdict::Ok => format!(
+                    "{} on {} net={}",
+                    n.neighbors.len(),
+                    n.iface.as_deref().unwrap_or("-"),
+                    n.network_key.as_deref().unwrap_or("-")
+                ),
             },
             Event::Incident(i) => format!("{} {}", i.trigger_id, i.signature),
         }
@@ -478,6 +504,13 @@ pub struct StatusSnapshot {
     /// `Response` would fail to decode — a live daemon rendered as "offline".
     #[serde(default)]
     pub wifi: Option<WifiSample>,
+    /// The latest neighbour reading — how many devices the segment showed and
+    /// whether the caches were readable at all.
+    ///
+    /// `serde(default)`, like `wifi`, so a pre-neighbours daemon's answer still
+    /// decodes in a newer bar.
+    #[serde(default)]
+    pub neighbors: Option<NeighborsSample>,
     pub incidents: Vec<IncidentSummary>,
     /// Whether the daemon is actively collecting. `true` (the default) = collectors
     /// run and samples flow; `false` = collection is paused (the daemon stays alive
@@ -518,6 +551,7 @@ impl Default for StatusSnapshot {
             dns: None,
             host: None,
             wifi: None,
+            neighbors: None,
             incidents: Vec::new(),
             observing: observing_default(),
             quiet: false,
@@ -757,6 +791,7 @@ mod tests {
             dns: None,
             host: None,
             wifi: None,
+            neighbors: None,
             incidents: vec![IncidentSummary {
                 id: "inc-1".into(),
                 opened_us: 1000,

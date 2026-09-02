@@ -13,6 +13,7 @@ collector-dns.workspace = true
 collector-route.workspace = true
 collector-host.workspace = true
 collector-wifi.workspace = true
+collector-neighbors.workspace = true
 triggers.workspace = true
 macos.workspace = true
 net-observer-ipc.workspace = true

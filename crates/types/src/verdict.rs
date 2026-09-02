@@ -38,6 +38,14 @@ token_enum!(TcpVerdict { Ok => "OK", Fail => "FAIL", Skip => "SKIP" });
 // individual field the API declined to give is `None` inside an `OK` sample, not
 // a whole-sample SKIP.
 token_enum!(WifiVerdict { Ok => "OK", Skip => "SKIP" });
+// The `neighbors` collector's verdict. `Ok` = the neighbour tables were read
+// (an empty table is still a reading — a network where nobody else answers is a
+// fact); `Skip` = they could not be read at all and `reason` says why.
+token_enum!(NeighborsVerdict { Ok => "OK", Skip => "SKIP" });
+// How one neighbour came to be known. `Arp`/`Ndp` are the passive kernel caches
+// read every tick; `Sweep` and `Mdns` only ever appear from an operator-pressed
+// scan, so a row's source says whether the daemon merely listened or spoke.
+token_enum!(NeighborSource { Arp => "arp", Ndp => "ndp", Sweep => "sweep", Mdns => "mdns" });
 token_enum!(DnsVerdict {
     Ok => "OK", FakeIp => "FAKEIP", Empty => "EMPTY", ServFail => "SERVFAIL",
     NxDomain => "NXDOMAIN", Timeout => "TIMEOUT", Skip => "SKIP",

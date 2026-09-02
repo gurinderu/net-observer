@@ -445,6 +445,33 @@ FROM dns_sample
 WHERE verdict = 'FAKEIP' AND (probe = 'ru' OR probe LIKE '%.ru')
 ORDER BY ts_us";
 
+/// **Who is on the segment** — the neighbour entities, newest sighting first.
+///
+/// Reads the long-lived `neighbor` table, not the per-tick readings: the
+/// question is "who is here / who was here", and the answer is one row per
+/// device per segment. `network` filters to one segment by its gateway MAC.
+///
+/// `source` is the honest part: `arp`/`ndp` means the daemon merely read a cache
+/// the OS had filled, `sweep`/`mdns` that an operator sent it looking.
+#[must_use]
+pub fn neighbors_sql(network: Option<&str>) -> String {
+    // The filter is a MAC, and a MAC is hex and colons — anything else cannot
+    // match a stored key, so it is rejected here rather than interpolated.
+    let filter = match network {
+        Some(n) if n.chars().all(|c| c.is_ascii_hexdigit() || c == ':') => {
+            format!("WHERE network_key = '{n}'")
+        }
+        Some(_) => "WHERE false".to_string(),
+        None => String::new(),
+    };
+    format!(
+        "SELECT network_key, mac, ip, oui, hostname, source, iface, first_seen_us, last_seen_us
+FROM neighbor
+{filter}
+ORDER BY last_seen_us DESC, mac"
+    )
+}
+
 impl DuckdbStore {
     /// Run [`verdict_at_sql`] with [`DEFAULT_STARVATION_LOAD`].
     pub fn verdict_at(&self, ts_us: i64) -> Result<QueryTable, StoreError> {
@@ -477,6 +504,11 @@ impl DuckdbStore {
     /// Run [`FAKEIP_BUGS_SQL`].
     pub fn fakeip_bugs(&self) -> Result<QueryTable, StoreError> {
         self.query_table(FAKEIP_BUGS_SQL)
+    }
+
+    /// Run [`neighbors_sql`] for every segment.
+    pub fn neighbors(&self) -> Result<QueryTable, StoreError> {
+        self.query_table(&neighbors_sql(None))
     }
 
     /// Run [`observation_gaps_sql`].
