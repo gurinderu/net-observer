@@ -39,8 +39,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, AsyncApp, Context, Entity, Rgba, SharedString, Subscription, Window,
-    WindowAppearance, div, px, rgb, rgba,
+    App, AsyncApp, Context, Entity, Rgba, SharedString, Subscription, Window, WindowAppearance,
+    div, px, rgb, rgba,
 };
 
 use net_observer_ipc::{
@@ -358,6 +358,10 @@ pub struct Glance {
     /// panel re-opens) so a second "Events" click focuses the existing window
     /// instead of opening a duplicate subscription; a stale handle re-opens.
     pub events_window: Option<gpui::AnyWindowHandle>,
+    /// The live network-map window, if one is open. Stashed here (persists across
+    /// panel re-opens) so a second "Map" click focuses the existing window instead
+    /// of opening a duplicate; a stale handle re-opens (see [`crate::map`]).
+    pub map_window: Option<gpui::AnyWindowHandle>,
     /// The panel's own bounded history of the last [`HISTORY_LEN`] refresh ticks,
     /// oldest first — the series behind the sparklines. Appended by
     /// [`Glance::record_tick`] from the refresh timer *only*, so one column is one
@@ -373,6 +377,7 @@ impl Glance {
             socket_path,
             control_msg: None,
             events_window: None,
+            map_window: None,
             history: VecDeque::with_capacity(HISTORY_LEN),
         }
     }
@@ -532,26 +537,10 @@ pub fn scan_round_trip_base(
     scan_round_trip(socket_path, ScanOptions::default())
 }
 
-/// Which body the panel shows under the header. The header (health + toggle) and
-/// footer (actions) are always present; only the middle switches. `Status` is the
-/// original glance (sparklines, verdict rows, incidents); `Map` is the live
-/// network map of the local segment (see [`crate::map`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PanelTab {
-    /// The original glance: trend sparklines, verdict rows, incidents.
-    #[default]
-    Status,
-    /// The network map of the local segment.
-    Map,
-}
-
 /// The root view of the panel window. Holds a handle to the shared [`Glance`]
 /// and re-renders whenever it changes.
 pub struct PanelView {
     model: Entity<Glance>,
-    /// Which body is shown — view-local, not part of the shared model: the tab
-    /// choice is per-open-panel and never persisted.
-    tab: PanelTab,
     _observe: Subscription,
 }
 
@@ -562,7 +551,6 @@ impl PanelView {
         let observe = cx.observe(&model, |_, _, cx| cx.notify());
         Self {
             model,
-            tab: PanelTab::default(),
             _observe: observe,
         }
     }
@@ -573,7 +561,6 @@ impl Render for PanelView {
         // Adapt to the system appearance instead of hardcoding a palette.
         let theme = Theme::for_appearance(window.appearance());
 
-        let tab = self.tab;
         let glance = self.model.read(cx);
         let snapshot = glance.snapshot.clone();
         let control_msg = glance.control_msg.clone();
@@ -608,9 +595,7 @@ impl Render for PanelView {
             .overflow_hidden()
             .child(header_row(&snapshot, online, offline_msg, theme, cx))
             .child(separator(theme))
-            .child(tab_row(tab, theme, cx))
-            .child(separator(theme))
-            .child(panel_body(tab, &snapshot, &history, now_us, theme))
+            .child(status_body(&snapshot, &history, now_us, theme))
             .child(separator(theme))
             .child(footer(
                 &snapshot,
@@ -623,90 +608,26 @@ impl Render for PanelView {
     }
 }
 
-/// The switchable middle of the panel, selected by the tab row. `Status` stacks
-/// the original glance sections; `Map` renders the live network map. Both return
-/// an [`AnyElement`] so the two shapes share one slot.
-fn panel_body(
-    tab: PanelTab,
+/// The middle of the panel: the status glance — trend sparklines over the current
+/// verdict rows, then recent incidents. The live network map is no longer a tab
+/// here; it opens as its own window from the footer "Map" control (see
+/// [`crate::map`]).
+fn status_body(
     snapshot: &StatusSnapshot,
     history: &VecDeque<HistoryPoint>,
     now_us: i64,
     theme: Theme,
-) -> AnyElement {
-    match tab {
-        PanelTab::Status => div()
-            .flex()
-            .flex_col()
-            // Trend before state: the gateway fails as a ramp, so the slope is
-            // read first and the current verdicts underneath it.
-            .child(sparklines_section(history, theme))
-            .child(separator(theme))
-            .child(status_rows(snapshot, now_us, theme))
-            .child(separator(theme))
-            .child(incidents_section(&snapshot.incidents, now_us, theme))
-            .into_any_element(),
-        PanelTab::Map => crate::map::network_map_section(snapshot, theme).into_any_element(),
-    }
-}
-
-/// The tab selector under the header: two chips (`Status · Map`) that switch the
-/// panel body. Modeled on the event-log window's type selector, so the panel and
-/// the window share one chip idiom.
-fn tab_row(current: PanelTab, theme: Theme, cx: &mut Context<PanelView>) -> impl IntoElement {
+) -> impl IntoElement {
     div()
         .flex()
-        .items_center()
-        .gap_1()
-        .px_3()
-        .py_1p5()
-        .child(tab_chip(
-            "tab-status",
-            "Status",
-            PanelTab::Status,
-            current,
-            theme,
-            cx,
-        ))
-        .child(tab_chip(
-            "tab-map",
-            "Map",
-            PanelTab::Map,
-            current,
-            theme,
-            cx,
-        ))
-}
-
-/// One tab chip: filled with the accent when selected, a muted hover target
-/// otherwise. Clicking it sets the view-local [`PanelView`] tab and re-renders.
-fn tab_chip(
-    id: &'static str,
-    label: &'static str,
-    tab: PanelTab,
-    current: PanelTab,
-    theme: Theme,
-    cx: &mut Context<PanelView>,
-) -> impl IntoElement {
-    let selected = tab == current;
-    let mut el = div()
-        .id(id)
-        .px_2()
-        .py_0p5()
-        .rounded_md()
-        .text_size(px(12.0))
-        .cursor_pointer();
-    if selected {
-        el = el.bg(rgb(theme.accent)).text_color(rgb(theme.knob));
-    } else {
-        el = el
-            .text_color(rgb(theme.muted))
-            .hover(|s| s.bg(rgb(theme.hover)));
-    }
-    el.child(label)
-        .on_click(cx.listener(move |this, _, _window, cx| {
-            this.tab = tab;
-            cx.notify();
-        }))
+        .flex_col()
+        // Trend before state: the gateway fails as a ramp, so the slope is
+        // read first and the current verdicts underneath it.
+        .child(sparklines_section(history, theme))
+        .child(separator(theme))
+        .child(status_rows(snapshot, now_us, theme))
+        .child(separator(theme))
+        .child(incidents_section(&snapshot.incidents, now_us, theme))
 }
 
 /// The header row: a health dot + the app name on the left, the observing toggle
@@ -1011,6 +932,24 @@ fn footer(
             crate::events::open_or_focus(cx, &model, socket);
         }));
 
+    // "Map" opens the live network map in its own window, exactly like "Events"
+    // opens the event log. The map reads the shared snapshot, so it needs no
+    // socket path — only the model to observe and stash its handle on.
+    let map = div()
+        .id("map")
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        .text_color(rgb(theme.accent))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme.hover)))
+        .child("Map")
+        .on_click(cx.listener(|this, _, _window, cx| {
+            let model = this.model.clone();
+            crate::map::open_or_focus(cx, &model);
+        }));
+
     let refresh = div()
         .id("refresh")
         .px_2()
@@ -1106,6 +1045,7 @@ fn footer(
                 .items_center()
                 .gap_1()
                 .child(events)
+                .child(map)
                 .child(freeze)
                 .child(quiet)
                 .child(scan),
