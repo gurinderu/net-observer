@@ -599,6 +599,12 @@ pub struct ScanReport {
     /// after composition, because matching needs a loaded [`vuln_db::VulnDb`]
     /// and this composer is pure.
     pub vulns: Vec<store::NeighborVuln>,
+    /// Set by the scanner when the `cve` rung was ATTEMPTED but its snapshot
+    /// could not be used — an existing-but-empty or wrong-layout directory, or a
+    /// load error. It carries the reason, so an empty `vulns` from an unusable
+    /// snapshot is never read as a clean "no vulnerabilities found" (SKIP is not
+    /// silence). `None` when cve did not run, or ran against a usable snapshot.
+    pub cve_note: Option<String>,
     /// The line the operator sees.
     pub message: String,
 }
@@ -803,6 +809,7 @@ pub fn compose_scan_report(
         found,
         scans,
         ports,
+        cve_note: None,
         // Filled by the scanner after this pure composition, if the `cve` rung
         // ran and a snapshot matched — matching needs I/O this composer avoids.
         vulns: Vec::new(),

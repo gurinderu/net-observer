@@ -727,20 +727,52 @@ impl NeighborScanner for SystemScanner {
             // corrupt mid-run) — log it and record no findings rather than a
             // guess; the ports and their banners are already recorded.
             if opts.cve {
-                match &self.cve_snapshot_dir {
+                // The snapshot is loaded HERE, at scan time, and its outcome is
+                // surfaced: an existing-but-empty or wrong-layout directory, or a
+                // load error, leaves `vulns` empty AND records a reason, so the
+                // operator never reads "no findings" as "no vulnerabilities" when
+                // the check never really ran. `api::scan_now` only sets `opts.cve`
+                // once a directory is configured, so `None` here is anomalous.
+                let cve_note = match &self.cve_snapshot_dir {
+                    None => Some("cve rung ran without a snapshot directory".to_string()),
                     Some(dir) => match vuln_db::VulnDb::load_from_dir(dir) {
+                        Err(e) => Some(format!(
+                            "snapshot at {} failed to load: {e}; findings NOT checked",
+                            dir.display()
+                        )),
+                        Ok(db) if db.is_empty() => Some(format!(
+                            "snapshot at {} is empty or wrong layout; findings NOT checked \
+                             (not a clean 'no vulnerabilities')",
+                            dir.display()
+                        )),
                         Ok(db) => {
                             report.vulns = pipeline::match_vulns(&db, &report.ports, ts_us);
+                            None
                         }
-                        Err(e) => tracing::error!(
-                            error = %e, dir = %dir.display(),
-                            "cve rung: snapshot failed to load; no findings recorded"
-                        ),
                     },
-                    None => tracing::error!(
-                        "cve rung ran without a snapshot directory; no findings recorded"
-                    ),
+                };
+                if let Some(reason) = &cve_note {
+                    tracing::error!(reason = %reason, "cve rung: snapshot unusable");
                 }
+                // A durable per-method row, like ports/banners: what the cve rung
+                // did, honestly — a count, or the reason it could not check.
+                report.scans.push(store::NeighborScan {
+                    ts_us,
+                    network_key: report.network_key.clone(),
+                    iface: report.iface.clone(),
+                    method: "cve".to_string(),
+                    target: self
+                        .cve_snapshot_dir
+                        .as_ref()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_default(),
+                    found: i32::try_from(report.vulns.len()).unwrap_or(i32::MAX),
+                    duration_ms: 0,
+                    detail: cve_note
+                        .clone()
+                        .or_else(|| Some(format!("{} findings", report.vulns.len()))),
+                });
+                report.cve_note = cve_note;
             }
 
             Some(report)

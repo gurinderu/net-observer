@@ -1189,6 +1189,11 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
     if !dropped.is_empty() {
         note = format!("{note} [dropped: {}]", dropped.join(", "));
     }
+    // The cve rung ran but its snapshot was unusable: say so, so the operator
+    // never reads an empty vuln result as a clean "no vulnerabilities found".
+    if let Some(cve_note) = &report.cve_note {
+        note = format!("{note} [cve: {cve_note}]");
+    }
 
     let sample = Sample::Neighbors(NeighborsSample {
         ts_us: report.ts_us,
@@ -1800,6 +1805,7 @@ mod tests {
             }],
             ports: Vec::new(),
             vulns: Vec::new(),
+            cve_note: None,
             message: "swept 192.168.1.0/24: 1 neighbours, 1 named".into(),
         }
     }
@@ -1854,6 +1860,29 @@ mod tests {
         // And the live snapshot shows what the operator just asked for.
         let snap = srv.snapshot.lock().unwrap();
         assert_eq!(snap.neighbors.as_ref().unwrap().neighbors.len(), 1);
+    }
+
+    /// An unusable cve snapshot (present-but-empty) must be SAID, so an empty
+    /// vuln result is never read as a clean "no vulnerabilities". The scanner
+    /// reports it via `cve_note`; `scan_now` must surface it in the message.
+    #[test]
+    fn an_unusable_cve_snapshot_is_surfaced_not_silent() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut report = fake_report();
+        report.cve_note = Some("snapshot at /tmp/x is empty or wrong layout".to_string());
+        srv.scanner = Some(Arc::new(FakeScanner(Some(report))));
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions::default()),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(
+            res.message.contains("[cve:") && res.message.contains("empty or wrong layout"),
+            "the operator must be told the snapshot was unusable: {}",
+            res.message
+        );
     }
 
     /// A paused daemon is inside a bracketed gap; a scan would write rows with a
