@@ -405,9 +405,16 @@ fn connect_open(ip: IpAddr, port: u16, iface_name: &str) -> bool {
         return false;
     };
     // Pin IPv4 connects to the physical interface, like every other probe here;
-    // a v6 link-local neighbour is already scoped by its address.
-    if ip.is_ipv4() {
-        let _ = crate::net::bind_to_iface_v4(socket.as_raw_fd(), iface_name);
+    // a v6 link-local neighbour is already scoped by its address. A port probe
+    // must NOT silently fall through to the default route: if the bind fails the
+    // connect would go over a tunnel and the record would still name the segment,
+    // so skip it — the sweep refuses for the same reason. An empty `iface_name`
+    // (the loopback test) has no interface to pin and is let through.
+    if ip.is_ipv4()
+        && !iface_name.is_empty()
+        && !crate::net::bind_to_iface_v4(socket.as_raw_fd(), iface_name)
+    {
+        return false;
     }
     if socket
         .connect_timeout(&addr.into(), PORT_CONNECT_TIMEOUT)

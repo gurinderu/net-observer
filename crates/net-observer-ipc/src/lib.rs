@@ -115,8 +115,14 @@ pub enum ControlCmd {
 /// Which rungs of an operator-pressed scan a single run should include.
 ///
 /// The base scan (subnet sweep + mDNS) always runs; these are the additions,
-/// each defaulting to `false`, so an older client or an omitted field asks for
-/// the base scan alone. Grows one field per rung of the ladder.
+/// each defaulting to `false`. `serde(default)` covers forward growth WITHIN this
+/// struct — a newer daemon adding a rung field still decodes an older client's
+/// `ScanOptions` that omits it. It does NOT rescue the enclosing variant's shape
+/// change (`ScanNeighbors` went from a unit variant to this newtype): a
+/// pre-options client that emits the bare string `"ScanNeighbors"` hard-errors
+/// against a daemon expecting `{"ScanNeighbors": {...}}`. That is acceptable on a
+/// single-host coordinated deploy, where the daemon and its clients ship
+/// together, but it is a decode failure, not a silent base-scan fallback.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScanOptions {
     /// Probe discovered neighbours' TCP ports.
