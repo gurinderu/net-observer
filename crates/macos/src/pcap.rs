@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 /// Base name of the ring capture files inside the ring directory.
@@ -19,7 +20,10 @@ const KEEP_FREEZES: usize = 12;
 /// A live `tcpdump` ring capture. Killing the process happens on `Drop`.
 #[derive(Debug)]
 pub struct PcapRing {
-    child: Child,
+    /// Behind a `Mutex` only because reaping the child ([`Child::try_wait`])
+    /// needs `&mut`, while the ring is shared behind an `Arc` so the control
+    /// socket and the supervisor can both reach it.
+    child: Mutex<Child>,
     ring_dir: PathBuf,
 }
 
@@ -56,7 +60,10 @@ impl PcapRing {
         let child = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
 
         tracing::info!(iface, ?ring_path, ring_mb, "started tcpdump pcap ring");
-        Ok(Self { child, ring_dir })
+        Ok(Self {
+            child: Mutex::new(child),
+            ring_dir,
+        })
     }
 
     /// Copy the current ring files into `dest_dir` and return the copied paths.
@@ -71,12 +78,30 @@ impl PcapRing {
         }
         copied
     }
+
+    /// Whether the `tcpdump` child is still running.
+    ///
+    /// Reaps the child if it has exited, so a dead ring is not left as a zombie
+    /// while its handle still looks live. A `try_wait` error (or a poisoned
+    /// lock) is reported as *not* alive: the supervisor then replaces the ring,
+    /// which is the safe direction — a spurious restart costs a child process,
+    /// a spurious "alive" costs the whole capture.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        let mut child = match self.child.lock() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        matches!(child.try_wait(), Ok(None))
+    }
 }
 
 impl Drop for PcapRing {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 

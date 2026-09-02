@@ -543,11 +543,97 @@ pub(crate) fn spawn_event_collector(
 pub trait PcapFreezer: Send + Sync {
     /// Copy the current ring into `dest_dir`, returning the written file paths.
     fn freeze(&self, dest_dir: &Path) -> Vec<PathBuf>;
+
+    /// Whether the capture behind this freezer is still running.
+    ///
+    /// The supervisor uses it to notice a ring whose `tcpdump` child died, so a
+    /// handle to a corpse is replaced rather than kept. Defaults to `true` for
+    /// freezers with no process behind them (test fakes).
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 impl PcapFreezer for macos::PcapRing {
     fn freeze(&self, dest_dir: &Path) -> Vec<PathBuf> {
         macos::PcapRing::freeze(self, dest_dir)
+    }
+
+    fn is_alive(&self) -> bool {
+        macos::PcapRing::is_alive(self)
+    }
+}
+
+/// A swappable slot holding the pcap ring that is *currently* running.
+///
+/// The ring is not tick-driven — it is a `tcpdump` child — and at boot there may
+/// be no interface to capture on (a `RunAtLoad` daemon starts with the machine).
+/// Handing the running ring around by value therefore froze the daemon's answer
+/// at whatever was true one second after launch. The slot replaces that value
+/// with a shared cell: the supervisor writes it when a ring starts, dies or is
+/// replaced, and every reader (the control socket's `FreezePcap`, the gw-change
+/// freeze handler) asks the slot at the moment it needs the ring.
+///
+/// Its own `PcapFreezer` impl is what lets the gw-change handler be wired
+/// unconditionally: with no ring it copies nothing and says so, instead of the
+/// handler being silently absent for the life of the process.
+#[derive(Default)]
+pub struct PcapRingSlot {
+    ring: Mutex<Option<Arc<dyn PcapFreezer>>>,
+}
+
+impl PcapRingSlot {
+    /// An empty slot: no ring running (yet).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// A slot already holding `ring`.
+    #[must_use]
+    pub fn with_ring(ring: Arc<dyn PcapFreezer>) -> Self {
+        Self {
+            ring: Mutex::new(Some(ring)),
+        }
+    }
+
+    /// The ring currently running, if any.
+    #[must_use]
+    pub fn get(&self) -> Option<Arc<dyn PcapFreezer>> {
+        self.ring.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Install `ring` (or clear the slot with `None`), returning what it held.
+    /// Dropping the previous value is what kills a replaced `tcpdump` child.
+    pub fn set(&self, ring: Option<Arc<dyn PcapFreezer>>) -> Option<Arc<dyn PcapFreezer>> {
+        std::mem::replace(
+            &mut *self.ring.lock().unwrap_or_else(|e| e.into_inner()),
+            ring,
+        )
+    }
+}
+
+impl std::fmt::Debug for PcapRingSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PcapRingSlot")
+            .field("running", &self.get().is_some())
+            .finish()
+    }
+}
+
+impl PcapFreezer for PcapRingSlot {
+    fn freeze(&self, dest_dir: &Path) -> Vec<PathBuf> {
+        match self.get() {
+            Some(ring) => ring.freeze(dest_dir),
+            None => {
+                tracing::warn!(?dest_dir, "pcap freeze requested with no ring running");
+                Vec::new()
+            }
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        self.get().is_some_and(|r| r.is_alive())
     }
 }
 

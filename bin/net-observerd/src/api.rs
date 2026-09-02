@@ -36,7 +36,7 @@ use tokio::sync::broadcast;
 use types::{ObservingCause, ObservingEdge};
 
 use crate::acting;
-use crate::pipeline::PcapFreezer;
+use crate::pipeline::PcapRingSlot;
 
 /// The uid `root` runs as. Always authorised for control: root can already stop
 /// and reconfigure the daemon, so refusing it would be theatre.
@@ -388,10 +388,11 @@ pub struct ApiServer {
     /// The link collector's quiet flag; `SetQuiet` is its only writer. Shared
     /// with the collector — a fresh `Arc` here would ack a quiet nobody honours.
     pub quiet: Arc<AtomicBool>,
-    /// The live pcap ring, when one is running, for `ControlCmd::FreezePcap`.
-    /// `None` when the ring is disabled or failed to start — the command is then
-    /// refused with a message, never silently ignored.
-    pub freezer: Option<Arc<dyn PcapFreezer>>,
+    /// The slot holding the pcap ring, asked at request time rather than held by
+    /// value: the ring can start late (no interface at boot) or die, and
+    /// `FreezePcap` must answer about the ring that is running *now*. An empty
+    /// slot makes the command a refusal with a message, never a silent success.
+    pub freezer: Arc<PcapRingSlot>,
     /// Where a manual freeze writes its copy: the daemon's blob directory, the
     /// same root the `gw-change` freeze handler uses.
     pub blob_dir: PathBuf,
@@ -647,7 +648,7 @@ async fn handle_conn(
                 acting: &srv.acting,
                 observing: &srv.observing,
                 quiet: &srv.quiet,
-                freezer: srv.freezer.as_ref(),
+                freezer: &srv.freezer,
                 blob_dir: &srv.blob_dir,
                 resume_at_us: &srv.resume_at_us,
                 snapshot: &srv.snapshot,
@@ -858,7 +859,7 @@ pub(crate) struct ControlCtx<'a> {
     pub acting: &'a ActingConfig,
     pub observing: &'a AtomicBool,
     pub quiet: &'a AtomicBool,
-    pub freezer: Option<&'a Arc<dyn PcapFreezer>>,
+    pub freezer: &'a PcapRingSlot,
     pub blob_dir: &'a Path,
     pub resume_at_us: &'a AtomicI64,
     pub snapshot: &'a Mutex<StatusSnapshot>,
@@ -1052,7 +1053,7 @@ fn control_response(
 /// that yields no file is also a failure — the command's whole product is the
 /// copied files — and both cases say so in the message.
 fn freeze_now(cx: &ControlCtx<'_>) -> ControlResult {
-    let Some(freezer) = cx.freezer else {
+    let Some(freezer) = cx.freezer.get() else {
         return ControlResult {
             ok: false,
             message: "pcap ring not running".to_string(),
@@ -1243,7 +1244,7 @@ mod tests {
             },
             observing: Arc::new(AtomicBool::new(true)),
             quiet: Arc::new(AtomicBool::new(false)),
-            freezer: None,
+            freezer: Arc::new(PcapRingSlot::empty()),
             blob_dir: std::env::temp_dir().join("net-observerd-test-blobs"),
             resume_at_us: Arc::new(AtomicI64::new(0)),
             snapshot: Arc::new(Mutex::new(StatusSnapshot::default())),
@@ -1262,7 +1263,7 @@ mod tests {
             acting: &srv.acting,
             observing: &srv.observing,
             quiet: &srv.quiet,
-            freezer: srv.freezer.as_ref(),
+            freezer: &srv.freezer,
             blob_dir: &srv.blob_dir,
             resume_at_us: &srv.resume_at_us,
             snapshot: &srv.snapshot,
@@ -1592,7 +1593,7 @@ mod tests {
     #[test]
     fn freeze_pcap_refuses_when_the_ring_is_not_running() {
         let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
-        assert!(srv.freezer.is_none());
+        assert!(srv.freezer.get().is_none());
         let cx = test_ctx(&srv);
         let res = control_request(ControlCmd::FreezePcap, Some(TEST_DAEMON_UID), &cx);
         assert!(!res.ok);
@@ -1615,7 +1616,9 @@ mod tests {
 
         let mut srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
         let freezer = Arc::new(RecordingFreezer(Mutex::new(None)));
-        srv.freezer = Some(freezer.clone() as Arc<dyn crate::pipeline::PcapFreezer>);
+        srv.freezer = Arc::new(PcapRingSlot::with_ring(
+            freezer.clone() as Arc<dyn crate::pipeline::PcapFreezer>
+        ));
         srv.blob_dir = temp_dir("freeze-manual");
         let blob_dir = srv.blob_dir.clone();
         let cx = test_ctx(&srv);
@@ -1639,6 +1642,53 @@ mod tests {
             res.message.contains('2'),
             "the message must name the file count: {}",
             res.message
+        );
+    }
+
+    /// The recovery path the boot-with-no-interface defect needs: the server is
+    /// built with an EMPTY slot (no interface at startup), refuses a freeze, and
+    /// then — with no restart and no rebuild of the server — starts succeeding
+    /// once the supervisor installs a ring into the very same slot.
+    #[test]
+    fn freeze_pcap_succeeds_once_a_late_ring_lands_in_the_slot() {
+        struct CountingFreezer(std::sync::atomic::AtomicUsize);
+        impl crate::pipeline::PcapFreezer for CountingFreezer {
+            fn freeze(&self, dest_dir: &Path) -> Vec<std::path::PathBuf> {
+                self.0.fetch_add(1, Ordering::Release);
+                vec![dest_dir.join("ring.pcap0")]
+            }
+        }
+
+        let mut srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        srv.blob_dir = temp_dir("freeze-late-ring");
+        let slot = srv.freezer.clone();
+
+        let refused = control_request(
+            ControlCmd::FreezePcap,
+            Some(TEST_DAEMON_UID),
+            &test_ctx(&srv),
+        );
+        assert!(!refused.ok, "no ring yet: the freeze must be refused");
+        assert_eq!(refused.message, "pcap ring not running");
+
+        // The supervisor's write, through the handle the server already holds.
+        let ring = Arc::new(CountingFreezer(std::sync::atomic::AtomicUsize::new(0)));
+        slot.set(Some(ring.clone() as Arc<dyn crate::pipeline::PcapFreezer>));
+
+        let ok = control_request(
+            ControlCmd::FreezePcap,
+            Some(TEST_DAEMON_UID),
+            &test_ctx(&srv),
+        );
+        assert!(
+            ok.ok,
+            "after recovery the freeze must succeed: {}",
+            ok.message
+        );
+        assert_eq!(
+            ring.0.load(Ordering::Acquire),
+            1,
+            "the LIVE ring was frozen"
         );
     }
 

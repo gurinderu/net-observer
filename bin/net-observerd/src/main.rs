@@ -39,9 +39,13 @@ use triggers::handlers::{Handler, RecordHandler};
 use types::Sample;
 
 use pipeline::{
-    FreezePcapHandler, PcapFreezer, SnapshotHandler, run, spawn_event_collector,
+    FreezePcapHandler, PcapFreezer, PcapRingSlot, SnapshotHandler, run, spawn_event_collector,
     spawn_interval_collector,
 };
+
+/// How often the pcap supervisor re-checks the ring. Bounded on purpose: every
+/// attempt may spawn a `tcpdump` child, so this is a slow patrol, not a tick.
+const PCAP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Minimum interval between fires for one trigger (5 minutes, in microseconds),
 /// mirroring net-observer so a captive portal can't storm the incident log.
@@ -365,9 +369,39 @@ async fn run_daemon() -> anyhow::Result<()> {
     // Drop our own sender so the consumer stops once every collector is gone.
     drop(tx);
 
-    // Start the pcap ring (best-effort: needs root + tcpdump). On failure, the
-    // gw-change trigger still records the incident, just without a pcap freeze.
-    let freezer = maybe_start_pcap_ring(&cfg, phys_iface.as_deref());
+    // Start the pcap ring (best-effort: needs root + tcpdump), and keep a
+    // supervisor on it. The slot is what the socket and the gw-change handler
+    // read, so a ring that starts late — or restarts after its child died — is
+    // picked up by both without any re-wiring.
+    let (freezer, pcap_reason) = if cfg.collectors.pcap_ring.enabled {
+        maybe_start_pcap_ring(&cfg, phys_iface.as_deref())
+    } else {
+        (Arc::new(PcapRingSlot::empty()), None)
+    };
+    let pcap_handle = cfg.collectors.pcap_ring.enabled.then(|| {
+        let slot = freezer.clone();
+        let ring_dir = Path::new(&cfg.blob_dir).join("ring");
+        let ring_mb = cfg.collectors.pcap_ring.ring_mb;
+        let filter = cfg.collectors.pcap_ring.filter.clone();
+        let gw = cfg.collectors.link.gw.clone();
+        let configured_iface = cfg.collectors.link.phys_iface.clone();
+        tokio::spawn(async move {
+            supervise_pcap_ring(
+                slot,
+                PCAP_RETRY_INTERVAL,
+                pcap_reason,
+                || {
+                    let facts = SystemFacts::new(gw.clone(), configured_iface.clone());
+                    async move { facts.phys_iface().await }
+                },
+                move |iface| {
+                    PcapRing::start(iface, ring_dir.clone(), ring_mb, &filter)
+                        .map(|r| Arc::new(r) as Arc<dyn PcapFreezer>)
+                },
+            )
+            .await;
+        })
+    });
 
     // Serve the read-only status socket for the unprivileged bar. Best-effort: a
     // bind failure is logged but never takes the daemon down (no API, still
@@ -429,6 +463,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             }
             abort_all(&handles);
             api_handle.abort();
+            abort_pcap(pcap_handle.as_ref());
             return Ok(());
         }
     }
@@ -441,6 +476,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     // on process exit).
     abort_all(&handles);
     api_handle.abort();
+    abort_pcap(pcap_handle.as_ref());
     match tokio::time::timeout(SHUTDOWN_GRACE, &mut consumer).await {
         Ok(Ok(())) => tracing::info!("net-observerd shut down cleanly"),
         Ok(Err(e)) => tracing::error!(error = %e, "consumer join failed during shutdown"),
@@ -629,6 +665,14 @@ impl EventSource for NullEventSource {
     }
 }
 
+/// Stop the pcap supervisor, if one is running. Named so the two shutdown paths
+/// cannot drift apart.
+fn abort_pcap(handle: Option<&JoinHandle<()>>) {
+    if let Some(h) = handle {
+        h.abort();
+    }
+}
+
 /// Abort every collector task, dropping their stream senders.
 fn abort_all(handles: &[JoinHandle<()>]) {
     for h in handles {
@@ -636,24 +680,21 @@ fn abort_all(handles: &[JoinHandle<()>]) {
     }
 }
 
-/// Start the pcap ring on the physical interface, or return `None` if disabled,
-/// no interface was found, or `tcpdump` could not be spawned (logged).
-fn maybe_start_pcap_ring(cfg: &Config, phys_iface: Option<&str>) -> Option<Arc<dyn PcapFreezer>> {
-    if !cfg.collectors.pcap_ring.enabled {
-        return None;
-    }
+/// Start the pcap ring on the physical interface, returning the slot the rest of
+/// the daemon reads through plus the reason it is empty, if it is.
+///
+/// A `None` reason means a ring is running. Any other case (disabled, no
+/// interface, `tcpdump` refused to spawn) leaves the slot empty; only the
+/// disabled case is terminal, and [`supervise_pcap_ring`] handles the rest.
+fn maybe_start_pcap_ring(
+    cfg: &Config,
+    phys_iface: Option<&str>,
+) -> (Arc<PcapRingSlot>, Option<String>) {
     let Some(iface) = phys_iface else {
-        // KNOWN GAP, deliberately left one-shot. Unlike an interval collector,
-        // the ring is not driven by a tick: it is a `tcpdump` child started once
-        // and handed to the control socket by value, so `FreezePcap` can answer
-        // about the ring that is actually running. Making it retry means a
-        // supervisor task owning a swappable ring slot (shared with the API
-        // server) that re-resolves the interface and restarts the child when one
-        // appears — a wiring change to the API surface, not a loop tweak, and out
-        // of scope here. Until then a boot with no interface leaves the daemon
-        // with no ring for its lifetime; the warning below is the only record.
-        tracing::warn!("no physical interface resolved; pcap ring disabled (not retried)");
-        return None;
+        return (
+            Arc::new(PcapRingSlot::empty()),
+            Some("no physical interface resolved".to_string()),
+        );
     };
     let ring_dir = Path::new(&cfg.blob_dir).join("ring");
     match PcapRing::start(
@@ -662,10 +703,80 @@ fn maybe_start_pcap_ring(cfg: &Config, phys_iface: Option<&str>) -> Option<Arc<d
         cfg.collectors.pcap_ring.ring_mb,
         &cfg.collectors.pcap_ring.filter,
     ) {
-        Ok(ring) => Some(Arc::new(ring) as Arc<dyn PcapFreezer>),
-        Err(e) => {
-            tracing::warn!(error = %e, "pcap ring failed to start; gw-change freeze disabled");
-            None
+        Ok(ring) => (
+            Arc::new(PcapRingSlot::with_ring(
+                Arc::new(ring) as Arc<dyn PcapFreezer>
+            )),
+            None,
+        ),
+        Err(e) => (
+            Arc::new(PcapRingSlot::empty()),
+            Some(format!("tcpdump could not be spawned: {e}")),
+        ),
+    }
+}
+
+/// Keep `slot` holding a live pcap ring, for as long as this task runs.
+///
+/// The ring is the only artifact that shows packets leaving and nothing coming
+/// back, and a `RunAtLoad` daemon boots exactly when there may be no interface
+/// to capture on. So the ring is supervised rather than attempted once: every
+/// `interval` this checks the slot and, if it is empty or its `tcpdump` child
+/// has exited, re-resolves the interface and starts a new ring into the same
+/// slot — which every reader (`FreezePcap`, the gw-change handler) consults at
+/// use time, so recovery needs no restart and no re-wiring.
+///
+/// A dead ring is REPLACED, not merely reported: a handle to a corpse would let
+/// `FreezePcap` answer `ok` while copying a frozen ring directory.
+///
+/// Logging is by *change of reason*, never per attempt: the first failure and
+/// each subsequent different reason are logged, and so is every recovery. A
+/// daemon that cannot capture must not drown the log it shares with the evidence.
+async fn supervise_pcap_ring<R, Fut, S>(
+    slot: Arc<PcapRingSlot>,
+    interval: Duration,
+    initial_reason: Option<String>,
+    resolve_iface: R,
+    start_ring: S,
+) where
+    R: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+    S: Fn(&str) -> std::io::Result<Arc<dyn PcapFreezer>>,
+{
+    if let Some(reason) = &initial_reason {
+        tracing::warn!(%reason, retry_s = interval.as_secs(), "pcap ring not running; will retry");
+    }
+    let mut last_reason = initial_reason;
+    loop {
+        tokio::time::sleep(interval).await;
+
+        if slot.is_alive() {
+            continue;
+        }
+        // Empty, or holding a ring whose child exited. Clearing the slot first
+        // drops that handle (killing and reaping the child) so the replacement
+        // never races a corpse.
+        if slot.set(None).is_some() {
+            tracing::warn!("pcap ring child exited; restarting it");
+            last_reason = None;
+        }
+
+        let reason = match resolve_iface().await {
+            None => Some("no physical interface resolved".to_string()),
+            Some(iface) => match start_ring(&iface) {
+                Ok(ring) => {
+                    slot.set(Some(ring));
+                    tracing::info!(iface, "pcap ring started");
+                    None
+                }
+                Err(e) => Some(format!("tcpdump could not be spawned: {e}")),
+            },
+        };
+        if reason != last_reason {
+            if let Some(reason) = &reason {
+                tracing::warn!(%reason, "pcap ring still not running");
+            }
+            last_reason = reason;
         }
     }
 }
@@ -693,7 +804,7 @@ fn build_api_server(
     snapshot: Arc<Mutex<StatusSnapshot>>,
     observing: Arc<AtomicBool>,
     quiet: Arc<AtomicBool>,
-    freezer: Option<Arc<dyn PcapFreezer>>,
+    freezer: Arc<PcapRingSlot>,
     resume_at_us: Arc<AtomicI64>,
     store: Arc<DuckdbStore>,
     events_tx: tokio::sync::broadcast::Sender<EncodedFrame>,
@@ -750,7 +861,7 @@ fn build_api_server(
 fn build_engine(
     store: Arc<DuckdbStore>,
     cfg: &Config,
-    freezer: Option<Arc<dyn PcapFreezer>>,
+    freezer: Arc<PcapRingSlot>,
     snapshot: Arc<Mutex<StatusSnapshot>>,
     events_tx: tokio::sync::broadcast::Sender<EncodedFrame>,
 ) -> TriggerEngine {
@@ -762,15 +873,15 @@ fn build_engine(
     let snap: Arc<dyn Handler> =
         Arc::new(SnapshotHandler::new(snapshot, INCIDENT_RING_CAP, events_tx));
 
-    let mut gw_change_handlers: Vec<Arc<dyn Handler>> = vec![record.clone(), snap.clone()];
-    if let Some(freezer) = freezer {
-        let freeze: Arc<dyn Handler> = Arc::new(FreezePcapHandler::new(
-            freezer,
-            store.clone(),
-            cfg.blob_dir.clone(),
-        ));
-        gw_change_handlers.push(freeze);
-    }
+    // Wired unconditionally, because the ring can start LATE: the handler holds
+    // the slot, so a gw-change after a recovery freezes the ring that is running
+    // then. With an empty slot it copies nothing and says so.
+    let freeze: Arc<dyn Handler> = Arc::new(FreezePcapHandler::new(
+        freezer as Arc<dyn PcapFreezer>,
+        store.clone(),
+        cfg.blob_dir.clone(),
+    ));
+    let gw_change_handlers: Vec<Arc<dyn Handler>> = vec![record.clone(), snap.clone(), freeze];
 
     let triggers = vec![
         Trigger::new(
@@ -820,6 +931,134 @@ mod tests {
         fn freeze(&self, dest_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
             vec![dest_dir.join("ring.pcap0")]
         }
+    }
+
+    /// A fake ring whose liveness can be flipped, standing in for a `tcpdump`
+    /// child that exits under the daemon.
+    struct MortalRing(Arc<AtomicBool>);
+    impl PcapFreezer for MortalRing {
+        fn freeze(&self, dest_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+            vec![dest_dir.join("ring.pcap0")]
+        }
+        fn is_alive(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    /// Poll `cond` on a short cadence until it holds, or fail the test. Real
+    /// (short) time rather than tokio's paused clock, because `tokio/test-util`
+    /// is not a dependency of this binary and this branch is not the place to
+    /// add one.
+    async fn wait_until(label: &str, cond: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for: {label}");
+    }
+
+    /// The supervisor's patrol interval under test — short enough to keep the
+    /// test in milliseconds, long enough that a patrol is still a patrol.
+    const TEST_PATROL: Duration = Duration::from_millis(10);
+
+    /// The defect this branch closes: no interface at boot must not disable the
+    /// ring for the life of the process. The supervisor is driven with fakes (no
+    /// `tcpdump`, no root): the interface is absent for the first attempts and
+    /// present afterwards, and the ring must appear in the slot on its own.
+    ///
+    /// Dies under: returning early instead of looping, or writing the ring
+    /// anywhere but the shared slot.
+    #[tokio::test]
+    async fn the_ring_starts_by_itself_once_an_interface_appears() {
+        let slot = Arc::new(PcapRingSlot::empty());
+        let iface_up = Arc::new(AtomicBool::new(false));
+        let starts = Arc::new(AtomicI64::new(0));
+
+        let task = {
+            let (slot, iface_up, starts) = (slot.clone(), iface_up.clone(), starts.clone());
+            tokio::spawn(async move {
+                supervise_pcap_ring(
+                    slot,
+                    TEST_PATROL,
+                    Some("no physical interface resolved".to_string()),
+                    move || {
+                        let up = iface_up.load(std::sync::atomic::Ordering::Acquire);
+                        async move { up.then(|| "en0".to_string()) }
+                    },
+                    move |_iface| {
+                        starts.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        Ok(Arc::new(FakeFreezer) as Arc<dyn PcapFreezer>)
+                    },
+                )
+                .await;
+            })
+        };
+
+        // Several patrols with no interface: still empty, and nothing spawned.
+        tokio::time::sleep(TEST_PATROL * 5).await;
+        assert!(slot.get().is_none(), "no interface: the slot stays empty");
+        assert_eq!(
+            starts.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "the supervisor must not spawn a capture with no interface to bind"
+        );
+
+        iface_up.store(true, std::sync::atomic::Ordering::Release);
+        wait_until("the ring to start on its own", || slot.get().is_some()).await;
+
+        // And a healthy ring is left alone: no churn of tcpdump children.
+        tokio::time::sleep(TEST_PATROL * 5).await;
+        assert_eq!(
+            starts.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a live ring must not be restarted every patrol"
+        );
+        task.abort();
+    }
+
+    /// A ring whose child exited must not be left in the slot as a live-looking
+    /// handle: the supervisor notices and replaces it.
+    ///
+    /// Dies under: checking only `slot.get().is_some()` instead of liveness.
+    #[tokio::test]
+    async fn a_dead_ring_is_replaced_rather_than_kept() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let dead_ring = Arc::new(MortalRing(alive.clone())) as Arc<dyn PcapFreezer>;
+        let slot = Arc::new(PcapRingSlot::with_ring(dead_ring.clone()));
+
+        let task = {
+            let slot = slot.clone();
+            tokio::spawn(async move {
+                supervise_pcap_ring(
+                    slot,
+                    TEST_PATROL,
+                    None,
+                    || async { Some("en0".to_string()) },
+                    |_iface| Ok(Arc::new(FakeFreezer) as Arc<dyn PcapFreezer>),
+                )
+                .await;
+            })
+        };
+
+        // While it is alive it is left alone.
+        tokio::time::sleep(TEST_PATROL * 5).await;
+        assert!(
+            slot.get().is_some_and(|r| Arc::ptr_eq(&r, &dead_ring)),
+            "a live ring must not be swapped out"
+        );
+
+        alive.store(false, std::sync::atomic::Ordering::Release);
+        wait_until("the corpse to be replaced", || {
+            slot.get().is_some_and(|r| !Arc::ptr_eq(&r, &dead_ring))
+        })
+        .await;
+        assert!(
+            slot.get().expect("a ring is installed").is_alive(),
+            "the replacement must be a live ring"
+        );
+        task.abort();
     }
 
     /// A config whose only deviations from the shipped defaults are the ones the
@@ -913,8 +1152,8 @@ mod tests {
             observing.clone(),
             quiet.clone(),
             // No pcap ring in this test: `FreezePcap` must refuse rather than
-            // panic, which is the `None` arm's whole job.
-            None,
+            // panic, which is the empty slot's whole job.
+            Arc::new(PcapRingSlot::empty()),
             resume_at_us.clone(),
             store.clone(),
             events_tx.clone(),
@@ -1098,7 +1337,7 @@ mod tests {
 
     /// Build the real [`build_engine`] — five rules, production constants — with
     /// `freezer`.
-    fn engine_under_test(freezer: Option<Arc<dyn PcapFreezer>>) -> EngineFixture {
+    fn engine_under_test(freezer: Arc<PcapRingSlot>) -> EngineFixture {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let (events_tx, events_rx) = tokio::sync::broadcast::channel::<EncodedFrame>(64);
@@ -1153,7 +1392,7 @@ mod tests {
     /// `fakeip` needs DNS.
     #[test]
     fn build_engine_wires_the_production_wedge_threshold() {
-        let mut fx = engine_under_test(None);
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
         let mut w = RecentWindow::new(8);
 
         // Two dead tick pairs — one short of the production threshold of three.
@@ -1192,7 +1431,7 @@ mod tests {
     /// fires `gw-change`.
     #[test]
     fn build_engine_wires_the_production_backoff() {
-        let mut fx = engine_under_test(None);
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
         let mut w = RecentWindow::new(8);
 
         feed(&mut fx.engine, &mut w, link(1, GwVerdict::Fail)); // fires
@@ -1226,7 +1465,7 @@ mod tests {
     /// threshold", so the dead proxy tick alone must stay silent.
     #[test]
     fn build_engine_wires_the_production_starvation_threshold() {
-        let mut fx = engine_under_test(None);
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
         let mut w = RecentWindow::new(8);
 
         feed(&mut fx.engine, &mut w, dead_proxy(1));
@@ -1256,7 +1495,9 @@ mod tests {
     /// with or without a ring).
     #[test]
     fn build_engine_gives_gw_change_the_pcap_freeze_and_every_rule_the_snapshot_ring() {
-        let freezer: Option<Arc<dyn PcapFreezer>> = Some(Arc::new(FakeFreezer));
+        let freezer = Arc::new(PcapRingSlot::with_ring(
+            Arc::new(FakeFreezer) as Arc<dyn PcapFreezer>
+        ));
         let mut fx = engine_under_test(freezer);
         let mut w = RecentWindow::new(8);
 
@@ -1306,7 +1547,7 @@ mod tests {
 
         // Without a ring the incident is still recorded — the freeze is the only
         // thing that goes missing.
-        let mut bare = engine_under_test(None);
+        let mut bare = engine_under_test(Arc::new(PcapRingSlot::empty()));
         let mut bare_w = RecentWindow::new(8);
         feed(&mut bare.engine, &mut bare_w, link(1, GwVerdict::Ok));
         feed(&mut bare.engine, &mut bare_w, link(2, GwVerdict::Fail));
@@ -1321,6 +1562,53 @@ mod tests {
                 .unwrap(),
             0,
             "with no ring there is nothing to freeze, so no blob_ref"
+        );
+    }
+
+    /// The OTHER consumer of the ring slot — the automatic path. The engine is
+    /// built while the slot is EMPTY (a boot with no interface), so its first
+    /// gateway change records the incident and freezes nothing; a ring then
+    /// lands in the same slot (the supervisor's write) and the next gateway
+    /// change freezes it. The two consumers must not drift: a recovered ring
+    /// that only the socket can see would silently lose every automatic freeze.
+    ///
+    /// Dies under: giving `build_engine` a snapshot of the slot's contents
+    /// instead of the slot, or reinstating the `if let Some(freezer)` that left
+    /// the freeze handler unwired for the life of the process.
+    #[test]
+    fn a_ring_that_starts_late_is_frozen_by_the_gw_change_trigger_too() {
+        let slot = Arc::new(PcapRingSlot::empty());
+        let mut fx = engine_under_test(slot.clone());
+        let mut w = RecentWindow::new(8);
+
+        feed(&mut fx.engine, &mut w, link(1, GwVerdict::Ok));
+        feed(&mut fx.engine, &mut w, link(2, GwVerdict::Fail));
+        assert_eq!(
+            incidents_for(&fx.store, "gw-change"),
+            1,
+            "the incident is recorded with or without a ring"
+        );
+        assert_eq!(
+            fx.store
+                .query_scalar_i64("SELECT count(*) FROM blob_ref WHERE kind='pcap'")
+                .unwrap(),
+            0,
+            "with an empty slot there is nothing to freeze"
+        );
+
+        // The supervisor's recovery, into the slot the engine already holds.
+        slot.set(Some(Arc::new(FakeFreezer) as Arc<dyn PcapFreezer>));
+
+        // A steady tick re-arms the latch (no change, so no fire), then a second
+        // gateway change past the backoff fires the rule again.
+        feed(&mut fx.engine, &mut w, link(3, GwVerdict::Fail));
+        feed(&mut fx.engine, &mut w, link(3 + BACKOFF_US, GwVerdict::Ok));
+        assert!(
+            fx.store
+                .query_scalar_i64("SELECT count(*) FROM blob_ref WHERE kind='pcap'")
+                .unwrap()
+                > 0,
+            "after recovery the AUTOMATIC freeze must reach the ring that is now running"
         );
     }
 
