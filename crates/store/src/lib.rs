@@ -2,7 +2,7 @@ pub mod diagnosis;
 mod duckdb_store;
 mod schema;
 
-pub use duckdb_store::{DuckdbStore, NeighborScan, QueryTable, StoreError};
+pub use duckdb_store::{DuckdbStore, NeighborPort, NeighborScan, QueryTable, StoreError};
 use types::{BlobRef, Incident, ObservingEdge, Sample, TriggerFired};
 
 pub trait Store {
@@ -27,5 +27,8 @@ pub trait Store {
     /// and the row saying it did so must be written through the same interface
     /// every other durable record goes through.
     fn write_neighbor_scan(&self, s: &NeighborScan) -> Result<(), StoreError>;
+    /// Record one open port found on a neighbour (see the `neighbor_port`
+    /// table). Upserts on `(network_key, mac, port)`, preserving `first_seen_us`.
+    fn write_neighbor_port(&self, p: &NeighborPort) -> Result<(), StoreError>;
     fn query_scalar_i64(&self, sql: &str) -> Result<i64, StoreError>;
 }

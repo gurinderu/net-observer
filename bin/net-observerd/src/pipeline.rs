@@ -572,10 +572,12 @@ impl PcapFreezer for macos::PcapRing {
 /// platform code and the control path is testable without putting packets on a
 /// real segment. The production impl is [`crate::SystemScanner`].
 pub trait NeighborScanner: Send + Sync {
-    /// Run the scan, blocking for as long as its own budget allows. `None` when
+    /// Run the scan, blocking for as long as its own budget allows. `opts` is the
+    /// EFFECTIVE option set (already intersected with config permission by the
+    /// caller), so the scanner runs exactly the rungs it is handed. `None` when
     /// there is nothing to scan (no interface, no IPv4 subnet) — a refusal the
     /// caller reports, not an error it swallows.
-    fn scan(&self) -> Option<ScanReport>;
+    fn scan(&self, opts: &net_observer_ipc::ScanOptions) -> Option<ScanReport>;
 }
 
 /// What one scan did and found, in the shape the control path needs: the
@@ -589,6 +591,9 @@ pub struct ScanReport {
     pub found: Vec<types::NeighborObs>,
     /// One row per method actually attempted.
     pub scans: Vec<store::NeighborScan>,
+    /// Open ports found, already attributed to the neighbour that owns the
+    /// address. Empty unless the run included the `ports` rung.
+    pub ports: Vec<store::NeighborPort>,
     /// The line the operator sees.
     pub message: String,
 }
@@ -612,6 +617,7 @@ pub fn compose_scan_report(
     sweep: &macos::neighbor_scan::SweepStats,
     arp: Vec<types::NeighborObs>,
     mdns: &macos::neighbor_scan::MdnsOutcome,
+    port_scan: Option<&macos::neighbor_scan::PortScanOutcome>,
 ) -> ScanReport {
     let swept = sweep.refused.is_none();
     let mut found = arp;
@@ -628,8 +634,29 @@ pub fn compose_scan_report(
         }
     }
 
+    // Attribute each open port to the neighbour that owns its address; a port on
+    // an address no neighbour claims is dropped — the row is keyed by MAC.
+    let ports: Vec<store::NeighborPort> = port_scan
+        .map(|ps| {
+            ps.open
+                .iter()
+                .filter_map(|f| {
+                    let ip = f.ip.to_string();
+                    let owner = found.iter().find(|n| n.ip == ip)?;
+                    Some(store::NeighborPort {
+                        network_key: network_key.clone(),
+                        mac: owner.mac.clone(),
+                        ip,
+                        port: f.port,
+                        ts_us,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let count = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
-    let scans = vec![
+    let mut scans = vec![
         store::NeighborScan {
             ts_us,
             network_key: network_key.clone(),
@@ -655,6 +682,18 @@ pub fn compose_scan_report(
             detail: Some(format!("{} service types browsed", mdns.types_browsed)),
         },
     ];
+    if let Some(ps) = port_scan {
+        scans.push(store::NeighborScan {
+            ts_us,
+            network_key: network_key.clone(),
+            iface: Some(iface.clone()),
+            method: "ports".to_string(),
+            target: format!("{} hosts x {} ports", ps.hosts, ps.ports_per_host),
+            found: count(ports.len()),
+            duration_ms: ps.duration_ms,
+            detail: Some(format!("{} open", ports.len())),
+        });
+    }
     let message = if swept {
         format!(
             "swept {} ({}/{} probed): {} neighbours, {} named",
@@ -672,12 +711,18 @@ pub fn compose_scan_report(
             named.len()
         )
     };
+    let message = if port_scan.is_some() {
+        format!("{message}; {} open ports", ports.len())
+    } else {
+        message
+    };
     ScanReport {
         ts_us,
         network_key,
         iface: Some(iface),
         found,
         scans,
+        ports,
         message,
     }
 }
@@ -897,6 +942,7 @@ mod tests {
             &sweep_stats(Some("subnet too large")),
             vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
             &MdnsOutcome::default(),
+            None,
         );
         assert_eq!(r.found[0].source, types::NeighborSource::Arp);
         let sweep_row = r.scans.iter().find(|s| s.method == "sweep").unwrap();
@@ -917,6 +963,7 @@ mod tests {
             &sweep_stats(None),
             vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
             &MdnsOutcome::default(),
+            None,
         );
         assert_eq!(r.found[0].source, types::NeighborSource::Sweep);
         let sweep_row = r.scans.iter().find(|s| s.method == "sweep").unwrap();
@@ -944,6 +991,7 @@ mod tests {
                 types_browsed: 4,
                 duration_ms: 3900,
             },
+            None,
         );
         let row = r.scans.iter().find(|s| s.method == "mdns").unwrap();
         assert_eq!(row.found, 1);
@@ -951,6 +999,45 @@ mod tests {
         assert_eq!(row.detail.as_deref(), Some("4 service types browsed"));
         assert_eq!(r.found[0].source, types::NeighborSource::Mdns);
         assert_eq!(r.found[0].hostname.as_deref(), Some("printer.local"));
+    }
+
+    /// Open ports are attributed to the neighbour that owns the address; a port
+    /// on an address no neighbour claims is dropped, and the ports row reports
+    /// its own reach.
+    #[test]
+    fn ports_attach_to_the_owning_neighbour_and_orphans_drop() {
+        use macos::neighbor_scan::{PortFinding, PortScanOutcome};
+        let ps = PortScanOutcome {
+            open: vec![
+                PortFinding {
+                    ip: "192.168.1.5".parse().unwrap(),
+                    port: 445,
+                },
+                PortFinding {
+                    ip: "192.168.1.99".parse().unwrap(),
+                    port: 22,
+                },
+            ],
+            hosts: 2,
+            ports_per_host: 27,
+            duration_ms: 1200,
+        };
+        let r = compose_scan_report(
+            42,
+            Some("aa:bb:cc:dd:ee:ff".into()),
+            "en0".into(),
+            &sweep_stats(None),
+            vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
+            &MdnsOutcome::default(),
+            Some(&ps),
+        );
+        assert_eq!(r.ports.len(), 1, "the orphan port on .99 must drop");
+        assert_eq!(r.ports[0].mac, "11:22:33:44:55:66");
+        assert_eq!(r.ports[0].port, 445);
+        let row = r.scans.iter().find(|s| s.method == "ports").unwrap();
+        assert_eq!(row.found, 1);
+        assert_eq!(row.target, "2 hosts x 27 ports");
+        assert!(r.message.contains("open ports"), "{}", r.message);
     }
     use super::*;
     use collector_core::Readiness;

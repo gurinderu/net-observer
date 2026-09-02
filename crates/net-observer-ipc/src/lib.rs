@@ -104,7 +104,30 @@ pub enum ControlCmd {
     /// `acting.enabled` is set — and why every run writes a `neighbor_scan` row
     /// saying what was probed. The passive `neighbors` collector needs none of
     /// this: it only ever reads caches the OS already filled.
-    ScanNeighbors,
+    ///
+    /// Carries [`ScanOptions`]: which rungs of the scan this run should include.
+    /// The daemon runs a rung only when it is BOTH requested here and permitted
+    /// by config; a requested-but-unpermitted rung is dropped and the result
+    /// message says so.
+    ScanNeighbors(ScanOptions),
+}
+
+/// Which rungs of an operator-pressed scan a single run should include.
+///
+/// The base scan (subnet sweep + mDNS) always runs; these are the additions,
+/// each defaulting to `false`. `serde(default)` covers forward growth WITHIN this
+/// struct — a newer daemon adding a rung field still decodes an older client's
+/// `ScanOptions` that omits it. It does NOT rescue the enclosing variant's shape
+/// change (`ScanNeighbors` went from a unit variant to this newtype): a
+/// pre-options client that emits the bare string `"ScanNeighbors"` hard-errors
+/// against a daemon expecting `{"ScanNeighbors": {...}}`. That is acceptable on a
+/// single-host coordinated deploy, where the daemon and its clients ship
+/// together, but it is a decode failure, not a silent base-scan fallback.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScanOptions {
+    /// Probe discovered neighbours' TCP ports.
+    #[serde(default)]
+    pub ports: bool,
 }
 
 /// The outcome of a [`ControlCmd`]: whether the action ran successfully plus a

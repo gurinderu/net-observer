@@ -653,7 +653,7 @@ impl NeighborScanner for SystemScanner {
     /// current-thread one. The daemon's `#[tokio::main]` is multi-thread, and
     /// every test drives the control path through a fake scanner instead of this
     /// type, so nothing exercises it on a single-threaded runtime today.
-    fn scan(&self) -> Option<ScanReport> {
+    fn scan(&self, opts: &net_observer_ipc::ScanOptions) -> Option<ScanReport> {
         tokio::task::block_in_place(|| {
             let rt = tokio::runtime::Handle::current();
             let iface = rt.block_on(self.facts.phys_iface())?;
@@ -676,6 +676,22 @@ impl NeighborScanner for SystemScanner {
                 .block_on(neighbors::read_arp(Some(&iface)))
                 .unwrap_or_default();
             let mdns = neighbor_scan::mdns_names_blocking();
+
+            // The `ports` rung, only when this run asked for it. Targets are the
+            // addresses the base scan just found, so a port scan never reaches
+            // past the neighbours actually on the segment.
+            let ports = if opts.ports {
+                let targets: Vec<std::net::IpAddr> =
+                    arp.iter().filter_map(|n| n.ip.parse().ok()).collect();
+                Some(neighbor_scan::port_scan_blocking(
+                    &targets,
+                    neighbor_scan::COMMON_PORTS,
+                    &iface,
+                ))
+            } else {
+                None
+            };
+
             Some(pipeline::compose_scan_report(
                 types::now_us(),
                 network_key,
@@ -683,6 +699,7 @@ impl NeighborScanner for SystemScanner {
                 &sweep,
                 arp,
                 &mdns,
+                ports.as_ref(),
             ))
         })
     }
@@ -945,6 +962,10 @@ fn build_api_server(
             cfg.collectors.link.gw.clone(),
             cfg.collectors.link.phys_iface.clone(),
         ))) as Arc<dyn NeighborScanner>),
+        // The config permission ceiling for the active scan.
+        scan_permission: net_observer_ipc::ScanOptions {
+            ports: cfg.collectors.neighbors.scan.ports,
+        },
         blob_dir: std::path::PathBuf::from(&cfg.blob_dir),
         resume_at_us,
         snapshot,

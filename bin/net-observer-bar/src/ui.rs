@@ -44,7 +44,7 @@ use gpui::{
 };
 
 use net_observer_ipc::{
-    ControlCmd, ControlResult, IncidentSummary, Request, Response, StatusSnapshot,
+    ControlCmd, ControlResult, IncidentSummary, Request, Response, ScanOptions, StatusSnapshot,
 };
 
 use crate::status::{Health, health};
@@ -264,8 +264,8 @@ pub fn send_freeze_pcap(socket_path: &str) -> Result<ControlResult, String> {
 /// machines that are not this one, so it is **acting-class** — a daemon without
 /// `acting.enabled` answers `ok: false` with a reason, shown like any other
 /// control outcome.
-pub fn send_scan_neighbors(socket_path: &str) -> Result<ControlResult, String> {
-    control_query(socket_path, ControlCmd::ScanNeighbors)
+pub fn send_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult, String> {
+    control_query(socket_path, ControlCmd::ScanNeighbors(opts))
 }
 
 /// The one blocking control round-trip every control action goes through, so the
@@ -511,12 +511,25 @@ pub fn freeze_round_trip(
 /// design (a settle wait plus an mDNS budget).
 pub fn scan_round_trip(
     socket_path: &str,
+    opts: ScanOptions,
 ) -> (
     Result<ControlResult, String>,
     Result<StatusSnapshot, GlanceError>,
 ) {
-    let control = send_scan_neighbors(socket_path);
+    let control = send_scan_neighbors(socket_path, opts);
     (control, read_fresh(socket_path))
+}
+
+/// The Scan button's round-trip: the base scan (sweep + mDNS), no port rung. The
+/// per-rung checkboxes are a later increment; the CLI's `--ports` drives the
+/// `ports` rung today. Shaped as a bare `fn(&str)` so `spawn_control` takes it.
+pub fn scan_round_trip_base(
+    socket_path: &str,
+) -> (
+    Result<ControlResult, String>,
+    Result<StatusSnapshot, GlanceError>,
+) {
+    scan_round_trip(socket_path, ScanOptions::default())
 }
 
 /// The root view of the panel window. Holds a handle to the shared [`Glance`]
@@ -968,7 +981,7 @@ fn footer(
         .hover(|s| s.bg(rgb(theme.hover)))
         .child("Scan")
         .on_click(cx.listener(|this, _, _window, cx| {
-            spawn_control(this, cx, scan_round_trip);
+            spawn_control(this, cx, scan_round_trip_base);
         }));
 
     let quit = div()
