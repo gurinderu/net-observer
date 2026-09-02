@@ -92,3 +92,21 @@ collector-wifi = { path = "crates/collector-wifi" }
 collector-neighbors = { path = "crates/collector-neighbors" }
 triggers = { path = "crates/triggers" }
 macos = { path = "crates/macos" }
+
+# Release tuning. This daemon is I/O-bound and idle between ~15s ticks, so the
+# aim is NOT steady-state speed (there is no hot path to speed up) — it is a
+# readable panic in production and a smaller, slightly-faster-to-start binary.
+#   - `debug = "line-tables-only"`: a panic reads as a stack with line numbers,
+#     not raw addresses. For a forensics daemon, diagnosability beats a few %.
+#   - `lto = "thin"` + `codegen-units = 1`: binary size and startup, at some
+#     build-time cost (already long: DuckDB compiles its C++ engine from source).
+#     `fat` was rejected — it lengthens that build further for no measured gain.
+#   - `panic` stays `"unwind"`. `abort` would break collector isolation: a single
+#     collector panic must be logged while the others keep ticking, not abort the
+#     whole daemon. (realm net-observer)
+# jemalloc/PGO/BOLT deliberately NOT used: they optimise sustained CPU load this
+# daemon does not have. `target-cpu=native` lives in `.cargo/config.toml`.
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 1
