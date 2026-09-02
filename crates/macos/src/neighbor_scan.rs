@@ -437,6 +437,13 @@ const BANNER_READ_TIMEOUT: Duration = Duration::from_millis(600);
 /// payload; anything past the first kilobyte is not identifying and is not read.
 const BANNER_MAX_BYTES: usize = 1024;
 
+/// Total wall-clock budget for one banner grab. Without it a host that dribbles
+/// a byte just under each read timeout, never sending a newline, would force ~1
+/// read per byte to the cap — minutes on a single port — and stall the whole
+/// operator-pressed scan, which blocks the control request. The per-read timeout
+/// bounds one read; this bounds the grab.
+const BANNER_GRAB_BUDGET: Duration = Duration::from_secs(2);
+
 /// Cleartext HTTP ports where a bare connect volunteers nothing, so a minimal
 /// `HEAD` is sent to elicit the status/`Server:` line. TLS ports (443/8443) are
 /// deliberately absent: the bytes there are a handshake, not a readable banner.
@@ -545,10 +552,16 @@ fn grab_banner(ip: IpAddr, port: u16, iface_name: &str) -> Option<String> {
         stream.write_all(b"HEAD / HTTP/1.0\r\n\r\n").ok()?;
     }
 
-    // Read up to the byte cap, then take the first line as the banner.
+    // Read up to the byte cap or the grab budget, then take the first line as the
+    // banner. The monotonic deadline is what makes a dribbling host cost seconds,
+    // not minutes.
+    let deadline = Instant::now() + BANNER_GRAB_BUDGET;
     let mut buf = [0u8; BANNER_MAX_BYTES];
     let mut used = 0;
     while used < buf.len() {
+        if Instant::now() >= deadline {
+            break;
+        }
         match stream.read(&mut buf[used..]) {
             Ok(0) => break,
             Ok(n) => {
@@ -564,19 +577,30 @@ fn grab_banner(ip: IpAddr, port: u16, iface_name: &str) -> Option<String> {
     first_line(&buf[..used])
 }
 
-/// The first line of a banner as trimmed, printable text — or `None` if there is
-/// nothing readable. Non-printable control bytes (a binary handshake, say) are
-/// dropped, so a TLS or binary service that slipped in stores no guessed banner.
+/// The first line of a banner as trimmed, printable-ASCII text — or `None` if
+/// there is nothing readable.
+///
+/// A service banner is printable ASCII in practice (`SSH-2.0-OpenSSH_7.4`,
+/// `220 smtp ready`, `Server: nginx`). If the greeting carries ANY byte outside
+/// printable ASCII (plus tab/CR) it is a binary or length-prefixed protocol — a
+/// TLS handshake, MySQL's greeting on 3306 — and `None` is stored rather than a
+/// lossy-decoded guess: silent wrong data is worse than none. `from_utf8_lossy`
+/// was the bug — it turned high bytes into U+FFFD, which is not a control char,
+/// so mojibake passed the old filter.
 fn first_line(bytes: &[u8]) -> Option<String> {
     let line_end = bytes
         .iter()
         .position(|&b| b == b'\n')
         .unwrap_or(bytes.len());
-    let text: String = String::from_utf8_lossy(&bytes[..line_end])
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\t')
-        .collect();
-    let text = text.trim().to_string();
+    let line = &bytes[..line_end];
+    if line
+        .iter()
+        .any(|&b| !(b == b'\t' || b == b'\r' || (0x20..=0x7e).contains(&b)))
+    {
+        return None;
+    }
+    // Now known to be valid ASCII.
+    let text = std::str::from_utf8(line).ok()?.trim().to_string();
     if text.is_empty() { None } else { Some(text) }
 }
 
@@ -672,6 +696,21 @@ mod tests {
 
     /// A port that accepts but says nothing yields no banner — silence is never
     /// turned into a guessed one.
+    #[test]
+    fn a_binary_greeter_stores_no_banner_only_ascii_does() {
+        // Printable ASCII is a real banner.
+        assert_eq!(
+            first_line(b"SSH-2.0-OpenSSH_9.6\r\n").as_deref(),
+            Some("SSH-2.0-OpenSSH_9.6")
+        );
+        // A high-byte / length-prefixed greeting (MySQL-style, TLS) is NOT a
+        // banner: storing lossy mojibake would be silent wrong data.
+        assert_eq!(first_line(&[0x0a, 0x33, 0x2e, 0xff, 0x00, 0x15]), None);
+        assert_eq!(first_line(&[0xde, 0xad, 0xbe, 0xef]), None);
+        // Empty / whitespace-only is nothing.
+        assert_eq!(first_line(b"   \r\n"), None);
+    }
+
     #[test]
     fn a_silent_port_yields_no_banner() {
         use std::net::TcpListener;
