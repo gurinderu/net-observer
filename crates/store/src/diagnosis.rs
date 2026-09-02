@@ -60,11 +60,16 @@
 //! mid-story:
 //!
 //! - A resume with no preceding pause opens no gap: only a `false` edge does.
-//! - A pause with no resume row closes where the record shows collection
+//! - A pause with no resume row closes at the next RECORDED startup edge when
+//!   there is one: a daemon that died while paused comes back collecting and
+//!   writes no resume edge, but it does write "this process began collecting
+//!   at this instant", and that is a fact rather than an inference.
+//! - Only failing that does the gap close where the record shows collection
 //!   demonstrably resumed anyway — at the first sample of any stream written
-//!   after it — because a daemon that died while paused comes back collecting
-//!   and writes no resume edge. Only when nothing at all follows the pause does
-//!   the gap stay open-ended, which is the truth: the record ends there.
+//!   after it. Records written before the startup edge existed have nothing
+//!   else, so the inference stays; `gap_closed_by` says which case was taken.
+//!   Only when nothing at all follows the pause does the gap stay open-ended,
+//!   which is the truth: the record ends there.
 //!
 //! ## Correlation
 //!
@@ -120,18 +125,38 @@ sample_ts AS (
 ///
 /// A gap opens at each `observing = false` edge and is half-open
 /// `[gap_opened_us, gap_closed_us)`: the pause instant is inside it, the resume
-/// instant is not. It closes at whichever comes first — the next resume edge, or
-/// the first sample of any stream — and `gap_closed_us` is `NULL` when neither
-/// exists, meaning the record simply ends inside the pause.
+/// instant is not. It closes at the earliest of three candidates, and
+/// `gap_closed_by` names which one it took:
+///
+/// | `gap_closed_by` | what closed the gap |
+/// | --- | --- |
+/// | `resume` | an operator `observing = true` edge (`cause` `control`) |
+/// | `startup` | a recorded startup edge — this process began collecting |
+/// | `sample` | no edge at all: the first sample of any stream, inferred |
+///
+/// A recorded edge WINS a tie with a sample at the same instant, because it is
+/// the fact and the sample is only evidence of it.
+///
+/// `gap_closed_us` (and `gap_closed_by`) is `NULL` when nothing at all follows
+/// the pause: the record simply ends inside it.
 const OBSERVATION_GAP_CTE: &str = "\
 observation_gap AS (
-  SELECT p.ts_us AS gap_opened_us, min(e.ts_us) AS gap_closed_us
-  FROM (SELECT ts_us FROM observing_edge WHERE NOT observing) p
-  LEFT JOIN (
-    SELECT ts_us FROM observing_edge WHERE observing
-    UNION ALL SELECT ts_us FROM sample_ts
-  ) e ON e.ts_us > p.ts_us
-  GROUP BY p.ts_us
+  SELECT gap_opened_us, gap_closed_us, gap_closed_by
+  FROM (
+    SELECT p.ts_us AS gap_opened_us,
+           e.ts_us AS gap_closed_us,
+           e.closed_by AS gap_closed_by,
+           row_number() OVER (PARTITION BY p.ts_us ORDER BY e.ts_us, e.prio) AS rn
+    FROM (SELECT ts_us FROM observing_edge WHERE NOT observing) p
+    LEFT JOIN (
+      SELECT ts_us,
+             CASE WHEN cause = 'startup' THEN 'startup' ELSE 'resume' END AS closed_by,
+             0 AS prio
+      FROM observing_edge WHERE observing
+      UNION ALL SELECT ts_us, 'sample' AS closed_by, 1 AS prio FROM sample_ts
+    ) e ON e.ts_us > p.ts_us
+  )
+  WHERE rn = 1
 )";
 
 /// The gap containing `ts_expr`, or no row at all. At most one row.
@@ -156,7 +181,8 @@ pub fn observation_gaps_sql() -> String {
     format!(
         "WITH {SAMPLE_TS_CTE},
 {OBSERVATION_GAP_CTE}
-SELECT gap_opened_us, gap_closed_us FROM observation_gap ORDER BY gap_opened_us"
+SELECT gap_opened_us, gap_closed_us, gap_closed_by
+FROM observation_gap ORDER BY gap_opened_us"
     )
 }
 
@@ -534,6 +560,19 @@ mod tests {
             ts_us,
             observing,
             peer_uid: Some(501),
+            cause: types::ObservingCause::Control,
+        })
+        .unwrap();
+    }
+
+    /// The boundary a booting daemon writes: it began collecting, and no peer
+    /// asked for it.
+    fn startup_edge(s: &DuckdbStore, ts_us: i64) {
+        s.write_observing_edge(&ObservingEdge {
+            ts_us,
+            observing: true,
+            peer_uid: None,
+            cause: types::ObservingCause::Startup,
         })
         .unwrap();
     }
@@ -1062,6 +1101,68 @@ mod tests {
         let t = s.verdict_at(55 * SEC).unwrap();
         assert_eq!(cell(&t, 0, "layer"), "healthy");
         assert_eq!(cell(&t, 0, "ts_us"), (50 * SEC).to_string());
+    }
+
+    /// The recorded fact beats the inference: a daemon that died while paused
+    /// comes back collecting and writes a STARTUP edge, so the gap closes at
+    /// that edge — the instant the record actually names — rather than at the
+    /// first sample the restarted process happened to take.
+    #[test]
+    fn a_startup_edge_closes_the_gap_at_the_edge_not_at_the_first_sample() {
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, 10 * SEC);
+        edge(&s, 20 * SEC, false);
+        // The daemon died paused and booted again at 35 s; its first tick is
+        // five seconds later.
+        startup_edge(&s, 35 * SEC);
+        healthy_tick(&s, 40 * SEC);
+
+        let gaps = s.observation_gaps().unwrap();
+        assert_eq!(gaps.rows.len(), 1);
+        assert_eq!(cell(&gaps, 0, "gap_closed_us"), (35 * SEC).to_string());
+        assert_eq!(cell(&gaps, 0, "gap_closed_by"), "startup");
+
+        // The instant between the startup edge and the first sample is no
+        // longer inside the silence: the record says collection had resumed.
+        let t = s.verdict_at(37 * SEC).unwrap();
+        assert_ne!(cell(&t, 0, "layer"), "gap");
+        // Inside the real silence, nothing changed.
+        assert_eq!(cell(&s.verdict_at(30 * SEC).unwrap(), 0, "layer"), "gap");
+    }
+
+    /// The fallback stays, and says so: with no startup edge the gap still
+    /// closes at the first sample, reported as the inference it is.
+    #[test]
+    fn without_a_startup_edge_the_gap_still_closes_at_the_first_sample() {
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, 10 * SEC);
+        edge(&s, 20 * SEC, false);
+        healthy_tick(&s, 40 * SEC);
+
+        let gaps = s.observation_gaps().unwrap();
+        assert_eq!(gaps.rows.len(), 1);
+        assert_eq!(cell(&gaps, 0, "gap_closed_us"), (40 * SEC).to_string());
+        assert_eq!(cell(&gaps, 0, "gap_closed_by"), "sample");
+    }
+
+    /// A startup edge on its own is not a transition out of anything: the
+    /// daemon simply booted. It must not open a gap (only a `false` edge does)
+    /// nor close one that was never opened.
+    #[test]
+    fn a_startup_edge_with_no_preceding_pause_changes_nothing() {
+        let s = DuckdbStore::in_memory().unwrap();
+        startup_edge(&s, 5 * SEC);
+        healthy_tick(&s, 10 * SEC);
+        healthy_tick(&s, 20 * SEC);
+
+        assert!(s.observation_gaps().unwrap().rows.is_empty());
+        // (before 10 s nothing was recorded at all, so there is no row there —
+        // and no gap invented to explain the emptiness either.)
+        assert!(s.verdict_at(6 * SEC).unwrap().rows.is_empty());
+        for ts in [15 * SEC, 25 * SEC] {
+            let t = s.verdict_at(ts).unwrap();
+            assert_eq!(cell(&t, 0, "layer"), "healthy", "at {ts}");
+        }
     }
 
     /// The one case where a pause does swallow every later instant, and

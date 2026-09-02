@@ -805,6 +805,7 @@ mod tests {
             ts_us: 0,
             observing: false,
             peer_uid: Some(501),
+            cause: types::ObservingCause::Control,
         });
         assert_eq!(
             format_frame_line(&edge),

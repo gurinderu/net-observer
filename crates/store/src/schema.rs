@@ -17,5 +17,12 @@ CREATE TABLE IF NOT EXISTS route_event (
 CREATE TABLE IF NOT EXISTS host_sample (
   ts_us BIGINT, load1 DOUBLE, load5 DOUBLE, load15 DOUBLE);
 CREATE TABLE IF NOT EXISTS observing_edge (
-  ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT);
+  ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT, cause VARCHAR);
+-- `cause` was added after the first daemon shipped rows without it. A database
+-- file written by that daemon keeps its three-column table (CREATE TABLE IF NOT
+-- EXISTS does nothing to an existing one), and the CLI's offline `query` path
+-- opens whatever file it is handed — so the column is added on open. Existing
+-- rows read back with a NULL cause, which the gap derivation treats as
+-- 'control': that is what they in fact were.
+ALTER TABLE observing_edge ADD COLUMN IF NOT EXISTS cause VARCHAR;
 "#;

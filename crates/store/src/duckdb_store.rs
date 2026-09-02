@@ -179,8 +179,13 @@ impl Store for DuckdbStore {
     }
     fn write_observing_edge(&self, e: &ObservingEdge) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO observing_edge VALUES (?,?,?)",
-            params![e.ts_us, e.observing, e.peer_uid.map(i64::from)],
+            "INSERT INTO observing_edge (ts_us, observing, peer_uid, cause) VALUES (?,?,?,?)",
+            params![
+                e.ts_us,
+                e.observing,
+                e.peer_uid.map(i64::from),
+                e.cause.as_str()
+            ],
         )?;
         Ok(())
     }
@@ -332,12 +337,14 @@ mod tests {
             ts_us: 1000,
             observing: false,
             peer_uid: Some(501),
+            cause: types::ObservingCause::Control,
         })
         .unwrap();
         s.write_observing_edge(&ObservingEdge {
             ts_us: 2000,
             observing: true,
             peer_uid: Some(501),
+            cause: types::ObservingCause::Control,
         })
         .unwrap();
         assert_eq!(
@@ -354,6 +361,59 @@ mod tests {
         );
     }
 
+    /// A database file written by the daemon that shipped before `cause`
+    /// existed must still open — the CLI's offline `query` path opens whatever
+    /// file it is handed. The column is added on open and the pre-existing rows
+    /// read back with a NULL cause, which the gap derivation reads as
+    /// `control`: what they in fact were.
+    #[test]
+    fn an_old_three_column_database_opens_and_keeps_its_rows() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use types::ObservingEdge;
+        let path = std::env::temp_dir().join(format!(
+            "net-observer-schema-{}-{}.duckdb",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+
+        // The pre-`cause` table, written by the daemon of the day.
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE observing_edge (ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT);
+                 INSERT INTO observing_edge VALUES (1000, false, 501);",
+            )
+            .unwrap();
+        }
+
+        let s = DuckdbStore::open(&path_str).unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM observing_edge WHERE cause IS NULL")
+                .unwrap(),
+            1,
+            "the old row must survive the added column"
+        );
+        // And the new daemon can keep writing into the migrated table.
+        s.write_observing_edge(&ObservingEdge {
+            ts_us: 2000,
+            observing: true,
+            peer_uid: None,
+            cause: types::ObservingCause::Startup,
+        })
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM observing_edge WHERE cause = 'startup'")
+                .unwrap(),
+            1
+        );
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn observing_edge_accepts_a_null_peer() {
         use types::ObservingEdge;
@@ -362,6 +422,7 @@ mod tests {
             ts_us: 1000,
             observing: false,
             peer_uid: None,
+            cause: types::ObservingCause::Control,
         })
         .unwrap();
         assert_eq!(
@@ -379,12 +440,14 @@ mod tests {
             ts_us: 100,
             observing: false,
             peer_uid: Some(501),
+            cause: types::ObservingCause::Control,
         })
         .unwrap();
         s.write_observing_edge(&ObservingEdge {
             ts_us: 200,
             observing: true,
             peer_uid: Some(501),
+            cause: types::ObservingCause::Control,
         })
         .unwrap();
         // The pause must read back before the resume: the interval between the

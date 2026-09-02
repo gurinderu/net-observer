@@ -778,6 +778,7 @@ mod tests {
                 ts_us: 4,
                 observing: false,
                 peer_uid: Some(501),
+                cause: types::ObservingCause::Control,
             })),
             "observing  collection off"
         );
@@ -938,6 +939,7 @@ mod tests {
             ts_us: 3,
             observing: false,
             peer_uid: Some(501),
+            cause: types::ObservingCause::Control,
         }));
         assert!(!edge.alert);
         assert_eq!(edge.line, "observing  collection off");

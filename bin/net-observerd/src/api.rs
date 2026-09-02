@@ -33,7 +33,7 @@ use store::Store;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
-use types::ObservingEdge;
+use types::{ObservingCause, ObservingEdge};
 
 use crate::acting;
 use crate::pipeline::PcapFreezer;
@@ -965,6 +965,9 @@ fn control_response(
                         ts_us,
                         observing: b,
                         peer_uid: Some(authorized.uid()),
+                        // An operator asked for this one. The startup edge is
+                        // the other producer, and it is written in `main`.
+                        cause: ObservingCause::Control,
                     };
 
                     // Sink 2, realtime: the same value on the bus for held-open

@@ -113,6 +113,45 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+/// Record that THIS process began collecting, at `ts_us`.
+///
+/// The observing *state* stays process-scoped and is never persisted — the
+/// daemon always boots collecting. What is durable is the boundary: one
+/// `observing_edge` row with `observing = true`, `peer_uid = NULL` (nobody
+/// asked; the process booted) and `cause = startup`, published on the realtime
+/// bus as the same `StreamFrame::Observing` an operator edge produces. One
+/// value, two sinks — exactly the mechanism `api::set_observing` uses, not a
+/// second one.
+///
+/// A store failure is logged as a gap and never fails startup: the daemon is
+/// collecting either way, and refusing to boot over a missing boundary row
+/// would trade a weaker record for no record at all.
+fn record_startup_edge(
+    store: &DuckdbStore,
+    events_tx: &tokio::sync::broadcast::Sender<EncodedFrame>,
+    ts_us: i64,
+) -> types::ObservingEdge {
+    use store::Store as _;
+
+    let edge = types::ObservingEdge {
+        ts_us,
+        observing: true,
+        peer_uid: None,
+        cause: types::ObservingCause::Startup,
+    };
+    match EncodedFrame::encode(&net_observer_ipc::StreamFrame::Observing(edge)) {
+        Ok(frame) => {
+            let _ = events_tx.send(frame);
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to encode startup observing frame"),
+    }
+    if let Err(e) = store.write_observing_edge(&edge) {
+        tracing::error!(error = %e,
+            "store write failed; startup observing edge not recorded (gap logged)");
+    }
+    edge
+}
+
 /// The async daemon body: load config, open the store, spawn the enabled
 /// collectors, run the consumer loop, and shut down on SIGTERM/SIGINT. The final
 /// drain is bounded (see [`SHUTDOWN_GRACE`]) so an un-abortable event source can
@@ -192,6 +231,15 @@ async fn run_daemon() -> anyhow::Result<()> {
     // subscribers it still never back-pressures: a `send` error just means nobody
     // is listening, and is ignored.
     let (events_tx, _) = tokio::sync::broadcast::channel::<EncodedFrame>(EVENT_BUS_CAP);
+
+    // The startup edge: the state is not persisted, but the TRANSITION is. A
+    // daemon that died while paused comes back collecting and writes no resume
+    // edge, so without this row the record cannot tell "still paused" from
+    // "crashed while paused, then restarted", and the diagnosis queries have to
+    // infer where the silence ended. Written through the same two sinks as an
+    // operator edge, immediately after the bus exists and before any collector
+    // can produce a sample, so it precedes the evidence it replaces.
+    record_startup_edge(store.as_ref(), &events_tx, types::now_us());
 
     let (tx, rx) = mpsc::channel::<Sample>(CHANNEL_CAP);
 
@@ -863,6 +911,7 @@ mod tests {
                 ts_us: 7,
                 observing: false,
                 peer_uid: Some(1),
+                cause: types::ObservingCause::Control,
             })
             .unwrap();
         assert_eq!(
@@ -872,6 +921,46 @@ mod tests {
             1,
             "the control path must write pause/resume edges into the daemon's own store"
         );
+    }
+
+    /// Startup writes the boundary that makes a restart a readable fact: one
+    /// durable `observing_edge` row (`observing = true`, `cause = startup`, no
+    /// peer) AND the same value on the realtime bus — the two sinks an operator
+    /// edge uses, not a second mechanism. The state itself is still not
+    /// persisted; only this transition is.
+    #[test]
+    fn startup_records_an_observing_edge_through_both_sinks() {
+        let store = DuckdbStore::in_memory().unwrap();
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel::<EncodedFrame>(8);
+
+        let edge = record_startup_edge(&store, &events_tx, 4_242);
+
+        assert_eq!(edge.ts_us, 4_242);
+        assert!(edge.observing, "a daemon always boots collecting");
+        assert_eq!(edge.peer_uid, None, "nobody asked; the process booted");
+        assert_eq!(edge.cause, types::ObservingCause::Startup);
+
+        // Sink 1, durable.
+        assert_eq!(
+            store
+                .query_scalar_i64(
+                    "SELECT count(*) FROM observing_edge \
+                     WHERE ts_us = 4242 AND observing AND peer_uid IS NULL \
+                       AND cause = 'startup'"
+                )
+                .unwrap(),
+            1,
+            "the startup transition must be durable, or a restart stays an inference"
+        );
+
+        // Sink 2, realtime: the same value, decoded off the bus.
+        let frame = events_rx.try_recv().expect("a frame must reach the bus");
+        let decoded: net_observer_ipc::StreamFrame = serde_json::from_slice(frame.bytes())
+            .expect("bus payload must decode as a StreamFrame");
+        match decoded {
+            net_observer_ipc::StreamFrame::Observing(back) => assert_eq!(back, edge),
+            other => panic!("unexpected frame variant: {other:?}"),
+        }
     }
 
     // ── the TriggerEngine wiring ───────────────────────────────────────────

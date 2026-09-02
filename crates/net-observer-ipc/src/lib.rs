@@ -1082,6 +1082,7 @@ mod tests {
             ts_us: 909,
             observing: false,
             peer_uid: Some(501),
+            cause: types::ObservingCause::Control,
         };
         match round_trip_frame(&StreamFrame::Observing(edge)) {
             StreamFrame::Observing(back) => assert_eq!(back, edge),
@@ -1160,6 +1161,7 @@ mod tests {
                 ts_us: 0,
                 observing: false,
                 peer_uid: Some(0),
+                cause: types::ObservingCause::Control,
             }),
             StreamFrame::Error(StreamError {
                 ts_us: 0,
@@ -1210,6 +1212,7 @@ mod tests {
                 ts_us: 0,
                 observing: false,
                 peer_uid: Some(501),
+                cause: types::ObservingCause::Control,
             }),
             StreamFrame::Error(StreamError {
                 ts_us: 0,
@@ -1271,6 +1274,7 @@ mod tests {
             ts_us: 10,
             observing: false,
             peer_uid: Some(501),
+            cause: types::ObservingCause::Control,
         });
         assert_eq!(paused.label(), "observing");
         assert_eq!(paused.detail(), "collection off");
@@ -1280,6 +1284,7 @@ mod tests {
             ts_us: 11,
             observing: true,
             peer_uid: None,
+            cause: types::ObservingCause::Control,
         });
         assert_eq!(resumed.detail(), "collection on");
 
