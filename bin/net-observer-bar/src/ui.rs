@@ -39,8 +39,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
 use gpui::{
-    App, AsyncApp, Context, Entity, Rgba, SharedString, Subscription, Window, WindowAppearance,
-    div, px, rgb, rgba,
+    AnyElement, App, AsyncApp, Context, Entity, Rgba, SharedString, Subscription, Window,
+    WindowAppearance, div, px, rgb, rgba,
 };
 
 use net_observer_ipc::{
@@ -532,10 +532,26 @@ pub fn scan_round_trip_base(
     scan_round_trip(socket_path, ScanOptions::default())
 }
 
+/// Which body the panel shows under the header. The header (health + toggle) and
+/// footer (actions) are always present; only the middle switches. `Status` is the
+/// original glance (sparklines, verdict rows, incidents); `Map` is the live
+/// network map of the local segment (see [`crate::map`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanelTab {
+    /// The original glance: trend sparklines, verdict rows, incidents.
+    #[default]
+    Status,
+    /// The network map of the local segment.
+    Map,
+}
+
 /// The root view of the panel window. Holds a handle to the shared [`Glance`]
 /// and re-renders whenever it changes.
 pub struct PanelView {
     model: Entity<Glance>,
+    /// Which body is shown — view-local, not part of the shared model: the tab
+    /// choice is per-open-panel and never persisted.
+    tab: PanelTab,
     _observe: Subscription,
 }
 
@@ -546,6 +562,7 @@ impl PanelView {
         let observe = cx.observe(&model, |_, _, cx| cx.notify());
         Self {
             model,
+            tab: PanelTab::default(),
             _observe: observe,
         }
     }
@@ -556,6 +573,7 @@ impl Render for PanelView {
         // Adapt to the system appearance instead of hardcoding a palette.
         let theme = Theme::for_appearance(window.appearance());
 
+        let tab = self.tab;
         let glance = self.model.read(cx);
         let snapshot = glance.snapshot.clone();
         let control_msg = glance.control_msg.clone();
@@ -590,13 +608,9 @@ impl Render for PanelView {
             .overflow_hidden()
             .child(header_row(&snapshot, online, offline_msg, theme, cx))
             .child(separator(theme))
-            // Trend before state: the gateway fails as a ramp, so the slope is
-            // read first and the current verdicts underneath it.
-            .child(sparklines_section(&history, theme))
+            .child(tab_row(tab, theme, cx))
             .child(separator(theme))
-            .child(status_rows(&snapshot, now_us, theme))
-            .child(separator(theme))
-            .child(incidents_section(&snapshot.incidents, now_us, theme))
+            .child(panel_body(tab, &snapshot, &history, now_us, theme))
             .child(separator(theme))
             .child(footer(
                 &snapshot,
@@ -607,6 +621,92 @@ impl Render for PanelView {
                 cx,
             ))
     }
+}
+
+/// The switchable middle of the panel, selected by the tab row. `Status` stacks
+/// the original glance sections; `Map` renders the live network map. Both return
+/// an [`AnyElement`] so the two shapes share one slot.
+fn panel_body(
+    tab: PanelTab,
+    snapshot: &StatusSnapshot,
+    history: &VecDeque<HistoryPoint>,
+    now_us: i64,
+    theme: Theme,
+) -> AnyElement {
+    match tab {
+        PanelTab::Status => div()
+            .flex()
+            .flex_col()
+            // Trend before state: the gateway fails as a ramp, so the slope is
+            // read first and the current verdicts underneath it.
+            .child(sparklines_section(history, theme))
+            .child(separator(theme))
+            .child(status_rows(snapshot, now_us, theme))
+            .child(separator(theme))
+            .child(incidents_section(&snapshot.incidents, now_us, theme))
+            .into_any_element(),
+        PanelTab::Map => crate::map::network_map_section(snapshot, theme).into_any_element(),
+    }
+}
+
+/// The tab selector under the header: two chips (`Status · Map`) that switch the
+/// panel body. Modeled on the event-log window's type selector, so the panel and
+/// the window share one chip idiom.
+fn tab_row(current: PanelTab, theme: Theme, cx: &mut Context<PanelView>) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_3()
+        .py_1p5()
+        .child(tab_chip(
+            "tab-status",
+            "Status",
+            PanelTab::Status,
+            current,
+            theme,
+            cx,
+        ))
+        .child(tab_chip(
+            "tab-map",
+            "Map",
+            PanelTab::Map,
+            current,
+            theme,
+            cx,
+        ))
+}
+
+/// One tab chip: filled with the accent when selected, a muted hover target
+/// otherwise. Clicking it sets the view-local [`PanelView`] tab and re-renders.
+fn tab_chip(
+    id: &'static str,
+    label: &'static str,
+    tab: PanelTab,
+    current: PanelTab,
+    theme: Theme,
+    cx: &mut Context<PanelView>,
+) -> impl IntoElement {
+    let selected = tab == current;
+    let mut el = div()
+        .id(id)
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .text_size(px(12.0))
+        .cursor_pointer();
+    if selected {
+        el = el.bg(rgb(theme.accent)).text_color(rgb(theme.knob));
+    } else {
+        el = el
+            .text_color(rgb(theme.muted))
+            .hover(|s| s.bg(rgb(theme.hover)));
+    }
+    el.child(label)
+        .on_click(cx.listener(move |this, _, _window, cx| {
+            this.tab = tab;
+            cx.notify();
+        }))
 }
 
 /// The header row: a health dot + the app name on the left, the observing toggle
