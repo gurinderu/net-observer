@@ -13,3 +13,7 @@ net-observer-ipc.workspace = true
 types.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+# Only the offline `diagnose` commands need a calendar: they take a moment in
+# time from a human (`--at 14:05`) and must resolve it in the LOCAL zone, which
+# needs the tz database. The `events` tail keeps its dependency-free UTC clock.
+jiff.workspace = true
