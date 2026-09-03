@@ -37,7 +37,9 @@ use macos::{
 use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{EncodedFrame, StatusSnapshot};
 use store::DuckdbStore;
-use triggers::conditions::{FakeIp, GwChange, GwDrop, Starvation, Wedge};
+use triggers::conditions::{
+    FakeIp, GwChange, GwDrop, GwMacChange, NeighborMacCollision, Starvation, Wedge,
+};
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
 use types::Sample;
@@ -1272,7 +1274,8 @@ fn build_engine(
         store.clone(),
         cfg.blob_dir.clone(),
     ));
-    let gw_change_handlers: Vec<Arc<dyn Handler>> = vec![record.clone(), snap.clone(), freeze];
+    let gw_change_handlers: Vec<Arc<dyn Handler>> =
+        vec![record.clone(), snap.clone(), freeze.clone()];
 
     let triggers = vec![
         Trigger::new(
@@ -1288,6 +1291,21 @@ fn build_engine(
             BACKOFF_US,
         ),
         Trigger::new(Box::new(GwChange), gw_change_handlers, BACKOFF_US),
+        // The same gateway address answered by a new MAC freezes the ring like
+        // any other gateway change: the frames around the swap are the evidence
+        // that separates an ARP spoof from a silent move to another network.
+        Trigger::new(
+            Box::new(GwMacChange),
+            vec![record.clone(), snap.clone(), freeze],
+            BACKOFF_US,
+        ),
+        // An address collision is provable from the neighbors table alone, so
+        // it records and snapshots but does not spend a ring freeze.
+        Trigger::new(
+            Box::new(NeighborMacCollision),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
         Trigger::new(
             Box::new(FakeIp),
             vec![record.clone(), snap.clone()],
