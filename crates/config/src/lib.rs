@@ -126,6 +126,13 @@ pub struct NeighborsCfg {
     /// never a pretence of one.
     #[serde(default)]
     pub cve_snapshot_dir: Option<String>,
+    /// Directory holding the local OUI snapshot (a Wireshark `manuf` file at
+    /// `<dir>/manuf`) that the ROLE inference resolves a neighbour's MAC vendor
+    /// against. `None` by default, provisioned out-of-band like the CVE snapshot.
+    /// When `None`, absent, or unreadable, roles degrade to gateway/unknown only
+    /// — honestly, never a guessed vendor. (realm net-observer, node #36)
+    #[serde(default)]
+    pub oui_snapshot_dir: Option<String>,
 }
 
 /// Per-capability permission for the active neighbour scan, each off by default.
@@ -230,6 +237,7 @@ impl Default for Config {
                     interval: Duration::from_secs(120),
                     scan: ScanCfg::default(),
                     cve_snapshot_dir: None,
+                    oui_snapshot_dir: None,
                 },
                 pcap_ring: PcapCfg {
                     enabled: true,
@@ -370,6 +378,29 @@ mod tests {
         assert!(
             c.collectors.neighbors.cve_snapshot_dir.is_none(),
             "no snapshot directory until the operator provisions one"
+        );
+    }
+
+    #[test]
+    fn oui_snapshot_dir_absent_by_default_and_read_from_toml() {
+        let c = Config::load(None).unwrap();
+        assert!(
+            c.collectors.neighbors.oui_snapshot_dir.is_none(),
+            "no OUI snapshot until the operator provisions one — roles then \
+             degrade to gateway/unknown, never a guessed vendor"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("oui.toml");
+        std::fs::write(
+            &p,
+            "[collectors.neighbors]\noui_snapshot_dir = \"/var/lib/observer/oui\"\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert_eq!(
+            c.collectors.neighbors.oui_snapshot_dir.as_deref(),
+            Some("/var/lib/observer/oui")
         );
     }
 

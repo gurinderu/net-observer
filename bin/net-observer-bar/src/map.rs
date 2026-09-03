@@ -37,7 +37,7 @@ use gpui::{
 };
 
 use net_observer_ipc::StatusSnapshot;
-use types::{NeighborObs, NeighborSource, NeighborsSample};
+use types::{NeighborObs, NeighborRole, NeighborsSample};
 
 use crate::ui::{Glance, Theme};
 
@@ -84,8 +84,10 @@ struct MapNode {
     /// The neighbour's address, shown under the identity so a node is not only a
     /// MAC-derived handle. Empty only if the observation carried no address.
     ip: String,
-    /// Which reading produced this observation (passive cache vs operator scan).
-    source: NeighborSource,
+    /// The daemon's confidence-rated hypothesis about this neighbour's role, the
+    /// discriminator the accent seam colours by. A hypothesis, drawn as a subtle
+    /// dot colour — never a hard "SWITCH" label. (realm net-observer, node #33)
+    role: NeighborRole,
 }
 
 impl MapNode {
@@ -94,7 +96,7 @@ impl MapNode {
             mac: obs.mac.clone(),
             label: node_label(obs),
             ip: obs.ip.clone(),
-            source: obs.source,
+            role: obs.role,
         }
     }
 }
@@ -193,22 +195,25 @@ fn ring_positions(n: usize, cx: f32, cy: f32, r: f32) -> Vec<(f32, f32)> {
         .collect()
 }
 
-/// The dot colour for one node.
+/// The dot colour for one node — its ROLE hypothesis, drawn subtly.
 ///
-/// **Seam for the later vulnerability increment.** Today this only distinguishes
-/// the gateway (accent) from a passively-seen neighbour (fg) and an
-/// operator-scanned one (muted): a scanned host was reached by putting packets on
-/// the wire, so it reads as less load-bearing than one the kernel already knew. A
-/// future increment will colour each node by its security findings — attach that
-/// here, keyed on the node's identity, without touching the layout. The coloring
-/// belongs to the maps decision: (realm net-observer, node #34).
+/// The gateway keeps the accent (it is also `NeighborRole::Gateway`, but the map
+/// decides the gateway from the raw key before a `MapNode` exists, so honour that
+/// flag first). Infra reads in the semantic `warn` amber — distinct from the
+/// accent blue, the fg ink and the muted grey, so network gear stands out without
+/// a label; a host keeps the primary ink; an unknown role (randomized MAC, or no
+/// OUI snapshot to reason from) is muted, reading as least load-bearing. The role
+/// is a HYPOTHESIS: a colour, never an asserted "SWITCH". (realm net-observer,
+/// nodes #33, #34, #36)
 fn node_accent(node: &MapNode, is_gateway: bool, theme: Theme) -> Rgba {
     if is_gateway {
         return rgb(theme.accent);
     }
-    match node.source {
-        NeighborSource::Arp | NeighborSource::Ndp => rgb(theme.fg),
-        NeighborSource::Sweep | NeighborSource::Mdns => rgb(theme.muted),
+    match node.role {
+        NeighborRole::Gateway => rgb(theme.accent),
+        NeighborRole::Infra { .. } => rgb(theme.warn),
+        NeighborRole::Host => rgb(theme.fg),
+        NeighborRole::Unknown => rgb(theme.muted),
     }
 }
 
@@ -360,7 +365,7 @@ pub fn network_map_section(snapshot: &StatusSnapshot, theme: Theme) -> impl Into
                             mac: String::new(),
                             label: "gateway ?".to_string(),
                             ip: String::new(),
-                            source: NeighborSource::Arp,
+                            role: NeighborRole::Gateway,
                         },
                         true,
                         theme,
@@ -549,6 +554,7 @@ fn window_options(cx: &App) -> WindowOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use types::NeighborSource;
 
     fn obs(mac: &str, ip: &str, source: NeighborSource, hostname: Option<&str>) -> NeighborObs {
         NeighborObs {
@@ -556,6 +562,38 @@ mod tests {
             ip: ip.to_string(),
             source,
             hostname: hostname.map(str::to_string),
+            role: NeighborRole::Unknown,
+        }
+    }
+
+    /// The accent seam colours a node by its ROLE hypothesis: infra, host and
+    /// unknown each read as a distinct dot, and the gateway flag overrides the
+    /// role entirely. Checked in both themes so neither collapses two roles.
+    #[test]
+    fn node_accent_differs_by_role() {
+        let node = |role| MapNode {
+            mac: "aa:bb:cc:dd:ee:ff".into(),
+            label: "x".into(),
+            ip: "192.168.1.2".into(),
+            role,
+        };
+        for appearance in [gpui::WindowAppearance::Dark, gpui::WindowAppearance::Light] {
+            let theme = Theme::for_appearance(appearance);
+            let host = node_accent(&node(NeighborRole::Host), false, theme);
+            let infra = node_accent(
+                &node(NeighborRole::Infra {
+                    confidence: types::RoleConfidence::Low,
+                }),
+                false,
+                theme,
+            );
+            let unknown = node_accent(&node(NeighborRole::Unknown), false, theme);
+            assert_ne!(infra, host, "infra must not read as a host");
+            assert_ne!(infra, unknown, "infra must not read as unknown");
+            assert_ne!(host, unknown, "host must not read as unknown");
+            // The gateway flag wins over whatever role the node carries.
+            let gw = node_accent(&node(NeighborRole::Host), true, theme);
+            assert_eq!(gw, rgb(theme.accent));
         }
     }
 

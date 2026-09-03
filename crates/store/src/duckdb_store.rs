@@ -375,8 +375,8 @@ mod tests {
     use super::*;
     use crate::Store;
     use types::{
-        GwVerdict, LinkSample, NeighborObs, NeighborSource, NeighborsSample, NeighborsVerdict,
-        Sample, TcpVerdict,
+        GwVerdict, LinkSample, NeighborObs, NeighborRole, NeighborSource, NeighborsSample,
+        NeighborsVerdict, Sample, TcpVerdict,
     };
 
     /// A neighbours tick for one device, so the upsert rules can be driven.
@@ -398,6 +398,7 @@ mod tests {
                 ip: ip.into(),
                 source,
                 hostname: hostname.map(str::to_string),
+                role: NeighborRole::Unknown,
             }],
         })
     }

@@ -30,7 +30,7 @@ pub fn build_neighbors_sample(ts_us: i64, reading: Option<NeighborReading>) -> N
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{NeighborObs, NeighborSource};
+    use types::{NeighborObs, NeighborRole, NeighborSource};
 
     fn obs(mac: &str) -> NeighborObs {
         NeighborObs {
@@ -38,6 +38,7 @@ mod tests {
             ip: "192.168.1.5".into(),
             source: NeighborSource::Arp,
             hostname: None,
+            role: NeighborRole::Unknown,
         }
     }
 

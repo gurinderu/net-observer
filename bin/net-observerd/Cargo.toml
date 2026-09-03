@@ -17,6 +17,7 @@ collector-neighbors.workspace = true
 triggers.workspace = true
 macos.workspace = true
 vuln-db.workspace = true
+oui-db.workspace = true
 net-observer-ipc.workspace = true
 tokio = { workspace = true, features = ["net", "io-util"] }
 # Only for `geteuid` in the control-path authorisation policy (`api::ControlPolicy`).

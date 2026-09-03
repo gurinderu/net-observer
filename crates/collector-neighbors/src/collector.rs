@@ -5,9 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use collector_core::{Collector, CollectorMeta, Os, Readiness, Source};
+use oui_db::OuiDb;
 use types::Sample;
 
 use crate::facts::NeighborFacts;
+use crate::role::assign_passive_roles;
 use crate::sample::build_neighbors_sample;
 
 /// Static metadata for the `neighbors` collector. Only macOS is declared: the
@@ -27,12 +29,21 @@ pub const META: CollectorMeta = CollectorMeta {
 pub struct NeighborsCollector<F: NeighborFacts> {
     facts: Arc<F>,
     interval: Duration,
+    /// The OUI registry used to hypothesise each neighbour's ROLE, loaded once at
+    /// startup and shared. `None` when no snapshot is provisioned — roles then
+    /// degrade to gateway/unknown only, never a guessed vendor. (node #36)
+    oui: Option<Arc<OuiDb>>,
 }
 
 impl<F: NeighborFacts> NeighborsCollector<F> {
-    /// Construct from the neighbour-facts port and the poll interval.
-    pub fn new(facts: Arc<F>, interval: Duration) -> Self {
-        Self { facts, interval }
+    /// Construct from the neighbour-facts port, the poll interval, and the shared
+    /// OUI registry (`None` when no snapshot is provisioned).
+    pub fn new(facts: Arc<F>, interval: Duration, oui: Option<Arc<OuiDb>>) -> Self {
+        Self {
+            facts,
+            interval,
+            oui,
+        }
     }
 }
 
@@ -51,7 +62,10 @@ impl<F: NeighborFacts> Collector for NeighborsCollector<F> {
 
     async fn collect(&self, ts_us: i64) -> Vec<Sample> {
         let reading = self.facts.read().await;
-        vec![Sample::Neighbors(build_neighbors_sample(ts_us, reading))]
+        let mut sample = build_neighbors_sample(ts_us, reading);
+        // Passive ROLE hypothesis: gateway by key, vendor by OUI, no ports.
+        assign_passive_roles(&mut sample, self.oui.as_deref());
+        vec![Sample::Neighbors(sample)]
     }
 
     fn skip(&self, ts_us: i64) -> Vec<Sample> {
@@ -63,7 +77,7 @@ impl<F: NeighborFacts> Collector for NeighborsCollector<F> {
 mod tests {
     use super::*;
     use crate::facts::NeighborReading;
-    use types::{NeighborObs, NeighborSource, NeighborsVerdict};
+    use types::{NeighborObs, NeighborRole, NeighborSource, NeighborsVerdict};
 
     struct FakeFacts(Option<NeighborReading>);
     impl NeighborFacts for FakeFacts {
@@ -80,7 +94,7 @@ mod tests {
     }
 
     fn collector(reading: Option<NeighborReading>) -> NeighborsCollector<FakeFacts> {
-        NeighborsCollector::new(Arc::new(FakeFacts(reading)), Duration::from_secs(60))
+        NeighborsCollector::new(Arc::new(FakeFacts(reading)), Duration::from_secs(60), None)
     }
 
     #[tokio::test]
@@ -93,6 +107,7 @@ mod tests {
                 ip: "192.168.1.5".into(),
                 source: NeighborSource::Arp,
                 hostname: None,
+                role: NeighborRole::Unknown,
             }],
         }));
         assert!(c.preflight().await.is_ready());

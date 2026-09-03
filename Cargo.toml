@@ -97,6 +97,7 @@ collector-neighbors = { path = "crates/collector-neighbors" }
 triggers = { path = "crates/triggers" }
 macos = { path = "crates/macos" }
 vuln-db = { path = "crates/vuln-db" }
+oui-db = { path = "crates/oui-db" }
 
 # Release tuning. This daemon is I/O-bound and idle between ~15s ticks, so the
 # aim is NOT steady-state speed (there is no hot path to speed up) — it is a

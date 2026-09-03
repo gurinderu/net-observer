@@ -25,7 +25,7 @@
 use collector_core::Readiness;
 use collector_link::LinkFacts;
 use collector_neighbors::{NeighborFacts, NeighborReading};
-use types::{NeighborObs, NeighborSource};
+use types::{NeighborObs, NeighborRole, NeighborSource};
 
 use crate::dhcp_arp::{SystemFacts, run};
 
@@ -136,6 +136,7 @@ pub fn parse_arp_table(out: &str, iface: Option<&str>) -> Vec<NeighborObs> {
             ip: ip.to_string(),
             source: NeighborSource::Arp,
             hostname: None,
+            role: NeighborRole::Unknown,
         });
     }
     v
@@ -165,6 +166,7 @@ pub fn parse_ndp_table(out: &str, iface: Option<&str>) -> Vec<NeighborObs> {
             ip: ip.to_string(),
             source: NeighborSource::Ndp,
             hostname: None,
+            role: NeighborRole::Unknown,
         });
     }
     v
@@ -273,12 +275,14 @@ fe80::5%en5                          12:22:33:44:55:66  en5   1m0s      S";
                 ip: "fe80::1".into(),
                 source: NeighborSource::Ndp,
                 hostname: None,
+                role: NeighborRole::Unknown,
             },
             NeighborObs {
                 mac: "a4:83:e7:1b:2c:3d".into(),
                 ip: "192.168.1.1".into(),
                 source: NeighborSource::Arp,
                 hostname: None,
+                role: NeighborRole::Unknown,
             },
         ];
         v.sort_by(|a, b| (&a.mac, &a.ip).cmp(&(&b.mac, &b.ip)));
