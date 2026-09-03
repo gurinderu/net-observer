@@ -7,6 +7,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # `.cargo/config.toml` builds with `-C target-cpu=native`, which is right on
+  # the one Mac this daemon runs on and wrong here: on the virtualised runner
+  # `native` resolves to a CPU without `aes`/`sha2`, and ring's const-assert on
+  # the expected aarch64-apple features then fails the whole build before a test
+  # runs. An environment RUSTFLAGS REPLACES the config's, so setting it empty
+  # drops the tuning and takes rustc's own aarch64-apple baseline. CI gains
+  # nothing from host tuning anyway. (realm net-observer, node #45)
+  RUSTFLAGS: ""
 
 jobs:
   tests:
