@@ -24,7 +24,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use types::{NeighborObs, NeighborSource};
+use types::{NeighborObs, NeighborRole, NeighborSource};
 
 use crate::dhcp_arp::run;
 
@@ -157,6 +157,7 @@ pub fn join_names_onto_arp(
                 ip: n.ip.clone(),
                 source: NeighborSource::Mdns,
                 hostname: Some(host.clone()),
+                role: NeighborRole::Unknown,
             });
         }
     }
@@ -792,6 +793,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             ip: ip.into(),
             source: NeighborSource::Arp,
             hostname: None,
+            role: NeighborRole::Unknown,
         }
     }
 

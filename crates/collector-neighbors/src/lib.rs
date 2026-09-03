@@ -15,8 +15,10 @@
 
 pub mod collector;
 pub mod facts;
+pub mod role;
 pub mod sample;
 
 pub use collector::{META, NeighborsCollector};
 pub use facts::{NeighborFacts, NeighborReading};
+pub use role::{assign_passive_roles, assign_scan_roles, classify_role};
 pub use sample::build_neighbors_sample;

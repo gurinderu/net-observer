@@ -1007,6 +1007,7 @@ mod tests {
             ip: ip.into(),
             source: types::NeighborSource::Arp,
             hostname: None,
+            role: types::NeighborRole::Unknown,
         }
     }
 

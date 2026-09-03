@@ -1250,6 +1250,7 @@ name = "collector-neighbors"
 version = "0.0.0"
 dependencies = [
  "collector-core",
+ "oui-db",
  "tokio",
  "types",
 ]
@@ -4020,6 +4021,7 @@ dependencies = [
  "libc",
  "macos",
  "net-observer-ipc",
+ "oui-db",
  "serde_json",
  "store",
  "tempfile",
@@ -6897,6 +6899,7 @@ version = "0.0.0"
 dependencies = [
  "jiff",
  "serde",
+ "serde_json",
  "thiserror 2.0.19",
 ]
 

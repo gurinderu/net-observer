@@ -5,6 +5,7 @@ edition.workspace = true
 [dependencies]
 types.workspace = true
 collector-core.workspace = true
+oui-db.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

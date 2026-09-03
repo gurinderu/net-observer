@@ -133,6 +133,39 @@ fn main() -> anyhow::Result<()> {
 /// A store failure is logged as a gap and never fails startup: the daemon is
 /// collecting either way, and refusing to boot over a missing boundary row
 /// would trade a weaker record for no record at all.
+/// Load the shared OUI registry for neighbour ROLE inference, ONCE at startup.
+///
+/// The configured value is a directory (like the CVE snapshot); the registry is
+/// the Wireshark `manuf` file at `<dir>/manuf`. Every failure mode — no directory
+/// configured, a missing/unreadable file, or an empty index — returns `None`, and
+/// the inference then degrades to gateway/unknown only rather than guessing a
+/// vendor. (realm net-observer, node #36)
+fn load_oui_db(dir: Option<&str>) -> Option<Arc<oui_db::OuiDb>> {
+    let dir = dir?;
+    let path = Path::new(dir).join("manuf");
+    match oui_db::OuiDb::load_from_file(&path) {
+        Ok(db) if db.is_empty() => {
+            tracing::warn!(
+                path = %path.display(),
+                "OUI snapshot loaded but empty; neighbour roles degrade to gateway/unknown"
+            );
+            None
+        }
+        Ok(db) => {
+            tracing::info!(path = %path.display(), ouis = db.len(), "loaded OUI snapshot");
+            Some(Arc::new(db))
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "OUI snapshot could not be read; neighbour roles degrade to gateway/unknown"
+            );
+            None
+        }
+    }
+}
+
 fn record_startup_edge(
     store: &DuckdbStore,
     events_tx: &tokio::sync::broadcast::Sender<EncodedFrame>,
@@ -182,6 +215,13 @@ async fn run_daemon() -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(&cfg.blob_dir);
 
     let store = Arc::new(DuckdbStore::open(&cfg.db_path).context("opening store")?);
+
+    // The OUI registry for neighbour ROLE inference, loaded ONCE here and shared
+    // (Arc) by the passive collector and the active scanner — loading it per tick
+    // or per scan would re-read a large file for nothing. `None` when no snapshot
+    // is provisioned, or it will not load: roles then degrade to gateway/unknown
+    // only, never a guessed vendor. (realm net-observer, node #36)
+    let oui = load_oui_db(cfg.collectors.neighbors.oui_snapshot_dir.as_deref());
 
     // The live, in-memory snapshot the socket API serves. The pipeline consumer
     // keeps it current (latest sample per variant); the SnapshotHandler mirrors
@@ -322,6 +362,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 cfg.collectors.link.phys_iface.clone(),
             ))),
             cfg.collectors.neighbors.interval,
+            oui.clone(),
         )));
     }
     if cfg.collectors.route.enabled {
@@ -442,6 +483,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             resume_at_us.clone(),
             store.clone(),
             events_tx.clone(),
+            oui.clone(),
         );
         tokio::spawn(async move {
             if let Err(e) = server.serve().await {
@@ -640,13 +682,21 @@ pub(crate) struct SystemScanner {
     /// produces no findings — the honest refusal is decided in `api::scan_now`
     /// before the scan runs; this is the loader for a run that got that far.
     cve_snapshot_dir: Option<std::path::PathBuf>,
+    /// The shared OUI registry for ROLE inference, loaded once at startup. `None`
+    /// when no snapshot is provisioned: roles degrade to gateway/unknown only.
+    oui: Option<Arc<oui_db::OuiDb>>,
 }
 
 impl SystemScanner {
-    pub(crate) fn new(facts: SystemFacts, cve_snapshot_dir: Option<std::path::PathBuf>) -> Self {
+    pub(crate) fn new(
+        facts: SystemFacts,
+        cve_snapshot_dir: Option<std::path::PathBuf>,
+        oui: Option<Arc<oui_db::OuiDb>>,
+    ) -> Self {
         Self {
             facts,
             cve_snapshot_dir,
+            oui,
         }
     }
 }
@@ -774,6 +824,24 @@ impl NeighborScanner for SystemScanner {
                 });
                 report.cve_note = cve_note;
             }
+
+            // ROLE hypothesis, refined with the ports this scan found open. The
+            // passive collector sets a gateway/vendor-only role each tick; the
+            // open ports here can raise an infra vendor's confidence or name an
+            // SNMP-answering host as managed. A port row is already attributed to
+            // its owner's MAC by `compose_scan_report`, so group by MAC once.
+            let mut ports_by_mac: std::collections::HashMap<String, Vec<u16>> =
+                std::collections::HashMap::new();
+            for p in &report.ports {
+                ports_by_mac.entry(p.mac.clone()).or_default().push(p.port);
+            }
+            let key = report.network_key.clone();
+            collector_neighbors::assign_scan_roles(
+                &mut report.found,
+                key.as_deref(),
+                self.oui.as_deref(),
+                |mac| ports_by_mac.get(mac).map_or(&[][..], Vec::as_slice),
+            );
 
             Some(report)
         })
@@ -996,6 +1064,7 @@ fn build_api_server(
     resume_at_us: Arc<AtomicI64>,
     store: Arc<DuckdbStore>,
     events_tx: tokio::sync::broadcast::Sender<EncodedFrame>,
+    oui: Option<Arc<oui_db::OuiDb>>,
 ) -> api::ApiServer {
     let socket_path = cfg.socket_path.clone();
     let socket_mode = cfg.socket_mode;
@@ -1043,6 +1112,7 @@ fn build_api_server(
                 .cve_snapshot_dir
                 .as_ref()
                 .map(std::path::PathBuf::from),
+            oui.clone(),
         )) as Arc<dyn NeighborScanner>),
         // The config permission ceiling for the active scan.
         scan_permission: net_observer_ipc::ScanOptions {
@@ -1372,6 +1442,7 @@ mod tests {
             resume_at_us.clone(),
             store.clone(),
             events_tx.clone(),
+            None,
         );
 
         // The config reaches the socket verbatim.

@@ -1792,6 +1792,7 @@ mod tests {
                 ip: "192.168.1.5".into(),
                 source: types::NeighborSource::Sweep,
                 hostname: Some("printer.local".into()),
+                role: types::NeighborRole::Unknown,
             }],
             scans: vec![store::NeighborScan {
                 ts_us: 5000,
