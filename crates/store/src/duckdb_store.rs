@@ -107,9 +107,25 @@ impl DuckdbStore {
 
     /// Run an arbitrary query and return its column names plus stringified rows.
     pub fn query_table(&self, sql: &str) -> Result<QueryTable, StoreError> {
+        self.query_table_params(sql, &[])
+    }
+
+    /// Run a prepared query with positional `?` parameter values and return its
+    /// column names plus stringified rows.
+    ///
+    /// `params` is bound positionally, in the order the `?` placeholders appear
+    /// in `sql` — a value that is reused at several placeholders is passed once
+    /// per occurrence. This is how `diagnosis`'s per-moment builders (`realm
+    /// net-observer, node #29`) supply the moment and the thresholds they used
+    /// to interpolate as text: the value never becomes part of the SQL string.
+    pub fn query_table_params(
+        &self,
+        sql: &str,
+        params: &[&dyn duckdb::types::ToSql],
+    ) -> Result<QueryTable, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query(params)?;
         let columns = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
         let ncols = columns.len();
         let mut out_rows = Vec::new();

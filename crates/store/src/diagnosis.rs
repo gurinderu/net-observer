@@ -78,6 +78,24 @@
 //! join the whole storage choice was made for.
 
 use crate::{DuckdbStore, QueryTable, StoreError};
+use duckdb::types::{ToSql, Value};
+
+/// A prepared query alongside the values bound to its `?` placeholders, in the
+/// order those placeholders appear in the SQL text.
+///
+/// Values leave the SQL text: `?` goes into the string, the value it stands for
+/// goes into `params`, and the driver binds it without re-parsing it as SQL.
+/// Why the builders were moved off `format!`: (realm net-observer, node #29).
+pub struct PreparedSql {
+    pub sql: String,
+    pub params: Vec<Value>,
+}
+
+impl PreparedSql {
+    fn params_as_dyn(&self) -> Vec<&dyn ToSql> {
+        self.params.iter().map(|v| v as &dyn ToSql).collect()
+    }
+}
 
 /// Host `load1` above which a dead tun reads as starvation rather than a wedge.
 ///
@@ -159,19 +177,17 @@ observation_gap AS (
   WHERE rn = 1
 )";
 
-/// The gap containing `ts_expr`, or no row at all. At most one row.
-fn gap_at_cte(ts_expr: &str) -> String {
-    format!(
-        "gap_at AS (
+/// The gap containing the moment bound at its two `?` placeholders (the same
+/// value goes to both), or no row at all. At most one row.
+const GAP_AT_CTE: &str = "\
+gap_at AS (
   SELECT gap_opened_us, gap_closed_us
   FROM observation_gap
-  WHERE gap_opened_us <= {ts_expr}
-    AND (gap_closed_us IS NULL OR gap_closed_us > {ts_expr})
+  WHERE gap_opened_us <= ?
+    AND (gap_closed_us IS NULL OR gap_closed_us > ?)
   ORDER BY gap_opened_us DESC
   LIMIT 1
-)"
-    )
-}
+)";
 
 /// **Observation gaps** — every interval the operator paused collection for.
 ///
@@ -189,7 +205,9 @@ FROM observation_gap ORDER BY gap_opened_us"
 /// The `WITH` clause shared by the per-moment queries: one row per link sample,
 /// carrying every layer's state as of that moment plus the diagnosed layer, and
 /// the observation gaps that say when such a row is not a reading at all.
-fn layer_state_with(load_threshold: f64) -> String {
+///
+/// Binds one `?` — the starvation threshold — in `layer`'s `CASE`.
+fn layer_state_with() -> String {
     format!(
         "WITH {PROXY_TICK_CTE},
 layer_state AS (
@@ -210,7 +228,7 @@ layer_state AS (
            WHEN p.vless = 'FAIL' THEN 'vless'
            -- tun=000, but without load there is no telling wedge from starvation.
            WHEN p.tun_code = 0 AND h.load1 IS NULL THEN 'unknown'
-           WHEN p.tun_code = 0 AND h.load1 > {load_threshold} THEN 'host'
+           WHEN p.tun_code = 0 AND h.load1 > ? THEN 'host'
            WHEN p.tun_code = 0 THEN 'proxy'
            WHEN l.gw <> 'OK' OR l.direct <> 'OK' THEN 'unknown'
            ELSE 'healthy'
@@ -236,16 +254,16 @@ layer_state AS (
 /// bounds of the gap in `gap_opened_us` / `gap_closed_us`. The newest sample
 /// before the pause is a reading from before the pause, not a reading at
 /// `ts_us`, and it is withheld rather than labelled.
-pub fn verdict_at_sql(ts_us: i64, load_threshold: f64) -> String {
-    format!(
+pub fn verdict_at_sql(ts_us: i64, load_threshold: f64) -> PreparedSql {
+    let sql = format!(
         "{},
-{}
+{GAP_AT_CTE}
 SELECT ts_us, gw, gw_rtt_ms, direct, vless, tun_code, load1, layer,
        CAST(NULL AS BIGINT) AS gap_opened_us, CAST(NULL AS BIGINT) AS gap_closed_us
 FROM (
   SELECT ts_us, gw, gw_rtt_ms, direct, vless, tun_code, load1, layer
   FROM layer_state
-  WHERE ts_us <= {ts_us}
+  WHERE ts_us <= ?
   ORDER BY ts_us DESC
   LIMIT 1
 )
@@ -255,9 +273,20 @@ SELECT CAST(NULL AS BIGINT), CAST(NULL AS VARCHAR), CAST(NULL AS DOUBLE),
        CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), CAST(NULL AS USMALLINT),
        CAST(NULL AS DOUBLE), 'gap', gap_opened_us, gap_closed_us
 FROM gap_at",
-        layer_state_with(load_threshold),
-        gap_at_cte(&ts_us.to_string())
-    )
+        layer_state_with(),
+    );
+    // Bound in the order their `?` appear: the threshold in `layer_state_with`,
+    // then the moment twice in `GAP_AT_CTE`, then the moment once more in the
+    // final `WHERE`.
+    PreparedSql {
+        sql,
+        params: vec![
+            Value::Double(load_threshold),
+            Value::BigInt(ts_us),
+            Value::BigInt(ts_us),
+            Value::BigInt(ts_us),
+        ],
+    }
 }
 
 /// **Incident with its context** — for every incident, the layer state at or
@@ -267,8 +296,8 @@ FROM gap_at",
 /// context at all: its state columns are `NULL`, its `layer` is `'gap'`, and
 /// `gap_opened_us` / `gap_closed_us` bound the silence it opened in. The layer
 /// state from before the pause is not context for it.
-pub fn incident_context_sql(load_threshold: f64) -> String {
-    format!(
+pub fn incident_context_sql(load_threshold: f64) -> PreparedSql {
+    let sql = format!(
         "{},
 ctx AS (
   SELECT i.id,
@@ -303,8 +332,12 @@ LEFT JOIN observation_gap g
   ON g.gap_opened_us <= c.opened_us
  AND (g.gap_closed_us IS NULL OR g.gap_closed_us > c.opened_us)
 ORDER BY c.opened_us",
-        layer_state_with(load_threshold)
-    )
+        layer_state_with()
+    );
+    PreparedSql {
+        sql,
+        params: vec![Value::Double(load_threshold)],
+    }
 }
 
 /// **Wedge vs starvation** — the discriminator the project paid nine hours to
@@ -323,8 +356,8 @@ ORDER BY c.opened_us",
 ///   record cannot tell the two apart.
 ///
 /// Ticks with a `NULL` `tun_code` (the probe did not run) are not episodes.
-pub fn wedge_vs_starvation_sql(load_threshold: f64, gap_us: i64) -> String {
-    format!(
+pub fn wedge_vs_starvation_sql(load_threshold: f64, gap_us: i64) -> PreparedSql {
+    let sql = format!(
         "WITH {PROXY_TICK_CTE},
 dead AS (
   SELECT ts_us, vless FROM proxy_tick WHERE tun_code = 0
@@ -333,7 +366,7 @@ marked AS (
   SELECT ts_us,
          vless,
          CASE WHEN lag(ts_us) OVER (ORDER BY ts_us) IS NULL
-                OR ts_us - lag(ts_us) OVER (ORDER BY ts_us) > {gap_us}
+                OR ts_us - lag(ts_us) OVER (ORDER BY ts_us) > ?
               THEN 1 ELSE 0 END AS starts_episode
   FROM dead
 ),
@@ -359,13 +392,17 @@ SELECT episode,
                          OR coalesce(direct, 'MISSING') <> 'OK'
                        THEN 1 ELSE 0 END) = 1 THEN 'unknown'
          WHEN count(load1) = 0 THEN 'unknown'
-         WHEN max(load1) > {load_threshold} THEN 'starvation'
+         WHEN max(load1) > ? THEN 'starvation'
          ELSE 'wedge'
        END AS verdict
 FROM ctx
 GROUP BY episode
 ORDER BY opened_us"
-    )
+    );
+    PreparedSql {
+        sql,
+        params: vec![Value::BigInt(gap_us), Value::Double(load_threshold)],
+    }
 }
 
 /// **Gateway drops** — the first link sample of each run of `FAIL`/`NOGW`.
@@ -400,14 +437,14 @@ ORDER BY ts_us";
 /// `observation_gap_us` — present on every row — says how many microseconds of
 /// the window the daemon was paused for. The listed rows are still real
 /// samples, so the shape can be read by eye; only the number is withheld.
-pub fn gateway_ramp_sql(drop_ts_us: i64, window_us: i64) -> String {
-    format!(
+pub fn gateway_ramp_sql(drop_ts_us: i64, window_us: i64) -> PreparedSql {
+    let sql = format!(
         "WITH {SAMPLE_TS_CTE},
 {OBSERVATION_GAP_CTE},
 win AS (
   SELECT ts_us, gw, gw_rtt_ms
   FROM link_sample
-  WHERE ts_us <= {drop_ts_us} AND ts_us >= {drop_ts_us} - {window_us}
+  WHERE ts_us <= ? AND ts_us >= ? - ?
 ),
 fit AS (
   SELECT regr_slope(gw_rtt_ms, ts_us) * 1000000.0 AS slope_ms_per_s,
@@ -418,13 +455,13 @@ fit AS (
 overlap AS (
   SELECT CAST(coalesce(sum(greatest(
            0,
-           least(coalesce(gap_closed_us, {drop_ts_us}), {drop_ts_us})
-             - greatest(gap_opened_us, {drop_ts_us} - {window_us})
+           least(coalesce(gap_closed_us, ?), ?)
+             - greatest(gap_opened_us, ? - ?)
          )), 0) AS BIGINT) AS observation_gap_us
   FROM observation_gap
 )
 SELECT w.ts_us,
-       {drop_ts_us} - w.ts_us AS us_before_drop,
+       ? - w.ts_us AS us_before_drop,
        w.gw,
        w.gw_rtt_ms,
        CASE WHEN o.observation_gap_us = 0 THEN f.slope_ms_per_s END AS slope_ms_per_s,
@@ -432,7 +469,22 @@ SELECT w.ts_us,
        o.observation_gap_us
 FROM win w, fit f, overlap o
 ORDER BY w.ts_us"
-    )
+    );
+    // Bound in text order: win's (drop, drop, window), overlap's
+    // (drop, drop, drop, window), then the final SELECT's drop.
+    PreparedSql {
+        sql,
+        params: vec![
+            Value::BigInt(drop_ts_us),
+            Value::BigInt(drop_ts_us),
+            Value::BigInt(window_us),
+            Value::BigInt(drop_ts_us),
+            Value::BigInt(drop_ts_us),
+            Value::BigInt(drop_ts_us),
+            Value::BigInt(window_us),
+            Value::BigInt(drop_ts_us),
+        ],
+    }
 }
 
 /// **Fakeip on a `.ru` name** — always a bug, per the oracle.
@@ -700,19 +752,27 @@ fn validate_network_key(n: &str) -> Result<(), BadNetworkKey> {
 }
 
 impl DuckdbStore {
+    /// Run a [`PreparedSql`] built by one of this module's parameterized
+    /// builders — the moment/threshold values are bound, never interpolated.
+    /// Exposed so callers outside this crate (the CLI's offline `diagnose`
+    /// commands) never need to depend on `duckdb`'s types directly.
+    pub fn query_prepared(&self, p: &PreparedSql) -> Result<QueryTable, StoreError> {
+        self.query_table_params(&p.sql, &p.params_as_dyn())
+    }
+
     /// Run [`verdict_at_sql`] with [`DEFAULT_STARVATION_LOAD`].
     pub fn verdict_at(&self, ts_us: i64) -> Result<QueryTable, StoreError> {
-        self.query_table(&verdict_at_sql(ts_us, DEFAULT_STARVATION_LOAD))
+        self.query_prepared(&verdict_at_sql(ts_us, DEFAULT_STARVATION_LOAD))
     }
 
     /// Run [`incident_context_sql`] with [`DEFAULT_STARVATION_LOAD`].
     pub fn incident_context(&self) -> Result<QueryTable, StoreError> {
-        self.query_table(&incident_context_sql(DEFAULT_STARVATION_LOAD))
+        self.query_prepared(&incident_context_sql(DEFAULT_STARVATION_LOAD))
     }
 
     /// Run [`wedge_vs_starvation_sql`] with the defaults.
     pub fn wedge_vs_starvation(&self) -> Result<QueryTable, StoreError> {
-        self.query_table(&wedge_vs_starvation_sql(
+        self.query_prepared(&wedge_vs_starvation_sql(
             DEFAULT_STARVATION_LOAD,
             DEFAULT_EPISODE_GAP_US,
         ))
@@ -725,7 +785,7 @@ impl DuckdbStore {
 
     /// Run [`gateway_ramp_sql`] with [`DEFAULT_RAMP_WINDOW_US`].
     pub fn gateway_ramp(&self, drop_ts_us: i64) -> Result<QueryTable, StoreError> {
-        self.query_table(&gateway_ramp_sql(drop_ts_us, DEFAULT_RAMP_WINDOW_US))
+        self.query_prepared(&gateway_ramp_sql(drop_ts_us, DEFAULT_RAMP_WINDOW_US))
     }
 
     /// Run [`FAKEIP_BUGS_SQL`].
