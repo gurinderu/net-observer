@@ -1212,6 +1212,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "collector-air"
+version = "0.0.0"
+dependencies = [
+ "collector-core",
+ "tokio",
+ "types",
+]
+
+[[package]]
 name = "collector-core"
 version = "0.0.0"
 dependencies = [
@@ -3775,6 +3784,7 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 name = "macos"
 version = "0.0.0"
 dependencies = [
+ "collector-air",
  "collector-core",
  "collector-dns",
  "collector-host",
@@ -4027,6 +4037,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "collector-air",
  "collector-core",
  "collector-dns",
  "collector-host",

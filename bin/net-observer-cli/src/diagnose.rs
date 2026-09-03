@@ -517,6 +517,156 @@ pub(crate) fn format_observation_gaps(table: &QueryTable) -> Result<String> {
     Ok(out)
 }
 
+/// Render the latest air slice: what the last scan heard, ranked by how likely
+/// each access point is to be sitting on our own band.
+///
+/// Three refusals, each rendered as one (realm net-observer, nodes #47 and #48):
+///
+/// - **the scan could not run** — `air = SKIP` prints its reason, and no list at
+///   all, because an empty list would read as clear air;
+/// - **our own channel is unknown** — the access points still print, but the
+///   overlap column says so rather than showing zeroes;
+/// - **an access point's channel is unreadable** — its overlap cell is
+///   [`ABSENT`], not a nought.
+///
+/// The wording never claims measured interference. macOS reports no channel
+/// occupancy to anybody, so "OVERLAP" is a band-geometry hypothesis and the
+/// legend under the table says exactly that.
+pub(crate) fn format_air(scan: &QueryTable, aps: &QueryTable, own: &QueryTable) -> Result<String> {
+    let c = Cols(&scan.columns);
+    let (ts_i, air_i, reason_i, count_i) = (
+        c.idx("ts_us")?,
+        c.idx("air")?,
+        c.idx("reason")?,
+        c.idx("ap_count")?,
+    );
+    let Some(row) = scan.rows.first() else {
+        return Ok(
+            "no air scan in the record: the `air` collector is off, or has not run yet\n"
+                .to_string(),
+        );
+    };
+    let mut out = String::new();
+    kv(&mut out, "scanned", &stamp(at(row, ts_i)));
+    if at(row, air_i) != "OK" {
+        kv(&mut out, "air", "SKIP");
+        kv(&mut out, "reason", &measured(row, reason_i, ABSENT));
+        out.push_str(
+            "\nThe scan could not run, so nothing is known about the air at that moment.\n\
+             This is NOT an empty radio environment.\n",
+        );
+        return Ok(out);
+    }
+    kv(&mut out, "heard", &measured(row, count_i, "0"));
+
+    // Our own channel, and what its absence costs.
+    let own_span = own_channel(own)?;
+    match own_span {
+        Some(s) => kv(
+            &mut out,
+            "our channel",
+            &format!("{} ({}, {} MHz)", s.channel, s.band.as_str(), s.width_mhz),
+        ),
+        None => kv(&mut out, "our channel", "(unknown - overlap not computed)"),
+    }
+
+    let a = Cols(&aps.columns);
+    let (ch_i, band_i, width_i, phy_i, sec_i, rssi_i, noise_i) = (
+        a.idx("channel")?,
+        a.idx("channel_band")?,
+        a.idx("channel_width_mhz")?,
+        a.idx("phy_mode")?,
+        a.idx("security")?,
+        a.idx("rssi_dbm")?,
+        a.idx("noise_dbm")?,
+    );
+    // Build (rank, rendered row) so the ordering is the hypothesis's own — the
+    // SQL ordering is only a stable fallback for when there is nothing to rank by.
+    let mut ranked: Vec<((i64, i32), Vec<String>)> = Vec::new();
+    for row in &aps.rows {
+        let channel = at(row, ch_i).parse::<i32>().ok();
+        let band = at(row, band_i);
+        let width = at(row, width_i).parse::<i32>().ok();
+        let rssi = at(row, rssi_i).parse::<i32>().ok();
+        let their = types::ChannelSpan::new(
+            channel,
+            if band.is_empty() { None } else { Some(band) },
+            width,
+        );
+        let hypothesis = match (own_span, their) {
+            (Some(ours), Some(theirs)) => Some(types::overlap_hypothesis(&ours, &theirs, rssi)),
+            _ => None,
+        };
+        let (overlap_cell, confidence_cell, rank) = match hypothesis {
+            Some(h) => (
+                format!("{:.0}%", h.overlap * 100.0),
+                format!("{:?}", h.confidence).to_lowercase(),
+                h.rank_key(),
+            ),
+            // No own channel, or no readable channel on their side: there is
+            // nothing to compute, and a zero would read as "does not overlap".
+            None => (ABSENT.to_string(), ABSENT.to_string(), (i64::MIN, i32::MIN)),
+        };
+        ranked.push((
+            rank,
+            vec![
+                measured(row, ch_i, ABSENT),
+                measured(row, band_i, ABSENT),
+                measured(row, width_i, ABSENT),
+                measured(row, rssi_i, ABSENT),
+                measured(row, noise_i, ABSENT),
+                overlap_cell,
+                confidence_cell,
+                measured(row, phy_i, ABSENT),
+                measured(row, sec_i, ABSENT),
+            ],
+        ));
+    }
+    if ranked.is_empty() {
+        out.push_str("\nThe scan ran and heard no other access point.\n");
+        return Ok(out);
+    }
+    // Descending: the strongest overlap, then the loudest signal, comes first.
+    ranked.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let rows: Vec<Vec<String>> = ranked.into_iter().map(|(_, r)| r).collect();
+    out.push('\n');
+    out.push_str(&aligned(
+        &[
+            "CH", "BAND", "WIDTH", "RSSI", "NOISE", "OVERLAP", "CONF", "PHY", "SECURITY",
+        ],
+        &rows,
+    ));
+    out.push_str(AIR_LEGEND);
+    Ok(out)
+}
+
+/// What the OVERLAP column is and, more importantly, what it is not.
+const AIR_LEGEND: &str = "\n\
+OVERLAP is how much of the narrower of the two channels the two bands share, \n\
+computed from channel numbers and widths - a HYPOTHESIS about who may be in our \n\
+band, ordered loudest-first within equal overlap. It is NOT measured \n\
+interference and NOT airtime taken: macOS reports no channel occupancy to any \n\
+program, so no such number exists here. CONF says how much of it was reported \n\
+rather than assumed. The report also carries no BSSID, so these access points \n\
+cannot be matched to those of any other scan.\n";
+
+/// Our own channel as the record last had it, or `None` when the radio never
+/// reported one (never associated, or the `wifi` collector off).
+fn own_channel(own: &QueryTable) -> Result<Option<types::ChannelSpan>> {
+    let Some(row) = own.rows.first() else {
+        return Ok(None);
+    };
+    let c = Cols(&own.columns);
+    let channel = at(row, c.idx("channel")?).parse::<i32>().ok();
+    let band = at(row, c.idx("channel_band")?).to_string();
+    let width = at(row, c.idx("channel_width_mhz")?).parse::<i32>().ok();
+    Ok(types::ChannelSpan::new(
+        channel,
+        if band.is_empty() { None } else { Some(&band) },
+        width,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +681,141 @@ mod tests {
                 .map(|r| r.iter().map(|c| (*c).to_string()).collect())
                 .collect(),
         }
+    }
+
+    const AIR_SCAN_COLS: &[&str] = &["ts_us", "air", "reason", "ap_count"];
+    const AIR_AP_COLS: &[&str] = &[
+        "channel",
+        "channel_band",
+        "channel_width_mhz",
+        "phy_mode",
+        "security",
+        "rssi_dbm",
+        "noise_dbm",
+    ];
+    const AIR_OWN_COLS: &[&str] = &["ts_us", "channel", "channel_band", "channel_width_mhz"];
+
+    fn own_on(channel: &str, band: &str, width: &str) -> QueryTable {
+        table(AIR_OWN_COLS, &[&["1000", channel, band, width]])
+    }
+
+    /// A scan the daemon could not run is a refusal with its reason — and says
+    /// in so many words that this is not an empty radio environment.
+    #[test]
+    fn a_skipped_air_scan_reads_as_a_refusal_not_as_clear_air() {
+        let scan = table(
+            AIR_SCAN_COLS,
+            &[&["1000", "SKIP", "Wi-Fi powered off", "0"]],
+        );
+        let out = format_air(&scan, &table(AIR_AP_COLS, &[]), &own_on("36", "5ghz", "80")).unwrap();
+        assert!(out.contains("SKIP"));
+        assert!(out.contains("Wi-Fi powered off"));
+        assert!(out.contains("NOT an empty radio environment"));
+        assert!(
+            !out.contains("OVERLAP"),
+            "no table for a scan that never ran"
+        );
+    }
+
+    /// A scan that ran and heard nobody is the OTHER fact, and says so.
+    #[test]
+    fn a_scan_that_heard_nobody_says_it_ran() {
+        let scan = table(AIR_SCAN_COLS, &[&["1000", "OK", "", "0"]]);
+        let out = format_air(&scan, &table(AIR_AP_COLS, &[]), &own_on("36", "5ghz", "80")).unwrap();
+        assert!(out.contains("heard no other access point"));
+    }
+
+    #[test]
+    fn no_scan_at_all_names_the_collector_rather_than_printing_a_blank() {
+        let out = format_air(
+            &table(AIR_SCAN_COLS, &[]),
+            &table(AIR_AP_COLS, &[]),
+            &table(AIR_OWN_COLS, &[]),
+        )
+        .unwrap();
+        assert!(out.contains("no air scan in the record"));
+    }
+
+    /// The ordering is the point of the command: an AP squarely in our band
+    /// outranks a louder one that is nowhere near it.
+    #[test]
+    fn access_points_are_ranked_by_overlap_before_loudness() {
+        let scan = table(AIR_SCAN_COLS, &[&["1000", "OK", "", "2"]]);
+        let aps = table(
+            AIR_AP_COLS,
+            &[
+                // Loud, but on a different band entirely.
+                &["6", "2ghz", "20", "802.11n", "wpa2", "-40", "-95"],
+                // Quieter, but sharing our exact channel.
+                &["36", "5ghz", "80", "802.11ax", "wpa3", "-80", "-95"],
+            ],
+        );
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80")).unwrap();
+        let on_channel = out.find("-80").expect("the on-channel AP is listed");
+        let off_channel = out.find("-40").expect("the off-channel AP is listed");
+        assert!(
+            on_channel < off_channel,
+            "the AP in our band must come first:\n{out}"
+        );
+        assert!(out.contains("100%"));
+        assert!(out.contains("0%"));
+    }
+
+    /// Every wording rule the epistemic boundary imposes, checked on the output
+    /// the operator actually reads (realm net-observer, node #48).
+    #[test]
+    fn the_output_never_claims_measured_interference() {
+        let scan = table(AIR_SCAN_COLS, &[&["1000", "OK", "", "1"]]);
+        let aps = table(
+            AIR_AP_COLS,
+            &[&["40", "5ghz", "20", "802.11ax", "wpa3", "-70", "-95"]],
+        );
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80")).unwrap();
+        assert!(out.contains("HYPOTHESIS"));
+        assert!(out.contains("NOT measured"));
+        assert!(out.contains("no channel occupancy"));
+        let lower = out.to_lowercase();
+        assert!(!lower.contains("airtime taken by"), "no airtime claim");
+        assert!(
+            !lower.contains("interfering with"),
+            "no asserted interference"
+        );
+    }
+
+    /// Without our own channel the access points still print — the overlap
+    /// column refuses instead of showing a column of zeroes, which would read as
+    /// "nobody is near us".
+    #[test]
+    fn an_unknown_own_channel_withholds_the_overlap_rather_than_zeroing_it() {
+        let scan = table(AIR_SCAN_COLS, &[&["1000", "OK", "", "1"]]);
+        let aps = table(
+            AIR_AP_COLS,
+            &[&["40", "5ghz", "20", "802.11ax", "wpa3", "-70", "-95"]],
+        );
+        let out = format_air(&scan, &aps, &table(AIR_OWN_COLS, &[])).unwrap();
+        assert!(out.contains("overlap not computed"));
+        assert!(out.contains(ABSENT));
+        assert!(!out.contains("0%"));
+    }
+
+    /// An AP whose channel the report garbled keeps its row, and its overlap
+    /// cell refuses rather than reading as "does not overlap".
+    #[test]
+    fn an_ap_without_a_readable_channel_withholds_its_overlap() {
+        let scan = table(AIR_SCAN_COLS, &[&["1000", "OK", "", "2"]]);
+        let aps = table(
+            AIR_AP_COLS,
+            &[
+                &["", "", "", "802.11ax", "wpa3", "-55", "-95"],
+                &["36", "5ghz", "80", "802.11ax", "wpa3", "-80", "-95"],
+            ],
+        );
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80")).unwrap();
+        assert!(out.contains(ABSENT));
+        // And it sorts last, below everything that could be placed at all.
+        let unplaceable = out.find("-55").unwrap();
+        let placed = out.find("-80").unwrap();
+        assert!(placed < unplaceable);
     }
 
     const VERDICT_COLS: &[&str] = &[

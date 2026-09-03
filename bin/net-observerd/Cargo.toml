@@ -14,6 +14,7 @@ collector-route.workspace = true
 collector-host.workspace = true
 collector-wifi.workspace = true
 collector-neighbors.workspace = true
+collector-air.workspace = true
 triggers.workspace = true
 macos.workspace = true
 vuln-db.workspace = true

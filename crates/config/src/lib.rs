@@ -38,6 +38,8 @@ pub struct Collectors {
     pub route: RouteCfg,
     pub host: HostCfg,
     pub wifi: WifiCfg,
+    #[serde(default)]
+    pub air: AirCfg,
     pub neighbors: NeighborsCfg,
     pub pcap_ring: PcapCfg,
 }
@@ -95,6 +97,31 @@ pub struct WifiCfg {
     pub enabled: bool,
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
+}
+
+/// The `air` collector: the radio environment — which foreign access points are
+/// audible, on which channels and how loudly (realm net-observer, node #48).
+///
+/// **Off by default**, unlike the other passive collectors, and on its **own
+/// slow interval** rather than the tick. Not because it emits anything — it does
+/// not; it reads the system's own wireless report — but because producing that
+/// report costs seconds of wall time per call (realm net-observer, node #47). A
+/// subsystem whose every sample occupies a collector for that long is one the
+/// operator opts into, and its period is minutes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AirCfg {
+    pub enabled: bool,
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+}
+
+impl Default for AirCfg {
+    fn default() -> Self {
+        AirCfg {
+            enabled: false,
+            interval: Duration::from_secs(300),
+        }
+    }
 }
 
 /// The serde default for a `bool` field that should default to `true` when the
@@ -247,6 +274,7 @@ impl Default for Config {
                     enabled: true,
                     interval: Duration::from_secs(15),
                 },
+                air: AirCfg::default(),
                 neighbors: NeighborsCfg {
                     enabled: true,
                     interval: Duration::from_secs(120),

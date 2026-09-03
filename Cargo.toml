@@ -13,6 +13,7 @@ members = [
     "crates/collector-host",
     "crates/collector-wifi",
     "crates/collector-neighbors",
+    "crates/collector-air",
     "crates/triggers",
     "crates/macos",
     "crates/vuln-db",
@@ -41,6 +42,7 @@ default-members = [
     "crates/collector-host",
     "crates/collector-wifi",
     "crates/collector-neighbors",
+    "crates/collector-air",
     "crates/triggers",
     "crates/macos",
     "crates/vuln-db",
@@ -104,6 +106,7 @@ collector-route = { path = "crates/collector-route" }
 collector-host = { path = "crates/collector-host" }
 collector-wifi = { path = "crates/collector-wifi" }
 collector-neighbors = { path = "crates/collector-neighbors" }
+collector-air = { path = "crates/collector-air" }
 triggers = { path = "crates/triggers" }
 macos = { path = "crates/macos" }
 vuln-db = { path = "crates/vuln-db" }

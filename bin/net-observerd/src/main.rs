@@ -20,6 +20,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use collector_air::AirCollector;
 use collector_core::{Collector, CollectorMeta, EventSource, Os, Readiness, Source};
 use collector_dns::DnsCollector;
 use collector_host::HostCollector;
@@ -32,7 +33,7 @@ use config::Config;
 use macos::LldpCapture;
 use macos::{
     BoundTcpProber, CoreWlanFacts, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource,
-    ProxySystemFacts, SystemFacts, SystemNeighbors, TcpdumpLldpCapture,
+    ProxySystemFacts, SystemFacts, SystemNeighbors, SystemProfilerAir, TcpdumpLldpCapture,
 };
 use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{EncodedFrame, StatusSnapshot};
@@ -437,6 +438,15 @@ async fn run_daemon() -> anyhow::Result<()> {
             cfg.collectors.wifi.interval,
         )));
     }
+    if cfg.collectors.air.enabled {
+        // Off unless the operator asked for it, and on its own slow period: the
+        // system wireless report costs seconds per call (realm net-observer,
+        // node #47). It transmits nothing — it only reads that report.
+        collectors.push(AnyCollector::Air(AirCollector::new(
+            Arc::new(SystemProfilerAir::new()),
+            cfg.collectors.air.interval,
+        )));
+    }
     if cfg.collectors.neighbors.enabled {
         // Shares the link collector's `SystemFacts` so the gateway and interface
         // it keys neighbours by are the same ones the link collector probes,
@@ -675,6 +685,7 @@ pub(crate) enum AnyCollector {
     Host(HostCollector<HostLoad>),
     Wifi(WifiCollector<CoreWlanFacts>),
     Neighbors(NeighborsCollector<SystemNeighbors>),
+    Air(AirCollector<SystemProfilerAir>),
     /// Test-only: an interval collector with a flippable preflight (see
     /// [`FakeCollector`]).
     #[cfg(test)]
@@ -692,6 +703,7 @@ impl AnyCollector {
             Self::Host(c) => c.meta(),
             Self::Wifi(c) => c.meta(),
             Self::Neighbors(c) => c.meta(),
+            Self::Air(c) => c.meta(),
             #[cfg(test)]
             Self::Fake(c) => c.meta(),
         }
@@ -707,6 +719,7 @@ impl AnyCollector {
             Self::Host(c) => c.source(),
             Self::Wifi(c) => c.source(),
             Self::Neighbors(c) => c.source(),
+            Self::Air(c) => c.source(),
             #[cfg(test)]
             Self::Fake(c) => c.source(),
         }
@@ -722,6 +735,7 @@ impl AnyCollector {
             Self::Host(c) => c.preflight().await,
             Self::Wifi(c) => c.preflight().await,
             Self::Neighbors(c) => c.preflight().await,
+            Self::Air(c) => c.preflight().await,
             #[cfg(test)]
             Self::Fake(c) => c.preflight().await,
         }
@@ -739,6 +753,7 @@ impl AnyCollector {
             Self::Host(c) => c.collect(ts_us).await,
             Self::Wifi(c) => c.collect(ts_us).await,
             Self::Neighbors(c) => c.collect(ts_us).await,
+            Self::Air(c) => c.collect(ts_us).await,
             #[cfg(test)]
             Self::Fake(c) => c.collect(ts_us).await,
         }
@@ -755,6 +770,7 @@ impl AnyCollector {
             Self::Host(c) => c.skip(ts_us),
             Self::Wifi(c) => c.skip(ts_us),
             Self::Neighbors(c) => c.skip(ts_us),
+            Self::Air(c) => c.skip(ts_us),
             #[cfg(test)]
             Self::Fake(c) => c.skip(ts_us),
         }
@@ -771,6 +787,7 @@ impl AnyCollector {
             Self::Host(c) => Box::new(c).into_event_source(),
             Self::Wifi(c) => Box::new(c).into_event_source(),
             Self::Neighbors(c) => Box::new(c).into_event_source(),
+            Self::Air(c) => Box::new(c).into_event_source(),
             #[cfg(test)]
             Self::Fake(c) => Box::new(c).into_event_source(),
         }
