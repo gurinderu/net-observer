@@ -87,8 +87,8 @@ use duckdb::types::{ToSql, Value};
 /// goes into `params`, and the driver binds it without re-parsing it as SQL.
 /// Why the builders were moved off `format!`: (realm net-observer, node #29).
 pub struct PreparedSql {
-    pub sql: String,
-    pub params: Vec<Value>,
+    sql: String,
+    params: Vec<Value>,
 }
 
 impl PreparedSql {
