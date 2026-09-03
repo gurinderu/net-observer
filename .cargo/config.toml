@@ -6,7 +6,11 @@
 # a single-host artifact.
 #
 # Note: an environment `RUSTFLAGS` REPLACES (does not merge with) this, so a
-# context that sets it — CI's `-D warnings` lint job — silently drops the flag.
-# That is harmless there: linting needs no host tuning.
+# context that sets it — CI's lint job, and now its test job — silently drops
+# the flag. That is not merely harmless there, it is required: on a virtualised
+# GitHub runner `native` resolves to a CPU WITHOUT `aes`/`sha2`, and any
+# dependency asserting the expected aarch64-apple feature set (ring does) fails
+# to compile. Both workflows therefore set RUSTFLAGS explicitly.
+# (realm net-observer, node #45)
 [build]
 rustflags = ["-C", "target-cpu=native"]
