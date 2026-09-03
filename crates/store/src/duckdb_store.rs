@@ -339,7 +339,11 @@ impl Store for DuckdbStore {
              ON CONFLICT (iface, remote_chassis, remote_port) DO UPDATE SET
                remote_system_name =
                  COALESCE(excluded.remote_system_name, topology_link.remote_system_name),
-               capabilities = excluded.capabilities,
+               -- Keep a previously-learned capability set when a later frame
+               -- carries no System-Capabilities TLV (empty string), mirroring the
+               -- system-name COALESCE: silent wrong data is worse than none.
+               capabilities =
+                 COALESCE(NULLIF(excluded.capabilities, ''), topology_link.capabilities),
                learned_via = excluded.learned_via,
                last_seen_us = excluded.last_seen_us",
             params![
@@ -633,6 +637,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(t.rows[0], vec!["1000", "2000", "sw1", "bridge,router"]);
+
+        // A THIRD sighting whose frame carried no capabilities TLV (empty string)
+        // must NOT blank the previously-learned set — empty is absence, not "none".
+        s.write_topology_link(&TopologyLink {
+            iface: "en0".into(),
+            remote_chassis: "00:11:22:33:44:55".into(),
+            remote_port: "Gi0/1".into(),
+            remote_system_name: None,
+            capabilities: String::new(),
+            learned_via: LearnedVia::Lldp,
+            ts_us: 3000,
+        })
+        .unwrap();
+        let cap = s
+            .query_table("SELECT capabilities FROM topology_link")
+            .unwrap();
+        assert_eq!(
+            cap.rows[0],
+            vec!["bridge,router"],
+            "empty caps must not erase"
+        );
     }
 
     /// A CVE hypothesis upserts onto its port keeping the first sighting; a later

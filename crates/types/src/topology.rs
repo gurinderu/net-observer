@@ -38,13 +38,19 @@ const ETH_HEADER_LEN: usize = 14;
 
 /// How a topology link was learned. Serialised as its lowercase token
 /// (`"lldp"` / `"cdp"`) so it reads the same in the store column and on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LearnedVia {
     /// IEEE 802.1AB LLDP.
     Lldp,
     /// Cisco Discovery Protocol.
     Cdp,
+    /// A protocol a newer peer knows and this build does not: the `#[serde(other)]`
+    /// sink, so an unknown token decodes here instead of failing the whole
+    /// `StatusSnapshot` decode and blanking an older reader.
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 impl LearnedVia {
@@ -54,6 +60,7 @@ impl LearnedVia {
         match self {
             LearnedVia::Lldp => "lldp",
             LearnedVia::Cdp => "cdp",
+            LearnedVia::Unknown => "unknown",
         }
     }
 }
@@ -103,9 +110,17 @@ pub fn link_from_frame(eth: &[u8], iface: &str, ts_us: i64) -> Option<TopologyLi
     if eth.len() < ETH_HEADER_LEN {
         return None;
     }
-    // Bytes 12..14 are the EtherType (LLDP) or the 802.3 length (CDP path).
-    let ethertype = u16::from_be_bytes([eth[12], eth[13]]);
-    let payload = &eth[ETH_HEADER_LEN..];
+    // Bytes 12..14 are the EtherType (LLDP) or the 802.3 length (CDP path). A
+    // single 802.1Q VLAN tag (0x8100) is peeled first: the real EtherType and
+    // payload sit 4 bytes further on. LLDP is normally untagged, but a tagged
+    // trunk would otherwise silently yield no edges.
+    let (ethertype, payload) = match u16::from_be_bytes([eth[12], eth[13]]) {
+        0x8100 if eth.len() >= ETH_HEADER_LEN + 4 => (
+            u16::from_be_bytes([eth[16], eth[17]]),
+            &eth[ETH_HEADER_LEN + 4..],
+        ),
+        other => (other, &eth[ETH_HEADER_LEN..]),
+    };
 
     if ethertype == ETHERTYPE_LLDP {
         link_from_lldp(payload, iface, ts_us)
@@ -251,6 +266,29 @@ mod tests {
             0x0e, 0x04, 0x00, 0x04, 0x00, 0x04, // system name TLV (type 5): "sw1"
             0x0a, 0x03, b's', b'w', b'1', 0x00, 0x00, // end
         ]
+    }
+
+    /// A single 802.1Q VLAN tag before the LLDP EtherType is peeled, so a
+    /// tagged-trunk LLDP frame still yields an edge instead of silently None.
+    #[test]
+    fn a_vlan_tagged_lldp_frame_still_yields_an_edge() {
+        let mut f = vec![
+            0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e, // dst
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // src
+            0x81, 0x00, 0x00, 0x64, // 802.1Q tag, VLAN 100
+        ];
+        f.extend_from_slice(&ETHERTYPE_LLDP.to_be_bytes());
+        f.extend_from_slice(&lldp_pdu());
+        let link = link_from_frame(&f, "en0", 9).expect("a tagged LLDP frame is an edge");
+        assert_eq!(link.remote_chassis, "00:11:22:33:44:55");
+    }
+
+    /// A `learned_via` token a newer peer might send decodes to `Unknown`, never
+    /// failing the whole decode — the serde(other) forward-compat.
+    #[test]
+    fn an_unknown_learned_via_token_decodes_to_unknown() {
+        let v: LearnedVia = serde_json::from_str("\"future_proto\"").expect("must not fail");
+        assert_eq!(v, LearnedVia::Unknown);
     }
 
     #[test]

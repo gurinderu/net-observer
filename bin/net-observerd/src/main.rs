@@ -555,7 +555,9 @@ async fn run_daemon() -> anyhow::Result<()> {
     // onto `handles` so it is aborted with the collectors on shutdown. The LIVE
     // capture is a project Ceiling (needs root + BPF on a real network); the
     // patrol degrades honestly when it cannot open one (see `lldp_capture`).
-    if cfg.collectors.neighbors.topology {
+    // Gated on the neighbours subsystem being enabled AND the topology
+    // toggle: disabling neighbours turns its sub-feature off too, no surprise.
+    if cfg.collectors.neighbors.enabled && cfg.collectors.neighbors.topology {
         match phys_iface.clone() {
             Some(iface) => handles.push(spawn_topology_patrol(
                 store.clone(),
