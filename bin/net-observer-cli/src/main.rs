@@ -382,11 +382,11 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
         Command::Why { at } => {
             let ts_us = diagnose::parse_at(at)?;
-            let table = run_query(&cli.db, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))?;
+            let table = run_prepared(&cli.db, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))?;
             print!("{}", diagnose::format_verdict_at(&table, ts_us)?);
         }
         Command::IncidentContext => {
-            let table = run_query(&cli.db, &diagnosis::incident_context_sql(LOAD_THRESHOLD))?;
+            let table = run_prepared(&cli.db, &diagnosis::incident_context_sql(LOAD_THRESHOLD))?;
             print!("{}", diagnose::format_incident_context(&table)?);
         }
         Command::WedgeOrStarvation => {
@@ -394,7 +394,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 LOAD_THRESHOLD,
                 diagnosis::DEFAULT_EPISODE_GAP_US,
             );
-            let table = run_query(&cli.db, &sql)?;
+            let table = run_prepared(&cli.db, &sql)?;
             print!("{}", diagnose::format_wedge_vs_starvation(&table)?);
         }
         Command::GatewayRamp { drop, window_us } => {
@@ -402,7 +402,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 Some(d) => diagnose::parse_at(d)?,
                 None => latest_gw_drop(&cli.db)?,
             };
-            let table = run_query(
+            let table = run_prepared(
                 &cli.db,
                 &diagnosis::gateway_ramp_sql(drop_ts_us, *window_us),
             )?;
@@ -678,7 +678,23 @@ fn format_control(result: &ControlResult) -> String {
 /// fails — detect that and print a clear, actionable message instead of leaking
 /// the raw driver error (and never panic).
 fn run_query(db_path: &str, sql: &str) -> Result<QueryTable> {
-    let store = DuckdbStore::open(db_path).map_err(|e| {
+    open_store(db_path)?
+        .query_table(sql)
+        .map_err(|e| anyhow!("query failed: {e}"))
+}
+
+/// Like [`run_query`], but for a [`diagnosis::PreparedSql`] built by one of the
+/// parameterized `diagnosis` builders (`why`, `incident-context`,
+/// `wedge-or-starvation`, `gateway-ramp`): the moment/threshold values are
+/// bound, not interpolated.
+fn run_prepared(db_path: &str, p: &diagnosis::PreparedSql) -> Result<QueryTable> {
+    open_store(db_path)?
+        .query_prepared(p)
+        .map_err(|e| anyhow!("query failed: {e}"))
+}
+
+fn open_store(db_path: &str) -> Result<DuckdbStore> {
+    DuckdbStore::open(db_path).map_err(|e| {
         let msg = e.to_string();
         if is_lock_error(&msg) {
             anyhow!(
@@ -688,10 +704,7 @@ fn run_query(db_path: &str, sql: &str) -> Result<QueryTable> {
         } else {
             anyhow!("failed to open DuckDB at {db_path}: {msg}")
         }
-    })?;
-    store
-        .query_table(sql)
-        .map_err(|e| anyhow!("query failed: {e}"))
+    })
 }
 
 /// The `ts_us` of the newest gateway drop in the record, used when
