@@ -503,6 +503,59 @@ ORDER BY v.last_seen_us DESC, v.mac, v.port, v.cve_id"
     ))
 }
 
+/// **The switch-topology links** — which switch/AP each interface uplinks to,
+/// newest sighting first.
+///
+/// Reads the long-lived `topology_link` table: one row per
+/// `(iface, remote_chassis, remote_port)` with first/last seen, the remote's
+/// advertised system name and capabilities, and whether LLDP or CDP carried it.
+/// `iface` filters to one local interface.
+///
+/// Every row is a HYPOTHESIS, never an asserted fact: LLDP/CDP are
+/// unauthenticated and trivially spoofable, so a link says "a device *claiming*
+/// this identity was heard on this interface", not "this is the switch".
+///
+/// Returns `Err` for an interface name the store could never have written rather
+/// than a query that matches nothing, exactly like [`neighbors_sql`].
+pub fn topology_sql(iface: Option<&str>) -> Result<String, BadIface> {
+    let filter = match iface {
+        None => String::new(),
+        Some(i) => {
+            validate_iface(i)?;
+            format!("WHERE iface = '{i}'")
+        }
+    };
+    Ok(format!(
+        "SELECT iface, remote_chassis, remote_port, remote_system_name, capabilities, \
+learned_via, first_seen_us, last_seen_us
+FROM topology_link
+{filter}
+ORDER BY last_seen_us DESC, iface, remote_chassis, remote_port"
+    ))
+}
+
+/// An interface name the store could never have written into `topology_link`.
+#[derive(Debug, thiserror::Error)]
+#[error("not an interface name: {0} (expected something like en0, en1 or utun3)")]
+pub struct BadIface(pub String);
+
+/// Accept a plausible network-interface name: a short run of ASCII letters,
+/// digits, `.` or `:` (BSD names like `en0`, `utun3`, `vlan0.10`). The point is
+/// the same as [`validate_network_key`]: a filter is interpolated into the SQL,
+/// so it must be constrained to what an interface name can actually be — never a
+/// vehicle for arbitrary text.
+fn validate_iface(i: &str) -> Result<(), BadIface> {
+    let ok = !i.is_empty()
+        && i.len() <= 32
+        && i.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(BadIface(i.to_string()))
+    }
+}
+
 /// A `network_key` the store could never have written.
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -620,6 +673,21 @@ mod tests {
         for bad in ["'; DROP TABLE neighbor_vuln; --", "a4:83", ""] {
             assert!(
                 vulns_sql(Some(bad)).is_err(),
+                "{bad:?} must be an error, not a query that matches nothing"
+            );
+        }
+    }
+    /// The topology reader validates its interface filter the same way, and
+    /// rejects an interpolation attempt rather than matching nothing.
+    #[test]
+    fn topology_sql_validates_the_iface_filter() {
+        assert!(!topology_sql(None).unwrap().contains("WHERE"));
+        assert!(topology_sql(Some("en0")).is_ok());
+        assert!(topology_sql(Some("utun3")).is_ok());
+        assert!(topology_sql(Some("vlan0.10")).is_ok());
+        for bad in ["'; DROP TABLE topology_link; --", "en 0", "", "имя"] {
+            assert!(
+                topology_sql(Some(bad)).is_err(),
                 "{bad:?} must be an error, not a query that matches nothing"
             );
         }

@@ -26,6 +26,4 @@ mdns-sd.workspace = true
 # feature set; `time`, `process`, and the multi-thread runtime come from there.
 tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true

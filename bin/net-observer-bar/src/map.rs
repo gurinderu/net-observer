@@ -37,7 +37,7 @@ use gpui::{
 };
 
 use net_observer_ipc::StatusSnapshot;
-use types::{NeighborObs, NeighborRole, NeighborsSample};
+use types::{LearnedVia, NeighborObs, NeighborRole, NeighborsSample, TopologyLink};
 
 use crate::ui::{Glance, Theme};
 
@@ -280,6 +280,180 @@ fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement
     )
 }
 
+/// The most uplink switches/APs the strip draws before it summarises the rest as
+/// "+N more". A machine has one or two real uplinks; more than this is unusual
+/// (several VLAN sub-interfaces, say) and does not need to all fit at once.
+const MAX_UPLINKS: usize = 3;
+
+/// Height of the uplink strip drawn above the neighbour star, in gpui logical px.
+const UPLINK_H: f32 = 58.0;
+
+/// One LLDP/CDP-discovered uplink reduced to what the strip draws: which
+/// switch/AP this machine connects to and on which of that device's ports.
+/// Derived purely from a [`TopologyLink`] so the render carries no parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UplinkNode {
+    /// The switch/AP's human label: its advertised system name, else its chassis
+    /// identity.
+    label: String,
+    /// The remote device's port this machine is plugged into.
+    port: String,
+    /// Whether LLDP or CDP carried the advertisement.
+    via: LearnedVia,
+}
+
+impl UplinkNode {
+    fn from_link(link: &TopologyLink) -> Self {
+        let label = link
+            .remote_system_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&link.remote_chassis)
+            .to_string();
+        Self {
+            label,
+            port: link.remote_port.clone(),
+            via: link.learned_via,
+        }
+    }
+}
+
+/// The uplink nodes to draw and the count dropped by the [`MAX_UPLINKS`] cap.
+/// Deduplicated by label+port so the same switch advertised on several protocols
+/// or several times is one node. Pure, so it is testable without a window.
+fn uplinks(snapshot: &StatusSnapshot) -> (Vec<UplinkNode>, usize) {
+    let mut nodes: Vec<UplinkNode> = Vec::new();
+    for link in &snapshot.topology {
+        let node = UplinkNode::from_link(link);
+        if !nodes
+            .iter()
+            .any(|n| n.label == node.label && n.port == node.port)
+        {
+            nodes.push(node);
+        }
+    }
+    let dropped = nodes.len().saturating_sub(MAX_UPLINKS);
+    nodes.truncate(MAX_UPLINKS);
+    (nodes, dropped)
+}
+
+/// The strip of uplink switch/AP nodes drawn above the neighbour star: each a
+/// distinctly-marked chip (a square glyph in the infra tint, deliberately unlike
+/// the round neighbour dots) joined by an edge down to a shared "this Mac"
+/// anchor. The edge is the discovered physical path — a hypothesis LLDP/CDP
+/// advertised, drawn subtly, never a hard claim. (realm net-observer, node #42)
+fn uplink_strip(nodes: &[UplinkNode], dropped: usize, theme: Theme) -> impl IntoElement {
+    let n = nodes.len();
+    // Chip centres spread evenly across the top; the anchor sits bottom-centre.
+    let width = 296.0;
+    let anchor = (width / 2.0, UPLINK_H - 6.0);
+    let xs: Vec<f32> = (0..n)
+        .map(|i| {
+            let step = width / (n as f32 + 1.0);
+            step * (i as f32 + 1.0)
+        })
+        .collect();
+    let top_y = 6.0 + CHIP_H / 2.0;
+
+    let edge_color = rgb(theme.track_on);
+    let targets: Vec<(f32, f32)> = xs.iter().map(|x| (*x, top_y)).collect();
+    let edges = canvas(
+        move |_bounds, _window, _cx| {},
+        move |bounds: Bounds<Pixels>, _prepaint: (), window, _cx| {
+            let mut builder = gpui::PathBuilder::stroke(px(1.0));
+            let origin = bounds.origin;
+            let a = point(origin.x + px(anchor.0), origin.y + px(anchor.1));
+            for (tx, ty) in &targets {
+                builder.move_to(a);
+                builder.line_to(point(origin.x + px(*tx), origin.y + px(*ty)));
+            }
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, edge_color);
+            }
+        },
+    );
+
+    let mut area = div()
+        .relative()
+        .w_full()
+        .h(px(UPLINK_H))
+        .child(div().absolute().size_full().child(edges));
+
+    for (node, x) in nodes.iter().zip(xs.iter()) {
+        area = area.child(
+            div()
+                .absolute()
+                .left(px(x - CHIP_W / 2.0))
+                .top(px(6.0))
+                .child(uplink_chip(node, theme)),
+        );
+    }
+    let caption = if dropped > 0 {
+        format!("uplinks \u{00b7} LLDP/CDP \u{00b7} +{dropped} more")
+    } else {
+        "uplinks \u{00b7} LLDP/CDP".to_string()
+    };
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(theme.muted))
+                .pb_1()
+                .child(caption),
+        )
+        .child(area)
+}
+
+/// One uplink chip: a square marker (distinct from the round neighbour dots) in
+/// the infra tint, the switch/AP label, and its port beneath.
+fn uplink_chip(node: &UplinkNode, theme: Theme) -> impl IntoElement {
+    let port_line = match node.via {
+        LearnedVia::Lldp => format!("{} \u{00b7} lldp", node.port),
+        LearnedVia::Cdp => format!("{} \u{00b7} cdp", node.port),
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .w(px(CHIP_W))
+        .h(px(CHIP_H))
+        .px_1p5()
+        .rounded_md()
+        .overflow_hidden()
+        .bg(rgba(theme.surface))
+        .border_1()
+        .border_color(rgb(theme.track_on))
+        .text_color(rgb(theme.fg))
+        .child(
+            div()
+                .text_size(px(9.0))
+                .text_color(rgb(theme.track_on))
+                .child("\u{25A0}"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_size(px(11.0))
+                        .child(node.label.clone()),
+                )
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_size(px(9.0))
+                        .text_color(rgb(theme.muted))
+                        .child(port_line),
+                ),
+        )
+}
+
 /// Place a chip at a centre point inside the relative map area.
 fn placed_chip(
     node: &MapNode,
@@ -303,16 +477,34 @@ fn placed_chip(
 pub fn network_map_section(snapshot: &StatusSnapshot, theme: Theme) -> impl IntoElement {
     let base = div().flex().flex_col().px_3().py_2();
 
-    let Some(sample) = &snapshot.neighbors else {
-        return empty_state(base, "no neighbour reading yet", theme);
-    };
-    if sample.neighbors.is_empty() {
-        let msg = match &sample.reason {
-            Some(reason) => format!("no neighbours: {reason}"),
-            None => "no neighbours seen \u{00b7} press Scan to look".to_string(),
+    // Uplinks are independent of the neighbour star: an LLDP/CDP-discovered
+    // switch can be known even before any neighbour reading has run.
+    let (uplink_nodes_v, uplink_dropped) = uplinks(snapshot);
+    let has_uplinks = !uplink_nodes_v.is_empty();
+
+    let sample = snapshot.neighbors.as_ref();
+    let neighbours_empty = sample.is_none_or(|s| s.neighbors.is_empty());
+
+    // Only a truly empty panel — no neighbours AND no uplinks — is the honest
+    // empty state; uplinks alone are still worth drawing.
+    if neighbours_empty && !has_uplinks {
+        let msg = match sample {
+            None => "no neighbour reading yet".to_string(),
+            Some(s) => match &s.reason {
+                Some(reason) => format!("no neighbours: {reason}"),
+                None => "no neighbours seen \u{00b7} press Scan to look".to_string(),
+            },
         };
         return empty_state(base, msg, theme);
     }
+
+    // Uplinks but no neighbour star yet: draw just the uplink strip.
+    if neighbours_empty {
+        return base
+            .child(uplink_strip(&uplink_nodes_v, uplink_dropped, theme))
+            .into_any_element();
+    }
+    let sample = sample.expect("neighbours non-empty implies a sample");
 
     let (gateway, ring, dropped) = partition(sample);
 
@@ -378,7 +570,12 @@ pub fn network_map_section(snapshot: &StatusSnapshot, theme: Theme) -> impl Into
         area = area.child(placed_chip(node, false, *cx, *cy, theme));
     }
 
-    let mut section = base.child(caption(sample, ring.len(), gateway.is_some(), theme));
+    let mut section = base;
+    // The uplink strip sits above the star when there is one to draw.
+    if has_uplinks {
+        section = section.child(uplink_strip(&uplink_nodes_v, uplink_dropped, theme));
+    }
+    section = section.child(caption(sample, ring.len(), gateway.is_some(), theme));
     section = section.child(area);
     if dropped > 0 {
         section = section.child(
@@ -726,6 +923,84 @@ mod tests {
                 CHIP_W + CHIP_GAP
             );
         }
+    }
+
+    fn link(chassis: &str, port: &str, name: Option<&str>, via: LearnedVia) -> TopologyLink {
+        TopologyLink {
+            iface: "en0".into(),
+            remote_chassis: chassis.into(),
+            remote_port: port.into(),
+            remote_system_name: name.map(str::to_string),
+            capabilities: "bridge".into(),
+            learned_via: via,
+            ts_us: 1,
+        }
+    }
+
+    /// The uplink reducer prefers the advertised system name, dedups a switch
+    /// seen twice, caps at [`MAX_UPLINKS`] and reports the overflow.
+    #[test]
+    fn uplinks_prefer_the_name_dedup_and_cap() {
+        let mut snap = StatusSnapshot {
+            topology: vec![
+                link(
+                    "00:11:22:33:44:55",
+                    "Gi0/1",
+                    Some("core-sw"),
+                    LearnedVia::Lldp,
+                ),
+                // Same switch+port advertised again (e.g. via CDP too): one node.
+                link(
+                    "00:11:22:33:44:55",
+                    "Gi0/1",
+                    Some("core-sw"),
+                    LearnedVia::Cdp,
+                ),
+            ],
+            ..Default::default()
+        };
+        let (nodes, dropped) = uplinks(&snap);
+        assert_eq!(nodes.len(), 1, "a switch seen twice is one node");
+        assert_eq!(nodes[0].label, "core-sw");
+        assert_eq!(nodes[0].port, "Gi0/1");
+        assert_eq!(dropped, 0);
+
+        // More distinct uplinks than the cap: capped, remainder reported.
+        let many: Vec<TopologyLink> = (0..MAX_UPLINKS + 2)
+            .map(|i| {
+                link(
+                    &format!("sw{i}"),
+                    &format!("Gi0/{i}"),
+                    None,
+                    LearnedVia::Lldp,
+                )
+            })
+            .collect();
+        snap.topology = many;
+        let (nodes, dropped) = uplinks(&snap);
+        assert_eq!(nodes.len(), MAX_UPLINKS);
+        assert_eq!(dropped, 2);
+        // With no system name the chassis is the label.
+        assert_eq!(nodes[0].label, "sw0");
+    }
+
+    /// A snapshot with uplinks but no neighbour reading still renders the strip
+    /// instead of the empty state — the map is not blank when a switch is known.
+    #[test]
+    fn a_snapshot_with_only_uplinks_is_not_empty() {
+        let snap = StatusSnapshot {
+            topology: vec![link(
+                "00:11:22:33:44:55",
+                "Gi0/1",
+                Some("core-sw"),
+                LearnedVia::Lldp,
+            )],
+            ..Default::default()
+        };
+        // Building the element must not panic and must see the uplink.
+        let (nodes, _) = uplinks(&snap);
+        assert_eq!(nodes.len(), 1);
+        let _ = network_map_section(&snap, Theme::for_appearance(gpui::WindowAppearance::Dark));
     }
 
     #[test]

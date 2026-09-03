@@ -40,7 +40,7 @@ use std::time::Duration;
 use serde::{Serialize, de::DeserializeOwned};
 use types::{
     DnsSample, HostSample, LinkSample, NeighborsSample, ObservingEdge, ProxySample, RouteEvent,
-    WifiSample,
+    TopologyLink, WifiSample,
 };
 
 /// A request from a client (the bar or cli) to the daemon.
@@ -545,6 +545,15 @@ pub struct StatusSnapshot {
     /// decodes in a newer bar.
     #[serde(default)]
     pub neighbors: Option<NeighborsSample>,
+    /// The switch-topology uplinks discovered from received LLDP/CDP frames —
+    /// which switch/AP this machine's interfaces connect to. The map draws these
+    /// as distinctly-marked nodes off the star. Each is a hypothesis (LLDP/CDP
+    /// are spoofable), not a hard claim. (realm net-observer, node #42)
+    ///
+    /// `serde(default)`, like `neighbors`, so a pre-topology daemon's answer
+    /// still decodes in a newer bar — an empty list, never a decode failure.
+    #[serde(default)]
+    pub topology: Vec<TopologyLink>,
     pub incidents: Vec<IncidentSummary>,
     /// Whether the daemon is actively collecting. `true` (the default) = collectors
     /// run and samples flow; `false` = collection is paused (the daemon stays alive
@@ -586,6 +595,7 @@ impl Default for StatusSnapshot {
             host: None,
             wifi: None,
             neighbors: None,
+            topology: Vec::new(),
             incidents: Vec::new(),
             observing: observing_default(),
             quiet: false,
@@ -826,6 +836,7 @@ mod tests {
             host: None,
             wifi: None,
             neighbors: None,
+            topology: Vec::new(),
             incidents: vec![IncidentSummary {
                 id: "inc-1".into(),
                 opened_us: 1000,

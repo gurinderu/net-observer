@@ -97,6 +97,12 @@ pub struct WifiCfg {
     pub interval: Duration,
 }
 
+/// The serde default for a `bool` field that should default to `true` when the
+/// key is absent (deriving `Default` would give `false`).
+fn default_true() -> bool {
+    true
+}
+
 /// The `neighbors` collector: who else is on the local segment, read from the
 /// kernel's ARP and NDP caches. Reading a cache the OS already filled sends
 /// nothing, so it is on by default like the other passive collectors — and the
@@ -110,6 +116,15 @@ pub struct NeighborsCfg {
     pub enabled: bool,
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
+    /// Switch-topology discovery: passively CAPTURE received LLDP/CDP frames and
+    /// record which switch/AP each interface uplinks to (realm net-observer, node
+    /// #42). On by default like the other passive collectors — it emits NOTHING
+    /// on the wire, only listens for the multicast discovery frames a switch
+    /// already broadcasts. It does, however, need root and a BPF/pcap read to
+    /// hear them, so it degrades HONESTLY: when the capture cannot open it logs
+    /// that and records no links, never a pretence of a clean topology.
+    #[serde(default = "default_true")]
+    pub topology: bool,
     /// What an operator-pressed scan is PERMITTED to do. The ceiling, not the
     /// switch: every capability is off by default, and the bar's checkboxes pick
     /// which permitted capabilities a given manual run includes. A run never
@@ -235,6 +250,7 @@ impl Default for Config {
                 neighbors: NeighborsCfg {
                     enabled: true,
                     interval: Duration::from_secs(120),
+                    topology: true,
                     scan: ScanCfg::default(),
                     cve_snapshot_dir: None,
                     oui_snapshot_dir: None,
