@@ -73,6 +73,19 @@ CREATE TABLE IF NOT EXISTS neighbor_vuln (
   confidence VARCHAR, known_exploited BOOLEAN, cvss DOUBLE,
   first_seen_us BIGINT, last_seen_us BIGINT,
   PRIMARY KEY (network_key, mac, port, cve_id));
+-- Switch-topology links learned passively from received LLDP/CDP frames: which
+-- switch/AP an interface uplinks to, and on which of that device's ports. Keyed
+-- by (iface, remote_chassis, remote_port) with first/last seen, like `neighbor`
+-- and `neighbor_port` — "this interface has uplinked to that switch:port since
+-- X" is the queryable fact. `learned_via` is 'lldp' or 'cdp'. Every row is a
+-- HYPOTHESIS: LLDP/CDP are unauthenticated and spoofable. Added after the store
+-- first shipped, so `CREATE TABLE IF NOT EXISTS` lets an older DB file migrate on
+-- open. (realm net-observer, node #42)
+CREATE TABLE IF NOT EXISTS topology_link (
+  iface VARCHAR, remote_chassis VARCHAR, remote_port VARCHAR,
+  remote_system_name VARCHAR, capabilities VARCHAR, learned_via VARCHAR,
+  first_seen_us BIGINT, last_seen_us BIGINT,
+  PRIMARY KEY (iface, remote_chassis, remote_port));
 CREATE TABLE IF NOT EXISTS observing_edge (
   ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT, cause VARCHAR);
 -- `cause` was added after the first daemon shipped rows without it. A database

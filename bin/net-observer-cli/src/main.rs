@@ -153,6 +153,17 @@ enum Command {
         #[arg(long)]
         network: Option<String>,
     },
+    /// The switch-topology uplinks learned passively from received LLDP/CDP
+    /// frames, newest sighting first (offline): local interface, remote chassis,
+    /// remote port, the switch/AP's system name and capabilities, and whether
+    /// LLDP or CDP carried it. Each row is a HYPOTHESIS — LLDP/CDP are
+    /// unauthenticated and spoofable — never an asserted fact.
+    Topology {
+        /// Restrict to one local interface (e.g. `en0`). Omit for every
+        /// interface this machine has recorded an uplink on.
+        #[arg(long)]
+        iface: Option<String>,
+    },
     /// Run an arbitrary SQL query directly against the DuckDB file (offline
     /// forensics — only works while `net-observerd` is stopped).
     Query {
@@ -357,6 +368,11 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
         Command::Vulns { network } => {
             let sql = diagnosis::vulns_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
+            let table = run_query(&cli.db, &sql)?;
+            print!("{}", format_table(&table));
+        }
+        Command::Topology { iface } => {
+            let sql = diagnosis::topology_sql(iface.as_deref()).map_err(|e| anyhow!("{e}"))?;
             let table = run_query(&cli.db, &sql)?;
             print!("{}", format_table(&table));
         }
@@ -873,6 +889,7 @@ mod tests {
             host: None,
             wifi: None,
             neighbors: None,
+            topology: Vec::new(),
             incidents: vec![
                 incident("i1", "wedge", 80, None),
                 incident("i2", "gw-drop", 60, Some(70)),

@@ -1,7 +1,7 @@
 use crate::{Store, schema::SCHEMA_SQL};
 use duckdb::{Connection, params};
 use std::sync::Mutex;
-use types::{BlobRef, Incident, ObservingEdge, Sample, TriggerFired};
+use types::{BlobRef, Incident, ObservingEdge, Sample, TopologyLink, TriggerFired};
 
 /// `network_key` for a segment whose gateway MAC could not be read. Neighbours
 /// still get recorded — under a key that says plainly the network was not
@@ -325,6 +325,40 @@ impl Store for DuckdbStore {
         )?;
         Ok(())
     }
+    fn write_topology_link(&self, l: &TopologyLink) -> Result<(), StoreError> {
+        self.conn.lock().unwrap().execute(
+            // `first_seen_us` preserved, like `neighbor`: the point of the row is
+            // since-when this interface has uplinked to that switch:port. A later
+            // sighting refines the system name and capabilities but never resets
+            // when the uplink was first seen. A NULL system name from a frame that
+            // carried none must not erase one an earlier frame advertised.
+            "INSERT INTO topology_link
+               (iface, remote_chassis, remote_port, remote_system_name,
+                capabilities, learned_via, first_seen_us, last_seen_us)
+             VALUES (?,?,?,?,?,?,?,?)
+             ON CONFLICT (iface, remote_chassis, remote_port) DO UPDATE SET
+               remote_system_name =
+                 COALESCE(excluded.remote_system_name, topology_link.remote_system_name),
+               -- Keep a previously-learned capability set when a later frame
+               -- carries no System-Capabilities TLV (empty string), mirroring the
+               -- system-name COALESCE: silent wrong data is worse than none.
+               capabilities =
+                 COALESCE(NULLIF(excluded.capabilities, ''), topology_link.capabilities),
+               learned_via = excluded.learned_via,
+               last_seen_us = excluded.last_seen_us",
+            params![
+                l.iface,
+                l.remote_chassis,
+                l.remote_port,
+                l.remote_system_name,
+                l.capabilities,
+                l.learned_via.as_str(),
+                l.ts_us,
+                l.ts_us
+            ],
+        )?;
+        Ok(())
+    }
     fn open_incident(&self, i: &Incident) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO incident VALUES (?,?,?,?,?)",
@@ -560,6 +594,70 @@ mod tests {
             .query_table("SELECT first_seen_us, last_seen_us, banner FROM neighbor_port")
             .unwrap();
         assert_eq!(t.rows[0], vec!["1000", "3000", "SSH-2.0-OpenSSH_9.6"]);
+    }
+
+    /// A topology link is one row per (iface, remote_chassis, remote_port),
+    /// keeping the moment the uplink was first seen while its last sighting moves
+    /// forward. A later frame that carried no system name must not erase one an
+    /// earlier frame advertised.
+    #[test]
+    fn a_topology_link_seen_twice_keeps_its_first_sighting_and_coalesces_the_name() {
+        use types::LearnedVia;
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_topology_link(&TopologyLink {
+            iface: "en0".into(),
+            remote_chassis: "00:11:22:33:44:55".into(),
+            remote_port: "Gi0/1".into(),
+            remote_system_name: Some("sw1".into()),
+            capabilities: "bridge".into(),
+            learned_via: LearnedVia::Lldp,
+            ts_us: 1000,
+        })
+        .unwrap();
+        // A later sighting of the same uplink whose frame carried no system name.
+        s.write_topology_link(&TopologyLink {
+            iface: "en0".into(),
+            remote_chassis: "00:11:22:33:44:55".into(),
+            remote_port: "Gi0/1".into(),
+            remote_system_name: None,
+            capabilities: "bridge,router".into(),
+            learned_via: LearnedVia::Lldp,
+            ts_us: 2000,
+        })
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM topology_link")
+                .unwrap(),
+            1
+        );
+        let t = s
+            .query_table(
+                "SELECT first_seen_us, last_seen_us, remote_system_name, capabilities \
+                 FROM topology_link",
+            )
+            .unwrap();
+        assert_eq!(t.rows[0], vec!["1000", "2000", "sw1", "bridge,router"]);
+
+        // A THIRD sighting whose frame carried no capabilities TLV (empty string)
+        // must NOT blank the previously-learned set — empty is absence, not "none".
+        s.write_topology_link(&TopologyLink {
+            iface: "en0".into(),
+            remote_chassis: "00:11:22:33:44:55".into(),
+            remote_port: "Gi0/1".into(),
+            remote_system_name: None,
+            capabilities: String::new(),
+            learned_via: LearnedVia::Lldp,
+            ts_us: 3000,
+        })
+        .unwrap();
+        let cap = s
+            .query_table("SELECT capabilities FROM topology_link")
+            .unwrap();
+        assert_eq!(
+            cap.rows[0],
+            vec!["bridge,router"],
+            "empty caps must not erase"
+        );
     }
 
     /// A CVE hypothesis upserts onto its port keeping the first sighting; a later

@@ -29,9 +29,10 @@ use collector_proxy::ProxyCollector;
 use collector_route::RouteCollector;
 use collector_wifi::WifiCollector;
 use config::Config;
+use macos::LldpCapture;
 use macos::{
     BoundTcpProber, CoreWlanFacts, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource,
-    ProxySystemFacts, SystemFacts, SystemNeighbors,
+    ProxySystemFacts, SystemFacts, SystemNeighbors, TcpdumpLldpCapture,
 };
 use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{EncodedFrame, StatusSnapshot};
@@ -49,6 +50,17 @@ use pipeline::{
 /// How often the pcap supervisor re-checks the ring. Bounded on purpose: every
 /// attempt may spawn a `tcpdump` child, so this is a slow patrol, not a tick.
 const PCAP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often the topology patrol opens a fresh short-lived LLDP/CDP capture.
+/// Switches broadcast discovery frames roughly once every 30-60s, so a 5-minute
+/// patrol reliably catches at least one advertisement per neighbour without
+/// keeping a capture open continuously — a slow patrol, like the pcap one.
+const TOPOLOGY_PATROL_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How long each topology capture listens before it is stopped. Long enough to
+/// span a switch's advertisement interval, short enough that the throwaway
+/// capture is plainly bounded.
+const TOPOLOGY_CAPTURE_BUDGET: Duration = Duration::from_secs(65);
 
 /// Minimum interval between fires for one trigger (5 minutes, in microseconds),
 /// mirroring net-observer so a captive portal can't storm the incident log.
@@ -164,6 +176,77 @@ fn load_oui_db(dir: Option<&str>) -> Option<Arc<oui_db::OuiDb>> {
             None
         }
     }
+}
+
+/// Spawn the topology patrol: on a slow interval, open a bounded LLDP/CDP
+/// capture on `iface`, map every received frame to a [`types::TopologyLink`],
+/// upsert each into the store, and mirror the current set onto the live
+/// snapshot the socket serves.
+///
+/// While paused (`observing == false`) the patrol skips its capture entirely —
+/// an operator pause stops collection outright rather than emitting synthetic
+/// readings (AGENTS.md: the sanctioned bracketed-pause exception). A capture
+/// that maps no links leaves the snapshot's last discovered set in place rather
+/// than blanking it, so one quiet interval does not erase a real uplink from the
+/// live view (the durable record is the store, which keeps first/last seen).
+fn spawn_topology_patrol(
+    store: Arc<DuckdbStore>,
+    snapshot: Arc<Mutex<StatusSnapshot>>,
+    observing: Arc<AtomicBool>,
+    iface: String,
+) -> JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    use store::Store as _;
+
+    tokio::spawn(async move {
+        let capture = TcpdumpLldpCapture::new(iface.clone());
+        let mut ticker = tokio::time::interval(TOPOLOGY_PATROL_INTERVAL);
+        loop {
+            ticker.tick().await;
+            if !observing.load(Ordering::Relaxed) {
+                continue;
+            }
+            // The capture blocks (spawns a child, waits its budget), so run it off
+            // the async runtime rather than stalling the reactor.
+            let cap = capture.clone();
+            let frames =
+                match tokio::task::spawn_blocking(move || cap.capture(TOPOLOGY_CAPTURE_BUDGET))
+                    .await
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "topology capture task failed to join");
+                        continue;
+                    }
+                };
+
+            let now = types::now_us();
+            let mut latest: Vec<types::TopologyLink> = Vec::new();
+            for frame in &frames {
+                let Some(link) = types::link_from_frame(frame, &iface, now) else {
+                    continue;
+                };
+                if let Err(e) = store.write_topology_link(&link) {
+                    tracing::warn!(error = %e,
+                        "store write failed; topology link dropped from DB (gap logged)");
+                }
+                // De-duplicate by the stable key so the live set carries one node
+                // per uplink even if a switch advertised several times this run.
+                if !latest.iter().any(|l| {
+                    l.iface == link.iface
+                        && l.remote_chassis == link.remote_chassis
+                        && l.remote_port == link.remote_port
+                }) {
+                    latest.push(link);
+                }
+            }
+
+            if !latest.is_empty() {
+                let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                snap.topology = latest;
+            }
+        }
+    })
 }
 
 fn record_startup_edge(
@@ -464,6 +547,29 @@ async fn run_daemon() -> anyhow::Result<()> {
             .await;
         })
     });
+
+    // Passive switch-topology discovery: a slow patrol that opens its OWN
+    // short-lived LLDP/CDP capture (never the shared incident ring), maps each
+    // received frame to an uplink edge, and records it. Gated on the config
+    // toggle and on having resolved a physical interface to listen on. Pushed
+    // onto `handles` so it is aborted with the collectors on shutdown. The LIVE
+    // capture is a project Ceiling (needs root + BPF on a real network); the
+    // patrol degrades honestly when it cannot open one (see `lldp_capture`).
+    // Gated on the neighbours subsystem being enabled AND the topology
+    // toggle: disabling neighbours turns its sub-feature off too, no surprise.
+    if cfg.collectors.neighbors.enabled && cfg.collectors.neighbors.topology {
+        match phys_iface.clone() {
+            Some(iface) => handles.push(spawn_topology_patrol(
+                store.clone(),
+                snapshot.clone(),
+                observing.clone(),
+                iface,
+            )),
+            None => tracing::warn!(
+                "topology discovery enabled but no physical interface resolved; not capturing LLDP/CDP"
+            ),
+        }
+    }
 
     // Serve the read-only status socket for the unprivileged bar. Best-effort: a
     // bind failure is logged but never takes the daemon down (no API, still

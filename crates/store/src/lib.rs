@@ -5,7 +5,7 @@ mod schema;
 pub use duckdb_store::{
     DuckdbStore, NeighborPort, NeighborScan, NeighborVuln, QueryTable, StoreError,
 };
-use types::{BlobRef, Incident, ObservingEdge, Sample, TriggerFired};
+use types::{BlobRef, Incident, ObservingEdge, Sample, TopologyLink, TriggerFired};
 
 pub trait Store {
     fn write_sample(&self, s: &Sample) -> Result<(), StoreError>;
@@ -36,5 +36,10 @@ pub trait Store {
     /// table). Upserts on `(network_key, mac, port, cve_id)`, preserving
     /// `first_seen_us`. Every row is a hypothesis, never an asserted fact.
     fn write_neighbor_vuln(&self, v: &NeighborVuln) -> Result<(), StoreError>;
+    /// Record one switch-topology link learned from a received LLDP/CDP frame
+    /// (see the `topology_link` table). Upserts on
+    /// `(iface, remote_chassis, remote_port)`, preserving `first_seen_us`. Every
+    /// row is a hypothesis — LLDP/CDP are unauthenticated — never an asserted fact.
+    fn write_topology_link(&self, l: &TopologyLink) -> Result<(), StoreError>;
     fn query_scalar_i64(&self, sql: &str) -> Result<i64, StoreError>;
 }
