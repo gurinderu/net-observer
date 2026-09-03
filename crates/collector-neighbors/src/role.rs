@@ -149,8 +149,15 @@ mod tests {
     /// A tiny in-memory oui-db from `manuf`-format lines, so the rules are tested
     /// with fake vendor data and no snapshot file.
     fn fake_db(lines: &str) -> OuiDb {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("role-test-{}.manuf", std::process::id()));
+        // A UNIQUE file per call: tests run in parallel, so a name keyed only on
+        // the pid let one test's `remove_file` delete the file another was about
+        // to load — a race that failed `load_from_file` nondeterministically.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "role-test-{}-{n}.manuf",
+            std::process::id()
+        ));
         std::fs::write(&path, lines).unwrap();
         let db = OuiDb::load_from_file(&path).unwrap();
         let _ = std::fs::remove_file(&path);
