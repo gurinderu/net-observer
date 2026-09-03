@@ -412,6 +412,9 @@ fn uplink_chip(node: &UplinkNode, theme: Theme) -> impl IntoElement {
     let port_line = match node.via {
         LearnedVia::Lldp => format!("{} \u{00b7} lldp", node.port),
         LearnedVia::Cdp => format!("{} \u{00b7} cdp", node.port),
+        // A protocol a newer daemon learned this uplink by that this bar does not
+        // know — show the port without an unbacked protocol claim.
+        LearnedVia::Unknown => node.port.clone(),
     };
     div()
         .flex()
