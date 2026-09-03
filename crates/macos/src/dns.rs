@@ -40,6 +40,7 @@ impl DnsResolver {
     /// `doh_url` for the DoH path.
     #[must_use]
     pub fn new(monitored_domain: String, ru_control_domain: String, doh_url: String) -> Self {
+        crate::tls::install_default_provider();
         let http = reqwest::Client::builder()
             .timeout(RESOLVE_TIMEOUT)
             .build()
@@ -171,6 +172,29 @@ fn classify(
 
 #[cfg(test)]
 mod tests {
+    /// Live check that the installed crypto provider actually completes a TLS
+    /// handshake with the DoH endpoint — compiling against a provider-less
+    /// rustls proves nothing about the handshake. Ignored by default: the rest
+    /// of the suite needs no network. Run it by name after changing the TLS
+    /// stack: `cargo test -p macos -- --ignored doh_handshake`.
+    /// (realm net-observer, node #46)
+    #[tokio::test]
+    #[ignore = "needs the network"]
+    async fn doh_handshake_succeeds_against_the_real_endpoint() {
+        super::super::tls::install_default_provider();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client builds");
+        let resp = http
+            .get("https://1.1.1.1/dns-query?name=example.com&type=A")
+            .header("accept", "application/dns-json")
+            .send()
+            .await
+            .expect("the TLS handshake and request must succeed");
+        assert!(resp.status().is_success(), "status: {}", resp.status());
+    }
+
     use super::*;
 
     #[test]
