@@ -1,0 +1,6 @@
+[package]
+name = "lldp"
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true

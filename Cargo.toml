@@ -17,6 +17,7 @@ members = [
     "crates/macos",
     "crates/vuln-db",
     "crates/oui-db",
+    "crates/lldp",
     "bin/net-observerd",
     "bin/net-observer-cli",
     "bin/net-observer-bar",
@@ -44,6 +45,7 @@ default-members = [
     "crates/macos",
     "crates/vuln-db",
     "crates/oui-db",
+    "crates/lldp",
     "bin/net-observerd",
     "bin/net-observer-cli",
 ]
@@ -98,6 +100,7 @@ triggers = { path = "crates/triggers" }
 macos = { path = "crates/macos" }
 vuln-db = { path = "crates/vuln-db" }
 oui-db = { path = "crates/oui-db" }
+lldp = { path = "crates/lldp" }
 
 # Release tuning. This daemon is I/O-bound and idle between ~15s ticks, so the
 # aim is NOT steady-state speed (there is no hot path to speed up) — it is a
