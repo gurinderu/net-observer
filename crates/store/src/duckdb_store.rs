@@ -118,7 +118,7 @@ impl DuckdbStore {
     /// per occurrence. This is how `diagnosis`'s per-moment builders (`realm
     /// net-observer, node #29`) supply the moment and the thresholds they used
     /// to interpolate as text: the value never becomes part of the SQL string.
-    pub fn query_table_params(
+    pub(crate) fn query_table_params(
         &self,
         sql: &str,
         params: &[&dyn duckdb::types::ToSql],

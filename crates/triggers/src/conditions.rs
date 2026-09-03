@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::window::{LinkProvenance, RecentWindow};
-use types::{DnsVerdict, GwVerdict, NeighborsVerdict, TcpVerdict};
+use types::{DnsVerdict, GwVerdict, LinkSample, NeighborsVerdict, TcpVerdict};
 
 /// How many recent DNS samples the `fakeip` condition scans (one polling tick
 /// emits several probe rows, so a small window covers the latest tick).
@@ -130,11 +130,16 @@ impl Condition for GwChange {
 }
 
 /// Fires when the newest link sample's ARP-resolved gateway MAC differs from the
-/// previous comparable sample's, while the DHCP-leased router IP is unchanged —
-/// the same address answered by a different MAC. `gw_arp_mac`/`dhcp_router` are
-/// read regardless of quiet mode (only the gateway echo is suppressed), so
-/// unlike `GwChange` no `SKIP`-scan is needed: an absent MAC on either side is
-/// simply not a comparison. (realm net-observer, node #32)
+/// newest comparable predecessor's, while the DHCP-leased router IP is unchanged
+/// — the same address answered by a different MAC.
+///
+/// A predecessor is comparable only if it carries both the router IP and the
+/// MAC: an empty ARP cache is common for a tick or two right after a link flap,
+/// which is exactly when the MAC changes, so the scan reaches back past those
+/// ticks rather than comparing against the immediate neighbour and losing the
+/// change for good. A comparison made across an operator pause or across
+/// unreadable ticks is labelled as such, so the incident never reads as two
+/// consecutive measurements. (realm net-observer, node #32)
 pub struct GwMacChange;
 impl Condition for GwMacChange {
     fn id(&self) -> &'static str {
@@ -142,16 +147,37 @@ impl Condition for GwMacChange {
     }
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let last = w.last_link()?;
-        let prev = w.prev_link()?;
         let last_router = last.dhcp_router.as_deref()?;
+        let last_mac = last.gw_arp_mac.as_deref()?;
+        let comparable = |l: &LinkSample| l.dhcp_router.is_some() && l.gw_arp_mac.is_some();
+        let recent = w.recent_link(GW_CHANGE_SCAN);
+        let unreadable = recent.iter().skip(1).take_while(|l| !comparable(l)).count();
+        let (prev, provenance) = match recent.iter().skip(1).find(|l| comparable(l)) {
+            Some(prev) => (*prev, LinkProvenance::Contiguous),
+            // Nothing comparable in the window: fall back to the basis carried
+            // across a pause, which must itself carry both values.
+            None => match w.prev_link_with_provenance()? {
+                (prev, _) if !comparable(prev) => return None,
+                (prev, provenance) => (prev, provenance),
+            },
+        };
         let prev_router = prev.dhcp_router.as_deref()?;
+        let prev_mac = prev.gw_arp_mac.as_deref()?;
         if last_router != prev_router {
             return None;
         }
-        let last_mac = last.gw_arp_mac.as_deref()?;
-        let prev_mac = prev.gw_arp_mac.as_deref()?;
-        (last_mac != prev_mac).then(|| Fire {
-            detail: format!("gateway {last_router} mac {prev_mac} -> {last_mac}"),
+        if last_mac == prev_mac {
+            return None;
+        }
+        let across = match (provenance, unreadable) {
+            (LinkProvenance::AcrossGap, _) => " (across an observation gap)".to_string(),
+            (LinkProvenance::Contiguous, 0) => String::new(),
+            (LinkProvenance::Contiguous, n) => {
+                format!(" (across {n} tick(s) without an ARP entry)")
+            }
+        };
+        Some(Fire {
+            detail: format!("gateway {last_router} mac {prev_mac} -> {last_mac}{across}"),
         })
     }
 }
@@ -169,22 +195,27 @@ impl Condition for NeighborMacCollision {
         if last.verdict != NeighborsVerdict::Ok {
             return None;
         }
-        let mut macs_by_ip: HashMap<&str, Vec<&str>> = HashMap::new();
+        // Ordered by IP, and every collision reported: the same reading must
+        // produce the same incident text, and a second collision in one reading
+        // is a second fact, not a duplicate of the first.
+        let mut macs_by_ip: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for n in &last.neighbors {
             let macs = macs_by_ip.entry(n.ip.as_str()).or_default();
             if !macs.contains(&n.mac.as_str()) {
                 macs.push(&n.mac);
             }
         }
-        macs_by_ip
+        let collisions: Vec<String> = macs_by_ip
             .into_iter()
-            .find(|(_, macs)| macs.len() > 1)
+            .filter(|(_, macs)| macs.len() > 1)
             .map(|(ip, mut macs)| {
                 macs.sort_unstable();
-                Fire {
-                    detail: format!("ip {ip} claimed by {}", macs.join(", ")),
-                }
+                format!("ip {ip} claimed by {}", macs.join(", "))
             })
+            .collect();
+        (!collisions.is_empty()).then(|| Fire {
+            detail: collisions.join("; "),
+        })
     }
 }
 
@@ -662,6 +693,62 @@ mod tests {
         assert!(GwMacChange.eval(&w).is_some());
     }
 
+    /// The ARP cache is routinely empty for a tick or two right after a link
+    /// flap — which is exactly when the gateway MAC changes. Comparing only
+    /// against the immediate predecessor loses the change permanently: the tick
+    /// after the unreadable one already agrees with itself.
+    #[test]
+    fn gw_mac_change_survives_a_transient_arp_miss() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_router_mac(
+            1,
+            Some("192.168.1.1"),
+            Some("aa:aa:aa:aa:aa:aa"),
+        ));
+        w.push(link_router_mac(2, Some("192.168.1.1"), None));
+        w.push(link_router_mac(
+            3,
+            Some("192.168.1.1"),
+            Some("bb:bb:bb:bb:bb:bb"),
+        ));
+        let fire = GwMacChange
+            .eval(&w)
+            .expect("a MAC change straddling an unreadable tick must still fire");
+        assert!(fire.detail.contains("aa:aa:aa:aa:aa:aa"));
+        assert!(fire.detail.contains("bb:bb:bb:bb:bb:bb"));
+        assert!(
+            fire.detail.contains("without an ARP entry"),
+            "the comparison is not two consecutive measurements and must say so: {}",
+            fire.detail
+        );
+    }
+
+    /// Across a pause the same gateway IP answered by a new MAC is equally well
+    /// explained by an ARP spoof and by a move to a different network that
+    /// happens to use the same address plan. The incident must not present the
+    /// first reading as the only one, so the provenance is labelled.
+    #[test]
+    fn gw_mac_change_across_a_resume_is_labelled() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_router_mac(
+            1,
+            Some("192.168.1.1"),
+            Some("aa:aa:aa:aa:aa:aa"),
+        ));
+        w.clear_for_resume();
+        w.push(link_router_mac(
+            10,
+            Some("192.168.1.1"),
+            Some("bb:bb:bb:bb:bb:bb"),
+        ));
+        let fire = GwMacChange.eval(&w).expect("must fire across a resume");
+        assert!(
+            fire.detail.contains("across an observation gap"),
+            "a comparison across a pause must be attributable: {}",
+            fire.detail
+        );
+    }
+
     #[test]
     fn neighbor_mac_collision_fires_on_two_macs_for_one_ip() {
         let mut w = RecentWindow::new(8);
@@ -680,6 +767,31 @@ mod tests {
         assert!(fire.detail.contains("192.168.1.50"));
         assert!(fire.detail.contains("aa:aa:aa:aa:aa:aa"));
         assert!(fire.detail.contains("bb:bb:bb:bb:bb:bb"));
+    }
+
+    /// Two collisions in one reading are two facts. Reporting whichever the
+    /// hash order happened to yield made the incident text differ between runs
+    /// on identical data and dropped the second collision entirely — neither is
+    /// acceptable in a record meant to be produced as evidence.
+    #[test]
+    fn neighbor_mac_collision_reports_every_collision_in_ip_order() {
+        let mut w = RecentWindow::new(8);
+        w.push(neighbors(
+            1,
+            NeighborsVerdict::Ok,
+            vec![
+                nobs("192.168.1.51", "cc:cc:cc:cc:cc:cc"),
+                nobs("192.168.1.51", "dd:dd:dd:dd:dd:dd"),
+                nobs("192.168.1.50", "aa:aa:aa:aa:aa:aa"),
+                nobs("192.168.1.50", "bb:bb:bb:bb:bb:bb"),
+            ],
+        ));
+        let fire = NeighborMacCollision.eval(&w).expect("both must fire");
+        assert_eq!(
+            fire.detail,
+            "ip 192.168.1.50 claimed by aa:aa:aa:aa:aa:aa, bb:bb:bb:bb:bb:bb; \
+ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
+        );
     }
 
     #[test]
