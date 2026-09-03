@@ -123,26 +123,35 @@ pub(crate) fn render_mac(bytes: &[u8]) -> Option<String> {
     )
 }
 
-/// Render bytes as a UTF-8 string when they are valid UTF-8 and contain no
-/// control characters; `None` otherwise. Used for interface names and text
-/// TLVs — a name we cannot read cleanly is left raw rather than lossily coerced.
+/// Render bytes as a UTF-8 string when they are valid UTF-8 and carry no control
+/// characters OTHER than the common whitespace (`\t`, `\n`, `\r`); `None`
+/// otherwise. The whitespace exception matters: real CDP Software Version and
+/// LLDP System Description strings are routinely multi-line, and rejecting every
+/// control byte silently dropped the single most device-identifying field on
+/// well-formed frames. A genuinely binary/mojibake value (other control bytes,
+/// or invalid UTF-8) is still left absent rather than lossily coerced.
 pub(crate) fn render_text(bytes: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(bytes).ok()?;
-    if s.chars().any(|c| c.is_control()) {
+    if s.chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+    {
         return None;
     }
     Some(s.to_owned())
 }
 
-/// Render an IPv4 (4 bytes) or IPv6 (16 bytes) address as text; `None` for any
-/// other length.
-pub(crate) fn render_ip(bytes: &[u8]) -> Option<String> {
-    match bytes.len() {
-        4 => {
+/// Render a management address as text, gated on the IANA `address_family` the
+/// TLV itself declares (1 = IPv4, 2 = IPv6) so the rendering can never contradict
+/// its own family byte — a family-1 TLV carrying 16 bytes stays raw rather than
+/// being confidently shown as an IPv6 address it never claimed to be. `None` for
+/// a family/length mismatch or an unrendered family, leaving the raw bytes.
+pub(crate) fn render_ip(family: u8, bytes: &[u8]) -> Option<String> {
+    match (family, bytes.len()) {
+        (1, 4) => {
             let a: [u8; 4] = bytes.try_into().ok()?;
             Some(std::net::Ipv4Addr::from(a).to_string())
         }
-        16 => {
+        (2, 16) => {
             let a: [u8; 16] = bytes.try_into().ok()?;
             Some(std::net::Ipv6Addr::from(a).to_string())
         }

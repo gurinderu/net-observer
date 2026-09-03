@@ -244,3 +244,26 @@ fn never_panics_on_truncations_of_a_valid_frame() {
         let _ = parse_lldp(&pdu[..n]);
     }
 }
+
+/// A large DECLARED TLV length (up to the 9-bit max, 511) running past even a
+/// long buffer must error cleanly, not panic or read out of bounds — the
+/// small-input fuzz test never exercises this shape.
+#[test]
+fn a_huge_declared_length_past_a_long_buffer_never_panics() {
+    // type=5 (system name), declared length 511, but far fewer bytes follow.
+    let mut frame = Vec::new();
+    let tl: u16 = (5 << 9) | 511;
+    frame.extend_from_slice(&tl.to_be_bytes());
+    frame.extend(vec![0xABu8; 200]); // 200 < 511
+    // Must not panic; a truncated TLV is an error, never a read past the end.
+    let _ = parse_lldp(&frame);
+
+    // A modest length inside a 4 KiB buffer proves the walk terminates over a
+    // long buffer rather than stalling or running away.
+    let mut big = Vec::new();
+    let tl2: u16 = (5 << 9) | 4;
+    big.extend_from_slice(&tl2.to_be_bytes());
+    big.extend_from_slice(b"name");
+    big.extend(vec![0u8; 4096]); // trailing garbage
+    let _ = parse_lldp(&big);
+}

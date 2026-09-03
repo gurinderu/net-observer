@@ -124,7 +124,9 @@ fn decode_chassis_id(value: &[u8]) -> Result<ChassisId, LldpError> {
         // 4 = MAC address.
         4 => render_mac(id),
         // 5 = network address (IANA family byte + address).
-        5 => id.split_first().and_then(|(_, addr)| render_ip(addr)),
+        5 => id
+            .split_first()
+            .and_then(|(fam, addr)| render_ip(*fam, addr)),
         // 6 = interface name, 7 = locally assigned: text.
         6 | 7 => render_text(id),
         _ => None,
@@ -143,7 +145,9 @@ fn decode_port_id(value: &[u8]) -> Result<PortId, LldpError> {
         // 3 = MAC address.
         3 => render_mac(id),
         // 4 = network address (IANA family byte + address).
-        4 => id.split_first().and_then(|(_, addr)| render_ip(addr)),
+        4 => id
+            .split_first()
+            .and_then(|(fam, addr)| render_ip(*fam, addr)),
         // 1 = interface alias, 5 = interface name, 7 = locally assigned: text.
         1 | 5 | 7 => render_text(id),
         _ => None,
@@ -183,7 +187,7 @@ fn decode_management_address(value: &[u8]) -> Option<ManagementAddress> {
     let address_family = r.u8("mgmt addr family").ok()?;
     // The address string length counts the family byte plus the address.
     let addr = r.take(addr_str_len - 1, "mgmt addr").ok()?;
-    let rendered = render_ip(addr);
+    let rendered = render_ip(address_family, addr);
     Some(ManagementAddress {
         address_family,
         rendered,
