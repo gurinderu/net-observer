@@ -503,6 +503,119 @@ ORDER BY v.last_seen_us DESC, v.mac, v.port, v.cve_id"
     ))
 }
 
+/// **Where I have been** — every network segment the record has ever seen, most
+/// recent activity first.
+///
+/// One row per `network_key` (the gateway MAC, or the literal `unknown` when it
+/// could not be read). A segment's span is the widest reach of its own rows:
+/// `min`/`max` over the `neighbor` first/last-seen columns and the
+/// `neighbor_sample` tick timestamps. `neighbors` counts the distinct devices
+/// the segment ever held.
+///
+/// Two of the columns are recovered rather than stored, and neither is asserted:
+///
+/// - `gateway_ip` is the address of the gateway's own `neighbor` entry — the row
+///   whose `mac` equals the segment key. It is present only when the daemon
+///   happened to record the gateway as a neighbour, and `NULL` otherwise (always
+///   `NULL` for the `unknown` segment, whose key is not a MAC).
+/// - `ssid_guess` is a BEST-EFFORT label, not a fact: the daemon never joins an
+///   SSID to a `network_key`, so this is the most recent `link_sample.ssid` whose
+///   tick falls inside the segment's span — a TIME-overlap guess. The column name
+///   says `guess` on purpose; a segment with no overlapping named `link_sample`
+///   leaves it blank rather than inventing one.
+///
+/// A segment recorded under `unknown` is listed like any other: during an outage
+/// the gateway MAC is often exactly what could not be read, so that segment is
+/// the one most likely to matter.
+pub fn segments_sql() -> String {
+    "WITH span AS (
+  SELECT network_key, min(t) AS first_seen_us, max(t) AS last_seen_us
+  FROM (
+    SELECT network_key, first_seen_us AS t FROM neighbor
+    UNION ALL SELECT network_key, last_seen_us AS t FROM neighbor
+    -- `neighbor_sample` stores a NULL key where the entity table writes the
+    -- 'unknown' sentinel; fold them together so one segment is one row.
+    UNION ALL SELECT coalesce(network_key, 'unknown') AS network_key, ts_us AS t
+              FROM neighbor_sample
+  )
+  GROUP BY network_key
+),
+cnt AS (
+  SELECT network_key, count(*) AS neighbors FROM neighbor GROUP BY network_key
+)
+SELECT s.network_key,
+       (SELECT n.ip FROM neighbor n
+        WHERE n.network_key = s.network_key AND n.mac = s.network_key
+        LIMIT 1) AS gateway_ip,
+       (SELECT ls.ssid FROM link_sample ls
+        WHERE ls.ssid IS NOT NULL
+          AND ls.ts_us >= s.first_seen_us AND ls.ts_us <= s.last_seen_us
+        ORDER BY ls.ts_us DESC
+        LIMIT 1) AS ssid_guess,
+       s.first_seen_us,
+       s.last_seen_us,
+       coalesce(c.neighbors, 0) AS neighbors
+FROM span s
+LEFT JOIN cnt c ON c.network_key = s.network_key
+ORDER BY s.last_seen_us DESC, s.network_key"
+        .to_string()
+}
+
+/// Which slice of one segment's history to read: a single instant, or a window.
+#[derive(Debug, Clone, Copy)]
+pub enum HistoryWindow {
+    /// The neighbours (and their ports/vulns) live at exactly this `ts_us`:
+    /// `first_seen_us <= at <= last_seen_us`.
+    At(i64),
+    /// The neighbours (and their ports/vulns) whose lifetime overlaps
+    /// `[since, until]`: `first_seen_us <= until AND last_seen_us >= since`.
+    Range { since: i64, until: i64 },
+}
+
+impl HistoryWindow {
+    /// The activity predicate for a table carrying `first_seen_us` /
+    /// `last_seen_us`, with those columns qualified by `alias`.
+    fn predicate(self, alias: &str) -> String {
+        match self {
+            HistoryWindow::At(at) => {
+                format!("{alias}.first_seen_us <= {at} AND {alias}.last_seen_us >= {at}")
+            }
+            HistoryWindow::Range { since, until } => {
+                format!("{alias}.first_seen_us <= {until} AND {alias}.last_seen_us >= {since}")
+            }
+        }
+    }
+}
+
+/// **One segment's recorded state** — the neighbours of `network` that were live
+/// at an instant, or active over a window, newest last-seen first.
+///
+/// Each row is a device (`neighbor`), carried with a count of its open ports and
+/// hypothesised vulns that were themselves active over the same slice — so "who
+/// was on this segment, and what was open on them" reads in one table without SQL.
+///
+/// `network` is validated exactly as [`neighbors_sql`] validates it: a gateway
+/// MAC or the literal `unknown`, and anything else is an `Err`, never a query
+/// that silently matches nothing. The `unknown` segment is as reachable here as
+/// in the segment list.
+pub fn history_sql(network: &str, window: HistoryWindow) -> Result<String, BadNetworkKey> {
+    validate_network_key(network)?;
+    let neighbor_pred = window.predicate("n");
+    let port_pred = window.predicate("p");
+    let vuln_pred = window.predicate("v");
+    Ok(format!(
+        "SELECT n.mac, n.ip, n.oui, n.hostname, n.source, n.iface,
+       n.first_seen_us, n.last_seen_us,
+       (SELECT count(*) FROM neighbor_port p
+        WHERE p.network_key = n.network_key AND p.mac = n.mac AND {port_pred}) AS open_ports,
+       (SELECT count(*) FROM neighbor_vuln v
+        WHERE v.network_key = n.network_key AND v.mac = n.mac AND {vuln_pred}) AS vulns
+FROM neighbor n
+WHERE n.network_key = '{network}' AND {neighbor_pred}
+ORDER BY n.last_seen_us DESC, n.mac"
+    ))
+}
+
 /// A `network_key` the store could never have written.
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -581,6 +694,21 @@ impl DuckdbStore {
     pub fn observation_gaps(&self) -> Result<QueryTable, StoreError> {
         self.query_table(&observation_gaps_sql())
     }
+
+    /// Run [`segments_sql`].
+    pub fn segments(&self) -> Result<QueryTable, StoreError> {
+        self.query_table(&segments_sql())
+    }
+
+    /// Run [`history_sql`] for one segment over `window`.
+    ///
+    /// `network` must already be a valid key; the CLI validates it at the
+    /// boundary (via [`history_sql`], whose `Err` it surfaces), so an invalid key
+    /// reaching here is a caller bug, not user input — hence the `expect`, the
+    /// same idiom [`DuckdbStore::neighbors`] uses for its own always-valid input.
+    pub fn history(&self, network: &str, window: HistoryWindow) -> Result<QueryTable, StoreError> {
+        self.query_table(&history_sql(network, window).expect("network key must be pre-validated"))
+    }
 }
 
 #[cfg(test)]
@@ -625,9 +753,10 @@ mod tests {
         }
     }
     use super::*;
-    use crate::Store;
+    use crate::{NeighborPort, NeighborVuln, Store};
     use types::{
-        DnsSample, DnsVerdict, GwVerdict, HostSample, Incident, LinkSample, ObservingEdge,
+        DnsSample, DnsVerdict, GwVerdict, HostSample, Incident, LinkSample, NeighborObs,
+        NeighborRole, NeighborSource, NeighborsSample, NeighborsVerdict, ObservingEdge,
         ProxySample, Sample, TcpVerdict,
     };
 
@@ -1450,5 +1579,196 @@ mod tests {
         assert_eq!(cell(&g, 0, "gap_closed_us"), (30 * SEC).to_string());
         assert_eq!(cell(&g, 1, "gap_opened_us"), (40 * SEC).to_string());
         assert_eq!(cell(&g, 1, "gap_closed_us"), (55 * SEC).to_string());
+    }
+
+    // ---- 7. segments (where have I been) and one segment's history ----------
+
+    /// One neighbour sighting on a segment. `key` is the `network_key`; `None`
+    /// records under the `unknown` sentinel, exactly as a live tick would.
+    fn neigh(s: &DuckdbStore, ts_us: i64, key: Option<&str>, mac: &str, ip: &str) {
+        s.write_sample(&Sample::Neighbors(NeighborsSample {
+            ts_us,
+            verdict: NeighborsVerdict::Ok,
+            reason: None,
+            network_key: key.map(str::to_string),
+            iface: Some("en0".into()),
+            neighbors: vec![NeighborObs {
+                mac: mac.into(),
+                ip: ip.into(),
+                source: NeighborSource::Arp,
+                hostname: None,
+                role: NeighborRole::Unknown,
+            }],
+        }))
+        .unwrap();
+    }
+
+    const K1: &str = "a4:83:e7:1b:2c:3d";
+    const K2: &str = "b8:27:eb:11:22:33";
+
+    #[test]
+    fn a_segment_appears_with_its_span_and_neighbour_count() {
+        let s = DuckdbStore::in_memory().unwrap();
+        // Two devices, first seen at different ticks: the span is the widest
+        // reach of the segment's rows, the count is the distinct devices.
+        neigh(&s, 10 * SEC, Some(K1), "11:22:33:44:55:66", "10.0.0.5");
+        neigh(&s, 30 * SEC, Some(K1), "11:22:33:44:55:77", "10.0.0.6");
+
+        let t = s.segments().unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "network_key"), K1);
+        assert_eq!(cell(&t, 0, "first_seen_us"), (10 * SEC).to_string());
+        assert_eq!(cell(&t, 0, "last_seen_us"), (30 * SEC).to_string());
+        assert_eq!(cell(&t, 0, "neighbors"), "2");
+    }
+
+    #[test]
+    fn two_network_keys_list_as_two_segments_newest_first() {
+        let s = DuckdbStore::in_memory().unwrap();
+        neigh(&s, 10 * SEC, Some(K1), "11:22:33:44:55:66", "10.0.0.5");
+        neigh(&s, 50 * SEC, Some(K2), "22:33:44:55:66:77", "192.168.1.9");
+
+        let t = s.segments().unwrap();
+        assert_eq!(t.rows.len(), 2);
+        // Newest activity first.
+        assert_eq!(cell(&t, 0, "network_key"), K2);
+        assert_eq!(cell(&t, 1, "network_key"), K1);
+    }
+
+    /// The gateway MAC is often exactly what an outage makes unreadable, so the
+    /// segment recorded under `unknown` must be listable, not hidden.
+    #[test]
+    fn the_unknown_segment_is_listed_like_any_other() {
+        let s = DuckdbStore::in_memory().unwrap();
+        neigh(&s, 10 * SEC, None, "11:22:33:44:55:66", "10.0.0.5");
+
+        let t = s.segments().unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "network_key"), "unknown");
+        assert_eq!(cell(&t, 0, "neighbors"), "1");
+        // Its key is not a MAC, so no gateway-own row can back a gateway_ip.
+        assert_eq!(cell(&t, 0, "gateway_ip"), "");
+    }
+
+    /// The SSID is a best-effort time-overlap guess: present when a named
+    /// `link_sample` falls inside the segment's span, blank otherwise. Never
+    /// asserted.
+    #[test]
+    fn the_ssid_label_is_best_effort_present_only_on_time_overlap() {
+        let s = DuckdbStore::in_memory().unwrap();
+        // K1 is active [10s, 30s] and a named link tick lands inside it.
+        neigh(&s, 10 * SEC, Some(K1), "11:22:33:44:55:66", "10.0.0.5");
+        neigh(&s, 30 * SEC, Some(K1), "11:22:33:44:55:66", "10.0.0.5");
+        link(&s, 20 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok); // ssid "cowork"
+        // K2 is active far later, with no link tick overlapping its span.
+        neigh(&s, 100 * SEC, Some(K2), "22:33:44:55:66:77", "192.168.1.9");
+
+        let t = s.segments().unwrap();
+        let k1_ssid = (0..t.rows.len())
+            .find(|&i| cell(&t, i, "network_key") == K1)
+            .map(|i| cell(&t, i, "ssid_guess"))
+            .unwrap();
+        let k2_ssid = (0..t.rows.len())
+            .find(|&i| cell(&t, i, "network_key") == K2)
+            .map(|i| cell(&t, i, "ssid_guess"))
+            .unwrap();
+        assert_eq!(
+            k1_ssid, "cowork",
+            "overlapping link tick supplies the guess"
+        );
+        assert_eq!(k2_ssid, "", "no overlap leaves it blank, not invented");
+    }
+
+    #[test]
+    fn history_at_selects_only_the_neighbours_live_at_that_instant() {
+        let s = DuckdbStore::in_memory().unwrap();
+        // A: live [10s, 50s]. B: live [60s, 80s].
+        neigh(&s, 10 * SEC, Some(K1), "aa:aa:aa:aa:aa:aa", "10.0.0.5");
+        neigh(&s, 50 * SEC, Some(K1), "aa:aa:aa:aa:aa:aa", "10.0.0.5");
+        neigh(&s, 60 * SEC, Some(K1), "bb:bb:bb:bb:bb:bb", "10.0.0.6");
+        neigh(&s, 80 * SEC, Some(K1), "bb:bb:bb:bb:bb:bb", "10.0.0.6");
+
+        // At 30s only A is live.
+        let t = s.history(K1, HistoryWindow::At(30 * SEC)).unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "mac"), "aa:aa:aa:aa:aa:aa");
+
+        // A window that spans both catches both.
+        let t = s
+            .history(
+                K1,
+                HistoryWindow::Range {
+                    since: 10 * SEC,
+                    until: 80 * SEC,
+                },
+            )
+            .unwrap();
+        assert_eq!(t.rows.len(), 2);
+    }
+
+    /// A window carries the count of ports and vulns active over the same slice,
+    /// so "who was here and what was open" reads in one table.
+    #[test]
+    fn history_carries_ports_and_vulns_active_in_the_window() {
+        let s = DuckdbStore::in_memory().unwrap();
+        neigh(&s, 10 * SEC, Some(K1), "aa:aa:aa:aa:aa:aa", "10.0.0.5");
+        neigh(&s, 50 * SEC, Some(K1), "aa:aa:aa:aa:aa:aa", "10.0.0.5");
+        s.write_neighbor_port(&NeighborPort {
+            network_key: Some(K1.into()),
+            mac: "aa:aa:aa:aa:aa:aa".into(),
+            ip: "10.0.0.5".into(),
+            port: 445,
+            ts_us: 20 * SEC,
+            banner: None,
+        })
+        .unwrap();
+        s.write_neighbor_vuln(&NeighborVuln {
+            network_key: Some(K1.into()),
+            mac: "aa:aa:aa:aa:aa:aa".into(),
+            port: 445,
+            cve_id: "CVE-2020-0796".into(),
+            confidence: "high".into(),
+            known_exploited: true,
+            cvss: Some(10.0),
+            ts_us: 20 * SEC,
+        })
+        .unwrap();
+
+        let t = s
+            .history(
+                K1,
+                HistoryWindow::Range {
+                    since: 10 * SEC,
+                    until: 50 * SEC,
+                },
+            )
+            .unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "open_ports"), "1");
+        assert_eq!(cell(&t, 0, "vulns"), "1");
+    }
+
+    /// The `unknown` segment is as reachable in `history` as in the list.
+    #[test]
+    fn history_reaches_the_unknown_segment() {
+        let s = DuckdbStore::in_memory().unwrap();
+        neigh(&s, 10 * SEC, None, "aa:aa:aa:aa:aa:aa", "10.0.0.5");
+        let t = s.history("unknown", HistoryWindow::At(10 * SEC)).unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "mac"), "aa:aa:aa:aa:aa:aa");
+    }
+
+    /// A non-key filter is an error, never a query that matches nothing — the
+    /// same discipline as `neighbors_sql`.
+    #[test]
+    fn history_rejects_a_non_key_network() {
+        assert!(history_sql(K1, HistoryWindow::At(0)).is_ok());
+        assert!(history_sql("unknown", HistoryWindow::At(0)).is_ok());
+        for bad in ["'; DROP TABLE neighbor; --", "a4:83", "не мак", ""] {
+            assert!(
+                history_sql(bad, HistoryWindow::At(0)).is_err(),
+                "{bad:?} must be an error, not a query that matches nothing"
+            );
+        }
     }
 }

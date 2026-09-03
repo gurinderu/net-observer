@@ -199,6 +199,36 @@ enum Command {
     /// The observation gaps the record contains — every interval the daemon
     /// deliberately collected nothing for, and what closed each (offline).
     Gaps,
+    /// The network segments this machine has ever recorded, newest activity
+    /// first (offline): the segment key, a best-effort SSID guess, the gateway
+    /// IP when recoverable, first/last seen, and how many devices it held.
+    ///
+    /// `ssid_guess` is a TIME-overlap heuristic, never an asserted fact: the
+    /// daemon does not join an SSID to a segment. A segment recorded under
+    /// `unknown` (the gateway MAC was unreadable) is listed like any other.
+    Segments,
+    /// One segment's recorded state (offline): the neighbours that were live at
+    /// an instant (`--at`), or active over a window (`--since`/`--until`), each
+    /// with a count of its open ports and hypothesised vulns over that slice.
+    History {
+        /// The segment to read, by its gateway MAC — or the literal `unknown`
+        /// for the segment whose gateway MAC was unreadable. A non-key is an
+        /// error, not an empty table.
+        #[arg(long)]
+        network: String,
+        /// A single instant, in any form `why --at` accepts. Mutually exclusive
+        /// with `--since`/`--until`; defaults to now if no window is given.
+        #[arg(long, conflicts_with_all = ["since", "until"])]
+        at: Option<String>,
+        /// Window start (inclusive), in any form `why --at` accepts. Requires
+        /// `--until`.
+        #[arg(long, requires = "until")]
+        since: Option<String>,
+        /// Window end (inclusive), in any form `why --at` accepts. Requires
+        /// `--since`.
+        #[arg(long, requires = "since")]
+        until: Option<String>,
+    },
 }
 
 /// The desired observation state for the `observe` subcommand.
@@ -368,6 +398,31 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Gaps => {
             let table = run_query(&cli.db, &diagnosis::observation_gaps_sql())?;
             print!("{}", diagnose::format_observation_gaps(&table)?);
+        }
+        Command::Segments => {
+            let table = run_query(&cli.db, &diagnosis::segments_sql())?;
+            print!("{}", format_table(&table));
+        }
+        Command::History {
+            network,
+            at,
+            since,
+            until,
+        } => {
+            // `clap` guarantees `--since`/`--until` come as a pair and never
+            // alongside `--at`; the remaining case is neither, which reads as
+            // "now".
+            let window = match (at, since, until) {
+                (_, Some(since), Some(until)) => diagnosis::HistoryWindow::Range {
+                    since: diagnose::parse_at(since)?,
+                    until: diagnose::parse_at(until)?,
+                },
+                (Some(at), _, _) => diagnosis::HistoryWindow::At(diagnose::parse_at(at)?),
+                _ => diagnosis::HistoryWindow::At(diagnose::parse_at("now")?),
+            };
+            let sql = diagnosis::history_sql(network, window).map_err(|e| anyhow!("{e}"))?;
+            let table = run_query(&cli.db, &sql)?;
+            print!("{}", format_table(&table));
         }
     }
     Ok(ExitCode::SUCCESS)
