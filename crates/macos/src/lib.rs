@@ -25,6 +25,7 @@ pub mod neighbors;
 pub mod net;
 pub mod pcap;
 pub mod route;
+pub mod tls;
 pub mod wifi;
 
 pub use clash::{ClashClient, ProxySystemFacts};

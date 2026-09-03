@@ -66,6 +66,7 @@ impl ClashClient {
 /// [`HTTP_TIMEOUT`] as the per-request deadline. Falls back to the default
 /// client if the builder fails (which it does not with the workspace features).
 fn build_http_client() -> reqwest::Client {
+    crate::tls::install_default_provider();
     reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()

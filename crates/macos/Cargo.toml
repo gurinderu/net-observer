@@ -19,6 +19,7 @@ objc2.workspace = true
 surge-ping.workspace = true
 socket2.workspace = true
 reqwest.workspace = true
+rustls-graviola.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 mdns-sd.workspace = true

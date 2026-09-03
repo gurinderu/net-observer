@@ -75,10 +75,18 @@ socket2 = "0.5"
 # Async HTTP client for the macOS adapters (Clash `now`, TUN 204 probe, DoH). The
 # collectors are native `async fn`, so the client is used from `reqwest`'s async
 # API on the daemon's tokio runtime (never `reqwest::blocking`). Kept lean:
-# `default-features = false` drops the bundled OpenSSL/`native-tls`, `rustls-tls`
-# selects the pure-Rust TLS backend, and `json` adds serde_json (de)serialization
-# for the DoH endpoint.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# `default-features = false` drops the bundled OpenSSL/`native-tls`, the
+# `-no-provider` rustls variant leaves the crypto choice to us (see
+# `rustls-graviola` below), and `json` adds serde_json (de)serialization for the
+# DoH endpoint.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots-no-provider",
+    "json",
+] }
+# The rustls crypto provider, installed as the process default before the first
+# client is built. Rust plus assembly, no C, x86-64 and aarch64 — one TLS stack
+# on this Mac and on the Linux port. (realm net-observer, node #46)
+rustls-graviola = "0.4"
 libc = "0.2"
 tempfile = "3"
 gpui = "0.2.2"
