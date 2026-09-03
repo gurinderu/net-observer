@@ -22,10 +22,12 @@ use crate::verdict::{NeighborSource, NeighborsVerdict};
 /// (`Gateway`, decided by the segment's own key) apart from the inferred ones,
 /// and `Infra` carries how strong the inference is so the reader can weigh it.
 ///
-/// Internally tagged (`{"kind": ...}`) and `#[serde(default)]`-friendly via
-/// [`NeighborRole::Unknown`]: an older peer that never sent a `role` decodes to
-/// `Unknown` rather than failing — the same forward-compatibility the rest of the
-/// socket surface relies on.
+/// Internally tagged (`{"kind": ...}`). Forward-compatible in BOTH directions
+/// via [`NeighborRole::Unknown`]: `#[serde(default)]` on the field decodes an
+/// older peer that never sent a `role`, and `#[serde(other)]` on `Unknown`
+/// decodes a NEWER peer's role variant this build does not know — either way the
+/// reader sees `Unknown` instead of failing the whole `NeighborObs`/`Response`
+/// decode and going blank. (realm net-observer, node #36)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NeighborRole {
@@ -43,8 +45,12 @@ pub enum NeighborRole {
     /// gear (or is unknown), with no management port open.
     Host,
     /// Nothing to go on: a randomized/locally-administered MAC, or no OUI
-    /// snapshot to resolve a vendor against. Never a guessed vendor.
+    /// snapshot to resolve a vendor against. Never a guessed vendor. Also the
+    /// `#[serde(other)]` sink for a role variant a newer peer sends that this
+    /// build does not know — an unknown role reads as "nothing to go on", never
+    /// a decode failure.
     #[default]
+    #[serde(other)]
     Unknown,
 }
 
@@ -76,6 +82,12 @@ pub struct NeighborObs {
     /// [`NeighborRole::Unknown`]. Filled by the inference step (gateway + OUI
     /// vendor passively; refined with open ports after a scan); left `Unknown`
     /// when there is no OUI snapshot to reason from.
+    ///
+    /// Deliberately EPHEMERAL — a live-map hint, not written to the `neighbor`
+    /// table. It is a derived view of what is persisted (the `oui`, and the
+    /// scanned `neighbor_port` ports), recomputed each read against the current
+    /// vendor snapshot, so it never goes stale in the store the way a cached
+    /// hypothesis would.
     #[serde(default)]
     pub role: NeighborRole,
 }
@@ -144,6 +156,17 @@ mod tests {
         let older =
             r#"{"mac":"a4:83:e7:1b:2c:3d","ip":"192.168.1.5","source":"Arp","hostname":null}"#;
         let n: NeighborObs = serde_json::from_str(older).expect("older obs must decode");
+        assert_eq!(n.role, NeighborRole::Unknown);
+    }
+
+    /// A role VARIANT a newer peer might send that this build does not know must
+    /// decode to `Unknown`, not fail the whole `NeighborObs` — otherwise adding a
+    /// role later blanks every un-upgraded reader. This is the `#[serde(other)]`
+    /// half of the forward-compatibility (the field-default is the other half).
+    #[test]
+    fn an_unknown_role_tag_decodes_to_unknown_not_an_error() {
+        let obs = r#"{"mac":"a4:83:e7:1b:2c:3d","ip":"192.168.1.5","source":"Arp","hostname":null,"role":{"kind":"future_variant","confidence":"high"}}"#;
+        let n: NeighborObs = serde_json::from_str(obs).expect("an unknown role tag must not fail");
         assert_eq!(n.role, NeighborRole::Unknown);
     }
 

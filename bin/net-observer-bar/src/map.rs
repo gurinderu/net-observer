@@ -153,7 +153,7 @@ fn partition(sample: &NeighborsSample) -> (Option<MapNode>, Vec<MapNode>, usize)
     let mut gateway = None;
     let mut ring = Vec::new();
     for obs in &sample.neighbors {
-        if gateway.is_none() && key.is_some_and(|k| k == obs.mac) {
+        if gateway.is_none() && key.is_some_and(|k| k.eq_ignore_ascii_case(&obs.mac)) {
             gateway = Some(MapNode::from_obs(obs));
         } else {
             ring.push(MapNode::from_obs(obs));
@@ -199,19 +199,19 @@ fn ring_positions(n: usize, cx: f32, cy: f32, r: f32) -> Vec<(f32, f32)> {
 ///
 /// The gateway keeps the accent (it is also `NeighborRole::Gateway`, but the map
 /// decides the gateway from the raw key before a `MapNode` exists, so honour that
-/// flag first). Infra reads in the semantic `warn` amber — distinct from the
-/// accent blue, the fg ink and the muted grey, so network gear stands out without
-/// a label; a host keeps the primary ink; an unknown role (randomized MAC, or no
-/// OUI snapshot to reason from) is muted, reading as least load-bearing. The role
-/// is a HYPOTHESIS: a colour, never an asserted "SWITCH". (realm net-observer,
-/// nodes #33, #34, #36)
+/// flag first). Infra reads in `track_on` — a distinct active tint, deliberately
+/// NOT the `warn` amber (which means "something is wrong" on the quiet/offline
+/// chips), so network gear stands out as a role, not an alert; a host keeps the
+/// primary ink; an unknown role (randomized MAC, or no OUI snapshot to reason
+/// from) is muted, reading as least load-bearing. The role is a HYPOTHESIS: a
+/// colour, never an asserted "SWITCH". (realm net-observer, nodes #33, #34, #36)
 fn node_accent(node: &MapNode, is_gateway: bool, theme: Theme) -> Rgba {
     if is_gateway {
         return rgb(theme.accent);
     }
     match node.role {
         NeighborRole::Gateway => rgb(theme.accent),
-        NeighborRole::Infra { .. } => rgb(theme.warn),
+        NeighborRole::Infra { .. } => rgb(theme.track_on),
         NeighborRole::Host => rgb(theme.fg),
         NeighborRole::Unknown => rgb(theme.muted),
     }
