@@ -64,7 +64,12 @@ jiff = { version = "0.2", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-duckdb = { version = "1", features = ["bundled"] }
+# Fork: upstream libduckdb-sys carries an unconditional build-dependency on
+# ureq, which hard-enables ring; ring then fails to compile on the CI runner
+# before any test runs. The fork makes that download path opt-in, so
+# `default-features = false` drops it. Pinned to a revision, not a branch.
+# (realm net-observer, node #45)
+duckdb = { git = "https://github.com/gurinderu/duckdb-rs", rev = "76b8eba", default-features = false, features = ["bundled"] }
 # Pure-Rust mDNS/DNS-SD, no async runtime of its own (the adapter drives its
 # blocking receiver on tokio's blocking pool). Used ONLY by the operator-pressed
 # neighbour scan — nothing queries mDNS on a timer.
