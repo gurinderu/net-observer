@@ -154,10 +154,7 @@ mod tests {
         // to load — a race that failed `load_from_file` nondeterministically.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "role-test-{}-{n}.manuf",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("role-test-{}-{n}.manuf", std::process::id()));
         std::fs::write(&path, lines).unwrap();
         let db = OuiDb::load_from_file(&path).unwrap();
         let _ = std::fs::remove_file(&path);
