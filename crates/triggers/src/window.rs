@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use types::{DnsSample, HostSample, LinkSample, ProxySample, Sample};
+use types::{DnsSample, HostSample, LinkSample, NeighborsSample, ProxySample, Sample};
 
 /// Where [`RecentWindow::prev_link`]'s answer came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +202,19 @@ impl RecentWindow {
             | Sample::Route(_)
             | Sample::Wifi(_)
             | Sample::Neighbors(_) => None,
+        })
+    }
+
+    /// The newest neighbors sample, if any.
+    pub fn last_neighbors(&self) -> Option<&NeighborsSample> {
+        self.buf.iter().rev().find_map(|s| match s {
+            Sample::Neighbors(n) => Some(n),
+            Sample::Link(_)
+            | Sample::Proxy(_)
+            | Sample::Dns(_)
+            | Sample::Route(_)
+            | Sample::Host(_)
+            | Sample::Wifi(_) => None,
         })
     }
 

@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use crate::window::{LinkProvenance, RecentWindow};
-use types::{DnsVerdict, GwVerdict, TcpVerdict};
+use types::{DnsVerdict, GwVerdict, NeighborsVerdict, TcpVerdict};
 
 /// How many recent DNS samples the `fakeip` condition scans (one polling tick
 /// emits several probe rows, so a small window covers the latest tick).
@@ -127,6 +129,65 @@ impl Condition for GwChange {
     }
 }
 
+/// Fires when the newest link sample's ARP-resolved gateway MAC differs from the
+/// previous comparable sample's, while the DHCP-leased router IP is unchanged —
+/// the same address answered by a different MAC. `gw_arp_mac`/`dhcp_router` are
+/// read regardless of quiet mode (only the gateway echo is suppressed), so
+/// unlike `GwChange` no `SKIP`-scan is needed: an absent MAC on either side is
+/// simply not a comparison. (realm net-observer, node #32)
+pub struct GwMacChange;
+impl Condition for GwMacChange {
+    fn id(&self) -> &'static str {
+        "gw-mac-change"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_link()?;
+        let prev = w.prev_link()?;
+        let last_router = last.dhcp_router.as_deref()?;
+        let prev_router = prev.dhcp_router.as_deref()?;
+        if last_router != prev_router {
+            return None;
+        }
+        let last_mac = last.gw_arp_mac.as_deref()?;
+        let prev_mac = prev.gw_arp_mac.as_deref()?;
+        (last_mac != prev_mac).then(|| Fire {
+            detail: format!("gateway {last_router} mac {prev_mac} -> {last_mac}"),
+        })
+    }
+}
+
+/// Fires when the newest `neighbors` reading holds two different MACs claiming
+/// the same IP — an address collision, provable only from that table.
+/// (realm net-observer, node #32)
+pub struct NeighborMacCollision;
+impl Condition for NeighborMacCollision {
+    fn id(&self) -> &'static str {
+        "neighbor-mac-collision"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_neighbors()?;
+        if last.verdict != NeighborsVerdict::Ok {
+            return None;
+        }
+        let mut macs_by_ip: HashMap<&str, Vec<&str>> = HashMap::new();
+        for n in &last.neighbors {
+            let macs = macs_by_ip.entry(n.ip.as_str()).or_default();
+            if !macs.contains(&n.mac.as_str()) {
+                macs.push(&n.mac);
+            }
+        }
+        macs_by_ip
+            .into_iter()
+            .find(|(_, macs)| macs.len() > 1)
+            .map(|(ip, mut macs)| {
+                macs.sort_unstable();
+                Fire {
+                    detail: format!("ip {ip} claimed by {}", macs.join(", ")),
+                }
+            })
+    }
+}
+
 /// Fires on a fake-IP DNS answer for a `.ru` name — the sing-box fakeip range
 /// leaking onto a control domain that must resolve to a real address. Driven by
 /// the `dns` collector's [`types::DnsSample`]s in the window.
@@ -175,7 +236,8 @@ mod tests {
     use super::*;
     use crate::window::RecentWindow;
     use types::{
-        DnsSample, DnsVerdict, GwVerdict, HostSample, LinkSample, ProxySample, Sample, TcpVerdict,
+        DnsSample, DnsVerdict, GwVerdict, HostSample, LinkSample, NeighborObs, NeighborRole,
+        NeighborSource, NeighborsSample, NeighborsVerdict, ProxySample, Sample, TcpVerdict,
     };
 
     fn dns(ts: i64, probe: &str, verdict: DnsVerdict, ip: Option<&str>) -> Sample {
@@ -237,6 +299,44 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(tun),
             selector: None,
+        })
+    }
+
+    /// A link sample carrying only what `GwMacChange` reads: the DHCP router IP
+    /// and the ARP-resolved gateway MAC, either possibly absent.
+    fn link_router_mac(ts: i64, router: Option<&str>, mac: Option<&str>) -> Sample {
+        Sample::Link(LinkSample {
+            ts_us: ts,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: router.map(str::to_string),
+            dhcp_dns: None,
+            gw_arp_mac: mac.map(str::to_string),
+            ssid: None,
+            wifi_capture_present: false,
+        })
+    }
+
+    fn nobs(ip: &str, mac: &str) -> NeighborObs {
+        NeighborObs {
+            mac: mac.into(),
+            ip: ip.into(),
+            source: NeighborSource::Arp,
+            hostname: None,
+            role: NeighborRole::Unknown,
+        }
+    }
+
+    fn neighbors(ts: i64, verdict: NeighborsVerdict, obs: Vec<NeighborObs>) -> Sample {
+        Sample::Neighbors(NeighborsSample {
+            ts_us: ts,
+            verdict,
+            reason: None,
+            network_key: None,
+            iface: None,
+            neighbors: obs,
         })
     }
 
@@ -469,5 +569,152 @@ mod tests {
         w.push(link_gw(1, GwVerdict::Fail));
         w.clear_for_resume();
         assert!(GwDrop.eval(&w).is_none());
+    }
+
+    #[test]
+    fn gw_mac_change_fires_on_same_ip_different_mac() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_router_mac(
+            1,
+            Some("192.168.1.1"),
+            Some("aa:aa:aa:aa:aa:aa"),
+        ));
+        assert!(GwMacChange.eval(&w).is_none(), "no predecessor yet");
+        w.push(link_router_mac(
+            2,
+            Some("192.168.1.1"),
+            Some("bb:bb:bb:bb:bb:bb"),
+        ));
+        let fire = GwMacChange
+            .eval(&w)
+            .expect("same gateway IP with a different MAC must fire");
+        assert!(fire.detail.contains("192.168.1.1"));
+        assert!(fire.detail.contains("aa:aa:aa:aa:aa:aa"));
+        assert!(fire.detail.contains("bb:bb:bb:bb:bb:bb"));
+    }
+
+    #[test]
+    fn gw_mac_change_silent_when_mac_is_unchanged() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_router_mac(
+            1,
+            Some("192.168.1.1"),
+            Some("aa:aa:aa:aa:aa:aa"),
+        ));
+        w.push(link_router_mac(
+            2,
+            Some("192.168.1.1"),
+            Some("aa:aa:aa:aa:aa:aa"),
+        ));
+        assert!(GwMacChange.eval(&w).is_none());
+    }
+
+    /// A genuine IP change (moving to a different router entirely) is `gw-change`
+    /// territory, not this signature — firing here too would double-report an
+    /// ordinary network switch as an ARP anomaly.
+    #[test]
+    fn gw_mac_change_silent_when_the_router_ip_also_changed() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_router_mac(
+            1,
+            Some("192.168.1.1"),
+            Some("aa:aa:aa:aa:aa:aa"),
+        ));
+        w.push(link_router_mac(
+            2,
+            Some("10.0.0.1"),
+            Some("bb:bb:bb:bb:bb:bb"),
+        ));
+        assert!(GwMacChange.eval(&w).is_none());
+    }
+
+    /// Missing ARP/DHCP data on either side (never observed yet, or the
+    /// `default_gw()` lookup failed that tick) breaks the comparison rather than
+    /// firing — an absent measurement is not evidence of a MAC change.
+    #[test]
+    fn gw_mac_change_silent_when_either_side_is_missing_data() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_router_mac(1, None, None));
+        w.push(link_router_mac(
+            2,
+            Some("192.168.1.1"),
+            Some("aa:aa:aa:aa:aa:aa"),
+        ));
+        assert!(GwMacChange.eval(&w).is_none());
+    }
+
+    /// A MAC change that happened during a pause is still detectable at resume:
+    /// `GwMacChange` rides `prev_link`'s carried basis exactly like `GwChange`.
+    #[test]
+    fn gw_mac_change_fires_across_a_resume() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_router_mac(
+            1,
+            Some("192.168.1.1"),
+            Some("aa:aa:aa:aa:aa:aa"),
+        ));
+        w.clear_for_resume();
+        w.push(link_router_mac(
+            10,
+            Some("192.168.1.1"),
+            Some("bb:bb:bb:bb:bb:bb"),
+        ));
+        assert!(GwMacChange.eval(&w).is_some());
+    }
+
+    #[test]
+    fn neighbor_mac_collision_fires_on_two_macs_for_one_ip() {
+        let mut w = RecentWindow::new(8);
+        w.push(neighbors(
+            1,
+            NeighborsVerdict::Ok,
+            vec![
+                nobs("192.168.1.50", "aa:aa:aa:aa:aa:aa"),
+                nobs("192.168.1.50", "bb:bb:bb:bb:bb:bb"),
+                nobs("192.168.1.51", "cc:cc:cc:cc:cc:cc"),
+            ],
+        ));
+        let fire = NeighborMacCollision
+            .eval(&w)
+            .expect("two MACs claiming the same IP must fire");
+        assert!(fire.detail.contains("192.168.1.50"));
+        assert!(fire.detail.contains("aa:aa:aa:aa:aa:aa"));
+        assert!(fire.detail.contains("bb:bb:bb:bb:bb:bb"));
+    }
+
+    #[test]
+    fn neighbor_mac_collision_silent_when_every_ip_has_one_mac() {
+        let mut w = RecentWindow::new(8);
+        w.push(neighbors(
+            1,
+            NeighborsVerdict::Ok,
+            vec![
+                nobs("192.168.1.50", "aa:aa:aa:aa:aa:aa"),
+                nobs("192.168.1.51", "cc:cc:cc:cc:cc:cc"),
+            ],
+        ));
+        assert!(NeighborMacCollision.eval(&w).is_none());
+    }
+
+    /// A `SKIP` reading (the sweep could not run) carries no observations, so it
+    /// must not be scanned for a collision that was never measured.
+    #[test]
+    fn neighbor_mac_collision_silent_on_a_skip_reading() {
+        let mut w = RecentWindow::new(8);
+        w.push(neighbors(
+            1,
+            NeighborsVerdict::Skip,
+            vec![
+                nobs("192.168.1.50", "aa:aa:aa:aa:aa:aa"),
+                nobs("192.168.1.50", "bb:bb:bb:bb:bb:bb"),
+            ],
+        ));
+        assert!(NeighborMacCollision.eval(&w).is_none());
+    }
+
+    #[test]
+    fn neighbor_mac_collision_silent_with_no_neighbors_sample_yet() {
+        let w = RecentWindow::new(8);
+        assert!(NeighborMacCollision.eval(&w).is_none());
     }
 }
