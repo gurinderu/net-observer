@@ -583,6 +583,75 @@ impl EncodedFrame {
     }
 }
 
+/// What one collector is to this daemon: present in the build, and permitted to
+/// run by its config.
+///
+/// `kind` is a **string**, deliberately not an [`EventKind`]: this list is the
+/// one place where a NEWER daemon names collectors an OLDER reader has never
+/// heard of, and an unknown enum variant would fail the whole `Response` decode
+/// — the exact failure mode this crate already carries two mitigations for. A
+/// string an old reader does not recognise is simply a capability it does not
+/// ask about. The vocabulary is [`EventKind::as_str`], so both sides spell the
+/// kinds identically.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CollectorCapability {
+    /// The collector's lowercase label, in the [`EventKind::as_str`] vocabulary.
+    pub kind: String,
+    /// `true` iff this daemon's config permits the collector to run. `false`
+    /// means the daemon CAN collect this and was told not to — a fact a reader
+    /// must show rather than hide, or the operator cannot find what to turn on.
+    pub enabled: bool,
+}
+
+/// What this daemon can collect at all — the build's collectors, each with
+/// whether config permits it to run.
+///
+/// The list is closed for this daemon: a collector absent from it is one this
+/// build does not have. That is what makes [`StatusSnapshot::collector`] able to
+/// tell "cannot" from "switched off", which a reader must never collapse.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Capabilities {
+    /// Every collector this build has, in a stable order.
+    #[serde(default)]
+    pub collectors: Vec<CollectorCapability>,
+}
+
+impl Capabilities {
+    /// Build a declaration from `(label, enabled)` pairs.
+    pub fn from_pairs<I: IntoIterator<Item = (&'static str, bool)>>(pairs: I) -> Self {
+        Self {
+            collectors: pairs
+                .into_iter()
+                .map(|(kind, enabled)| CollectorCapability {
+                    kind: kind.to_string(),
+                    enabled,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// What a reader may say about one collector on the daemon it is talking to.
+///
+/// Four states, and collapsing any two of them is a lie of exactly the kind this
+/// project exists to avoid:
+///
+/// * [`Unknown`](CollectorAvailability::Unknown) — the daemon declared nothing at
+///   all (a build older than [`StatusSnapshot::capabilities`]). We do not know.
+/// * [`Absent`](CollectorAvailability::Absent) — the daemon declared its
+///   collectors and this one is not among them: this build CANNOT collect it.
+/// * [`Disabled`](CollectorAvailability::Disabled) — the daemon has it and config
+///   switched it off. It can be turned on.
+/// * [`Enabled`](CollectorAvailability::Enabled) — it is running; whether it has
+///   produced anything yet is an ordinary data question, not a capability one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectorAvailability {
+    Unknown,
+    Absent,
+    Disabled,
+    Enabled,
+}
+
 /// The live, in-memory status the daemon serves. Each collector's latest sample
 /// plus a bounded ring of recent incidents.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -635,6 +704,37 @@ pub struct StatusSnapshot {
     /// decode its answer.
     #[serde(default)]
     pub quiet: bool,
+    /// What this daemon can collect at all — the collectors in its build, each
+    /// with whether config permits it to run.
+    ///
+    /// `None` is a THIRD value, not a fallback: it means the daemon said nothing,
+    /// because it predates this field. A reader must not read that as "no
+    /// collectors" — see [`CollectorAvailability`].
+    ///
+    /// `serde(default)`, like every field above it, so a pre-capabilities
+    /// daemon's answer still decodes; and because the collector labels are
+    /// strings, a NEWER daemon naming a collector this build never heard of does
+    /// not break the decode in the other direction either.
+    #[serde(default)]
+    pub capabilities: Option<Capabilities>,
+}
+
+impl StatusSnapshot {
+    /// What this daemon can say about `kind`: the four-way distinction of
+    /// [`CollectorAvailability`], derived from the declaration it sent.
+    ///
+    /// This is the ONLY place the four states are decided, so no consumer can
+    /// quietly fold "cannot" into "switched off".
+    pub fn collector(&self, kind: EventKind) -> CollectorAvailability {
+        let Some(caps) = self.capabilities.as_ref() else {
+            return CollectorAvailability::Unknown;
+        };
+        match caps.collectors.iter().find(|c| c.kind == kind.as_str()) {
+            None => CollectorAvailability::Absent,
+            Some(c) if c.enabled => CollectorAvailability::Enabled,
+            Some(_) => CollectorAvailability::Disabled,
+        }
+    }
 }
 
 /// The serde/`Default` value for [`StatusSnapshot::observing`]: `true`, matching a
@@ -660,6 +760,7 @@ impl Default for StatusSnapshot {
             incidents: Vec::new(),
             observing: observing_default(),
             quiet: false,
+            capabilities: None,
         }
     }
 }
@@ -1263,6 +1364,10 @@ mod tests {
             // a field that silently failed to serialize would still round-trip as
             // `false` and the assertion below would pass on a broken wire format.
             quiet: true,
+            // Same trick as `quiet`: `capabilities` defaults to `None`, so a
+            // non-default value here is what proves the declaration is actually
+            // on the wire rather than being reconstructed by the default.
+            capabilities: Some(Capabilities::from_pairs([("air", false)])),
         };
 
         let mut buf = Vec::new();
@@ -1280,6 +1385,11 @@ mod tests {
         assert_eq!(back.incidents[0].closed_us, Some(2000));
         assert!(!back.observing);
         assert!(back.quiet);
+        assert_eq!(back.capabilities, snap.capabilities);
+        assert_eq!(
+            back.collector(EventKind::Air),
+            CollectorAvailability::Disabled
+        );
     }
 
     #[test]
@@ -1871,5 +1981,80 @@ mod tests {
         // parked on a silent daemon.
         fn assert_send<T: Send>() {}
         assert_send::<SubscriptionHandle>();
+    }
+    /// The three states a reader must keep apart, plus the fourth that says the
+    /// daemon never spoke. Collapsing any pair of them is the falsehood this
+    /// distinction exists to prevent: hiding a collector the operator could turn
+    /// on, or offering a window onto one the daemon cannot fill.
+    #[test]
+    fn capability_tells_cannot_from_switched_off_from_running() {
+        // 1. A daemon too old to declare anything: unknown, NOT "no collectors".
+        let old = StatusSnapshot::default();
+        assert_eq!(
+            old.collector(EventKind::Air),
+            CollectorAvailability::Unknown
+        );
+
+        // 2. A daemon that declared its collectors and has no air one at all.
+        let without = StatusSnapshot {
+            capabilities: Some(Capabilities::from_pairs([("link", true), ("wifi", true)])),
+            ..StatusSnapshot::default()
+        };
+        assert_eq!(
+            without.collector(EventKind::Air),
+            CollectorAvailability::Absent
+        );
+        assert_eq!(
+            without.collector(EventKind::Wifi),
+            CollectorAvailability::Enabled
+        );
+
+        // 3. It HAS the collector and config switched it off — a state that must
+        //    stay visible, because it is the one the operator can change.
+        let off = StatusSnapshot {
+            capabilities: Some(Capabilities::from_pairs([("air", false), ("link", true)])),
+            ..StatusSnapshot::default()
+        };
+        assert_eq!(
+            off.collector(EventKind::Air),
+            CollectorAvailability::Disabled
+        );
+
+        // 4. Running. Whether a scan has landed yet is an ordinary data question.
+        let on = StatusSnapshot {
+            capabilities: Some(Capabilities::from_pairs([("air", true)])),
+            ..StatusSnapshot::default()
+        };
+        assert_eq!(on.collector(EventKind::Air), CollectorAvailability::Enabled);
+    }
+
+    /// Both directions of the shared surface, which is what `serde(default)` and
+    /// the string collector label buy: an OLD daemon's answer (no such field)
+    /// still decodes, and a NEW daemon naming a collector this build never heard
+    /// of does not take the whole `Response` down with it.
+    #[test]
+    fn the_capability_field_is_compatible_in_both_directions() {
+        // Old daemon → new reader: the field is simply absent.
+        let old_wire = r#"{"generated_us":1,"link":null,"proxy":null,"dns":null,"host":null,
+            "incidents":[]}"#;
+        let snap: StatusSnapshot = serde_json::from_str(old_wire).expect("old answer must decode");
+        assert!(snap.capabilities.is_none());
+        assert_eq!(
+            snap.collector(EventKind::Air),
+            CollectorAvailability::Unknown
+        );
+
+        // New daemon → old-ish reader: a collector label this build cannot name.
+        let new_wire = r#"{"generated_us":1,"link":null,"proxy":null,"dns":null,"host":null,
+            "incidents":[],"capabilities":{"collectors":[
+                {"kind":"air","enabled":true},{"kind":"telepathy","enabled":true}]}}"#;
+        let snap: StatusSnapshot =
+            serde_json::from_str(new_wire).expect("newer answer must decode");
+        assert_eq!(
+            snap.collector(EventKind::Air),
+            CollectorAvailability::Enabled
+        );
+        // The unknown one is carried, not rejected, and simply never asked about.
+        assert_eq!(snap.capabilities.expect("declared").collectors.len(), 2);
     }
 }

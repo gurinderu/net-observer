@@ -929,6 +929,7 @@ mod tests {
             ],
             observing,
             quiet: false,
+            capabilities: None,
         }
     }
 

@@ -36,7 +36,7 @@ use macos::{
     ProxySystemFacts, SystemFacts, SystemNeighbors, SystemProfilerAir, TcpdumpLldpCapture,
 };
 use macos::{neighbor_scan, neighbors};
-use net_observer_ipc::{EncodedFrame, StatusSnapshot};
+use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
     FakeIp, GwChange, GwDrop, GwMacChange, NeighborMacCollision, Starvation, Wedge,
@@ -313,7 +313,16 @@ async fn run_daemon() -> anyhow::Result<()> {
     // keeps it current (latest sample per variant); the SnapshotHandler mirrors
     // fired incidents into its bounded ring. The daemon stays the sole DuckDB
     // owner — the socket answers from this snapshot, never the DB.
-    let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+    let snapshot = Arc::new(Mutex::new(StatusSnapshot {
+        // Say what this daemon can collect, once, at startup: the collectors
+        // this build HAS, each with whether config lets it run. A reader cannot
+        // otherwise tell "this daemon has no such collector" from "it has one and
+        // it is switched off", and it must not offer the operator a window onto
+        // something that can never fill — nor hide the switch he is looking for.
+        // Config is read once and never reloaded, so this never goes stale.
+        capabilities: Some(declared_capabilities(&cfg.collectors)),
+        ..StatusSnapshot::default()
+    }));
 
     // The observer's OWN collection on/off flag (self-control). `true` (default)
     // = collecting; `false` = paused. The interval + event collectors check it
@@ -983,6 +992,28 @@ impl NeighborScanner for SystemScanner {
 /// Every real collector in `AnyCollector` is a concrete type wired to real ports
 /// (`IcmpPinger`, `SystemFacts`, …), so there is no other way to present the
 /// spawner with a prerequisite that is missing and then appears.
+/// What this build can collect, as the daemon declares it to its readers.
+///
+/// One entry per collector compiled into this daemon, in the
+/// [`EventKind::as_str`] vocabulary, carrying whether config permits it to run.
+/// Absence from this list is the daemon saying "I do not have that collector at
+/// all" — which is why every collector is listed here whether or not it is
+/// enabled, and why a new collector must be added here as well as to the
+/// pipeline. `pcap_ring` is deliberately absent: it is not a collector and
+/// produces no event kind.
+fn declared_capabilities(c: &config::Collectors) -> Capabilities {
+    Capabilities::from_pairs([
+        (EventKind::Link.as_str(), c.link.enabled),
+        (EventKind::Proxy.as_str(), c.proxy.enabled),
+        (EventKind::Dns.as_str(), c.dns.enabled),
+        (EventKind::Route.as_str(), c.route.enabled),
+        (EventKind::Host.as_str(), c.host.enabled),
+        (EventKind::Wifi.as_str(), c.wifi.enabled),
+        (EventKind::Air.as_str(), c.air.enabled),
+        (EventKind::Neighbors.as_str(), c.neighbors.enabled),
+    ])
+}
+
 #[cfg(test)]
 pub(crate) struct FakeCollector {
     pub(crate) meta: &'static CollectorMeta,
@@ -1360,6 +1391,41 @@ fn build_engine(
 
 #[cfg(test)]
 mod tests {
+
+    /// The daemon must declare every collector it HAS, not only the ones running
+    /// — otherwise a reader cannot tell "this build has no air collector" from
+    /// "the air collector is switched off", and the operator loses the switch.
+    /// `air` is off in the defaults, which makes this the live case.
+    #[test]
+    fn the_declaration_names_collectors_it_has_but_does_not_run() {
+        use net_observer_ipc::CollectorAvailability;
+
+        let cfg = config::Config::default();
+        assert!(
+            !cfg.collectors.air.enabled,
+            "the fixture assumes air is off"
+        );
+
+        let snap = StatusSnapshot {
+            capabilities: Some(declared_capabilities(&cfg.collectors)),
+            ..StatusSnapshot::default()
+        };
+        // Present in the build, switched off by config.
+        assert_eq!(
+            snap.collector(EventKind::Air),
+            CollectorAvailability::Disabled
+        );
+        // And a collector the defaults do run.
+        assert_eq!(
+            snap.collector(EventKind::Link),
+            CollectorAvailability::Enabled
+        );
+        // Not a collector, and deliberately never declared as one.
+        assert_eq!(
+            snap.collector(EventKind::Incident),
+            CollectorAvailability::Absent
+        );
+    }
     use super::*;
     use std::time::Instant;
 
