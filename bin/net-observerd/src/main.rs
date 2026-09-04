@@ -1020,16 +1020,36 @@ impl NeighborScanner for SystemScanner {
 /// pipeline. `pcap_ring` is deliberately absent: it is not a collector and
 /// produces no event kind.
 fn declared_capabilities(c: &config::Collectors) -> Capabilities {
-    Capabilities::from_pairs([
-        (EventKind::Link.as_str(), c.link.enabled),
-        (EventKind::Proxy.as_str(), c.proxy.enabled),
-        (EventKind::Dns.as_str(), c.dns.enabled),
-        (EventKind::Route.as_str(), c.route.enabled),
-        (EventKind::Host.as_str(), c.host.enabled),
-        (EventKind::Wifi.as_str(), c.wifi.enabled),
-        (EventKind::Air.as_str(), c.air.enabled),
-        (EventKind::Neighbors.as_str(), c.neighbors.enabled),
-    ])
+    Capabilities::from_pairs(
+        EventKind::ALL
+            .iter()
+            .filter_map(|k| collector_switch(*k, c).map(|enabled| (k.as_str(), enabled))),
+    )
+}
+
+/// Which config switch governs the collector behind one event kind, or `None`
+/// for a kind no collector produces.
+///
+/// This match is EXHAUSTIVE over [`EventKind`] on purpose, and it is the only
+/// place the answer is written. A new collector brings a new kind (its samples
+/// have to reach the readers somehow), and this file then fails to compile until
+/// the new kind is classified — so a collector wired into the pipeline can no
+/// longer be forgotten in the declaration and announced to the bar as absent.
+fn collector_switch(kind: EventKind, c: &config::Collectors) -> Option<bool> {
+    Some(match kind {
+        EventKind::Link => c.link.enabled,
+        EventKind::Proxy => c.proxy.enabled,
+        EventKind::Dns => c.dns.enabled,
+        EventKind::Route => c.route.enabled,
+        EventKind::Host => c.host.enabled,
+        EventKind::Wifi => c.wifi.enabled,
+        EventKind::Air => c.air.enabled,
+        EventKind::Neighbors => c.neighbors.enabled,
+        // Not a collector: incidents are what the triggers write about the
+        // collectors' samples. `pcap_ring` is absent for the same reason from the
+        // other side — it produces no event kind at all.
+        EventKind::Incident => return None,
+    })
 }
 
 #[cfg(test)]
@@ -1276,7 +1296,7 @@ fn build_api_server(
         // Who may send a `Request::Control` at all — orthogonal to
         // `acting.enabled`, which only gates the acting *class* of commands.
         policy: api::ControlPolicy::from_config(cfg.socket_owner_uid, cfg.control_uids.clone()),
-        observing,
+        observing: observing.clone(),
         // Shared, never fresh — for `quiet` the same reason as `observing`, and
         // the ring handle so `FreezePcap` copies the ring that is actually
         // running rather than refusing next to a live capture.
@@ -1305,6 +1325,9 @@ fn build_api_server(
         air_scanner: Some(Arc::new(OnDemandAirScan::new(
             Arc::new(SystemProfilerAir::new()),
             samples_tx,
+            // The SAME flag the control socket flips and the interval collectors
+            // read: a pause landing mid-scan must reach the in-flight read.
+            observing.clone(),
         )) as Arc<dyn AirScanner>),
         // The config permission ceiling for the active scan.
         scan_permission: net_observer_ipc::ScanOptions {
@@ -1409,6 +1432,65 @@ fn build_engine(
 
 #[cfg(test)]
 mod tests {
+
+    /// The declaration covers EXACTLY the collectors this daemon can spawn.
+    ///
+    /// Both directions are failures the operator would act on: a collector wired
+    /// into the pipeline and missing here is announced as `Absent`, and the bar
+    /// hides its window for a collector that is merely switched off; a name here
+    /// with no collector behind it promises a switch that turns nothing on.
+    ///
+    /// The set is taken from the collector crates' own `META.name` — the same
+    /// constants `AnyCollector`'s arms carry — so the assertion is anchored to
+    /// the wiring rather than to a second hand-written list. The compile-time
+    /// half of the guard is `collector_switch`, whose match over `EventKind` is
+    /// exhaustive.
+    #[test]
+    fn the_declaration_covers_exactly_the_collectors_the_daemon_can_spawn() {
+        use net_observer_ipc::EventKind;
+
+        // One entry per `AnyCollector` variant, by the collector's own metadata.
+        let spawnable: Vec<&'static str> = vec![
+            collector_link::META.name,
+            collector_proxy::META.name,
+            collector_dns::META.name,
+            collector_route::META.name,
+            collector_host::META.name,
+            collector_wifi::META.name,
+            collector_neighbors::META.name,
+            collector_air::META.name,
+        ];
+
+        let cfg = config::Config::default();
+        let declared: Vec<String> = declared_capabilities(&cfg.collectors)
+            .collectors
+            .iter()
+            .map(|c| c.kind.clone())
+            .collect();
+
+        for name in &spawnable {
+            assert!(
+                declared.iter().any(|d| d == name),
+                "collector `{name}` can be spawned but is not declared; readers would call it Absent. declared: {declared:?}"
+            );
+        }
+        for d in &declared {
+            assert!(
+                spawnable.contains(&d.as_str()),
+                "`{d}` is declared but no collector produces it; the switch would turn nothing on"
+            );
+        }
+        assert_eq!(declared.len(), spawnable.len(), "declared: {declared:?}");
+
+        // Every declared name is a real kind label, so the bar's per-kind lookup
+        // can never miss on a typo.
+        for d in &declared {
+            assert!(
+                EventKind::ALL.iter().any(|k| k.as_str() == d),
+                "`{d}` is not an EventKind label"
+            );
+        }
+    }
 
     /// The daemon must declare every collector it HAS, not only the ones running
     /// — otherwise a reader cannot tell "this build has no air collector" from

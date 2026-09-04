@@ -679,6 +679,13 @@ pub enum AirScanRequest {
 pub struct OnDemandAirScan<F: collector_air::AirFacts + 'static> {
     facts: Arc<F>,
     tx: mpsc::Sender<Sample>,
+    /// The shared observation flag, read a SECOND time just before the sample is
+    /// forwarded. The control path checks it when the press arrives, but the
+    /// radio read takes seconds: a pause landing mid-read is already acked and
+    /// has already written its `observing_edge`, so a slice stamped inside that
+    /// bracket would make the edge and the data disagree about the same seconds.
+    /// This is the same double check the interval path does around `collect()`.
+    observing: Arc<AtomicBool>,
     /// Single-flight latch: `true` while a scan is in the air. A second press
     /// during those seconds is refused, never queued.
     running: Arc<AtomicBool>,
@@ -688,11 +695,14 @@ pub struct OnDemandAirScan<F: collector_air::AirFacts + 'static> {
 }
 
 impl<F: collector_air::AirFacts + 'static> OnDemandAirScan<F> {
-    /// Wire a scanner onto the same sample stream the collectors feed.
-    pub fn new(facts: Arc<F>, tx: mpsc::Sender<Sample>) -> Self {
+    /// Wire a scanner onto the same sample stream the collectors feed, sharing
+    /// the daemon's observation flag so a pause landing mid-scan discards the
+    /// result instead of stamping it inside the pause bracket.
+    pub fn new(facts: Arc<F>, tx: mpsc::Sender<Sample>, observing: Arc<AtomicBool>) -> Self {
         Self {
             facts,
             tx,
+            observing,
             running: Arc::new(AtomicBool::new(false)),
             last_start: Mutex::new(None),
         }
@@ -737,12 +747,24 @@ impl<F: collector_air::AirFacts + 'static> AirScanner for OnDemandAirScan<F> {
         let facts = Arc::clone(&self.facts);
         let tx = self.tx.clone();
         let running = Arc::clone(&self.running);
+        let observing = Arc::clone(&self.observing);
         tokio::spawn(async move {
             // The latch is released however this task leaves — including on a
             // panic inside the read — so one failed scan cannot wedge the button
             // for the life of the daemon.
             let _guard = LatchGuard(running);
             let read = facts.read().await;
+            // Re-check AFTER the read and before the send, exactly as the
+            // interval path re-checks after `collect()`: a pause that landed
+            // while the radio was being read is already acked and its
+            // `observing_edge` already written, so this slice must not be
+            // persisted or published inside that bracket.
+            if !observing.load(Ordering::Acquire) {
+                tracing::info!(
+                    "observation paused while an air scan was reading; slice discarded to keep the pause bracket honest"
+                );
+                return;
+            }
             let sample = Sample::Air(collector_air::build_air_sample(types::now_us(), read));
             if let Err(e) = tx.send(sample).await {
                 tracing::warn!(error = %e, "on-demand air scan produced a sample the pipeline could not take");
@@ -1233,6 +1255,7 @@ mod tests {
                     reads: Arc::clone(&reads),
                 }),
                 tx,
+                Arc::new(AtomicBool::new(true)),
             );
 
             assert_eq!(scanner.request_scan(), AirScanRequest::Started);
@@ -1249,13 +1272,57 @@ mod tests {
             assert!(rx.try_recv().is_err());
         }
 
+        /// The pause bracket wins over an in-flight scan. The press is accepted
+        /// while observation is on; the operator pauses during the seconds the
+        /// radio is being read; the slice must NOT reach the pipeline, because a
+        /// row stamped inside the bracket would contradict the `observing_edge`
+        /// about the very same seconds. Same invariant the interval collector
+        /// keeps by re-checking after `collect()`.
+        #[tokio::test]
+        async fn a_pause_during_the_read_discards_the_slice() {
+            let release = Arc::new(Notify::new());
+            let reads = Arc::new(AtomicUsize::new(0));
+            let observing = Arc::new(AtomicBool::new(true));
+            let (tx, mut rx) = mpsc::channel::<Sample>(4);
+            let scanner = OnDemandAirScan::new(
+                Arc::new(HeldAir {
+                    release: Arc::clone(&release),
+                    reads: Arc::clone(&reads),
+                }),
+                tx,
+                Arc::clone(&observing),
+            );
+
+            // Accepted while observing.
+            assert_eq!(scanner.request_scan(), AirScanRequest::Started);
+            // The operator pauses while the read is parked.
+            observing.store(false, Ordering::Release);
+            release.notify_one();
+
+            // The radio WAS read — the scan really was in flight — but nothing
+            // reaches the consumer.
+            tokio::task::yield_now().await;
+            for _ in 0..64 {
+                if reads.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(reads.load(Ordering::Acquire), 1);
+            assert!(
+                rx.try_recv().is_err(),
+                "a slice read inside the pause bracket must not be persisted or published"
+            );
+        }
+
         /// The refusal inside the minimum interval says how long is left, and
         /// the number is rounded UP: a client that waits exactly as long as it
         /// was told must not be refused again for obeying.
         #[test]
         fn the_interval_refusal_states_a_wait_that_is_long_enough() {
             let (tx, _rx) = mpsc::channel::<Sample>(1);
-            let scanner = OnDemandAirScan::new(Arc::new(DeadAir), tx);
+            let scanner =
+                OnDemandAirScan::new(Arc::new(DeadAir), tx, Arc::new(AtomicBool::new(true)));
             let now = Instant::now();
             *scanner.last_start.lock().unwrap() = Some(now);
 
@@ -1278,7 +1345,8 @@ mod tests {
         #[test]
         fn a_first_press_is_never_inside_the_interval() {
             let (tx, _rx) = mpsc::channel::<Sample>(1);
-            let scanner = OnDemandAirScan::new(Arc::new(DeadAir), tx);
+            let scanner =
+                OnDemandAirScan::new(Arc::new(DeadAir), tx, Arc::new(AtomicBool::new(true)));
             assert_eq!(scanner.too_soon(Instant::now()), None);
         }
 
@@ -1288,7 +1356,8 @@ mod tests {
         #[tokio::test]
         async fn a_scan_that_cannot_read_the_radio_still_leaves_a_skip_sample() {
             let (tx, mut rx) = mpsc::channel::<Sample>(4);
-            let scanner = OnDemandAirScan::new(Arc::new(DeadAir), tx);
+            let scanner =
+                OnDemandAirScan::new(Arc::new(DeadAir), tx, Arc::new(AtomicBool::new(true)));
             assert_eq!(scanner.request_scan(), AirScanRequest::Started);
             match rx.recv().await.expect("a failed scan is still a row") {
                 Sample::Air(a) => {
@@ -1305,7 +1374,8 @@ mod tests {
         #[tokio::test]
         async fn the_latch_is_released_once_the_scan_finishes() {
             let (tx, mut rx) = mpsc::channel::<Sample>(4);
-            let scanner = OnDemandAirScan::new(Arc::new(DeadAir), tx);
+            let scanner =
+                OnDemandAirScan::new(Arc::new(DeadAir), tx, Arc::new(AtomicBool::new(true)));
             assert_eq!(scanner.request_scan(), AirScanRequest::Started);
             rx.recv().await.expect("the scan produced its sample");
             // The interval, not the latch, is what refuses the next press now.
