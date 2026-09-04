@@ -46,7 +46,16 @@
           pname = "net-observer";
           version = "0.0.0";
           src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # duckdb comes from a git fork (gurinderu/duckdb-rs, pinned by rev in
+            # Cargo.lock), and importCargoLock cannot fetch a git dependency
+            # without a fixed-output hash. When the rev in Cargo.lock changes,
+            # set this to lib.fakeHash, rebuild, and paste the "got:" hash.
+            outputHashes = {
+              "duckdb-1.10505.0" = "sha256-9tFQAE8RjfKzOUORBFfBkroSo8ykrlCV+XdK+JvgW/M=";
+            };
+          };
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.libpcap pkgs.iconv ];
           cargoBuildFlags = [ "-p" "net-observerd" "-p" "net-observer-cli" ];
