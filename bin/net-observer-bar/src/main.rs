@@ -45,7 +45,7 @@ mod menubar;
 mod status;
 mod ui;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 // The same `clap` surface as the sibling binaries (`net-observerd`, `net-observer-cli`):
 // `--config=<path>` works, a `--config` without a value is a hard error rather
@@ -63,12 +63,36 @@ struct Cli {
     #[arg(long)]
     config: Option<String>,
     /// Open the panel immediately on launch instead of waiting for a
-    /// status-item click.
+    /// status-item click. A synonym for `--window panel`; `--window` wins when
+    /// both are given.
     #[arg(long)]
     open: bool,
+    /// Open one window immediately on launch, once the app is up and the model
+    /// holds its first snapshot. The windows are otherwise reachable only by
+    /// clicking a menu entry, which a scripted or headless run cannot do.
+    #[arg(long, value_enum)]
+    window: Option<StartWindow>,
+}
+
+/// Which window to open at startup (`--window`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum StartWindow {
+    /// The anchored status panel (what `--open` opens).
+    Panel,
+    /// The network map.
+    Map,
+    /// The air (Wi-Fi) map.
+    Air,
+    /// The realtime event log.
+    Events,
 }
 
 fn main() {
     let cli = Cli::parse();
-    menubar::run(cli.config, cli.open);
+    let start = cli.window.or(if cli.open {
+        Some(StartWindow::Panel)
+    } else {
+        None
+    });
+    menubar::run(cli.config, start);
 }

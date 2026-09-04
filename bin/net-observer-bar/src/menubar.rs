@@ -101,7 +101,7 @@ impl ClickTarget {
 /// Run the menu-bar app. Blocks (drives the AppKit run loop) until the user
 /// quits. GUI code cannot run headlessly, so this is verified by compiling +
 /// clippy; the tested surface is the data layer ([`crate::status`], [`crate::ui`]).
-pub fn run(config: Option<String>, open: bool) {
+pub fn run(config: Option<String>, start: Option<crate::StartWindow>) {
     // Config is best-effort here: the GUI must not fail to launch just because a
     // config file is malformed — fall back to defaults and surface a down daemon
     // in the panel as an "offline" state instead. `config` is the `--config` path
@@ -174,8 +174,9 @@ pub fn run(config: Option<String>, open: bool) {
         let dismissed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
         // 4. Wire the click: button -> ClickTarget.handleClick: -> flip the flag.
-        //    Seed it with `open` so `--open` pops the panel on the first poll.
-        let click_flag = Arc::new(AtomicBool::new(open));
+        //    Seed it with the panel request so `--open` / `--window panel` pops
+        //    the panel on the first poll.
+        let click_flag = Arc::new(AtomicBool::new(start == Some(crate::StartWindow::Panel)));
         let target = ClickTarget::new(click_flag.clone());
         // SAFETY: `setTarget:`/`setAction:` are the standard AppKit control
         // wiring. `target_ref` points at a live `ClickTarget` (an `NSObject`
@@ -241,8 +242,34 @@ pub fn run(config: Option<String>, open: bool) {
                 // open time (see `open_panel`), when it is actually laid out.
                 let button = button_for_click;
                 let mut panel: Option<WindowHandle<PanelView>> = None;
+                // The non-panel startup window, opened once on the first poll —
+                // by then the app is up and the model already holds the startup
+                // snapshot, so the window does not render on nothing. Same route
+                // as a menu click: each window's own `open_or_focus`.
+                let mut pending = match start {
+                    Some(crate::StartWindow::Panel) | None => None,
+                    other => other,
+                };
                 loop {
                     Timer::after(CLICK_POLL).await;
+                    if let Some(what) = pending.take() {
+                        let alive = acx.update(|app| {
+                            let socket = model.read(app).socket_path.clone();
+                            match what {
+                                crate::StartWindow::Map => crate::map::open_or_focus(app, &model),
+                                crate::StartWindow::Air => {
+                                    crate::air::open_or_focus(app, &model, socket);
+                                }
+                                crate::StartWindow::Events => {
+                                    crate::events::open_or_focus(app, &model, socket);
+                                }
+                                crate::StartWindow::Panel => {}
+                            }
+                        });
+                        if alive.is_err() {
+                            break;
+                        }
+                    }
                     if click_flag.swap(false, Ordering::AcqRel) {
                         let alive = acx.update(|app| {
                             toggle_panel(app, &mut panel, &model, &button, &dismissed_at)
