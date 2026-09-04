@@ -110,6 +110,10 @@ impl MenuView {
     ) -> AnyElement {
         div()
             .id(id)
+            // Test handle only: a no-op unless gpui's `test-support` is on, where
+            // it lets the headless UI tests read every row's laid-out bounds and
+            // assert the rows fit inside the menu window (see `headless_ui.rs`).
+            .debug_selector(|| format!("menu-row:{id}"))
             .flex()
             .items_center()
             .w_full()
@@ -426,5 +430,110 @@ mod tests {
             "the whole menu is on screen: {m:?}"
         );
         assert!(f32::from(m.origin.y) >= 0.0, "{m:?}");
+    }
+}
+
+/// Headless UI tests for the flyout, on gpui's own test platform: layout and
+/// scene construction run for real, rasterization does not. No display, no
+/// daemon, no root.
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+    use crate::ui::Glance;
+    use gpui::{TestAppContext, VisualTestContext};
+    use net_observer_ipc::StatusSnapshot;
+
+    /// Every row of the menu lands inside the menu window, and no two rows sit on
+    /// top of each other.
+    ///
+    /// The menu window is a fixed [`MENU_W`]×[`MENU_H`], so `MENU_H` is a claim
+    /// about eight rows plus three headings and two rules — a claim nothing
+    /// checked while the rows were counted by eye on a screenshot. gpui paints
+    /// nothing outside a window, so a row that does not fit is not clipped or
+    /// scrolled to: it is simply absent. This is the shape of the defect that
+    /// used to hit the footer when all eight actions sat in one row there.
+    #[gpui::test]
+    fn menu_rows_stay_inside_the_menu_window(cx: &mut TestAppContext) {
+        let model = cx.update(|cx| {
+            cx.new(|_| {
+                Glance::new(
+                    StatusSnapshot::default(),
+                    None,
+                    "/tmp/net-observer-test.sock".to_string(),
+                )
+            })
+        });
+        let for_view = model.clone();
+        let guard = Arc::new(AtomicBool::new(false));
+        let for_guard = guard.clone();
+        let window = cx.add_window(|_, cx| {
+            let observe = cx.observe(&for_view, |_, _, cx| cx.notify());
+            MenuView {
+                model: for_view,
+                _observe: observe,
+                focus_guard: for_guard,
+            }
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        // Draw the window itself at the menu's real size, rather than the element
+        // by hand: every row is wired with `cx.listener`, which only resolves
+        // inside the window's own render pass.
+        let menu = size(px(MENU_W), px(MENU_H));
+        cx.simulate_resize(menu);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|window, _| window.viewport_size()),
+            menu,
+            "the test window must be the menu's own size"
+        );
+
+        // Every action the panel's footer used to carry, in flyout order.
+        let rows: [&'static str; 8] = [
+            "menu-row:events",
+            "menu-row:map",
+            "menu-row:air",
+            "menu-row:freeze",
+            "menu-row:quiet",
+            "menu-row:scan",
+            "menu-row:refresh",
+            "menu-row:quit",
+        ];
+        let mut laid_out = Vec::new();
+        for id in rows {
+            let b = cx
+                .debug_bounds(id)
+                .unwrap_or_else(|| panic!("`{id}` was not laid out at all"));
+            assert!(
+                b.origin.x >= px(0.0) && b.origin.y >= px(0.0),
+                "`{id}` starts outside the menu: {b:?}"
+            );
+            assert!(
+                b.origin.x + b.size.width <= menu.width,
+                "`{id}` runs past the menu's right edge: {b:?}"
+            );
+            assert!(
+                b.origin.y + b.size.height <= menu.height,
+                "`{id}` runs past the menu's bottom edge: {b:?} (the menu is {MENU_H}px tall)"
+            );
+            laid_out.push((id, b));
+        }
+
+        for (i, (a_id, a)) in laid_out.iter().enumerate() {
+            for (b_id, b) in laid_out.iter().skip(i + 1) {
+                assert!(
+                    !overlaps(*a, *b),
+                    "`{a_id}` and `{b_id}` overlap: {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Half-open rectangle intersection: touching edges are not an overlap.
+    fn overlaps(a: Bounds<Pixels>, b: Bounds<Pixels>) -> bool {
+        a.origin.x < b.origin.x + b.size.width
+            && b.origin.x < a.origin.x + a.size.width
+            && a.origin.y < b.origin.y + b.size.height
+            && b.origin.y < a.origin.y + a.size.height
     }
 }

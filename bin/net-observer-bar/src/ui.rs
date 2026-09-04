@@ -797,6 +797,10 @@ fn toggle_switch(
 
     let mut track = div()
         .id("observing-toggle")
+        // Test handle only: a no-op unless gpui's `test-support` is on
+        // (dev-dependency), where it makes this element's laid-out bounds
+        // readable by the headless UI tests (see `headless_ui.rs`).
+        .debug_selector(|| "observing-toggle".into())
         .flex()
         .items_center()
         .w(px(40.0))
@@ -1003,6 +1007,8 @@ fn footer(
     let trigger_ink = if menu_open { theme.knob } else { theme.accent };
     let mut trigger = div()
         .id("menu-trigger")
+        // Test handle only; see `observing-toggle` above.
+        .debug_selector(|| "menu-trigger".into())
         .flex()
         .items_center()
         .justify_between()
@@ -1773,5 +1779,74 @@ mod tests {
             fresh.to_string(),
             "both halves report the same offline error"
         );
+    }
+}
+
+/// Headless UI tests: the panel drawn on gpui's own test platform, whose window
+/// runs layout and scene construction for real and implements `draw(&Scene)` as a
+/// no-op. No display, no daemon, no root — see `menu.rs` / `map.rs` / `menubar.rs`
+/// for the sibling suites.
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+    use crate::menubar::{PANEL_H, PANEL_W};
+    use gpui::{TestAppContext, VisualTestContext, size};
+    use net_observer_ipc::StatusSnapshot;
+
+    /// Every control the panel draws must be laid out **inside** the panel.
+    ///
+    /// The panel is a fixed 320×560 popup, and gpui paints nothing outside a
+    /// window: a control that lands past the edge is not clipped or scrolled to,
+    /// it is simply not there. That is exactly how a footer packed with eight
+    /// buttons in one row lost its last ones — visible only on a screenshot, and
+    /// only if you knew to count.
+    #[gpui::test]
+    fn panel_controls_stay_inside_the_panel(cx: &mut TestAppContext) {
+        let model = cx.update(|cx| {
+            cx.new(|_| {
+                Glance::new(
+                    StatusSnapshot::default(),
+                    None,
+                    "/tmp/net-observer-test.sock".to_string(),
+                )
+            })
+        });
+        let for_view = model.clone();
+        let window = cx.add_window(|_, cx| PanelView::new(for_view, cx));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        // Draw the window itself at the panel's real size, rather than the
+        // element by hand: the panel's controls are wired with `cx.listener`,
+        // which only resolves inside the window's own render pass.
+        let panel = size(px(PANEL_W as f32), px(PANEL_H as f32));
+        cx.simulate_resize(panel);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|window, _| window.viewport_size()),
+            panel,
+            "the test window must be the panel's own size"
+        );
+
+        for selector in ["menu-trigger", "observing-toggle"] {
+            let b = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("`{selector}` was not laid out at all"));
+            assert!(
+                b.origin.x >= px(0.0) && b.origin.y >= px(0.0),
+                "`{selector}` starts outside the panel: {b:?}"
+            );
+            assert!(
+                b.origin.x + b.size.width <= panel.width,
+                "`{selector}` runs past the panel's right edge ({:?} > {:?})",
+                b.origin.x + b.size.width,
+                panel.width
+            );
+            assert!(
+                b.origin.y + b.size.height <= panel.height,
+                "`{selector}` runs past the panel's bottom edge ({:?} > {:?})",
+                b.origin.y + b.size.height,
+                panel.height
+            );
+        }
     }
 }
