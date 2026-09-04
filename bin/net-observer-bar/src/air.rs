@@ -71,7 +71,8 @@ use gpui::{
 };
 
 use net_observer_ipc::{
-    ControlCmd, ControlOutcome, Event, EventKind, StreamFrame, SubscriptionHandle,
+    CollectorAvailability, ControlCmd, ControlOutcome, Event, EventKind, StreamFrame,
+    SubscriptionHandle,
 };
 use types::{
     AirObservation, AirSample, AirVerdict, Band, ChannelOverlapHypothesis, ChannelSpan,
@@ -494,6 +495,11 @@ fn overlap_label(lane: &Lane) -> String {
 /// The root view of the air-map window.
 pub(crate) struct AirView {
     feed: Entity<AirFeed>,
+    /// The panel's shared model, read for ONE thing: what the daemon says it can
+    /// collect. Read live on every render rather than captured at open, so a
+    /// daemon upgraded or a collector enabled under an open window is reflected
+    /// here without reopening it.
+    glance: Entity<Glance>,
     /// Where to send the scan command. The bar is a pure socket client: it takes
     /// the reading itself nowhere near the radio.
     socket_path: String,
@@ -501,6 +507,9 @@ pub(crate) struct AirView {
     /// same path frames arrive on.
     tx: mpsc::SyncSender<BridgeMsg>,
     _observe: Subscription,
+    /// Re-render when the panel's snapshot changes, so the capability sentence
+    /// below follows the daemon instead of the moment this window opened.
+    _observe_glance: Subscription,
     /// Held so the release hook stays registered for the view's whole life.
     _release: Subscription,
 }
@@ -508,18 +517,22 @@ pub(crate) struct AirView {
 impl AirView {
     fn new(
         feed: Entity<AirFeed>,
+        glance: Entity<Glance>,
         shutdown: Arc<Shutdown>,
         socket_path: String,
         tx: mpsc::SyncSender<BridgeMsg>,
         cx: &mut Context<Self>,
     ) -> Self {
         let observe = cx.observe(&feed, |_this, _, cx| cx.notify());
+        let observe_glance = cx.observe(&glance, |_this, _, cx| cx.notify());
         let release = cx.on_release(move |_view, _cx| shutdown.trip());
         Self {
             feed,
+            glance,
             socket_path,
             tx,
             _observe: observe,
+            _observe_glance: observe_glance,
             _release: release,
         }
     }
@@ -572,7 +585,39 @@ impl Render for AirView {
         let air_unsupported = feed.air_unsupported;
         let scan = feed.scan.clone();
 
+        // What the daemon says about the air collector. Only consulted while no
+        // scan has arrived: once a slice exists the collector plainly works, and a
+        // stale capability line must not talk over real data.
+        let capability = self.glance.read(cx).snapshot.collector(EventKind::Air);
+
         let body = match &feed.air {
+            // The daemon HAS the air collector and its config switched it off.
+            // Never folded into "no scan yet" (which would blame the absence on
+            // timing) nor into "cannot collect" (which would tell the operator
+            // there is nothing to turn on). This is the one state that names the
+            // switch.
+            None if capability == CollectorAvailability::Disabled => note(
+                "The air collector is switched off.",
+                "This daemon can read the radio environment; its configuration does not let \
+                 it. Nothing here is a reading of the air. Set `collectors.air.enabled = \
+                 true` in the daemon's config (or `NET_OBSERVER_COLLECTORS__AIR__ENABLED=1`) \
+                 and restart it — or press \"Scan now\" for a single slice, which the daemon \
+                 serves on demand regardless.",
+                theme.warn,
+                theme,
+            )
+            .into_any_element(),
+            // The daemon named its collectors and the air is not among them —
+            // the same fact `air_unsupported` reports from the other direction
+            // (a daemon too old to read a filter naming that kind).
+            None if capability == CollectorAvailability::Absent => note(
+                "This daemon cannot collect the air.",
+                "It listed the collectors it has and the air is not one of them. No scan can \
+                 have happened, which is not the same as one having found nothing.",
+                theme.warn,
+                theme,
+            )
+            .into_any_element(),
             // The daemon itself predates the air collector. Distinct from "no
             // scan yet", which would claim a capability this daemon lacks.
             None if feed.air_unsupported => note(
@@ -1009,7 +1054,7 @@ pub(crate) fn open_or_focus(cx: &mut App, glance: &Entity<Glance>, socket_path: 
         cx.activate(true);
         return;
     }
-    if let Some(handle) = open_window(cx, socket_path) {
+    if let Some(handle) = open_window(cx, glance.clone(), socket_path) {
         let any: AnyWindowHandle = handle.into();
         glance.update(cx, |g, _| g.air_window = Some(any));
         cx.activate(true);
@@ -1017,7 +1062,11 @@ pub(crate) fn open_or_focus(cx: &mut App, glance: &Entity<Glance>, socket_path: 
 }
 
 /// Create the air-map window and wire its subscription bridge.
-fn open_window(cx: &mut App, socket_path: String) -> Option<WindowHandle<AirView>> {
+fn open_window(
+    cx: &mut App,
+    glance: Entity<Glance>,
+    socket_path: String,
+) -> Option<WindowHandle<AirView>> {
     let feed = cx.new(|_| AirFeed::default());
     let (tx, rx) = mpsc::sync_channel::<BridgeMsg>(BRIDGE_DEPTH);
     let shutdown = Arc::new(Shutdown::default());
@@ -1074,7 +1123,7 @@ fn open_window(cx: &mut App, socket_path: String) -> Option<WindowHandle<AirView
 
     let options = window_options(cx);
     match cx.open_window(options, move |_window, cx| {
-        cx.new(|cx| AirView::new(feed, shutdown, button_socket, button_tx, cx))
+        cx.new(|cx| AirView::new(feed, glance, shutdown, button_socket, button_tx, cx))
     }) {
         Ok(handle) => Some(handle),
         Err(e) => {

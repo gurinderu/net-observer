@@ -29,6 +29,8 @@
 //!   the anchor is clamped to the screen: it prefers the panel's right side,
 //!   flips to the left when there is no room, and slides up to fit.
 
+use net_observer_ipc::{CollectorAvailability, EventKind};
+
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Bounds, Context, Entity, InteractiveElement,
     IntoElement, ParentElement, Pixels, Render, StatefulInteractiveElement, Styled, Subscription,
@@ -156,10 +158,31 @@ impl Render for MenuView {
             let model = this.model.clone();
             crate::map::open_or_focus(cx, &model);
         });
-        let air = self.entry("air", "Air", theme.accent, theme, cx, |this, cx| {
-            let socket = this.model.read(cx).socket_path.clone();
-            let model = this.model.clone();
-            crate::air::open_or_focus(cx, &model, socket);
+        // The air row exists only when the daemon can produce air at all.
+        //
+        // Three states, kept apart on purpose (realm net-observer, shared surface
+        // `net-observer-ipc`):
+        //
+        // * `Absent` / `Unknown` — this daemon has no air collector, or is too old
+        //   to say. There is nothing to open and never will be until it is
+        //   replaced, so the row is not drawn: an interface must not offer what
+        //   the daemon cannot do.
+        // * `Disabled` — the daemon HAS the collector and config switched it off.
+        //   The row stays, and says so, because hiding it would hide the very
+        //   thing the operator has to find in order to turn it on.
+        // * `Enabled` — the ordinary row.
+        //
+        // Read from the live snapshot on every render, never latched at launch, so
+        // upgrading the daemon or enabling the collector makes the row appear under
+        // a bar that is already running.
+        let air_availability = self.model.read(cx).snapshot.collector(EventKind::Air);
+        let air = collector_row(air_availability).map(|label| {
+            let color = if label.off { theme.muted } else { theme.accent };
+            self.entry("air", label.text("Air"), color, theme, cx, |this, cx| {
+                let socket = this.model.read(cx).socket_path.clone();
+                let model = this.model.clone();
+                crate::air::open_or_focus(cx, &model, socket);
+            })
         });
         let freeze = self.entry(
             "freeze",
@@ -217,7 +240,7 @@ impl Render for MenuView {
             .child(Self::heading("windows", theme))
             .child(events)
             .child(map)
-            .child(air)
+            .children(air)
             .child(separator(theme))
             .child(Self::heading("daemon", theme))
             .child(freeze)
@@ -227,6 +250,42 @@ impl Render for MenuView {
             .child(Self::heading("panel", theme))
             .child(refresh)
             .child(quit)
+    }
+}
+
+/// How a window row for one collector should be drawn, or `None` for "not at
+/// all".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CollectorRow {
+    /// The daemon has this collector and config switched it off. The row says so
+    /// rather than disappearing.
+    pub(crate) off: bool,
+}
+
+impl CollectorRow {
+    /// The row's label: the plain name, or the name marked as not collecting.
+    fn text(self, name: &str) -> String {
+        if self.off {
+            format!("{name} (off)")
+        } else {
+            name.to_string()
+        }
+    }
+}
+
+/// The rule this whole change exists for: which of the states a daemon can be in
+/// gets a menu row, and which of those rows admits that nothing is being
+/// collected.
+///
+/// `None` — no row — is reserved for a daemon that CANNOT collect this: absent
+/// from its declaration, or a daemon too old to have made one. A daemon that has
+/// the collector and was told not to run it keeps its row, marked `off`, because
+/// that row is the only place the operator would look for the switch.
+pub(crate) fn collector_row(availability: CollectorAvailability) -> Option<CollectorRow> {
+    match availability {
+        CollectorAvailability::Absent | CollectorAvailability::Unknown => None,
+        CollectorAvailability::Disabled => Some(CollectorRow { off: true }),
+        CollectorAvailability::Enabled => Some(CollectorRow { off: false }),
     }
 }
 
@@ -383,6 +442,31 @@ fn close_panel_unless_it_took_focus(cx: &mut App, model: Entity<Glance>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The border the owner asked for, in one place: a capability the daemon does
+    /// not have is not offered; one it has but was told not to run is offered and
+    /// admits it; one that runs is an ordinary row.
+    #[test]
+    fn a_row_is_hidden_only_when_the_daemon_cannot_collect() {
+        // Cannot: no row at all, so the interface never offers a window that can
+        // never fill.
+        assert_eq!(collector_row(CollectorAvailability::Absent), None);
+        // A daemon too old to say is treated as cannot for DRAWING purposes — but
+        // it reached here as its own state, never folded into "switched off".
+        assert_eq!(collector_row(CollectorAvailability::Unknown), None);
+
+        // Switched off: the row stays, marked, because it is where the operator
+        // goes to turn it on. Hiding it would hide the switch.
+        let off = collector_row(CollectorAvailability::Disabled).expect("the row must stay");
+        assert!(off.off);
+        assert_eq!(off.text("Air"), "Air (off)");
+
+        // Running: the ordinary row. Whether a scan has landed is a data
+        // question the window answers, not a capability one.
+        let on = collector_row(CollectorAvailability::Enabled).expect("the row must be there");
+        assert!(!on.off);
+        assert_eq!(on.text("Air"), "Air");
+    }
 
     fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
         Bounds {
