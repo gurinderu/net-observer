@@ -165,10 +165,13 @@ pub struct FrequencyExtent {
     pub lo_mhz: f64,
     /// Upper edge, MHz.
     pub hi_mhz: f64,
-    /// The placement itself had to be guessed — a 2.4 GHz radio wider than
-    /// 20 MHz, whose bonding direction is not reported, so the extent spans both
-    /// possible placements and is wider than the radio actually is.
+    /// The placement itself had to be guessed — the same condition
+    /// [`overlap_hypothesis`] lowers its confidence for, so the picture and the
+    /// number never disagree about whether the radio's position is known.
     pub placement_ambiguous: bool,
+    /// The extent covers more than one possible placement, so the drawn band
+    /// is wider than the radio's own width: every placement it could have.
+    pub drawn_as_union: bool,
 }
 
 impl ChannelSpan {
@@ -183,7 +186,12 @@ impl ChannelSpan {
             // `candidate_spans` works in doubled MHz so odd halves stay exact.
             lo_mhz: f64::from(lo) / 2.0,
             hi_mhz: f64::from(hi) / 2.0,
-            placement_ambiguous: guessed && spans.len() > 1,
+            // Exactly the condition `overlap_hypothesis` calls a guessed
+            // placement: any span the grid could not resolve, not only the
+            // two-bonding case. The drawing and the number must not disagree
+            // about when the placement is known.
+            placement_ambiguous: guessed,
+            drawn_as_union: spans.len() > 1,
         })
     }
 }

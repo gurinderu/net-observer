@@ -154,13 +154,30 @@ impl AirFeed {
     fn apply(&mut self, msg: BridgeMsg) {
         match msg {
             BridgeMsg::Frame(frame) => {
-                self.offline = None;
                 match frame {
-                    StreamFrame::Event(Event::Air(a)) => self.air = Some(a),
-                    StreamFrame::Event(Event::Wifi(w)) => self.own = Some(w),
-                    StreamFrame::Ready(r) => self.paused = !r.observing,
-                    StreamFrame::Observing(e) => self.paused = !e.observing,
-                    StreamFrame::Gap(_) | StreamFrame::Error(_) | StreamFrame::Event(_) => {}
+                    StreamFrame::Event(Event::Air(a)) => {
+                        self.offline = None;
+                        self.air = Some(a);
+                    }
+                    StreamFrame::Event(Event::Wifi(w)) => {
+                        self.offline = None;
+                        self.own = Some(w);
+                    }
+                    StreamFrame::Ready(r) => {
+                        self.offline = None;
+                        self.paused = !r.observing;
+                    }
+                    StreamFrame::Observing(e) => {
+                        self.offline = None;
+                        self.paused = !e.observing;
+                    }
+                    // An error frame is the daemon refusing, not the daemon
+                    // working: clearing the note here would leave a stale slice
+                    // looking live.
+                    StreamFrame::Error(e) => {
+                        self.offline = Some(format!("daemon: {}", e.message).into())
+                    }
+                    StreamFrame::Gap(_) | StreamFrame::Event(_) => self.offline = None,
                 }
             }
             BridgeMsg::Offline(reason) => self.offline = Some(reason.into()),
@@ -311,7 +328,8 @@ fn place(span: ChannelSpan, axis: (f64, f64)) -> Option<(f32, f32)> {
     Some((left as f32, w as f32))
 }
 
-/// How loud a foreign AP arrives, as an opacity in `0.20..=0.85`.
+/// How loud a foreign AP arrives, as an opacity: `0.25..=0.85` for a reported
+/// signal, and `0.20` — below the whole reported range — when there is none.
 ///
 /// A rendering of the reported RSSI and nothing else: `-90 dBm` is barely there,
 /// `-35 dBm` is next door. An AP whose signal was not reported gets the floor,
@@ -357,6 +375,15 @@ fn lane_label(lane: &Lane) -> String {
     if lane.span.width_assumed {
         s.push_str(" (assumed)");
     }
+    if lane
+        .span
+        .frequency_extent()
+        .is_some_and(|e| e.drawn_as_union)
+    {
+        // The bar is drawn wider than the radio: 2.4 GHz bonding direction is
+        // not reported, so the band shown is every placement it could have.
+        s.push_str(" · bonding unknown, drawn as widest possible");
+    }
     match lane.rssi_dbm {
         Some(r) => s.push_str(&format!(" · {r} dBm")),
         None => s.push_str(" · signal not reported"),
@@ -375,11 +402,19 @@ fn overlap_label(lane: &Lane) -> String {
     match lane.hypothesis {
         None => "overlap not computable — this Mac's own channel is unknown".to_string(),
         Some(h) if h.overlap <= 0.0 => "no band overlap with our channel".to_string(),
-        Some(h) => format!(
-            "hypothesis: covers {:.0}% of our channel · {}",
-            h.overlap * 100.0,
-            confidence_label(h.confidence)
-        ),
+        Some(h) => {
+            // A real sliver must not print as the same 0% a disjoint channel
+            // does — the reader already settled this wording.
+            let share = if h.overlap < 0.005 {
+                "<1%".to_string()
+            } else {
+                format!("{:.0}%", h.overlap * 100.0)
+            };
+            format!(
+                "hypothesis: covers {share} of our channel · {}",
+                confidence_label(h.confidence)
+            )
+        }
     }
 }
 
@@ -410,6 +445,8 @@ impl Render for AirView {
         let offline = feed.offline.clone();
         let paused = feed.paused;
         let own = feed.own_span();
+        let scanned_at = feed.air.as_ref().map(|a| a.ts_us);
+        let own_read_at = feed.own.as_ref().map(|w| w.ts_us);
 
         let body = match &feed.air {
             // No scan has arrived. NOT empty air: the air collector is off by
@@ -460,7 +497,7 @@ impl Render for AirView {
             .text_color(rgb(theme.fg))
             .font_family(".SystemUIFont")
             .text_size(px(13.0))
-            .child(header(own, paused, theme))
+            .child(header(own, paused, scanned_at, own_read_at, theme))
             .children(offline.map(|reason| {
                 div()
                     .px_3()
@@ -474,9 +511,79 @@ impl Render for AirView {
     }
 }
 
+/// How far our own channel reading may lag the scan before the pairing stops
+/// being about the same association: one minute of ordinary roaming.
+const OWN_CHANNEL_STALE_US: i64 = 60_000_000;
+
+/// Wall-clock time of a microsecond stamp, in the system zone.
+fn clock(ts_us: i64) -> String {
+    match jiff::Timestamp::from_microsecond(ts_us) {
+        Ok(ts) => {
+            let z = ts.to_zoned(jiff::tz::TimeZone::system());
+            format!("{:02}:{:02}:{:02}", z.hour(), z.minute(), z.second())
+        }
+        Err(_) => "--:--:--".to_string(),
+    }
+}
+
+/// A microsecond span as a short duration, for saying how far apart two
+/// readings are without making the reader do arithmetic.
+fn gap_label(us: i64) -> String {
+    let secs = us / 1_000_000;
+    if secs < 90 {
+        format!("{secs}s")
+    } else if secs < 5400 {
+        format!("{}m", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// The two provenance lines under the header: when the slice was taken, and
+/// when the channel it is compared against was read.
+struct ProvenanceLines {
+    scanned: String,
+    /// `Some` when our own channel has a moment of its own; carries a warning
+    /// instead of a note when the two readings are far enough apart that we may
+    /// have roamed between them.
+    pairing: Option<String>,
+}
+
+/// Say when each half of the picture was read.
+///
+/// The scan and our own association come from different readings on different
+/// cadences; pairing them silently would compute the overlap against a band we
+/// had already left (realm net-observer, node #48).
+fn provenance_lines(scanned_at: Option<i64>, own_read_at: Option<i64>) -> ProvenanceLines {
+    let scanned = match scanned_at {
+        Some(us) => format!("scanned at {}", clock(us)),
+        None => "scanned at an unknown moment".to_string(),
+    };
+    let pairing = match (scanned_at, own_read_at) {
+        (Some(scan), Some(own_us)) if (scan - own_us).abs() > OWN_CHANNEL_STALE_US => {
+            Some(format!(
+                "our channel was read at {} — {} apart from the scan, so we may have roamed between them",
+                clock(own_us),
+                gap_label((scan - own_us).abs())
+            ))
+        }
+        (_, Some(own_us)) => Some(format!("our channel read at {}", clock(own_us))),
+        (_, None) => None,
+    };
+    ProvenanceLines { scanned, pairing }
+}
+
 /// The window header: what this map is, our own association, and the caveat that
 /// governs every number below it (realm net-observer, node #48).
-fn header(own: Option<ChannelSpan>, paused: bool, theme: Theme) -> impl IntoElement {
+fn header(
+    own: Option<ChannelSpan>,
+    paused: bool,
+    scanned_at: Option<i64>,
+    own_read_at: Option<i64>,
+    theme: Theme,
+) -> impl IntoElement {
     let own_line = match own {
         Some(s) => format!(
             "this Mac: {} · ch {} · {} MHz{}",
@@ -487,6 +594,12 @@ fn header(own: Option<ChannelSpan>, paused: bool, theme: Theme) -> impl IntoElem
         ),
         None => "this Mac: not associated, or the channel was not reported".to_string(),
     };
+    // A scan is a slice, and a slice with no moment on it cannot deny being
+    // "the air right now" — the one claim this window must never make when the
+    // socket has been quiet for an hour (realm net-observer, node #48).
+    let lines = provenance_lines(scanned_at, own_read_at);
+    let scanned_line = lines.scanned;
+    let pairing_line = lines.pairing;
     div()
         .flex()
         .flex_col()
@@ -505,6 +618,18 @@ fn header(own: Option<ChannelSpan>, paused: bool, theme: Theme) -> impl IntoElem
                 .text_color(rgb(theme.muted))
                 .child(own_line),
         )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(theme.muted))
+                .child(scanned_line),
+        )
+        .children(pairing_line.map(|line| {
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(theme.warn))
+                .child(line)
+        }))
         // The epistemic boundary, stated in the window and not only in the docs.
         .child(div().text_size(px(11.0)).text_color(rgb(theme.warn)).child(
             "Overlap is a HYPOTHESIS about where the bands sit, not measured \
@@ -829,6 +954,48 @@ fn bridge_send(tx: &mpsc::SyncSender<BridgeMsg>, msg: BridgeMsg) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A slice with no moment on it cannot deny being "the air right now", and
+    /// after a socket drop that is exactly what a stale one would claim.
+    #[test]
+    fn the_header_carries_the_moment_of_the_scan_and_of_our_channel() {
+        let scanned = 4_000_000_000_i64;
+        let l = provenance_lines(Some(scanned), Some(scanned));
+        let out: Vec<String> = std::iter::once(l.scanned).chain(l.pairing).collect();
+        assert!(
+            out.iter().any(|l| l.starts_with("scanned at ")),
+            "the scan's moment is always shown: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with("our channel read at ")),
+            "and so is our own reading's: {out:?}"
+        );
+        // Far apart: the pairing itself becomes the warning.
+        let l = provenance_lines(Some(scanned), Some(scanned - 4 * 3600 * 1_000_000));
+        let out: Vec<String> = std::iter::once(l.scanned).chain(l.pairing).collect();
+        assert!(
+            out.iter().any(|l| l.contains("we may have roamed")),
+            "a scan paired with a four-hour-old channel must say so: {out:?}"
+        );
+        assert!(out.iter().any(|l| l.contains("4h")), "{out:?}");
+    }
+
+    /// An error frame is the daemon refusing, not the daemon working: it must
+    /// not clear the offline note and leave a stale slice looking live.
+    #[test]
+    fn an_error_frame_is_surfaced_rather_than_swallowed() {
+        let mut feed = AirFeed::default();
+        feed.apply(BridgeMsg::Frame(StreamFrame::Error(
+            net_observer_ipc::StreamError {
+                ts_us: 1,
+                code: net_observer_ipc::StreamErrorCode::TooManySubscribers,
+                message: "too many subscribers".to_string(),
+            },
+        )));
+        let note = feed.offline.clone().expect("the refusal is shown");
+        assert!(note.contains("too many subscribers"), "{note}");
+    }
+
     use super::*;
     use net_observer_ipc::Ready;
     use types::{ObservingCause, ObservingEdge};
