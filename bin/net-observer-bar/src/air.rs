@@ -1056,16 +1056,26 @@ fn ring_mark_label(lane: &Lane) -> String {
     s
 }
 
+/// One neighbour as the rings view handles it: the band it was heard in, and
+/// the lane carrying its reading.
+type BandLane = (Band, Lane);
+
+/// The split [`ring_marks`] returns.
+struct RingMarks {
+    /// Neighbours with a reported signal — each has a ring to sit on.
+    placed: Vec<BandLane>,
+    /// Neighbours with no reported signal — no ring can carry them, so they are
+    /// named outside the drawing instead.
+    unplaceable: Vec<BandLane>,
+}
+
 /// The neighbours the rings can carry, in the window's own ranking order, and
 /// the ones that must be named outside the drawing instead.
 ///
 /// A neighbour with no reported signal has no ring to sit on. Drawing it
 /// anywhere would be inventing the reading the whole view is made of, so it is
 /// counted and said instead — SKIP, never silence.
-fn ring_marks(
-    sample: &AirSample,
-    own: Option<ChannelSpan>,
-) -> (Vec<(Band, Lane)>, Vec<(Band, Lane)>) {
+fn ring_marks(sample: &AirSample, own: Option<ChannelSpan>) -> RingMarks {
     let mut placed = Vec::new();
     let mut unplaceable = Vec::new();
     for g in group(sample, own) {
@@ -1077,7 +1087,10 @@ fn ring_marks(
             }
         }
     }
-    (placed, unplaceable)
+    RingMarks {
+        placed,
+        unplaceable,
+    }
 }
 
 /// The rings view: this Mac at the centre, concentric rings labelled in dBm, and
@@ -1094,7 +1107,10 @@ fn rings_section(
     d: f32,
     theme: Theme,
 ) -> impl IntoElement {
-    let (placed, unplaceable) = ring_marks(sample, own);
+    let RingMarks {
+        placed,
+        unplaceable,
+    } = ring_marks(sample, own);
 
     let mut plot = div()
         .debug_selector(|| "air-rings".to_string())
@@ -2624,10 +2640,13 @@ mod tests {
     #[test]
     fn a_neighbour_without_a_signal_sits_on_no_ring() {
         let sample = scan(vec![
-            ap(36, "5", Some(80), Some(-55)),
-            ap(40, "5", Some(20), None),
+            ap(36, "5ghz", Some(80), Some(-55)),
+            ap(40, "5ghz", Some(20), None),
         ]);
-        let (placed, unplaceable) = ring_marks(&sample, Some(own(36, "5", 80)));
+        let RingMarks {
+            placed,
+            unplaceable,
+        } = ring_marks(&sample, Some(own(36, "5ghz", 80)));
         assert_eq!(placed.len(), 1);
         assert_eq!(unplaceable.len(), 1, "it must be counted, never dropped");
         assert!(
@@ -2638,8 +2657,8 @@ mod tests {
 
     #[test]
     fn a_mark_names_its_channel_its_width_and_a_distance_range() {
-        let sample = scan(vec![ap(36, "5", Some(80), Some(-62))]);
-        let (placed, _) = ring_marks(&sample, Some(own(36, "5", 80)));
+        let sample = scan(vec![ap(36, "5ghz", Some(80), Some(-62))]);
+        let RingMarks { placed, .. } = ring_marks(&sample, Some(own(36, "5ghz", 80)));
         let label = ring_mark_label(&placed[0].1);
         assert!(label.contains("-62 dBm"), "{label}");
         assert!(label.contains("ch 36"), "{label}");
@@ -2666,13 +2685,19 @@ mod tests {
 /// Headless UI tests for the air map, on gpui's own test platform: layout and
 /// scene construction run for real, rasterization does not.
 ///
+/// **What this carrier cannot say.** gpui's debug-bounds map only ever grows
+/// over a window's life: `Frame::clear()` clears every other per-frame table and
+/// leaves `debug_bounds` alone, so a selector drawn once stays findable in that
+/// window forever. Presence is therefore assertable anywhere; **absence is
+/// assertable only in a window that never drew the element** — open a fresh one
+/// in the mode under test rather than switching an existing one into it.
+///
 /// The fixture is a verbatim `system_profiler -json SPAirPortDataType` slice
 /// taken from this Mac while it was associated on 5 GHz channel 48 — fifteen
 /// audible foreign access points, ten in 2.4 GHz and five in 5 GHz. It is the
 /// slice the window was first run against, and the one it was unreadable on. It
 /// is parsed by `macos::air::parse_air_report`, the daemon's own parser, so what
 /// these tests draw is what production would hand the window.
-
 #[cfg(test)]
 mod headless_tests {
     use super::*;
@@ -2717,10 +2742,22 @@ mod headless_tests {
     }
 
     /// The same window at a chosen size, keeping the handle so a test can drive
-    /// the view switch the way a click does.
+    /// the view switch the way a click does. Opens on the channel axis, the mode
+    /// the window opens in for real.
     fn live_window_at(
         cx: &mut TestAppContext,
         viewport: Size<Pixels>,
+    ) -> (VisualTestContext, Size<Pixels>, WindowHandle<AirView>) {
+        live_window_in(cx, viewport, AirMode::Channels)
+    }
+
+    /// A window that opens ALREADY in `mode` and has therefore never drawn any
+    /// other mode's elements. This is the only window an absence can be asserted
+    /// in — see the note on the debug-bounds map at the top of this module.
+    fn live_window_in(
+        cx: &mut TestAppContext,
+        viewport: Size<Pixels>,
+        mode: AirMode,
     ) -> (VisualTestContext, Size<Pixels>, WindowHandle<AirView>) {
         let own = live_own();
         let glance = cx.update(|cx| {
@@ -2755,14 +2792,18 @@ mod headless_tests {
         // fixture, not from a socket, and nothing here presses "scan now".
         let (tx, _rx) = mpsc::sync_channel(BRIDGE_DEPTH);
         let window = cx.add_window(|_, cx| {
-            AirView::new(
+            let mut view = AirView::new(
                 feed,
                 glance,
                 Arc::new(Shutdown::default()),
                 "/tmp/net-observer-air-test.sock".to_string(),
                 tx,
                 cx,
-            )
+            );
+            // Set before the first paint, so this window never draws any other
+            // mode.
+            view.mode = mode;
+            view
         });
         let vcx = VisualTestContext::from_window(window.into(), cx);
         vcx.simulate_resize(viewport);
@@ -3024,7 +3065,7 @@ mod headless_tests {
             assert!(within(plot, ring), "the {level} dBm ring spills: {ring:?}");
         }
 
-        let (placed, _) = ring_marks(&live_sample(), Some(live_own()));
+        let RingMarks { placed, .. } = ring_marks(&live_sample(), Some(live_own()));
         assert!(
             placed.len() > 5,
             "the fixture must be crowded to prove this"
@@ -3073,7 +3114,7 @@ mod headless_tests {
     /// one number that could be read as a measurement.
     #[test]
     fn every_drawn_neighbour_is_given_a_distance_range_and_never_a_figure() {
-        let (placed, _) = ring_marks(&live_sample(), Some(live_own()));
+        let RingMarks { placed, .. } = ring_marks(&live_sample(), Some(live_own()));
         assert!(!placed.is_empty(), "the fixture must place neighbours");
         for (_band, lane) in &placed {
             let label = ring_mark_label(lane);
@@ -3095,11 +3136,17 @@ mod headless_tests {
         }
     }
 
-    /// Switching views is a reading of the same slice and loses nothing: the
-    /// channel axis is whole again after a trip through the rings, and the rings
-    /// carry exactly the neighbours the axis does.
+    /// A round trip through the rings and back loses nothing: the channel axis is
+    /// whole again with every band on it, and the rings carry exactly the
+    /// neighbours the axis does.
+    ///
+    /// It says nothing about what the rings view does NOT draw: this window drew
+    /// the axis on the way in, so its debug bounds keep the axis findable for the
+    /// rest of its life whatever is on screen. That absence is asserted in
+    /// `a_window_opened_on_the_rings_never_draws_the_channel_axis`, in a window
+    /// that never drew one.
     #[gpui::test]
-    fn switching_the_view_keeps_the_whole_slice(cx: &mut TestAppContext) {
+    fn a_round_trip_through_the_rings_and_back_keeps_the_whole_slice(cx: &mut TestAppContext) {
         let (mut cx, _viewport, window) = live_window_at(cx, rings_viewport());
         let own = live_own();
         let groups = group(&live_sample(), Some(own));
@@ -3109,11 +3156,10 @@ mod headless_tests {
             bounds(&mut cx, &format!("air-axis:{here}")).expect("the channel axis is drawn first");
 
         switch_to(&mut cx, window, AirMode::Rings);
-        assert!(
-            bounds(&mut cx, &format!("air-axis:{here}")).is_none(),
-            "the axis view is still drawn under the rings"
-        );
-        let (placed, unplaceable) = ring_marks(&live_sample(), Some(own));
+        let RingMarks {
+            placed,
+            unplaceable,
+        } = ring_marks(&live_sample(), Some(own));
         let drawn: usize = groups.iter().map(|g| g.lanes.len()).sum();
         assert_eq!(
             placed.len() + unplaceable.len(),
@@ -3140,6 +3186,47 @@ mod headless_tests {
                 );
             }
         }
+    }
+
+    /// A window that opens on the rings draws the rings and no channel axis.
+    ///
+    /// The absence half of the round-trip test, and it lives here because it can
+    /// only be said here: this window has never drawn an axis, so a found
+    /// `air-axis:*` would be one the rings view drew now.
+    #[gpui::test]
+    fn a_window_opened_on_the_rings_never_draws_the_channel_axis(cx: &mut TestAppContext) {
+        let (mut cx, _viewport, _window) = live_window_in(cx, rings_viewport(), AirMode::Rings);
+        for g in group(&live_sample(), Some(live_own())) {
+            let band = band_label(g.band);
+            assert!(
+                bounds(&mut cx, &format!("air-axis:{band}")).is_none(),
+                "the {band} channel axis is drawn under the rings"
+            );
+        }
+        for level in RING_LEVELS {
+            assert!(
+                bounds(&mut cx, &format!("air-ring:{level}")).is_some(),
+                "the {level} m ring is missing from the view that is only rings"
+            );
+        }
+    }
+
+    /// And the other way: a window that opens on the channel axis draws the axis
+    /// and no rings. Same reason it is a separate window.
+    #[gpui::test]
+    fn a_window_opened_on_the_channels_never_draws_the_rings(cx: &mut TestAppContext) {
+        let (mut cx, _viewport, _window) = live_window_in(cx, rings_viewport(), AirMode::Channels);
+        for level in RING_LEVELS {
+            assert!(
+                bounds(&mut cx, &format!("air-ring:{level}")).is_none(),
+                "the {level} m ring is drawn over the channel axis"
+            );
+        }
+        let here = band_label(live_own().band);
+        assert!(
+            bounds(&mut cx, &format!("air-axis:{here}")).is_some(),
+            "the view that is only the axis drew no axis"
+        );
     }
 
     /// `inner` lies wholly inside `outer`, both in absolute window coordinates.
