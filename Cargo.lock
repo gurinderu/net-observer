@@ -4058,10 +4058,12 @@ dependencies = [
  "config",
  "gpui",
  "jiff",
+ "macos",
  "net-observer-ipc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "serde_json",
  "tempfile",
  "types",
 ]

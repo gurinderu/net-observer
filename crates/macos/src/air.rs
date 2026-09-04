@@ -247,11 +247,20 @@ fn parse_dbm(s: &str) -> Option<i32> {
 
 /// Strip the platform's `spairport_security_mode_` prefix, leaving
 /// `"wpa2_personal_mixed"`. A label without the prefix is kept as it came.
+///
+/// The report on this machine also emits the token with its leading `s` missing
+/// — `pairport_security_mode_wpa3_transition` — for every WPA3-transition
+/// network, so that spelling is stripped too. Matching only the documented
+/// spelling leaked the raw token into the menu bar's labels, which is how this
+/// was found (realm net-observer, node #48).
 #[must_use]
 pub fn parse_security(s: &str) -> String {
-    s.strip_prefix("spairport_security_mode_")
-        .unwrap_or(s)
-        .to_string()
+    for prefix in ["spairport_security_mode_", "pairport_security_mode_"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    s.to_string()
 }
 
 #[cfg(test)]
@@ -439,5 +448,16 @@ mod tests {
             "wpa3_transition"
         );
         assert_eq!(parse_security("none"), "none");
+    }
+
+    /// The live report on this machine spells the WPA3-transition token without
+    /// its leading `s`. Observed, not supposed: the fixture in the menu bar's
+    /// tests is a verbatim `system_profiler` slice that carries it.
+    #[test]
+    fn strips_the_security_prefix_the_report_spells_without_its_leading_s() {
+        assert_eq!(
+            parse_security("pairport_security_mode_wpa3_transition"),
+            "wpa3_transition"
+        );
     }
 }
