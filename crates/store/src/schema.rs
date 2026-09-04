@@ -23,6 +23,26 @@ CREATE TABLE IF NOT EXISTS wifi_sample (
   ts_us BIGINT, wifi VARCHAR, reason VARCHAR, rssi_dbm INTEGER, noise_dbm INTEGER,
   snr_db INTEGER, tx_rate_mbps DOUBLE, phy_mode VARCHAR, channel INTEGER,
   channel_width_mhz INTEGER, channel_band VARCHAR);
+-- The radio environment: the foreign access points audible from here.
+-- Two tables, and NOT the two shapes `neighbor` uses. There is no long-lived
+-- entity table for a foreign AP, because the system report carries no BSSID at
+-- all (realm net-observer, node #47): two APs on one channel are indistinguishable
+-- between scans, so an AP cannot be followed through time and a row keyed by
+-- identity would be a fiction. What the record holds is therefore a series of
+-- SLICES: `air_sample` is the scan (including its SKIPs, so a stretch where the
+-- radio could not be scanned stays visible) and `air_ap` the access points that
+-- one scan heard, joined back by `ts_us`.
+-- `air = 'OK'` with `ap_count = 0` is a real reading — the scan ran and heard
+-- nobody. `air = 'SKIP'` is the different fact that it could not look, and
+-- `reason` says why; the two must never be conflated.
+-- Overlap with our own channel is deliberately NOT a column: it is derived by
+-- the reader against the `wifi_sample` of the moment, and it is a HYPOTHESIS,
+-- since no channel-occupancy figure exists on this platform (node #48).
+CREATE TABLE IF NOT EXISTS air_sample (
+  ts_us BIGINT, air VARCHAR, reason VARCHAR, ap_count INTEGER);
+CREATE TABLE IF NOT EXISTS air_ap (
+  ts_us BIGINT, channel INTEGER, channel_band VARCHAR, channel_width_mhz INTEGER,
+  phy_mode VARCHAR, security VARCHAR, rssi_dbm INTEGER, noise_dbm INTEGER);
 -- Neighbours on the local segment. Two shapes on purpose: `neighbor_sample` is
 -- the per-tick reading (including its SKIPs, so a stretch where the caches could
 -- not be read stays visible), and `neighbor` is the long-lived entity — one row

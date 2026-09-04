@@ -39,8 +39,8 @@ use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
 use types::{
-    DnsSample, HostSample, LinkSample, NeighborsSample, ObservingEdge, ProxySample, RouteEvent,
-    TopologyLink, WifiSample,
+    AirSample, DnsSample, HostSample, LinkSample, NeighborsSample, ObservingEdge, ProxySample,
+    RouteEvent, TopologyLink, WifiSample,
 };
 
 /// A request from a client (the bar or cli) to the daemon.
@@ -175,6 +175,8 @@ pub enum EventKind {
     Host,
     Wifi,
     Neighbors,
+    /// The radio environment: one scan of the foreign access points audible here.
+    Air,
     Incident,
 }
 
@@ -191,6 +193,7 @@ impl EventKind {
             EventKind::Host => "host",
             EventKind::Wifi => "wifi",
             EventKind::Neighbors => "neighbors",
+            EventKind::Air => "air",
             EventKind::Incident => "incident",
         }
     }
@@ -213,6 +216,7 @@ pub enum Event {
     Host(HostSample),
     Wifi(WifiSample),
     Neighbors(NeighborsSample),
+    Air(AirSample),
     Incident(IncidentSummary),
 }
 
@@ -228,6 +232,7 @@ impl Event {
             Event::Host(_) => EventKind::Host,
             Event::Wifi(_) => EventKind::Wifi,
             Event::Neighbors(_) => EventKind::Neighbors,
+            Event::Air(_) => EventKind::Air,
             Event::Incident(_) => EventKind::Incident,
         }
     }
@@ -243,6 +248,7 @@ impl Event {
             Event::Host(h) => h.ts_us,
             Event::Wifi(w) => w.ts_us,
             Event::Neighbors(n) => n.ts_us,
+            Event::Air(a) => a.ts_us,
             Event::Incident(i) => i.opened_us,
         }
     }
@@ -305,6 +311,16 @@ impl Event {
                     n.iface.as_deref().unwrap_or("-"),
                     n.network_key.as_deref().unwrap_or("-")
                 ),
+            },
+            // The line says how many access points were HEARD, never anything
+            // about interference: no channel-occupancy figure exists on this
+            // platform, so the overlap with our own band is computed by a reader
+            // and presented as a hypothesis (realm net-observer, node #48).
+            Event::Air(a) => match a.air {
+                types::AirVerdict::Skip => {
+                    format!("SKIP {}", a.reason.as_deref().unwrap_or("-"))
+                }
+                types::AirVerdict::Ok => format!("{} AP heard", a.aps.len()),
             },
             Event::Incident(i) => format!("{} {}", i.trigger_id, i.signature),
         }

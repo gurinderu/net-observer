@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::air::AirSample;
 use crate::neighbor::NeighborsSample;
 use crate::verdict::{DnsVerdict, GwVerdict, TcpVerdict, WifiVerdict};
 
@@ -111,6 +112,10 @@ pub enum Sample {
     Host(HostSample),
     Wifi(WifiSample),
     Neighbors(NeighborsSample),
+    /// One scan of the radio environment — the foreign access points audible
+    /// here. Its own slow period, not the tick: the scan costs seconds
+    /// (realm net-observer, node #47).
+    Air(AirSample),
 }
 
 impl Sample {
@@ -123,6 +128,7 @@ impl Sample {
             Sample::Host(h) => h.ts_us,
             Sample::Wifi(w) => w.ts_us,
             Sample::Neighbors(n) => n.ts_us,
+            Sample::Air(a) => a.ts_us,
         }
     }
 }
@@ -203,6 +209,22 @@ mod tests {
             channel_band: Some("5ghz".into()),
         });
         assert_eq!(w.ts_us(), 31);
+
+        let a = Sample::Air(crate::AirSample {
+            ts_us: 37,
+            air: crate::AirVerdict::Ok,
+            reason: None,
+            aps: vec![crate::AirObservation {
+                channel: Some(44),
+                channel_band: Some("5ghz".into()),
+                channel_width_mhz: Some(80),
+                phy_mode: Some("802.11a/n/ac/ax".into()),
+                security: Some("wpa2_personal".into()),
+                rssi_dbm: Some(-72),
+                noise_dbm: Some(-95),
+            }],
+        });
+        assert_eq!(a.ts_us(), 37);
     }
 
     #[test]

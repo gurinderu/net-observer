@@ -14,6 +14,7 @@
 //! Raw ICMP and `tcpdump` require root, so the reachability paths are verified
 //! manually; the pure parsing/copy logic is unit-tested.
 
+pub mod air;
 pub mod clash;
 pub mod corewlan;
 pub mod dhcp_arp;
@@ -28,6 +29,7 @@ pub mod route;
 pub mod tls;
 pub mod wifi;
 
+pub use air::SystemProfilerAir;
 pub use clash::{ClashClient, ProxySystemFacts};
 pub use corewlan::CoreWlanFacts;
 pub use dhcp_arp::SystemFacts;

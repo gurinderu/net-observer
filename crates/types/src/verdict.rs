@@ -42,6 +42,14 @@ token_enum!(WifiVerdict { Ok => "OK", Skip => "SKIP" });
 // (an empty table is still a reading — a network where nobody else answers is a
 // fact); `Skip` = they could not be read at all and `reason` says why.
 token_enum!(NeighborsVerdict { Ok => "OK", Skip => "SKIP" });
+// The `air` collector's verdict. `Ok` = the radio-environment scan ran and
+// `AirSample::aps` is what it heard (an empty list under `Ok` is the real reading
+// "nobody else is audible"); `Skip` = the scan could not run at all — radio off,
+// the system report failed, or it carried no wireless section — and `reason` says
+// which. There is deliberately no `Fail`: a crowded channel is a measurement, not
+// a failed probe. SKIP exists so that "could not look" is never rendered as an
+// empty list, which would read as clear air.
+token_enum!(AirVerdict { Ok => "OK", Skip => "SKIP" });
 // How one neighbour came to be known. `Arp`/`Ndp` are the passive kernel caches
 // read every tick; `Sweep` and `Mdns` only ever appear from an operator-pressed
 // scan, so a row's source says whether the daemon merely listened or spoke.

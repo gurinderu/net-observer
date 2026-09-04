@@ -230,6 +230,38 @@ impl Store for DuckdbStore {
                     w.channel_band
                 ],
             )?,
+            // Two writes, like the neighbours arm — but the second table is a
+            // per-scan slice, not a long-lived entity: with no BSSID in the
+            // report there is nothing to key an AP by across scans (realm
+            // net-observer, node #47). The scan's own row is written even when it
+            // is a SKIP, so "could not look" never renders as clear air.
+            Sample::Air(a) => {
+                c.execute(
+                    "INSERT INTO air_sample VALUES (?,?,?,?)",
+                    params![
+                        a.ts_us,
+                        a.air.to_string(),
+                        a.reason,
+                        i32::try_from(a.aps.len()).unwrap_or(i32::MAX)
+                    ],
+                )?;
+                for ap in &a.aps {
+                    c.execute(
+                        "INSERT INTO air_ap VALUES (?,?,?,?,?,?,?,?)",
+                        params![
+                            a.ts_us,
+                            ap.channel,
+                            ap.channel_band,
+                            ap.channel_width_mhz,
+                            ap.phy_mode,
+                            ap.security,
+                            ap.rssi_dbm,
+                            ap.noise_dbm
+                        ],
+                    )?;
+                }
+                0
+            }
             // Two writes, not one: the tick's own row (so a SKIP leaves a trace)
             // and an upsert per neighbour into the long-lived entity table.
             Sample::Neighbors(n) => {
@@ -778,6 +810,106 @@ mod tests {
             s.query_scalar_i64("SELECT count(*) FROM host_sample WHERE load1 > 10")
                 .unwrap(),
             1
+        );
+    }
+
+    /// One air scan lands as its own row plus one row per access point heard,
+    /// joined by `ts_us` — the slice shape the missing BSSID forces.
+    #[test]
+    fn write_and_read_back_air_sample() {
+        use types::{AirObservation, AirSample, AirVerdict};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Air(AirSample {
+            ts_us: 7000,
+            air: AirVerdict::Ok,
+            reason: None,
+            aps: vec![
+                AirObservation {
+                    channel: Some(44),
+                    channel_band: Some("5ghz".into()),
+                    channel_width_mhz: Some(80),
+                    phy_mode: Some("802.11a/n/ac/ax".into()),
+                    security: Some("wpa2_personal".into()),
+                    rssi_dbm: Some(-72),
+                    noise_dbm: Some(-95),
+                },
+                AirObservation {
+                    channel: Some(2),
+                    channel_band: Some("2ghz".into()),
+                    channel_width_mhz: Some(20),
+                    phy_mode: Some("802.11b/g/n".into()),
+                    security: None,
+                    rssi_dbm: Some(-69),
+                    noise_dbm: None,
+                },
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT ap_count FROM air_sample WHERE ts_us=7000")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM air_ap WHERE ts_us=7000 AND channel=44 \
+                 AND channel_band='5ghz' AND channel_width_mhz=80 AND rssi_dbm=-72 \
+                 AND noise_dbm=-95 AND security='wpa2_personal'"
+            )
+            .unwrap(),
+            1
+        );
+        // A field the report declined stays NULL rather than becoming a zero.
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM air_ap WHERE ts_us=7000 AND channel=2 \
+                 AND security IS NULL AND noise_dbm IS NULL"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    /// The distinction the SKIP rule exists for, at the storage layer: a scan
+    /// that could not run leaves a row saying so, while a scan that ran and heard
+    /// nobody leaves an `OK` row with no access points. Both are rows; they are
+    /// not the same row.
+    #[test]
+    fn a_skipped_air_scan_is_not_stored_as_clear_air() {
+        use types::{AirSample, AirVerdict};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Air(AirSample {
+            ts_us: 7100,
+            air: AirVerdict::Skip,
+            reason: Some("Wi-Fi powered off".into()),
+            aps: Vec::new(),
+        }))
+        .unwrap();
+        s.write_sample(&Sample::Air(AirSample {
+            ts_us: 7200,
+            air: AirVerdict::Ok,
+            reason: None,
+            aps: Vec::new(),
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM air_sample \
+                 WHERE ts_us=7100 AND air='SKIP' AND reason='Wi-Fi powered off' AND ap_count=0"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM air_sample WHERE ts_us=7200 AND air='OK' AND ap_count=0"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM air_ap").unwrap(),
+            0
         );
     }
 

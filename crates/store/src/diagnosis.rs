@@ -824,6 +824,43 @@ impl DuckdbStore {
     }
 }
 
+/// **The latest air scan itself** — when it ran, its verdict, why it was skipped
+/// if it was, and how many access points it heard.
+///
+/// Read alongside [`AIR_LATEST_APS_SQL`], and read FIRST: a `SKIP` row means the
+/// scan could not look, and its empty AP list must never be presented as an
+/// empty air (realm net-observer, node #48).
+pub const AIR_LATEST_SCAN_SQL: &str = "\
+SELECT ts_us, air, reason, ap_count
+FROM air_sample
+ORDER BY ts_us DESC
+LIMIT 1";
+
+/// **The access points the latest air scan heard** — one row each, as reported.
+///
+/// A slice, not a history: the report carries no BSSID, so an AP here cannot be
+/// matched to one in any other scan (realm net-observer, node #47). Ordered
+/// loudest first as a stable fallback; the reader re-orders by the overlap
+/// hypothesis it computes against our own channel.
+pub const AIR_LATEST_APS_SQL: &str = "\
+SELECT channel, channel_band, channel_width_mhz, phy_mode, security, rssi_dbm, noise_dbm
+FROM air_ap
+WHERE ts_us = (SELECT max(ts_us) FROM air_sample)
+ORDER BY rssi_dbm DESC NULLS LAST, channel";
+
+/// **Our own channel**, from the most recent `wifi_sample` that actually carried
+/// one — the band the overlap hypothesis is computed against.
+///
+/// Returns no row when the radio has never reported a channel (never associated,
+/// or the `wifi` collector disabled), and the reader must then say the overlap
+/// cannot be computed rather than showing a column of zeroes.
+pub const AIR_SELF_CHANNEL_SQL: &str = "\
+SELECT ts_us, channel, channel_band, channel_width_mhz
+FROM wifi_sample
+WHERE wifi = 'OK' AND channel IS NOT NULL AND channel_band IS NOT NULL
+ORDER BY ts_us DESC
+LIMIT 1";
+
 #[cfg(test)]
 mod tests {
 

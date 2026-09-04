@@ -164,6 +164,15 @@ enum Command {
         #[arg(long)]
         iface: Option<String>,
     },
+    /// The latest slice of the radio environment (offline): every foreign access
+    /// point the last scan heard, with its channel, band, width, signal and
+    /// noise, ordered by how likely it is to be sitting in our own band.
+    ///
+    /// The OVERLAP column is a HYPOTHESIS computed from channel geometry, never
+    /// a measurement of interference: macOS reports no channel occupancy to any
+    /// program. A scan that could not run is reported as a refusal with its
+    /// reason, never as an empty list that would read as clear air.
+    Air,
     /// Run an arbitrary SQL query directly against the DuckDB file (offline
     /// forensics — only works while `net-observerd` is stopped).
     Query {
@@ -259,8 +268,9 @@ impl ObserveState {
 }
 
 /// The event kind accepted by `events --kind`. A thin CLI mirror of
-/// [`EventKind`] so `clap` renders `<link|proxy|dns|route|host|wifi|neighbors|incident>` in the
-/// help without leaking the wire type into the argument surface.
+/// [`EventKind`] so `clap` renders
+/// `<link|proxy|dns|route|host|wifi|neighbors|air|incident>` in the help without
+/// leaking the wire type into the argument surface.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum EventKindArg {
     Link,
@@ -270,6 +280,7 @@ enum EventKindArg {
     Host,
     Wifi,
     Neighbors,
+    Air,
     Incident,
 }
 
@@ -284,6 +295,7 @@ impl EventKindArg {
             EventKindArg::Host => EventKind::Host,
             EventKindArg::Wifi => EventKind::Wifi,
             EventKindArg::Neighbors => EventKind::Neighbors,
+            EventKindArg::Air => EventKind::Air,
             EventKindArg::Incident => EventKind::Incident,
         }
     }
@@ -375,6 +387,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             let sql = diagnosis::topology_sql(iface.as_deref()).map_err(|e| anyhow!("{e}"))?;
             let table = run_query(&cli.db, &sql)?;
             print!("{}", format_table(&table));
+        }
+        Command::Air => {
+            // Three reads, one moment: the scan itself (so a SKIP is rendered as
+            // a refusal), what it heard, and our own channel to compare against.
+            let scan = run_query(&cli.db, diagnosis::AIR_LATEST_SCAN_SQL)?;
+            let aps = run_query(&cli.db, diagnosis::AIR_LATEST_APS_SQL)?;
+            let own = run_query(&cli.db, diagnosis::AIR_SELF_CHANNEL_SQL)?;
+            print!("{}", diagnose::format_air(&scan, &aps, &own)?);
         }
         Command::Query { sql } => {
             let table = run_query(&cli.db, sql)?;
