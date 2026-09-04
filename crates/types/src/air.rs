@@ -153,6 +153,41 @@ impl ChannelSpan {
     }
 }
 
+/// Where a [`ChannelSpan`] sits on the frequency axis, in MHz.
+///
+/// The union of the placements [`overlap_hypothesis`] itself considers, so a
+/// drawing built from this shows the same geometry the hypothesis is computed
+/// from rather than a second, quietly different model of the band
+/// (realm net-observer, node #48).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrequencyExtent {
+    /// Lower edge, MHz.
+    pub lo_mhz: f64,
+    /// Upper edge, MHz.
+    pub hi_mhz: f64,
+    /// The placement itself had to be guessed — a 2.4 GHz radio wider than
+    /// 20 MHz, whose bonding direction is not reported, so the extent spans both
+    /// possible placements and is wider than the radio actually is.
+    pub placement_ambiguous: bool,
+}
+
+impl ChannelSpan {
+    /// The frequency range this radio may occupy, or `None` when the channel
+    /// number cannot be placed in its band at all.
+    #[must_use]
+    pub fn frequency_extent(&self) -> Option<FrequencyExtent> {
+        let (spans, guessed) = candidate_spans(self);
+        let lo = spans.iter().map(|(lo, _)| *lo).min()?;
+        let hi = spans.iter().map(|(_, hi)| *hi).max()?;
+        Some(FrequencyExtent {
+            // `candidate_spans` works in doubled MHz so odd halves stay exact.
+            lo_mhz: f64::from(lo) / 2.0,
+            hi_mhz: f64::from(hi) / 2.0,
+            placement_ambiguous: guessed && spans.len() > 1,
+        })
+    }
+}
+
 /// How strongly a [`ChannelOverlapHypothesis`] is held.
 ///
 /// Never rises above `High`, and `High` is still a hypothesis: it says the two
@@ -487,5 +522,29 @@ mod tests {
         let strong_off_channel = overlap_hypothesis(&own, &span(149, Band::FiveGhz, 80), Some(-40));
         assert!(strong_on_channel.rank_key() > weak_on_channel.rank_key());
         assert!(weak_on_channel.rank_key() > strong_off_channel.rank_key());
+    }
+
+    #[test]
+    fn frequency_extent_matches_the_block_the_overlap_uses() {
+        // 80 MHz advertising primary 36 is bonded 36-48 → 5170..5250.
+        let e = span(36, Band::FiveGhz, 80).frequency_extent().unwrap();
+        assert!((e.lo_mhz - 5170.0).abs() < 1e-9, "{e:?}");
+        assert!((e.hi_mhz - 5250.0).abs() < 1e-9, "{e:?}");
+        assert!(!e.placement_ambiguous);
+    }
+
+    #[test]
+    fn frequency_extent_spans_both_bondings_when_the_direction_is_unknown() {
+        let e = span(6, Band::TwoGhz, 40).frequency_extent().unwrap();
+        assert!(e.placement_ambiguous, "{e:?}");
+        assert!(
+            e.hi_mhz - e.lo_mhz > 40.0,
+            "both placements are covered: {e:?}"
+        );
+    }
+
+    #[test]
+    fn frequency_extent_is_none_where_the_channel_cannot_be_placed() {
+        assert!(span(99, Band::TwoGhz, 20).frequency_extent().is_none());
     }
 }
