@@ -24,6 +24,19 @@
 //! L2 devices, this one shows frequency bands, and mixing them hides the one
 //! thing this map exists to show (realm net-observer, node #48).
 //!
+//! ## Two readings of one slice
+//!
+//! A switch at the top offers the same sample as **channels** (the axis above)
+//! or as **signal rings**: this Mac in the centre, concentric rings labelled in
+//! dBm, one mark per audible neighbour on the ring its measured signal puts it
+//! on. The rings answer a different question — how loud, and therefore roughly
+//! how far. Two hard limits are drawn on the screen and not merely written
+//! here: the ANGLE of a mark carries nothing at all (one antenna gives no
+//! bearing, marks are spread by rank), and the metres are a bracket out of a
+//! path-loss model with an invented transmit power, wrong by factors rather
+//! than by percentages. The measured quantity is the dBm; metres are its
+//! caption. See [`rings_section`] and [`distance_hypothesis`].
+//!
 //! ## What this map is NOT
 //!
 //! It does not measure interference. macOS hands out no channel-occupancy (CCA /
@@ -136,6 +149,38 @@ const MIN_TICK_LABEL_GAP: f32 = 24.0;
 /// Bands are packed into shared rows now, so the drawing costs a row only where
 /// two of them actually cross.
 const MAX_ROWS_PER_BAND: usize = 24;
+
+/// The side of the square the signal rings are drawn in, gpui logical px:
+/// clamped to this range and otherwise fitted to the window (see
+/// [`rings_diameter`]). Marker placement is arithmetic on that known box rather
+/// than a layout query, exactly as the channel axis is on [`AXIS_W`].
+const RINGS_D_MIN: f32 = 340.0;
+const RINGS_D_MAX: f32 = 520.0;
+/// Vertical space the rings view's own chrome (header, tabs, scan bar and the
+/// two standing caveats) takes before the plot gets any.
+const RINGS_CHROME_H: f32 = 300.0;
+/// Horizontal padding the section applies (`px_3` on both sides).
+const RINGS_SIDE_PAD: f32 = 24.0;
+/// The dBm levels the rings are drawn and labelled at. The rings are the ruler
+/// of that view, and the ruler is the *measured* quantity — never metres.
+const RING_LEVELS: [i32; 4] = [-40, -55, -70, -85];
+/// The signal mapped to the centre and to the outer edge of the plot. Anything
+/// louder than the first or fainter than the second is clamped onto the box
+/// rather than drawn outside it.
+const RING_STRONG_DBM: f64 = -30.0;
+const RING_WEAK_DBM: f64 = -95.0;
+/// The box one marker's dot and its caption are laid out in. Markers are clamped
+/// into the plot by this size, so no caption can leave the drawing.
+const MARK_W: f32 = 168.0;
+const MARK_H: f32 = 30.0;
+/// The angular step between consecutive markers, in degrees — the golden angle.
+///
+/// The angle carries NO information (see [`rings_section`]); this constant only
+/// has to be deterministic and to spread markers evenly, so that the same scan
+/// always draws the same picture and two neighbours rarely land on top of each
+/// other. The index it multiplies is the neighbour's rank, which is a property
+/// of the reading, not of the drawing.
+const GOLDEN_ANGLE_DEG: f64 = 137.507_764_05;
 
 /// A message from the subscription thread to the gpui bridge task.
 #[derive(Debug)]
@@ -802,6 +847,375 @@ fn band_relation(group: &BandGroup) -> Option<String> {
     }
 }
 
+/// The two readings of one air slice this window offers.
+///
+/// Same shape as the network map's graph/list switch: one sample, two questions.
+/// The channel axis answers "who is standing in my channel"; the rings answer
+/// "how loud is each of them", which is the only spatial-ish question a single
+/// antenna can be asked at all — and even then only along one dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AirMode {
+    /// The shared per-band channel axis (see [`band_section`]).
+    Channels,
+    /// Concentric rings of measured signal (see [`rings_section`]).
+    Rings,
+}
+
+/// The distance hypothesis for one neighbour — a RANGE in metres, never a
+/// number, and never a measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DistanceHypothesis {
+    near_m: f64,
+    far_m: f64,
+}
+
+/// The transmit power assumed for every foreign AP, dBm EIRP.
+///
+/// It is **not observed**: the scan report carries no transmitter power, and
+/// nothing in the 802.11 beacon this Mac hears is obliged to state one either.
+/// 20 dBm is the ordinary ceiling a consumer access point is configured to in
+/// most regulatory domains. A neighbour running at 10 dBm is really about a
+/// third of the estimated distance; one at 30 dBm about three times it.
+const ASSUMED_TX_DBM: f64 = 20.0;
+/// The indoor path-loss exponent bracket. Free space is 2.0; a floor of offices,
+/// walls and furniture reaches 3–4. The whole spread of the answer comes from
+/// not knowing which of these the signal actually travelled through.
+const PATH_LOSS_EXPONENT_MIN: f64 = 2.0;
+const PATH_LOSS_EXPONENT_MAX: f64 = 4.0;
+/// The window the model is allowed to answer inside. Below the floor the model
+/// has no resolution left (near field, body loss, an AP on this desk); above the
+/// ceiling an indoor estimate is arithmetic without meaning.
+const DISTANCE_FLOOR_M: f64 = 1.0;
+const DISTANCE_CEILING_M: f64 = 300.0;
+/// The narrowest range this function will report, as a ratio. Below it the two
+/// ends would round to the same number and the answer would *look* like a
+/// measurement, which is the one thing it must never look like.
+const MIN_DISTANCE_SPREAD: f64 = 1.5;
+
+/// How far away a neighbour heard at `rssi_dbm` on a carrier of `centre_mhz`
+/// **might** be — as a bracket, from the log-distance path-loss model.
+///
+/// # The model, so that it can be argued with
+///
+/// One-metre free-space reference, then a log-distance tail:
+///
+/// ```text
+/// FSPL(1 m) [dB] = 20·log10(f_MHz) − 27.55
+/// L          [dB] = P_tx − P_rx − FSPL(1 m)
+/// d(n)        [m] = 10 ^ ( L / (10·n) )
+/// ```
+///
+/// The bracket is `d(4) … d(2)`: the same reading, believed to have crossed
+/// free space at one end and a cluttered indoor floor at the other.
+///
+/// # What is assumed, and therefore what can be wrong
+///
+/// 1. **`P_tx` is invented** ([`ASSUMED_TX_DBM`]) — it is not in the scan report
+///    and cannot be. Every 10 dB the real transmitter differs by moves the whole
+///    bracket by a factor of ~3 (at n = 2) and is NOT reflected in its width.
+/// 2. **The exponent is a guess bracketed by** [`PATH_LOSS_EXPONENT_MIN`] and
+///    [`PATH_LOSS_EXPONENT_MAX`]. This is the only uncertainty the reported
+///    width actually expresses.
+/// 3. **`P_rx` is one sample of a fading channel.** Multipath moves an RSSI by
+///    ±5 dB with nothing at all moving in the room.
+/// 4. **Antenna gain and orientation are ignored** on both ends.
+/// 5. **Walls are not modelled** as walls — a single concrete floor can cost
+///    more than the whole 2→4 bracket does.
+///
+/// So this is a hypothesis with an error measured in *factors*, not per cent,
+/// and the caller must render it as a range with an estimate mark on it. The
+/// leading quantity of this view is the measured dBm; metres are its caption.
+///
+/// `None` when the carrier frequency is unknown, i.e. the AP could not be placed
+/// on a frequency axis at all — no invented centre stands in for it.
+fn distance_hypothesis(rssi_dbm: i32, centre_mhz: f64) -> Option<DistanceHypothesis> {
+    if !(centre_mhz.is_finite() && centre_mhz > 0.0) {
+        return None;
+    }
+    let fspl_1m = 20.0 * centre_mhz.log10() - 27.55;
+    let loss = ASSUMED_TX_DBM - f64::from(rssi_dbm) - fspl_1m;
+    let d = |n: f64| (10.0_f64.powf(loss / (10.0 * n))).clamp(DISTANCE_FLOOR_M, DISTANCE_CEILING_M);
+    let near_m = d(PATH_LOSS_EXPONENT_MAX);
+    let far_m = d(PATH_LOSS_EXPONENT_MIN)
+        .max(near_m * MIN_DISTANCE_SPREAD)
+        .min(DISTANCE_CEILING_M);
+    Some(DistanceHypothesis { near_m, far_m })
+}
+
+/// The centre frequency a span sits on, from the same extent the axis view
+/// draws — no second arithmetic for the same fact.
+fn centre_mhz(span: ChannelSpan) -> Option<f64> {
+    span.frequency_extent().map(|e| (e.lo_mhz + e.hi_mhz) / 2.0)
+}
+
+/// One metre figure, rounded to what the model can carry: no decimals above
+/// 10 m, one below it. Never more precision than a factor-wide guess deserves.
+fn metres(m: f64) -> String {
+    if m < 10.0 {
+        format!("{m:.1}")
+    } else {
+        format!("{:.0}", m.round())
+    }
+}
+
+/// The distance bracket as the reader sees it: always two ends, always marked
+/// as an estimate.
+fn distance_label(d: DistanceHypothesis) -> String {
+    format!("est. {}–{} m", metres(d.near_m), metres(d.far_m))
+}
+
+/// The distance bracket for one lane, when its signal and its carrier are both
+/// known.
+fn lane_distance(lane: &Lane) -> Option<DistanceHypothesis> {
+    distance_hypothesis(lane.rssi_dbm?, centre_mhz(lane.span)?)
+}
+
+/// The sentence that governs the whole rings view, kept on screen rather than
+/// in a tooltip: the angle of a mark carries nothing at all.
+const ANGLE_MEANS_NOTHING: &str = "The angle of a mark means nothing: one antenna gives no \
+     bearing, so a neighbour's direction is not observable here. Marks are spread around each \
+     ring by rank alone. Only the distance from the centre — the ring, in dBm — is a reading.";
+
+/// The sentence that governs the metres under every mark.
+const METRES_ARE_A_GUESS: &str = "Metres are a hypothesis, not a measurement: a path-loss model \
+     with an assumed transmit power and an indoor exponent between 2 and 4. Wrong by factors, \
+     not by percentages — the ring (dBm) is the measured quantity.";
+
+/// The side of the rings plot for a window of this size — the same fitting the
+/// network map does for its star, so the drawing is sized to the room it has.
+fn rings_diameter(avail_w: f32, avail_h: f32) -> f32 {
+    avail_w.min(avail_h).clamp(RINGS_D_MIN, RINGS_D_MAX)
+}
+
+/// The radius the outermost ring may reach in a plot of side `d`, leaving
+/// exactly the room one marker box needs vertically so that no mark can be
+/// pushed off the plot.
+fn ring_max_r(d: f32) -> f32 {
+    d / 2.0 - MARK_H / 2.0
+}
+
+/// Where a signal sits between the centre and the outer edge, px.
+fn ring_radius(rssi_dbm: f64, d: f32) -> f32 {
+    let t = ((RING_STRONG_DBM - rssi_dbm) / (RING_STRONG_DBM - RING_WEAK_DBM)).clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        (t * f64::from(ring_max_r(d))) as f32
+    }
+}
+
+/// The top-left corner of marker `index`'s box inside the plot.
+///
+/// The radius is the reading; the angle is [`GOLDEN_ANGLE_DEG`] times the rank
+/// and says nothing (see [`ANGLE_MEANS_NOTHING`]). The caption is laid towards
+/// the centre — leftwards on the right half, rightwards on the left half — which
+/// is what keeps every box inside the plot without clamping the radius, and so
+/// without a layout constraint ever distorting the one quantity that is real.
+fn mark_origin(index: usize, rssi_dbm: i32, d: f32) -> (f32, f32) {
+    #[allow(clippy::cast_precision_loss)]
+    let turn = (index as f64) * GOLDEN_ANGLE_DEG;
+    let rad = turn.to_radians();
+    let r = f64::from(ring_radius(f64::from(rssi_dbm), d));
+    let centre = f64::from(d) / 2.0;
+    let x = centre + r * rad.cos();
+    let y = centre + r * rad.sin();
+    #[allow(clippy::cast_possible_truncation)]
+    let (x, y) = (x as f32, y as f32);
+    // The dot sits on the point; the caption runs inwards from it.
+    let left = if x > d / 2.0 {
+        x - MARK_W + 4.0
+    } else {
+        x - 4.0
+    };
+    // A last-resort clamp: on the narrowest allowed plot a caption laid inwards
+    // still fits, but the invariant "no mark leaves the drawing" is enforced
+    // here rather than inferred. It can only move a mark along the angle, which
+    // carries nothing; the radius the clamp would distort is already inside.
+    let left = left.clamp(0.0, (d - MARK_W).max(0.0));
+    let top = (y - MARK_H / 2.0).clamp(0.0, (d - MARK_H).max(0.0));
+    (left, top)
+}
+
+/// The one-line caption beside a mark: the measured signal first, then the
+/// channel and width, then the distance bracket as a bracket.
+fn ring_mark_label(lane: &Lane) -> String {
+    let mut s = match lane.rssi_dbm {
+        Some(r) => format!("{r} dBm"),
+        None => "signal not reported".to_string(),
+    };
+    s.push_str(&format!(
+        " · ch {} · {} MHz",
+        lane.span.channel, lane.span.width_mhz
+    ));
+    if lane.span.width_assumed {
+        s.push_str(" (assumed)");
+    }
+    match lane_distance(lane) {
+        Some(d) => s.push_str(&format!(" · {}", distance_label(d))),
+        None => s.push_str(" · distance not estimable"),
+    }
+    s
+}
+
+/// The neighbours the rings can carry, in the window's own ranking order, and
+/// the ones that must be named outside the drawing instead.
+///
+/// A neighbour with no reported signal has no ring to sit on. Drawing it
+/// anywhere would be inventing the reading the whole view is made of, so it is
+/// counted and said instead — SKIP, never silence.
+fn ring_marks(
+    sample: &AirSample,
+    own: Option<ChannelSpan>,
+) -> (Vec<(Band, Lane)>, Vec<(Band, Lane)>) {
+    let mut placed = Vec::new();
+    let mut unplaceable = Vec::new();
+    for g in group(sample, own) {
+        for lane in g.lanes {
+            if lane.rssi_dbm.is_some() {
+                placed.push((g.band, lane));
+            } else {
+                unplaceable.push((g.band, lane));
+            }
+        }
+    }
+    (placed, unplaceable)
+}
+
+/// The rings view: this Mac at the centre, concentric rings labelled in dBm, and
+/// one mark per audible neighbour on the ring its measured signal puts it on.
+///
+/// What this view is and is NOT, said here once and on the screen permanently:
+/// the ring is a reading, the angle is nothing, the metres are a hypothesis with
+/// a factor-wide error ([`distance_hypothesis`]). There is no height, no floor,
+/// no movement and no identity here — foreign APs carry no BSSID, so this is one
+/// slice and never a track (realm net-observer, nodes #47 and #48).
+fn rings_section(
+    sample: &AirSample,
+    own: Option<ChannelSpan>,
+    d: f32,
+    theme: Theme,
+) -> impl IntoElement {
+    let (placed, unplaceable) = ring_marks(sample, own);
+
+    let mut plot = div()
+        .debug_selector(|| "air-rings".to_string())
+        .relative()
+        .w(px(d))
+        .h(px(d));
+
+    let centre = d / 2.0;
+    for level in RING_LEVELS {
+        let r = ring_radius(f64::from(level), d);
+        plot = plot.child(
+            div()
+                .debug_selector({
+                    let sel = format!("air-ring:{level}");
+                    move || sel
+                })
+                .absolute()
+                .left(px(centre - r))
+                .top(px(centre - r))
+                .w(px(r * 2.0))
+                .h(px(r * 2.0))
+                .rounded_full()
+                .border_1()
+                .border_color(rgba(with_alpha(theme.fg, 0.18))),
+        );
+        plot = plot.child(
+            div()
+                .absolute()
+                .left(px(centre + 6.0))
+                .top(px(centre - r))
+                .text_size(px(10.0))
+                .text_color(rgb(theme.muted))
+                .child(format!("{level} dBm")),
+        );
+    }
+
+    // This Mac. The rings are read outward from here and from nowhere else.
+    plot = plot.child(
+        div()
+            .debug_selector(|| "air-rings-centre".to_string())
+            .absolute()
+            .left(px(centre - 4.0))
+            .top(px(centre - 4.0))
+            .w(px(8.0))
+            .h(px(8.0))
+            .rounded_full()
+            .bg(rgb(theme.accent)),
+    );
+
+    for (i, (band, lane)) in placed.iter().enumerate() {
+        // `placed` holds only lanes whose signal was reported; a lane without one
+        // has no ring, and is named below the drawing rather than invented onto it.
+        let Some(rssi) = lane.rssi_dbm else { continue };
+        let (left, top) = mark_origin(i, rssi, d);
+        let towards_centre = left < d / 2.0;
+        let dot = div()
+            .flex_none()
+            .w(px(7.0))
+            .h(px(7.0))
+            .rounded_full()
+            .bg(rgba(with_alpha(theme.fg, weight(lane.rssi_dbm))));
+        let caption = div()
+            .flex_1()
+            .overflow_hidden()
+            .text_size(px(10.0))
+            .text_color(rgb(theme.muted))
+            .child(format!("{} · {}", band_label(*band), ring_mark_label(lane)));
+        let mut row = div()
+            .debug_selector({
+                let sel = format!("air-ring-mark:{i}");
+                move || sel
+            })
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(MARK_W))
+            .h(px(MARK_H))
+            .flex()
+            .items_center()
+            .gap_1()
+            .overflow_hidden();
+        row = if towards_centre {
+            row.child(dot).child(caption)
+        } else {
+            row.child(caption).child(dot)
+        };
+        plot = plot.child(row);
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .child(
+            div()
+                .debug_selector(|| "air-rings-angle-caveat".to_string())
+                .text_size(px(11.0))
+                .text_color(rgb(theme.warn))
+                .child(ANGLE_MEANS_NOTHING),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(theme.muted))
+                .child(METRES_ARE_A_GUESS),
+        )
+        .child(plot)
+        .children((!unplaceable.is_empty()).then(|| {
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(theme.muted))
+                .child(format!(
+                    "{} further access point(s) reported no signal and sit on no ring — heard, \
+                     but not placeable here.",
+                    unplaceable.len()
+                ))
+        }))
+}
+
 /// The root view of the air-map window.
 pub(crate) struct AirView {
     feed: Entity<AirFeed>,
@@ -822,6 +1236,9 @@ pub(crate) struct AirView {
     _observe_glance: Subscription,
     /// Held so the release hook stays registered for the view's whole life.
     _release: Subscription,
+    /// Which reading of the same slice is on screen. Purely a view state: the
+    /// feed is untouched by it, so switching cannot lose or re-fetch anything.
+    mode: AirMode,
 }
 
 impl AirView {
@@ -844,6 +1261,7 @@ impl AirView {
             _observe: observe,
             _observe_glance: observe_glance,
             _release: release,
+            mode: AirMode::Channels,
         }
     }
 
@@ -971,13 +1389,23 @@ impl Render for AirView {
                 theme,
             )
             .into_any_element(),
-            Some(a) => {
-                let mut col = div().flex().flex_col().gap_4().px_3().py_2();
-                for g in group(a, own) {
-                    col = col.child(band_section(&g, theme));
+            Some(a) => match self.mode {
+                AirMode::Channels => {
+                    let mut col = div().flex().flex_col().gap_4().px_3().py_2();
+                    for g in group(a, own) {
+                        col = col.child(band_section(&g, theme));
+                    }
+                    col.into_any_element()
                 }
-                col.into_any_element()
-            }
+                AirMode::Rings => {
+                    let viewport = window.viewport_size();
+                    let d = rings_diameter(
+                        f32::from(viewport.width) - RINGS_SIDE_PAD,
+                        f32::from(viewport.height) - RINGS_CHROME_H,
+                    );
+                    rings_section(a, own, d, theme).into_any_element()
+                }
+            },
         };
 
         div()
@@ -996,6 +1424,7 @@ impl Render for AirView {
                 air_unsupported,
                 theme,
             ))
+            .child(mode_tabs(self.mode, theme, cx))
             .child(scan_bar(&scan, air_unsupported, theme, cx))
             .children(offline.map(|reason| {
                 div()
@@ -1088,6 +1517,42 @@ fn provenance_lines(
 /// while the command is in flight, "scanning" only after the daemon accepted,
 /// and shows the daemon's own words on a refusal. A daemon that does not know
 /// the command says so instead of the button going quiet.
+/// The window's view switch — the same two-tab control the network map uses for
+/// its graph/list pair ([`crate::map`]), because it is the same act: one sample,
+/// two readings, and no data behind either of them.
+fn mode_tabs(mode: AirMode, theme: Theme, cx: &mut Context<AirView>) -> impl IntoElement {
+    let tab = |label: &'static str, this: AirMode, cx: &mut Context<AirView>| {
+        let selected = mode == this;
+        div()
+            .id(label)
+            .debug_selector({
+                let sel = format!("air-tab:{label}");
+                move || sel
+            })
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .text_size(px(12.0))
+            .cursor_pointer()
+            .text_color(rgb(if selected { theme.accent } else { theme.muted }))
+            .when(selected, |d| d.bg(rgb(theme.hover)))
+            .hover(|s| s.bg(rgb(theme.hover)))
+            .child(label)
+            .on_click(cx.listener(move |view, _, _window, cx| {
+                view.mode = this;
+                cx.notify();
+            }))
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_3()
+        .pb_1()
+        .child(tab("Channels", AirMode::Channels, cx))
+        .child(tab("Signal rings", AirMode::Rings, cx))
+}
+
 fn scan_bar(
     scan: &ScanState,
     air_unsupported: bool,
@@ -2099,6 +2564,103 @@ mod tests {
         )))));
         assert!(feed.offline.is_none());
     }
+    #[test]
+    fn the_distance_hypothesis_shrinks_as_the_signal_grows() {
+        let f = 5200.0;
+        let mut last: Option<DistanceHypothesis> = None;
+        for rssi in [-90, -80, -70, -60, -50, -40] {
+            let d = distance_hypothesis(rssi, f).expect("a placeable carrier");
+            if let Some(prev) = last {
+                assert!(
+                    d.near_m <= prev.near_m && d.far_m <= prev.far_m,
+                    "a louder neighbour was estimated further away: {rssi} dBm -> {d:?} \
+                     after {prev:?}"
+                );
+            }
+            last = Some(d);
+        }
+        // And somewhere in the ordinary range the shrinking is real, not a plateau
+        // of clamps.
+        let far = distance_hypothesis(-80, f).unwrap();
+        let near = distance_hypothesis(-50, f).unwrap();
+        assert!(near.far_m < far.far_m, "{near:?} vs {far:?}");
+    }
+
+    #[test]
+    fn the_distance_hypothesis_is_always_a_bracket_inside_its_own_window() {
+        for rssi in -100..=-10 {
+            for f in [2437.0, 5200.0, 6135.0] {
+                let d = distance_hypothesis(rssi, f).expect("a placeable carrier");
+                assert!(
+                    d.near_m >= DISTANCE_FLOOR_M && d.far_m <= DISTANCE_CEILING_M,
+                    "{rssi} dBm at {f} MHz left the model's window: {d:?}"
+                );
+                assert!(
+                    d.far_m >= d.near_m * MIN_DISTANCE_SPREAD,
+                    "{rssi} dBm at {f} MHz was answered too narrowly to be a guess: {d:?}"
+                );
+                let label = distance_label(d);
+                assert!(
+                    label.starts_with("est. ") && label.contains('\u{2013}'),
+                    "the distance was not offered as a marked range: {label}"
+                );
+                let ends: Vec<&str> = label
+                    .trim_start_matches("est. ")
+                    .trim_end_matches(" m")
+                    .split('\u{2013}')
+                    .collect();
+                assert_eq!(ends.len(), 2, "not two ends: {label}");
+                assert_ne!(ends[0], ends[1], "the range rounded to one number: {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unplaceable_carrier_gets_no_distance_at_all() {
+        assert!(distance_hypothesis(-60, 0.0).is_none());
+        assert!(distance_hypothesis(-60, f64::NAN).is_none());
+    }
+
+    #[test]
+    fn a_neighbour_without_a_signal_sits_on_no_ring() {
+        let sample = scan(vec![
+            ap(36, "5", Some(80), Some(-55)),
+            ap(40, "5", Some(20), None),
+        ]);
+        let (placed, unplaceable) = ring_marks(&sample, Some(own(36, "5", 80)));
+        assert_eq!(placed.len(), 1);
+        assert_eq!(unplaceable.len(), 1, "it must be counted, never dropped");
+        assert!(
+            ring_mark_label(&unplaceable[0].1).contains("signal not reported"),
+            "an unheard signal must be said, not implied"
+        );
+    }
+
+    #[test]
+    fn a_mark_names_its_channel_its_width_and_a_distance_range() {
+        let sample = scan(vec![ap(36, "5", Some(80), Some(-62))]);
+        let (placed, _) = ring_marks(&sample, Some(own(36, "5", 80)));
+        let label = ring_mark_label(&placed[0].1);
+        assert!(label.contains("-62 dBm"), "{label}");
+        assert!(label.contains("ch 36"), "{label}");
+        assert!(label.contains("80 MHz"), "{label}");
+        assert!(
+            label.contains("est. ") && label.contains('\u{2013}'),
+            "{label}"
+        );
+    }
+
+    #[test]
+    fn the_rings_are_ordered_outward_by_falling_signal() {
+        let d = 520.0;
+        let mut last = -1.0_f32;
+        for level in RING_LEVELS {
+            let r = ring_radius(f64::from(level), d);
+            assert!(r > last, "ring {level} dBm is not outside the louder one");
+            assert!(r <= ring_max_r(d) + 0.01);
+            last = r;
+        }
+    }
 }
 
 /// Headless UI tests for the air map, on gpui's own test platform: layout and
@@ -2110,6 +2672,7 @@ mod tests {
 /// slice the window was first run against, and the one it was unreadable on. It
 /// is parsed by `macos::air::parse_air_report`, the daemon's own parser, so what
 /// these tests draw is what production would hand the window.
+
 #[cfg(test)]
 mod headless_tests {
     use super::*;
@@ -2149,6 +2712,16 @@ mod headless_tests {
 
     /// A window showing the live slice, ready to be measured.
     fn live_window(cx: &mut TestAppContext) -> (VisualTestContext, Size<Pixels>) {
+        let (vcx, viewport, _handle) = live_window_at(cx, size(px(WIN_W), px(WIN_H)));
+        (vcx, viewport)
+    }
+
+    /// The same window at a chosen size, keeping the handle so a test can drive
+    /// the view switch the way a click does.
+    fn live_window_at(
+        cx: &mut TestAppContext,
+        viewport: Size<Pixels>,
+    ) -> (VisualTestContext, Size<Pixels>, WindowHandle<AirView>) {
         let own = live_own();
         let glance = cx.update(|cx| {
             cx.new(|_| {
@@ -2192,10 +2765,26 @@ mod headless_tests {
             )
         });
         let vcx = VisualTestContext::from_window(window.into(), cx);
-        let viewport = size(px(WIN_W), px(WIN_H));
         vcx.simulate_resize(viewport);
         vcx.run_until_parked();
-        (vcx, viewport)
+        (vcx, viewport, window)
+    }
+
+    /// Switch the view the way the tab does, then let the frame settle.
+    fn switch_to(cx: &mut VisualTestContext, window: WindowHandle<AirView>, mode: AirMode) {
+        window
+            .update(cx, |view, _window, cx| {
+                view.mode = mode;
+                cx.notify();
+            })
+            .expect("the window is open");
+        cx.run_until_parked();
+    }
+
+    /// A window big enough for the rings to be drawn whole — the size this view
+    /// is meant to be read at.
+    fn rings_viewport() -> Size<Pixels> {
+        size(px(760.0), px(980.0))
     }
 
     fn bounds(cx: &mut VisualTestContext, selector: &str) -> Option<Bounds<Pixels>> {
@@ -2407,6 +2996,150 @@ mod headless_tests {
             overlap_label(&blind[0].lanes[0]).contains("unknown"),
             "an actually unknown own channel must still say so"
         );
+    }
+
+    /// Every mark of the rings view lies inside the drawing, and the drawing
+    /// inside the window — no neighbour is pushed off the page by a caption.
+    #[gpui::test]
+    fn every_ring_mark_sits_inside_the_drawing_and_inside_the_window(cx: &mut TestAppContext) {
+        let (mut cx, viewport, window) = live_window_at(cx, rings_viewport());
+        switch_to(&mut cx, window, AirMode::Rings);
+
+        let plot = bounds(&mut cx, "air-rings").expect("the rings view drew its plot");
+        let page = Bounds {
+            origin: gpui::Point {
+                x: px(0.0),
+                y: px(0.0),
+            },
+            size: viewport,
+        };
+        assert!(within(page, plot), "the plot leaves the window: {plot:?}");
+        assert!(
+            bounds(&mut cx, "air-rings-centre").is_some_and(|c| within(plot, c)),
+            "this Mac must be drawn at the centre of its own rings"
+        );
+        for level in RING_LEVELS {
+            let ring = bounds(&mut cx, &format!("air-ring:{level}"))
+                .unwrap_or_else(|| panic!("the {level} dBm ring was not drawn"));
+            assert!(within(plot, ring), "the {level} dBm ring spills: {ring:?}");
+        }
+
+        let (placed, _) = ring_marks(&live_sample(), Some(live_own()));
+        assert!(
+            placed.len() > 5,
+            "the fixture must be crowded to prove this"
+        );
+        for i in 0..placed.len() {
+            let mark = bounds(&mut cx, &format!("air-ring-mark:{i}"))
+                .unwrap_or_else(|| panic!("neighbour {i} was not marked on any ring"));
+            assert!(
+                within(plot, mark),
+                "mark {i} leaves the drawing: {mark:?} vs {plot:?}"
+            );
+            assert!(
+                within(page, mark),
+                "mark {i} leaves the window: {mark:?} vs {page:?}"
+            );
+        }
+    }
+
+    /// The one thing this view could be misread as — a direction finder — is
+    /// denied on the page itself, permanently, not in a tooltip.
+    #[gpui::test]
+    fn the_rings_say_on_the_page_that_the_angle_means_nothing(cx: &mut TestAppContext) {
+        let (mut cx, _viewport, window) = live_window_at(cx, rings_viewport());
+        switch_to(&mut cx, window, AirMode::Rings);
+        assert!(
+            bounds(&mut cx, "air-rings-angle-caveat").is_some(),
+            "the standing line about the angle is not on the page"
+        );
+        let line = ANGLE_MEANS_NOTHING;
+        assert!(line.contains("angle"), "{line}");
+        assert!(
+            line.contains("means nothing") || line.contains("arbitrary"),
+            "the line hedges instead of denying: {line}"
+        );
+        assert!(
+            METRES_ARE_A_GUESS.contains("hypothesis")
+                && METRES_ARE_A_GUESS.contains(
+                    "not a \
+             measurement"
+                ),
+            "the metres are not marked as a guess: {METRES_ARE_A_GUESS}"
+        );
+    }
+
+    /// Distance reaches the reader as a bracket with an estimate mark, never as
+    /// one number that could be read as a measurement.
+    #[test]
+    fn every_drawn_neighbour_is_given_a_distance_range_and_never_a_figure() {
+        let (placed, _) = ring_marks(&live_sample(), Some(live_own()));
+        assert!(!placed.is_empty(), "the fixture must place neighbours");
+        for (_band, lane) in &placed {
+            let label = ring_mark_label(lane);
+            assert!(
+                label.contains("est. "),
+                "a distance was offered unmarked: {label}"
+            );
+            let tail = label.rsplit("est. ").next().unwrap();
+            assert!(
+                tail.contains('\u{2013}') && tail.ends_with(" m"),
+                "the distance is not a range: {label}"
+            );
+            let ends: Vec<&str> = tail.trim_end_matches(" m").split('\u{2013}').collect();
+            assert_eq!(ends.len(), 2, "{label}");
+            assert_ne!(ends[0], ends[1], "the range collapsed to a number: {label}");
+            // The measured quantity leads; metres follow it.
+            let dbm = label.find("dBm").expect("the reading leads the caption");
+            assert!(dbm < label.find("est. ").unwrap(), "{label}");
+        }
+    }
+
+    /// Switching views is a reading of the same slice and loses nothing: the
+    /// channel axis is whole again after a trip through the rings, and the rings
+    /// carry exactly the neighbours the axis does.
+    #[gpui::test]
+    fn switching_the_view_keeps_the_whole_slice(cx: &mut TestAppContext) {
+        let (mut cx, _viewport, window) = live_window_at(cx, rings_viewport());
+        let own = live_own();
+        let groups = group(&live_sample(), Some(own));
+        let here = band_label(own.band);
+
+        let axis_before =
+            bounds(&mut cx, &format!("air-axis:{here}")).expect("the channel axis is drawn first");
+
+        switch_to(&mut cx, window, AirMode::Rings);
+        assert!(
+            bounds(&mut cx, &format!("air-axis:{here}")).is_none(),
+            "the axis view is still drawn under the rings"
+        );
+        let (placed, unplaceable) = ring_marks(&live_sample(), Some(own));
+        let drawn: usize = groups.iter().map(|g| g.lanes.len()).sum();
+        assert_eq!(
+            placed.len() + unplaceable.len(),
+            drawn,
+            "the rings view lost neighbours the axis view had"
+        );
+        for i in 0..placed.len() {
+            assert!(
+                bounds(&mut cx, &format!("air-ring-mark:{i}")).is_some(),
+                "neighbour {i} vanished on the rings"
+            );
+        }
+
+        switch_to(&mut cx, window, AirMode::Channels);
+        let axis_after = bounds(&mut cx, &format!("air-axis:{here}"))
+            .expect("the channel axis came back with its data");
+        assert_eq!(axis_before.size, axis_after.size);
+        for g in &groups {
+            let band = band_label(g.band);
+            for i in 0..g.lanes.len() {
+                assert!(
+                    bounds(&mut cx, &format!("air-band:{band}:{i}")).is_some(),
+                    "{band} band {i} was lost by the round trip through the rings"
+                );
+            }
+        }
     }
 
     /// `inner` lies wholly inside `outer`, both in absolute window coordinates.
