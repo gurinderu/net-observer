@@ -1,5 +1,24 @@
 //! The **air map** window: the foreign access points this radio can hear, drawn
-//! as bands on a channel axis, with our own association drawn underneath them.
+//! as bands on a shared channel axis with our own association highlighted across
+//! it.
+//!
+//! ## The form, and why it is this one
+//!
+//! Each band gets ONE axis, labelled with the channel numbers a person changes
+//! an access point to (2.4 GHz: 1…13; 5 GHz: 36, 40, 44, …), and every neighbour
+//! heard in that band is a band on it, packed into shared rows so that two of
+//! them cross on the page exactly where they cross in the air. The frequency
+//! range stays a small caption: the geometry is linear in MHz — the same
+//! arithmetic the overlap hypothesis is computed from — while the labels are
+//! channels, so the picture and the number cannot disagree.
+//!
+//! The first form was one private strip per access point, one under another.
+//! With fifteen neighbours audible that is a screen and a half of scrolling, and
+//! the question the map exists for — who is standing in *my* channel — was not
+//! answerable from it at all. The details are now one line each, under the
+//! drawing, ordered by who is most likely in our band; and the caveat below is
+//! said once in the header rather than under every neighbour, where repetition
+//! turned it into furniture (realm net-observer, node #48).
 //!
 //! A map of its own, deliberately not a layer on the network map: that one shows
 //! L2 devices, this one shows frequency bands, and mixing them hides the one
@@ -96,11 +115,27 @@ const WIN_H: f32 = 560.0;
 /// Width of the drawn channel axis, px. Fixed so band placement is arithmetic on
 /// a known width rather than a layout query.
 const AXIS_W: f32 = 560.0;
-/// Height of the lane a foreign AP is drawn in, and of our own band's lane.
-const LANE_H: f32 = 18.0;
-const OWN_LANE_H: f32 = 24.0;
+/// Height of one drawn foreign band, and the gap between the rows they are
+/// packed into.
+const BAR_H: f32 = 9.0;
+const BAR_GAP: f32 = 2.0;
+/// Height of our own association's band, drawn thicker than a foreign one
+/// directly above the axis: it is the reference everything else is read against.
+const OWN_LANE_H: f32 = 13.0;
+/// The axis rule, the tick marks below it, and the room the channel numbers get.
+const AXIS_RULE_H: f32 = 1.0;
+const TICK_H: f32 = 4.0;
+const TICK_LABEL_H: f32 = 13.0;
+/// Half the box a channel number is drawn in, px. The number is centred on its
+/// tick, so it may reach this far either side of it.
+const TICK_LABEL_HALF_W: f32 = 11.0;
+/// Closest two *labelled* ticks may sit before the numbers would collide. Ticks
+/// nearer than this still get a mark; only the number is dropped.
+const MIN_TICK_LABEL_GAP: f32 = 24.0;
 /// How many foreign APs are drawn per band before the rest become a count.
-const MAX_ROWS_PER_BAND: usize = 14;
+/// Bands are packed into shared rows now, so the drawing costs a row only where
+/// two of them actually cross.
+const MAX_ROWS_PER_BAND: usize = 24;
 
 /// A message from the subscription thread to the gpui bridge task.
 #[derive(Debug)]
@@ -270,15 +305,44 @@ impl AirFeed {
     }
 }
 
-/// One foreign AP prepared for drawing: where it sits, how it was heard, and the
-/// overlap hypothesis against our own band (absent when we have no own band).
+/// What can be said about a foreign AP and our own channel.
+///
+/// Three cases, and they are three because the window once collapsed the first
+/// two: with our channel plainly named in the header, every 2.4 GHz neighbour
+/// still carried "this Mac's own channel is unknown" underneath it. That is not
+/// a hedge, it is a false statement — the channel was known, the neighbour was
+/// simply in another band (realm net-observer, node #48).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Overlap {
+    /// We are not associated, or the channel was not reported: nothing can be
+    /// computed against anything.
+    OwnChannelUnknown,
+    /// Our channel is known and sits in another band, which is *why* there is no
+    /// overlap — a fact about the neighbour, not a gap in what we know.
+    OwnBandElsewhere(Band),
+    /// Both radios are in this band, so the hypothesis is computable.
+    Computed(ChannelOverlapHypothesis),
+}
+
+impl Overlap {
+    /// The hypothesis when there is one — the ranking key's only input.
+    fn hypothesis(self) -> Option<ChannelOverlapHypothesis> {
+        match self {
+            Overlap::Computed(h) => Some(h),
+            _ => None,
+        }
+    }
+}
+
+/// One foreign AP prepared for drawing: where it sits, how it was heard, and
+/// what can be said about it and our own band.
 #[derive(Debug, Clone)]
 struct Lane {
     span: ChannelSpan,
     rssi_dbm: Option<i32>,
     phy_mode: Option<String>,
     security: Option<String>,
-    hypothesis: Option<ChannelOverlapHypothesis>,
+    overlap: Overlap,
 }
 
 /// One band's worth of the map: the axis it is drawn on, our own band if we are
@@ -291,6 +355,10 @@ struct Lane {
 struct BandGroup {
     band: Band,
     own: Option<ChannelSpan>,
+    /// Where this Mac actually is, even when that is another band — so the
+    /// section can say *why* nothing here overlaps us, once, instead of every
+    /// lane repeating a hedge about an unknown channel.
+    own_elsewhere: Option<Band>,
     lanes: Vec<Lane>,
     /// Lanes beyond [`MAX_ROWS_PER_BAND`], reported as a count.
     dropped: usize,
@@ -308,40 +376,48 @@ fn group(sample: &AirSample, own: Option<ChannelSpan>) -> Vec<BandGroup> {
         groups.push(BandGroup {
             band: own.band,
             own: Some(own),
+            own_elsewhere: None,
             lanes: Vec::new(),
             dropped: 0,
         });
     }
     for ap in &sample.aps {
         let Some(span) = span_of(ap) else { continue };
-        let hypothesis = own
-            .filter(|o| o.band == span.band)
-            .map(|o| overlap_hypothesis(&o, &span, ap.rssi_dbm));
+        let overlap = match own {
+            None => Overlap::OwnChannelUnknown,
+            Some(o) if o.band == span.band => {
+                Overlap::Computed(overlap_hypothesis(&o, &span, ap.rssi_dbm))
+            }
+            Some(o) => Overlap::OwnBandElsewhere(o.band),
+        };
         let lane = Lane {
             span,
             rssi_dbm: ap.rssi_dbm,
             phy_mode: ap.phy_mode.clone(),
             security: ap.security.clone(),
-            hypothesis,
+            overlap,
         };
         match groups.iter_mut().find(|g| g.band == span.band) {
             Some(g) => g.lanes.push(lane),
             None => groups.push(BandGroup {
                 band: span.band,
                 own: None,
+                own_elsewhere: own.map(|o| o.band),
                 lanes: vec![lane],
                 dropped: 0,
             }),
         }
     }
     for g in &mut groups {
-        g.lanes.sort_by(|a, b| match (a.hypothesis, b.hypothesis) {
-            (Some(x), Some(y)) => y.rank_key().cmp(&x.rank_key()),
-            _ => b
-                .rssi_dbm
-                .unwrap_or(i32::MIN)
-                .cmp(&a.rssi_dbm.unwrap_or(i32::MIN)),
-        });
+        g.lanes.sort_by(
+            |a, b| match (a.overlap.hypothesis(), b.overlap.hypothesis()) {
+                (Some(x), Some(y)) => y.rank_key().cmp(&x.rank_key()),
+                _ => b
+                    .rssi_dbm
+                    .unwrap_or(i32::MIN)
+                    .cmp(&a.rssi_dbm.unwrap_or(i32::MIN)),
+            },
+        );
         if g.lanes.len() > MAX_ROWS_PER_BAND {
             g.dropped = g.lanes.len() - MAX_ROWS_PER_BAND;
             g.lanes.truncate(MAX_ROWS_PER_BAND);
@@ -378,10 +454,137 @@ fn axis_range(group: &BandGroup) -> Option<(f64, f64)> {
     if lo > hi {
         return None;
     }
+    // 2.4 GHz is small enough to draw whole, and drawn whole it is the picture
+    // people already have of it: the thirteen overlapping channels, 1 / 6 / 11
+    // where they always are. Framing it to whatever happens to be audible would
+    // move the numbers between scans.
+    if group.band == Band::TwoGhz {
+        lo = lo.min(2402.0);
+        hi = hi.max(2482.0);
+    }
     // A single 20 MHz span would otherwise fill the axis edge to edge and read
     // as "the whole band"; the pad keeps the drawing honest about scale.
     let pad = ((hi - lo) * 0.08).max(10.0);
     Some((lo - pad, hi + pad))
+}
+
+/// The channel numbers a band is labelled with: the 20 MHz grid the operator's
+/// access point offers in its own settings, not a frequency ruler.
+///
+/// The axis stays linear in MHz — that is the geometry the overlap is computed
+/// from — and only its *labels* are channels, so the two never disagree.
+fn band_channels(band: Band) -> Vec<i32> {
+    match band {
+        Band::TwoGhz => (1..=14).collect(),
+        Band::FiveGhz => vec![
+            36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140,
+            144, 149, 153, 157, 161, 165,
+        ],
+        // 6 GHz numbers its 20 MHz channels 1, 5, 9, … 233.
+        Band::SixGhz => (0..59).map(|i| 1 + 4 * i).collect(),
+    }
+}
+
+/// Where a channel number's own 20 MHz slot is centred on the axis, in px, or
+/// `None` when the channel is off the drawn window.
+///
+/// Placed through [`ChannelSpan::frequency_extent`] — the same arithmetic every
+/// band on this axis is drawn with, so a tick cannot drift away from the bands
+/// it is labelling.
+fn channel_centre_px(band: Band, channel: i32, axis: (f64, f64)) -> Option<f32> {
+    let span = ChannelSpan {
+        channel,
+        band,
+        width_mhz: 20,
+        width_assumed: false,
+    };
+    let e = span.frequency_extent()?;
+    let centre = f64::midpoint(e.lo_mhz, e.hi_mhz);
+    let (lo, hi) = axis;
+    if hi <= lo || centre < lo || centre > hi {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Some((((centre - lo) / (hi - lo)) * f64::from(AXIS_W)) as f32)
+}
+
+/// One tick on the channel axis: which channel, where, and whether its number is
+/// printed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Tick {
+    channel: i32,
+    x: f32,
+    labelled: bool,
+}
+
+/// The ticks a band's axis carries, thinned so two printed numbers never touch.
+///
+/// Our own channel is labelled first and unconditionally: it is the one number
+/// the reader came for, and a thinning pass that dropped it would leave the
+/// highlight on the axis unexplained. Everything else is taken left to right and
+/// kept only where it clears every number already printed.
+fn axis_ticks(band: Band, axis: (f64, f64), own_channel: Option<i32>) -> Vec<Tick> {
+    let mut ticks: Vec<Tick> = band_channels(band)
+        .into_iter()
+        .filter_map(|c| channel_centre_px(band, c, axis).map(|x| (c, x)))
+        .map(|(channel, x)| Tick {
+            channel,
+            x,
+            labelled: false,
+        })
+        .collect();
+    let mut printed: Vec<f32> = Vec::new();
+    if let Some(own) = own_channel
+        && let Some(t) = ticks.iter_mut().find(|t| t.channel == own)
+    {
+        t.labelled = true;
+        printed.push(t.x);
+    }
+    for t in &mut ticks {
+        if t.labelled {
+            continue;
+        }
+        if printed
+            .iter()
+            .all(|p| (t.x - p).abs() >= MIN_TICK_LABEL_GAP)
+        {
+            t.labelled = true;
+            printed.push(t.x);
+        }
+    }
+    ticks
+}
+
+/// Assign each placed band a row, so that two bands share a row only when they
+/// do not cross on the axis.
+///
+/// The point of the map is "who is standing in my channel", so bands that
+/// overlap must be visibly stacked over the same stretch of axis rather than
+/// listed one per line. `placed` is indexed as given (ranked order); the returned
+/// row numbers are parallel to it.
+fn pack_rows(placed: &[(f32, f32)]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..placed.len()).collect();
+    order.sort_by(|a, b| {
+        placed[*a]
+            .0
+            .partial_cmp(&placed[*b].0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut ends: Vec<f32> = Vec::new();
+    let mut rows = vec![0usize; placed.len()];
+    for i in order {
+        let (left, w) = placed[i];
+        let row = ends
+            .iter()
+            .position(|e| left >= e + BAR_GAP)
+            .unwrap_or(ends.len());
+        if row == ends.len() {
+            ends.push(f32::MIN);
+        }
+        ends[row] = ends[row].max(left + w);
+        rows[i] = row;
+    }
+    rows
 }
 
 /// Where a span is drawn inside an axis: `(left_px, width_px)`, clamped to the
@@ -426,12 +629,62 @@ fn with_alpha(color: u32, alpha: f32) -> u32 {
 }
 
 /// The human label for a confidence level — always phrased as a belief.
+///
+/// Short on purpose. What *lowers* confidence, and that even the highest is a
+/// hypothesis, is said once in the header; repeated under fifteen neighbours the
+/// same sentence stops being read at all (realm net-observer, node #48).
 fn confidence_label(c: OverlapConfidence) -> &'static str {
     match c {
-        OverlapConfidence::Low => "low confidence (a channel width or bonding was assumed)",
-        OverlapConfidence::Medium => "medium confidence (signal strength not reported)",
-        OverlapConfidence::High => "high confidence (still a hypothesis, not a measurement)",
+        OverlapConfidence::Low => "low confidence",
+        OverlapConfidence::Medium => "medium confidence",
+        OverlapConfidence::High => "high confidence",
     }
+}
+
+/// Turn one of the platform report's own tokens into a word a person reads.
+///
+/// `system_profiler` answers in identifiers — `spairport_security_mode_wpa2_
+/// personal_mixed`, `spairport_network_type_station` — and one of them reached
+/// the window verbatim, minus a letter, because a single hard-coded prefix did
+/// not match what the report actually spelled. The scaffolding is therefore
+/// dropped by *segment*, so no spelling of the prefix can survive as a fragment:
+/// leading `spairport` / `pairport` / `network` / `security` / `mode` / `type`
+/// segments are stripped, and what is left is spaced and capitalised.
+///
+/// Anything that is not one of those tokens (`802.11a/n/ac/ax`) passes through
+/// unchanged.
+fn humanize_token(raw: &str) -> Option<String> {
+    const SCAFFOLD: [&str; 6] = [
+        "spairport",
+        "pairport",
+        "network",
+        "security",
+        "mode",
+        "type",
+    ];
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let words: Vec<&str> = raw
+        .split('_')
+        .skip_while(|w| SCAFFOLD.contains(&w.to_ascii_lowercase().as_str()))
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    let pretty: Vec<String> = words
+        .iter()
+        .map(|w| match w.to_ascii_lowercase().as_str() {
+            "wpa" => "WPA".to_string(),
+            "wpa2" => "WPA2".to_string(),
+            "wpa3" => "WPA3".to_string(),
+            "wep" => "WEP".to_string(),
+            "none" | "open" => "open".to_string(),
+            _ => (*w).to_string(),
+        })
+        .collect();
+    Some(pretty.join(" "))
 }
 
 fn band_label(b: Band) -> &'static str {
@@ -444,6 +697,10 @@ fn band_label(b: Band) -> &'static str {
 
 /// The one-line description of a foreign AP. Never a name: the report redacts
 /// the SSID and carries no BSSID, so there is no identity to print.
+///
+/// One line, not three. Fifteen neighbours at three lines each is a screen and a
+/// half of scrolling in which the picture above never appears; the details are a
+/// table under the drawing and read as one (realm net-observer, node #48).
 fn lane_label(lane: &Lane) -> String {
     let mut s = format!("ch {} · {} MHz", lane.span.channel, lane.span.width_mhz);
     if lane.span.width_assumed {
@@ -456,39 +713,92 @@ fn lane_label(lane: &Lane) -> String {
     {
         // The bar is drawn wider than the radio: 2.4 GHz bonding direction is
         // not reported, so the band shown is every placement it could have.
-        s.push_str(" · bonding unknown, drawn as widest possible");
+        s.push_str(" · bonding unknown, drawn widest");
     }
     match lane.rssi_dbm {
         Some(r) => s.push_str(&format!(" · {r} dBm")),
         None => s.push_str(" · signal not reported"),
     }
-    if let Some(phy) = &lane.phy_mode {
+    if let Some(phy) = lane.phy_mode.as_deref().and_then(humanize_token) {
         s.push_str(&format!(" · {phy}"));
     }
-    if let Some(sec) = &lane.security {
+    if let Some(sec) = lane.security.as_deref().and_then(humanize_token) {
         s.push_str(&format!(" · {sec}"));
     }
     s
 }
 
-/// The overlap line under a lane: the hypothesis, said as a hypothesis.
+/// The overlap statement for one lane, said as what it is.
+///
+/// Four outcomes and no fewer. "Our channel is unknown" and "our channel is
+/// known and in another band" are different facts, and printing the first for
+/// the second told the reader the header was lying to him.
 fn overlap_label(lane: &Lane) -> String {
-    match lane.hypothesis {
-        None => "overlap not computable — this Mac's own channel is unknown".to_string(),
-        Some(h) if h.overlap <= 0.0 => "no band overlap with our channel".to_string(),
-        Some(h) => {
+    match lane.overlap {
+        Overlap::OwnChannelUnknown => {
+            "overlap not computable — this Mac's own channel is unknown".to_string()
+        }
+        Overlap::OwnBandElsewhere(b) => {
+            format!(
+                "different band from ours — this Mac is on {}, so these cannot overlap",
+                band_label(b)
+            )
+        }
+        Overlap::Computed(h) if h.overlap <= 0.0 => "no band overlap with our channel".to_string(),
+        Overlap::Computed(h) => {
             // A real sliver must not print as the same 0% a disjoint channel
             // does — the reader already settled this wording.
-            let share = if h.overlap < 0.005 {
-                "<1%".to_string()
-            } else {
-                format!("{:.0}%", h.overlap * 100.0)
-            };
             format!(
-                "hypothesis: covers {share} of our channel · {}",
+                "hypothesis: covers {} of our channel · {}",
+                share_label(h.overlap),
                 confidence_label(h.confidence)
             )
         }
+    }
+}
+
+/// The overlap as a percentage, with a real sliver kept distinct from nothing.
+fn share_label(overlap: f64) -> String {
+    if overlap < 0.005 {
+        "<1%".to_string()
+    } else {
+        format!("{:.0}%", overlap * 100.0)
+    }
+}
+
+/// The overlap cell in a band section's table.
+///
+/// `None` where no overlap is computable — because our channel is unknown, or
+/// because the neighbour is in another band. Both of those are facts about the
+/// whole section, said once at its top by [`band_relation`]; repeating either
+/// under every one of fifteen neighbours is how the window came to state, under
+/// each of them, something its own header contradicted.
+///
+/// Where an overlap *is* computable the sentence is [`overlap_label`]'s, so
+/// there is one wording and not two that can drift apart.
+fn overlap_cell(lane: &Lane) -> Option<String> {
+    match lane.overlap {
+        Overlap::OwnChannelUnknown | Overlap::OwnBandElsewhere(_) => None,
+        Overlap::Computed(_) => Some(overlap_label(lane)),
+    }
+}
+
+/// The one sentence a band section says about itself and us — said once, at the
+/// top of the section, instead of under every neighbour in it.
+fn band_relation(group: &BandGroup) -> Option<String> {
+    match (group.own, group.own_elsewhere) {
+        (Some(s), _) => Some(format!(
+            "this Mac is here, on ch {} — the highlighted column",
+            s.channel
+        )),
+        (None, Some(b)) => Some(format!(
+            "this Mac is on {}, not on this band: nothing here can overlap our channel",
+            band_label(b)
+        )),
+        (None, None) => Some(
+            "this Mac's own channel is unknown, so no overlap can be computed against it"
+                .to_string(),
+        ),
     }
 }
 
@@ -895,8 +1205,11 @@ fn header(
         .child(div().text_size(px(11.0)).text_color(rgb(theme.warn)).child(
             "Overlap is a HYPOTHESIS about where the bands sit, not measured \
                      interference: macOS reports channel occupancy (CCA / airtime) to \
-                     nobody. Foreign APs carry no BSSID, so this is one slice — the same \
-                     AP cannot be followed between scans.",
+                     nobody. Confidence drops when a channel width or a 2.4 GHz bonding \
+                     direction had to be assumed, or when a signal strength was not \
+                     reported — and the highest confidence is still a hypothesis. Foreign \
+                     APs carry no BSSID, so this is one slice — the same AP cannot be \
+                     followed between scans. Said once here, not under every neighbour.",
         ))
         .children(paused.then(|| {
             div()
@@ -906,8 +1219,15 @@ fn header(
         }))
 }
 
-/// One band's section: its own axis, our band drawn on it, and the foreign bands
-/// over it.
+/// One band's section: ONE channel axis, every band in this band drawn on it,
+/// and a compact table under it ordered by who is most likely in our channel.
+///
+/// The window used to give each neighbour its own miniature axis and its own
+/// three lines of prose; fifteen of them read as a list, and the question the
+/// map exists for — who is standing in *my* channel — was not answerable from
+/// the picture at all. One axis, our own channel highlighted across it, and
+/// bands packed into shared rows so a crossing is a crossing on the page
+/// (realm net-observer, node #48).
 fn band_section(group: &BandGroup, theme: Theme) -> impl IntoElement + use<> {
     let Some(axis) = axis_range(group) else {
         return div()
@@ -920,54 +1240,173 @@ fn band_section(group: &BandGroup, theme: Theme) -> impl IntoElement + use<> {
             .into_any_element();
     };
 
+    let band = band_label(group.band);
+    // Placed in ranked order, so a row's index in the table is the same index as
+    // its band on the axis and the two can be read against each other.
+    let placed: Vec<Option<(f32, f32)>> = group.lanes.iter().map(|l| place(l.span, axis)).collect();
+    let drawable: Vec<(f32, f32)> = placed.iter().filter_map(|p| *p).collect();
+    let rows = pack_rows(&drawable);
+    let row_count = rows.iter().copied().max().map_or(0, |r| r + 1);
+
+    let bars_h = if row_count == 0 {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let n = row_count as f32;
+        n * BAR_H + (n - 1.0) * BAR_GAP
+    };
+    // Bands, then our own band, then the rule, its ticks and their numbers.
+    let plot_h = bars_h + BAR_GAP + OWN_LANE_H + AXIS_RULE_H + TICK_H + TICK_LABEL_H;
+    let own_top = bars_h + BAR_GAP;
+    let rule_top = own_top + OWN_LANE_H;
+
+    let mut plot = div()
+        .debug_selector({
+            let sel = format!("air-axis:{band}");
+            move || sel
+        })
+        .relative()
+        .w(px(AXIS_W))
+        .h(px(plot_h));
+
+    // The highlight goes down first, so every band is drawn over it: it is the
+    // question ("who is in here?"), not an answer about any one neighbour.
+    if let Some((left, w)) = group.own.and_then(|s| place(s, axis)) {
+        plot = plot.child(
+            div()
+                .debug_selector({
+                    let sel = format!("air-own-column:{band}");
+                    move || sel
+                })
+                .absolute()
+                .left(px(left))
+                .top(px(0.0))
+                .w(px(w))
+                .h(px(rule_top))
+                .bg(rgba(with_alpha(theme.accent, 0.16))),
+        );
+        plot = plot.child(
+            div()
+                .debug_selector({
+                    let sel = format!("air-own:{band}");
+                    move || sel
+                })
+                .absolute()
+                .left(px(left))
+                .top(px(own_top))
+                .w(px(w))
+                .h(px(OWN_LANE_H))
+                .rounded_sm()
+                .bg(rgb(theme.accent)),
+        );
+    }
+
+    let mut drawn = 0usize;
+    for (i, p) in placed.iter().enumerate() {
+        let Some((left, w)) = *p else { continue };
+        let row = rows[drawn];
+        drawn += 1;
+        #[allow(clippy::cast_precision_loss)]
+        let top = bars_h - (row as f32 + 1.0) * BAR_H - row as f32 * BAR_GAP;
+        plot = plot.child(
+            div()
+                .debug_selector({
+                    let sel = format!("air-band:{band}:{i}");
+                    move || sel
+                })
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(w))
+                .h(px(BAR_H))
+                .rounded_sm()
+                .bg(rgba(with_alpha(theme.fg, weight(group.lanes[i].rssi_dbm)))),
+        );
+    }
+
+    plot = plot.child(
+        div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(rule_top))
+            .w(px(AXIS_W))
+            .h(px(AXIS_RULE_H))
+            .bg(rgb(theme.separator)),
+    );
+
+    for tick in axis_ticks(group.band, axis, group.own.map(|s| s.channel)) {
+        plot = plot.child(
+            div()
+                .absolute()
+                .left(px(tick.x))
+                .top(px(rule_top))
+                .w(px(1.0))
+                .h(px(if tick.labelled { TICK_H } else { TICK_H / 2.0 }))
+                .bg(rgb(theme.separator)),
+        );
+        if !tick.labelled {
+            continue;
+        }
+        let own = group.own.is_some_and(|s| s.channel == tick.channel);
+        // Centred on its tick and clamped to the axis, so the leftmost and
+        // rightmost numbers stay inside the drawing rather than hanging off it.
+        let left = (tick.x - TICK_LABEL_HALF_W).clamp(0.0, AXIS_W - 2.0 * TICK_LABEL_HALF_W);
+        plot = plot.child(
+            div()
+                .debug_selector({
+                    let sel = format!("air-tick:{band}:{}", tick.channel);
+                    move || sel
+                })
+                .absolute()
+                .left(px(left))
+                .top(px(rule_top + TICK_H))
+                .w(px(2.0 * TICK_LABEL_HALF_W))
+                .h(px(TICK_LABEL_H))
+                .flex()
+                .justify_center()
+                .text_size(px(9.0))
+                .text_color(rgb(if own { theme.accent } else { theme.muted }))
+                .child(tick.channel.to_string()),
+        );
+    }
+
     let mut section = div()
         .flex()
         .flex_col()
         .gap_1()
         .child(
             div()
-                .text_size(px(12.0))
-                .text_color(rgb(theme.fg))
-                .child(band_label(group.band)),
+                .flex()
+                .items_baseline()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(theme.fg))
+                        .child(format!("{band} · channels")),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(rgb(theme.muted))
+                        .child(format!("{:.0}–{:.0} MHz", axis.0, axis.1)),
+                ),
         )
-        .child(
+        .children(band_relation(group).map(|line| {
             div()
                 .text_size(px(10.0))
                 .text_color(rgb(theme.muted))
-                .child(format!("{:.0}–{:.0} MHz", axis.0, axis.1)),
-        );
+                .child(line)
+        }))
+        .child(plot);
 
-    // Our own band first, as the reference every lane above it is placed against.
-    section = section.child(match group.own.and_then(|s| place(s, axis)) {
-        Some((left, w)) => div()
-            .relative()
-            .w(px(AXIS_W))
-            .h(px(OWN_LANE_H))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(left))
-                    .top(px(2.0))
-                    .w(px(w))
-                    .h(px(OWN_LANE_H - 4.0))
-                    .rounded_md()
-                    .bg(rgb(theme.accent)),
-            )
-            .into_any_element(),
-        None => div()
-            .text_size(px(11.0))
-            .text_color(rgb(theme.muted))
-            .child("our own channel is not on this band")
-            .into_any_element(),
-    });
-
-    for lane in &group.lanes {
-        section = section.child(lane_row(lane, axis, theme));
+    for (i, lane) in group.lanes.iter().enumerate() {
+        section = section.child(lane_row(group.band, i, lane, theme));
     }
     if group.dropped > 0 {
         section = section.child(
             div()
-                .text_size(px(11.0))
+                .text_size(px(10.0))
                 .text_color(rgb(theme.muted))
                 .child(format!("+{} more heard, not drawn", group.dropped)),
         );
@@ -975,45 +1414,36 @@ fn band_section(group: &BandGroup, theme: Theme) -> impl IntoElement + use<> {
     section.into_any_element()
 }
 
-/// One foreign AP: its band drawn over the axis, then its label and the overlap
-/// hypothesis. The bar's ink is one neutral colour at an opacity set by signal
-/// strength — deliberately not a severity palette, which would read as a
-/// measured verdict about interference.
-fn lane_row(lane: &Lane, axis: (f64, f64), theme: Theme) -> impl IntoElement + use<> {
-    let bar = match place(lane.span, axis) {
-        Some((left, w)) => div()
-            .relative()
-            .w(px(AXIS_W))
-            .h(px(LANE_H))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(left))
-                    .top(px(3.0))
-                    .w(px(w))
-                    .h(px(LANE_H - 6.0))
-                    .rounded_sm()
-                    .bg(rgba(with_alpha(theme.fg, weight(lane.rssi_dbm)))),
-            )
-            .into_any_element(),
-        None => div().h(px(LANE_H)).into_any_element(),
-    };
+/// One row of a band section's table: everything known about one foreign AP on a
+/// single line, with the overlap cell present only where an overlap is
+/// computable at all.
+///
+/// The ink is one neutral colour — deliberately not a severity palette, which
+/// would read as a measured verdict about interference.
+fn lane_row(band: Band, i: usize, lane: &Lane, theme: Theme) -> impl IntoElement + use<> {
+    let sel = format!("air-row:{}:{i}", band_label(band));
     div()
+        .debug_selector(move || sel)
         .flex()
-        .flex_col()
-        .child(bar)
+        .items_baseline()
+        .gap_2()
+        .w(px(AXIS_W))
+        .overflow_hidden()
         .child(
             div()
+                .flex_1()
+                .overflow_hidden()
                 .text_size(px(11.0))
                 .text_color(rgb(theme.fg))
                 .child(lane_label(lane)),
         )
-        .child(
+        .children(overlap_cell(lane).map(|cell| {
             div()
+                .flex_none()
                 .text_size(px(10.0))
                 .text_color(rgb(theme.muted))
-                .child(overlap_label(lane)),
-        )
+                .child(cell)
+        }))
 }
 
 /// A stated state of the map: a headline in a semantic colour and the sentence
@@ -1480,8 +1910,8 @@ mod tests {
         let groups = group(&s, Some(own(56, "5ghz", 80)));
         let five = groups.iter().find(|g| g.band == Band::FiveGhz).unwrap();
         assert_eq!(five.lanes[0].span.channel, 56);
-        assert!(five.lanes[0].hypothesis.unwrap().overlap > 0.0);
-        assert_eq!(five.lanes[1].hypothesis.unwrap().overlap, 0.0);
+        assert!(five.lanes[0].overlap.hypothesis().unwrap().overlap > 0.0);
+        assert_eq!(five.lanes[1].overlap.hypothesis().unwrap().overlap, 0.0);
     }
 
     /// Without an own association there is no overlap to hypothesise about, and
@@ -1490,7 +1920,7 @@ mod tests {
     fn no_own_channel_means_no_overlap_claim() {
         let groups = group(&scan(vec![ap(36, "5ghz", Some(80), Some(-60))]), None);
         let lane = &groups[0].lanes[0];
-        assert!(lane.hypothesis.is_none());
+        assert_eq!(lane.overlap, Overlap::OwnChannelUnknown);
         assert!(overlap_label(lane).contains("not computable"));
     }
 
@@ -1511,12 +1941,13 @@ mod tests {
         let g = BandGroup {
             band: Band::FiveGhz,
             own: Some(own(36, "5ghz", 80)),
+            own_elsewhere: None,
             lanes: vec![Lane {
                 span: own(149, "5ghz", 20),
                 rssi_dbm: Some(-60),
                 phy_mode: None,
                 security: None,
-                hypothesis: None,
+                overlap: Overlap::OwnChannelUnknown,
             }],
             dropped: 0,
         };
@@ -1551,7 +1982,7 @@ mod tests {
             rssi_dbm: Some(-60),
             phy_mode: None,
             security: None,
-            hypothesis: Some(overlap_hypothesis(
+            overlap: Overlap::Computed(overlap_hypothesis(
                 &own(36, "5ghz", 80),
                 &own(ch, "5ghz", 80),
                 Some(-60),
@@ -1572,7 +2003,7 @@ mod tests {
             rssi_dbm: None,
             phy_mode: Some("802.11ax".to_string()),
             security: Some("wpa2_personal".to_string()),
-            hypothesis: None,
+            overlap: Overlap::OwnChannelUnknown,
         };
         let s = lane_label(&l);
         assert!(s.contains("ch 36"));
@@ -1667,5 +2098,324 @@ mod tests {
             vec![],
         )))));
         assert!(feed.offline.is_none());
+    }
+}
+
+/// Headless UI tests for the air map, on gpui's own test platform: layout and
+/// scene construction run for real, rasterization does not.
+///
+/// The fixture is a verbatim `system_profiler -json SPAirPortDataType` slice
+/// taken from this Mac while it was associated on 5 GHz channel 48 — fifteen
+/// audible foreign access points, ten in 2.4 GHz and five in 5 GHz. It is the
+/// slice the window was first run against, and the one it was unreadable on. It
+/// is parsed by `macos::air::parse_air_report`, the daemon's own parser, so what
+/// these tests draw is what production would hand the window.
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+    use crate::ui::Glance;
+    use gpui::{Bounds, Pixels, Size, TestAppContext, VisualTestContext};
+    use net_observer_ipc::StatusSnapshot;
+
+    /// The captured report.
+    const LIVE_REPORT: &str = include_str!("../tests/fixtures/air_live.json");
+
+    /// Every foreign AP in the fixture, through the daemon's own parser.
+    fn live_aps() -> Vec<AirObservation> {
+        macos::air::parse_air_report(LIVE_REPORT).expect("the fixture is a readable report")
+    }
+
+    /// This Mac's own association as the same fixture states it, read with the
+    /// same channel parser — never retyped, or the test would prove the window
+    /// against a channel the report does not carry.
+    fn live_own() -> ChannelSpan {
+        let v: serde_json::Value = serde_json::from_str(LIVE_REPORT).expect("the fixture is JSON");
+        let current = v["SPAirPortDataType"][0]["spairport_airport_interfaces"][0]
+            ["spairport_current_network_information"]["spairport_network_channel"]
+            .as_str()
+            .expect("the fixture names our own channel");
+        let (ch, band, width) = macos::air::parse_channel(current);
+        ChannelSpan::new(ch, band.as_deref(), width).expect("our own channel is placeable")
+    }
+
+    fn live_sample() -> AirSample {
+        AirSample {
+            ts_us: 1_700_000_000_000_000,
+            air: AirVerdict::Ok,
+            reason: None,
+            aps: live_aps(),
+        }
+    }
+
+    /// A window showing the live slice, ready to be measured.
+    fn live_window(cx: &mut TestAppContext) -> (VisualTestContext, Size<Pixels>) {
+        let own = live_own();
+        let glance = cx.update(|cx| {
+            cx.new(|_| {
+                Glance::new(
+                    StatusSnapshot::default(),
+                    None,
+                    "/tmp/net-observer-air-test.sock".to_string(),
+                )
+            })
+        });
+        let feed = cx.update(|cx| {
+            cx.new(|_| AirFeed {
+                air: Some(live_sample()),
+                own: Some(WifiSample {
+                    ts_us: 1_700_000_000_000_000,
+                    wifi: WifiVerdict::Ok,
+                    reason: None,
+                    rssi_dbm: Some(-50),
+                    noise_dbm: Some(-96),
+                    snr_db: Some(46),
+                    tx_rate_mbps: Some(216.0),
+                    phy_mode: Some("11ax".to_string()),
+                    channel: Some(own.channel),
+                    channel_width_mhz: Some(own.width_mhz),
+                    channel_band: Some(own.band.as_str().to_string()),
+                }),
+                ..Default::default()
+            })
+        });
+        // A bridge that goes nowhere: the window under test is fed from the
+        // fixture, not from a socket, and nothing here presses "scan now".
+        let (tx, _rx) = mpsc::sync_channel(BRIDGE_DEPTH);
+        let window = cx.add_window(|_, cx| {
+            AirView::new(
+                feed,
+                glance,
+                Arc::new(Shutdown::default()),
+                "/tmp/net-observer-air-test.sock".to_string(),
+                tx,
+                cx,
+            )
+        });
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        let viewport = size(px(WIN_W), px(WIN_H));
+        vcx.simulate_resize(viewport);
+        vcx.run_until_parked();
+        (vcx, viewport)
+    }
+
+    fn bounds(cx: &mut VisualTestContext, selector: &str) -> Option<Bounds<Pixels>> {
+        let sel: &'static str = Box::leak(selector.to_string().into_boxed_str());
+        cx.debug_bounds(sel)
+    }
+
+    /// Each band section draws ONE axis, and every band and every channel number
+    /// in that section lies inside it — the axis is the section, not a decoration
+    /// beside it.
+    ///
+    /// The failure this pins is the shape the window shipped with: no shared
+    /// axis at all, one private strip per access point. There is then no
+    /// `air-axis:*` to find and no tick to measure, so this test cannot pass on a
+    /// per-AP list however that list is laid out.
+    #[gpui::test]
+    fn every_band_and_channel_number_sits_inside_its_band_axis(cx: &mut TestAppContext) {
+        let (mut cx, _viewport) = live_window(cx);
+        let own = live_own();
+        let groups = group(&live_sample(), Some(own));
+        assert_eq!(groups.len(), 2, "the fixture is heard in exactly two bands");
+
+        for g in &groups {
+            let band = band_label(g.band);
+            let axis = bounds(&mut cx, &format!("air-axis:{band}"))
+                .unwrap_or_else(|| panic!("the {band} section drew no shared axis"));
+            assert!(
+                (axis.size.width - px(AXIS_W)).abs() < px(0.51),
+                "the {band} axis is not the full drawn width: {axis:?}"
+            );
+
+            let mut ticks = 0;
+            for ch in band_channels(g.band) {
+                if let Some(t) = bounds(&mut cx, &format!("air-tick:{band}:{ch}")) {
+                    ticks += 1;
+                    assert!(
+                        within(axis, t),
+                        "the channel number {ch} spills out of the {band} axis: \
+                         {t:?} vs {axis:?}"
+                    );
+                }
+            }
+            assert!(
+                ticks >= 4,
+                "the {band} axis carries only {ticks} channel numbers — an axis \
+                 nobody can read a channel off"
+            );
+
+            for i in 0..g.lanes.len() {
+                let bar = bounds(&mut cx, &format!("air-band:{band}:{i}"))
+                    .unwrap_or_else(|| panic!("{band} band {i} was not drawn on the axis"));
+                assert!(
+                    within(axis, bar),
+                    "{band} band {i} leaves its own axis: {bar:?} vs {axis:?}"
+                );
+            }
+        }
+    }
+
+    /// Our own association is drawn on the SAME axis as the neighbours, inside
+    /// its band's section and nowhere else — so "who is standing in my channel"
+    /// is a question the picture answers.
+    #[gpui::test]
+    fn our_own_channel_is_marked_on_the_axis_it_shares_with_the_neighbours(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut cx, _viewport) = live_window(cx);
+        let own = live_own();
+        let here = band_label(own.band);
+        let axis = bounds(&mut cx, &format!("air-axis:{here}")).expect("our band drew its axis");
+        let mark = bounds(&mut cx, &format!("air-own:{here}"))
+            .expect("our own association is drawn on our band's axis");
+        assert!(within(axis, mark), "{mark:?} vs {axis:?}");
+        let column = bounds(&mut cx, &format!("air-own-column:{here}"))
+            .expect("our channel is highlighted across the axis");
+        assert!(within(axis, column));
+        assert!(
+            column.size.height > mark.size.height,
+            "the highlight must run up through the neighbours' rows, not sit beside them"
+        );
+        assert!(
+            bounds(&mut cx, &format!("air-tick:{here}:{}", own.channel)).is_some(),
+            "our own channel number must be printed even where ticks are thinned"
+        );
+
+        let other = other_band(&live_sample(), own);
+        assert!(
+            bounds(&mut cx, &format!("air-own:{}", band_label(other))).is_none(),
+            "our band must not be drawn on a band we are not in"
+        );
+    }
+
+    /// The band a neighbour was heard in that is NOT ours.
+    fn other_band(sample: &AirSample, own: ChannelSpan) -> Band {
+        group(sample, Some(own))
+            .into_iter()
+            .map(|g| g.band)
+            .find(|b| *b != own.band)
+            .expect("the fixture is heard in a second band")
+    }
+
+    /// Every word the window puts on screen for the live slice, gathered from
+    /// the functions that produce it.
+    fn live_text() -> Vec<String> {
+        let own = live_own();
+        let mut out = Vec::new();
+        for g in group(&live_sample(), Some(own)) {
+            out.push(band_label(g.band).to_string());
+            out.extend(band_relation(&g));
+            for lane in &g.lanes {
+                out.push(lane_label(lane));
+                out.push(overlap_label(lane));
+                out.extend(overlap_cell(lane));
+            }
+        }
+        out
+    }
+
+    /// No platform token reaches the reader.
+    ///
+    /// The live report spells one security mode
+    /// `pairport_security_mode_wpa3_transition` — the documented token with its
+    /// leading `s` missing — and the window printed it verbatim under five of the
+    /// fifteen access points. The substring test is on `pairport`, so BOTH
+    /// spellings fail it: matching the documented prefix alone is exactly the bug.
+    #[test]
+    fn no_platform_token_reaches_the_reader() {
+        let text = live_text();
+        assert!(
+            !text.is_empty(),
+            "the fixture must produce labels for this to prove anything"
+        );
+        // The token itself first, so a failure names the defect rather than
+        // whichever line happened to be ranked first.
+        for line in &text {
+            assert!(
+                !line.contains("pairport"),
+                "a raw system_profiler token reached the window: {line}"
+            );
+        }
+        for line in &text {
+            assert!(
+                !line.contains('_'),
+                "a platform identifier reached the window unspaced: {line}"
+            );
+        }
+        // Not merely absent: the fact the token carried is still said.
+        assert!(
+            text.iter().any(|l| l.contains("WPA3")),
+            "the WPA3-transition networks lost their security mode entirely"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("WPA2")),
+            "the WPA2 networks lost their security mode entirely"
+        );
+    }
+
+    /// With our own channel known, a neighbour in the other band is described as
+    /// being in another band — never as evidence that our channel is unknown.
+    ///
+    /// This is the contradiction the window shipped with: the header said
+    /// "this Mac: 5 GHz · ch 48 · 20 MHz" while every 2.4 GHz neighbour under it
+    /// said our channel was unknown.
+    #[test]
+    fn a_neighbour_in_another_band_never_calls_our_channel_unknown() {
+        let own = live_own();
+        let groups = group(&live_sample(), Some(own));
+        let elsewhere = groups
+            .iter()
+            .find(|g| g.band != own.band)
+            .expect("the fixture is heard in a second band");
+        assert!(
+            !elsewhere.lanes.is_empty(),
+            "the other band must carry neighbours"
+        );
+        assert_eq!(elsewhere.own_elsewhere, Some(own.band));
+
+        let relation = band_relation(elsewhere).expect("the section states its relation to us");
+        assert!(
+            !relation.contains("unknown"),
+            "the section calls our known channel unknown: {relation}"
+        );
+        assert!(
+            relation.contains(band_label(own.band)),
+            "the section must name where this Mac actually is: {relation}"
+        );
+
+        for lane in &elsewhere.lanes {
+            assert_eq!(lane.overlap, Overlap::OwnBandElsewhere(own.band));
+            let line = overlap_label(lane);
+            assert!(
+                !line.contains("unknown"),
+                "a cross-band neighbour claims our channel is unknown: {line}"
+            );
+            assert!(
+                line.contains("different band"),
+                "a cross-band neighbour must say why there is no overlap: {line}"
+            );
+            assert!(
+                overlap_cell(lane).is_none(),
+                "no overlap figure may be offered where none is computable"
+            );
+        }
+
+        // And the hedge that IS about an unknown channel still exists, for the
+        // case that really is one: without an association, nothing is computable.
+        let blind = group(&live_sample(), None);
+        assert!(
+            overlap_label(&blind[0].lanes[0]).contains("unknown"),
+            "an actually unknown own channel must still say so"
+        );
+    }
+
+    /// `inner` lies wholly inside `outer`, both in absolute window coordinates.
+    /// A half-pixel of slack absorbs the rounding of a flex layout, not a spill.
+    fn within(outer: Bounds<Pixels>, inner: Bounds<Pixels>) -> bool {
+        let slack = px(0.5);
+        inner.origin.x + slack >= outer.origin.x
+            && inner.origin.y + slack >= outer.origin.y
+            && inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width + slack
+            && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height + slack
     }
 }

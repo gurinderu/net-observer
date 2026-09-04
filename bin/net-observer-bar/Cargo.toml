@@ -57,3 +57,12 @@ tempfile.workspace = true
 # real while rasterization does not. Enabled only here, so a normal
 # `cargo build -p net-observer-bar` never pulls it in.
 gpui = { workspace = true, features = ["test-support"] }
+# The air map's headless tests are driven by a verbatim `system_profiler
+# SPAirPortDataType` slice captured from this Mac (`tests/fixtures/air_live.json`,
+# 15 audible access points). It is parsed with the SAME parser the daemon uses —
+# `macos::air::parse_air_report` — rather than a second one written for the test,
+# so the window is proved against what the platform really emits and the fixture
+# cannot quietly drift from production parsing. Dev-only: the bar itself is a
+# pure socket client and depends on no platform adapter.
+macos.workspace = true
+serde_json.workspace = true
