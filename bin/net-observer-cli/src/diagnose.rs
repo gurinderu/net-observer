@@ -560,13 +560,36 @@ pub(crate) fn format_air(scan: &QueryTable, aps: &QueryTable, own: &QueryTable) 
     kv(&mut out, "heard", &measured(row, count_i, "0"));
 
     // Our own channel, and what its absence costs.
-    let own_span = own_channel(own)?;
-    match own_span {
-        Some(s) => kv(
-            &mut out,
-            "our channel",
-            &format!("{} ({}, {} MHz)", s.channel, s.band.as_str(), s.width_mhz),
-        ),
+    let own_read = own_channel(own)?;
+    let own_span = own_read.map(|(s, _)| s);
+    match own_read {
+        Some((s, read_at)) => {
+            let scanned_at = at(row, ts_i).parse::<i64>().ok();
+            let lag = match (scanned_at, read_at) {
+                (Some(scan_us), Some(own_us)) => Some((scan_us - own_us).abs()),
+                _ => None,
+            };
+            let provenance = match (read_at, lag) {
+                (Some(us), Some(lag)) if lag > OWN_CHANNEL_STALE_US => format!(
+                    " - read {}, {} BEFORE this scan: we may have roamed since",
+                    stamp(&us.to_string()),
+                    human_us(lag)
+                ),
+                (Some(us), _) => format!(" - read {}", stamp(&us.to_string())),
+                (None, _) => " - read at an unknown moment".to_string(),
+            };
+            kv(
+                &mut out,
+                "our channel",
+                &format!(
+                    "{} ({}, {} MHz){}",
+                    s.channel,
+                    s.band.as_str(),
+                    s.width_mhz,
+                    provenance
+                ),
+            );
+        }
         None => kv(&mut out, "our channel", "(unknown - overlap not computed)"),
     }
 
@@ -599,7 +622,13 @@ pub(crate) fn format_air(scan: &QueryTable, aps: &QueryTable, own: &QueryTable) 
         };
         let (overlap_cell, confidence_cell, rank) = match hypothesis {
             Some(h) => (
-                format!("{:.0}%", h.overlap * 100.0),
+                if h.overlap > 0.0 && h.overlap < 0.005 {
+                    // A real sliver must not print as the same "0%" a disjoint
+                    // channel does.
+                    "<1%".to_string()
+                } else {
+                    format!("{:.0}%", h.overlap * 100.0)
+                },
                 format!("{:?}", h.confidence).to_lowercase(),
                 h.rank_key(),
             ),
@@ -650,9 +679,14 @@ program, so no such number exists here. CONF says how much of it was reported \n
 rather than assumed. The report also carries no BSSID, so these access points \n\
 cannot be matched to those of any other scan.\n";
 
-/// Our own channel as the record last had it, or `None` when the radio never
-/// reported one (never associated, or the `wifi` collector off).
-fn own_channel(own: &QueryTable) -> Result<Option<types::ChannelSpan>> {
+/// Our own channel as the record last had it, with the moment it was read, or
+/// `None` when the radio never reported one (never associated, or the `wifi`
+/// collector off).
+///
+/// The moment travels with the channel on purpose: this reading has no time
+/// bound of its own, so a channel the radio left days ago would otherwise be
+/// compared against a scan taken now, silently. (realm net-observer, node #48)
+fn own_channel(own: &QueryTable) -> Result<Option<(types::ChannelSpan, Option<i64>)>> {
     let Some(row) = own.rows.first() else {
         return Ok(None);
     };
@@ -660,12 +694,33 @@ fn own_channel(own: &QueryTable) -> Result<Option<types::ChannelSpan>> {
     let channel = at(row, c.idx("channel")?).parse::<i32>().ok();
     let band = at(row, c.idx("channel_band")?).to_string();
     let width = at(row, c.idx("channel_width_mhz")?).parse::<i32>().ok();
+    let read_at = at(row, c.idx("ts_us")?).parse::<i64>().ok();
     Ok(types::ChannelSpan::new(
         channel,
         if band.is_empty() { None } else { Some(&band) },
         width,
-    ))
+    )
+    .map(|s| (s, read_at)))
 }
+
+/// A microsecond span as a short human duration, for saying how stale a reading
+/// is without making the reader do arithmetic.
+fn human_us(us: i64) -> String {
+    let secs = us / 1_000_000;
+    if secs < 90 {
+        format!("{secs}s")
+    } else if secs < 5400 {
+        format!("{}m", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// How far our own channel reading may lag the scan before the comparison stops
+/// being about the same association: one minute of ordinary roaming.
+const OWN_CHANNEL_STALE_US: i64 = 60_000_000;
 
 #[cfg(test)]
 mod tests {
@@ -759,6 +814,33 @@ mod tests {
         );
         assert!(out.contains("100%"));
         assert!(out.contains("0%"));
+    }
+
+    /// Our own channel has no time bound of its own: the reading is simply the
+    /// newest the wifi collector ever produced. A scan compared against a
+    /// channel we left hours ago must say so, or the whole overlap column is
+    /// quietly about the wrong band.
+    #[test]
+    fn a_stale_own_channel_is_labelled_with_its_age() {
+        // Scan at 4h; own channel read at 0 — the radio may have roamed since.
+        let scan = table(AIR_SCAN_COLS, &[&["14400000000", "OK", "", "1"]]);
+        let aps = table(
+            AIR_AP_COLS,
+            &[&["40", "5ghz", "20", "802.11ax", "wpa3", "-70", "-95"]],
+        );
+        let own = table(AIR_OWN_COLS, &[&["0", "36", "5ghz", "80"]]);
+        let out = format_air(&scan, &aps, &own).unwrap();
+        assert!(
+            out.contains("BEFORE this scan"),
+            "a stale own channel must be called stale:\n{out}"
+        );
+        assert!(out.contains("4h"), "and say how stale:\n{out}");
+
+        // A reading from the same minute carries its moment but no warning.
+        let own = table(AIR_OWN_COLS, &[&["14400000000", "36", "5ghz", "80"]]);
+        let out = format_air(&scan, &aps, &own).unwrap();
+        assert!(out.contains("read "), "the moment is always shown:\n{out}");
+        assert!(!out.contains("BEFORE this scan"));
     }
 
     /// Every wording rule the epistemic boundary imposes, checked on the output

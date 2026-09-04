@@ -57,6 +57,9 @@ impl SystemProfilerAir {
     async fn report(&self) -> Result<String, String> {
         let run = Command::new("system_profiler")
             .args(["-json", DATA_TYPE])
+            // On timeout the future is dropped; without this the wedged child
+            // outlives it and one process leaks per period.
+            .kill_on_drop(true)
             .output();
         let out = match tokio::time::timeout(REPORT_TIMEOUT, run).await {
             Err(_) => return Err(format!("system_profiler {DATA_TYPE} timed out")),

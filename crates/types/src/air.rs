@@ -93,15 +93,26 @@ impl Band {
         }
     }
 
-    /// Centre frequency in MHz of `channel` in this band, for the 5/6 GHz bands
-    /// whose channels are laid out as `base + 5 * n`. `None` for 2.4 GHz, whose
-    /// overlap is computed from channel numbers instead (see
-    /// [`overlap_hypothesis`]).
-    fn centre_mhz(self, channel: i32) -> Option<i32> {
+    /// Centre frequency in MHz of the 20 MHz channel numbered `channel`.
+    fn primary_centre_mhz(self, channel: i32) -> Option<i32> {
         match self {
+            // 2.4 GHz is `2407 + 5 n`, except channel 14, which is not.
+            Band::TwoGhz if channel == 14 => Some(2484),
+            Band::TwoGhz if (1..=13).contains(&channel) => Some(2407 + 5 * channel),
             Band::TwoGhz => None,
             Band::FiveGhz => Some(5000 + 5 * channel),
             Band::SixGhz => Some(5950 + 5 * channel),
+        }
+    }
+
+    /// First channel number of the band's block grid: wide channels are bonded
+    /// upward from this anchor in fixed blocks, not centred on whatever primary
+    /// the AP happens to advertise.
+    fn block_anchor(self) -> Option<i32> {
+        match self {
+            Band::FiveGhz => Some(36),
+            Band::SixGhz => Some(1),
+            Band::TwoGhz => None,
         }
     }
 }
@@ -192,49 +203,86 @@ impl ChannelOverlapHypothesis {
     }
 }
 
+/// The frequency spans a radio may occupy, in doubled MHz so that odd halves
+/// stay exact in integer arithmetic.
+///
+/// Usually one span. In 2.4 GHz a 40 MHz radio bonds either upward or downward
+/// from its primary and the report does not say which, so both placements are
+/// returned and the caller keeps the larger overlap — an admitted maybe, rather
+/// than a confident zero. (realm net-observer, node #48)
+fn candidate_spans(span: &ChannelSpan) -> (Vec<(i32, i32)>, bool) {
+    let Some(primary) = span.band.primary_centre_mhz(span.channel) else {
+        return (Vec::new(), true);
+    };
+    let half = span.width_mhz;
+    if span.band == Band::TwoGhz {
+        if span.width_mhz <= 20 {
+            return (vec![(2 * primary - half, 2 * primary + half)], false);
+        }
+        // Bonded upward or downward: the secondary channel is not reported.
+        let offset = span.width_mhz - 20;
+        let up = 2 * primary + offset;
+        let down = 2 * primary - offset;
+        return (
+            vec![(up - half, up + half), (down - half, down + half)],
+            true,
+        );
+    }
+    // 5/6 GHz: a wide channel occupies a fixed block, and the reported number is
+    // the primary 20 MHz inside it. Centring the width on the primary would
+    // place an 80 MHz radio up to 30 MHz away from where it actually sits.
+    let (Some(anchor), step) = (span.band.block_anchor(), span.width_mhz / 5) else {
+        return (vec![(2 * primary - half, 2 * primary + half)], true);
+    };
+    if step <= 0 || span.channel < anchor {
+        return (vec![(2 * primary - half, 2 * primary + half)], true);
+    }
+    let block_start = anchor + ((span.channel - anchor) / step) * step;
+    let centre_channel = block_start + step / 2 - 2;
+    let Some(centre) = span.band.primary_centre_mhz(centre_channel) else {
+        return (vec![(2 * primary - half, 2 * primary + half)], true);
+    };
+    (vec![(2 * centre - half, 2 * centre + half)], false)
+}
+
 /// Compute the overlap hypothesis between our own channel and a foreign one.
 ///
-/// * **2.4 GHz** channels are 5 MHz apart and 20 MHz wide, so any two whose
-///   numbers differ by less than 5 overlap; the fraction is `(5 - |Δ|) / 5`.
-///   The number rule is used for the whole band, including a rare 40 MHz AP —
-///   the report's channel numbering is what is trustworthy there.
-/// * **5 / 6 GHz** channels are placed by centre frequency (`5000 + 5·n`,
-///   `5950 + 5·n`) and the spans are intersected: the fraction is the shared
-///   width over the narrower of the two channels.
-/// * **Different bands** never overlap.
+/// Both radios are placed as frequency spans and intersected; the fraction is
+/// the shared width over the narrower of the two channels. Channel numbers name
+/// the *primary* 20 MHz, so a wide 5/6 GHz channel is first resolved to the
+/// block it is bonded into — an 80 MHz AP advertising channel 44 occupies
+/// 5170-5250, not 5200-5280. Different bands never overlap.
+///
+/// Where the placement itself had to be guessed — a 2.4 GHz radio wider than
+/// 20 MHz, whose bonding direction is not reported — the larger of the two
+/// possible overlaps is taken and the confidence drops, because understating a
+/// neighbour is the more expensive error here.
 #[must_use]
 pub fn overlap_hypothesis(
     own: &ChannelSpan,
     other: &ChannelSpan,
     other_rssi_dbm: Option<i32>,
 ) -> ChannelOverlapHypothesis {
-    let overlap = if own.band != other.band {
+    let (own_spans, own_guessed) = candidate_spans(own);
+    let (other_spans, other_guessed) = candidate_spans(other);
+    let narrower = own.width_mhz.min(other.width_mhz) * 2;
+    let overlap = if own.band != other.band || narrower <= 0 {
         0.0
-    } else if own.band == Band::TwoGhz {
-        let delta = (own.channel - other.channel).abs();
-        f64::from((5 - delta).max(0)) / 5.0
     } else {
-        match (
-            own.band.centre_mhz(own.channel),
-            other.band.centre_mhz(other.channel),
-        ) {
-            (Some(a), Some(b)) => {
-                // Halves are doubled throughout so odd widths stay exact in
-                // integer arithmetic.
-                let (a_lo, a_hi) = (2 * a - own.width_mhz, 2 * a + own.width_mhz);
-                let (b_lo, b_hi) = (2 * b - other.width_mhz, 2 * b + other.width_mhz);
+        let mut best = 0.0_f64;
+        for (a_lo, a_hi) in &own_spans {
+            for (b_lo, b_hi) in &other_spans {
                 let shared = (a_hi.min(b_hi) - a_lo.max(b_lo)).max(0);
-                let narrower = own.width_mhz.min(other.width_mhz) * 2;
-                if narrower <= 0 {
-                    0.0
-                } else {
-                    (f64::from(shared) / f64::from(narrower)).min(1.0)
+                let fraction = (f64::from(shared) / f64::from(narrower)).min(1.0);
+                if fraction > best {
+                    best = fraction;
                 }
             }
-            _ => 0.0,
         }
+        best
     };
-    let confidence = if own.width_assumed || other.width_assumed {
+    let placement_guessed = own.band == other.band && (own_guessed || other_guessed);
+    let confidence = if own.width_assumed || other.width_assumed || placement_guessed {
         OverlapConfidence::Low
     } else if other_rssi_dbm.is_none() {
         OverlapConfidence::Medium
@@ -293,17 +341,34 @@ mod tests {
         assert_eq!(h.rssi_dbm, Some(-60));
     }
 
-    /// The 2.4 GHz rule from the measurement: numbers 5 apart no longer overlap,
-    /// and everything closer overlaps proportionally.
+    /// 2.4 GHz channels sit 5 MHz apart and are 20 MHz wide, so the shared
+    /// fraction is `(4 - |delta|) / 4` and channels 4 apart are already
+    /// disjoint — the classic 1/6/11 plan is exactly this arithmetic.
     #[test]
-    fn two_ghz_overlaps_below_five_channels_apart() {
+    fn two_ghz_overlaps_below_four_channels_apart() {
         let own = span(6, Band::TwoGhz, 20);
         let at = |c: i32| overlap_hypothesis(&own, &span(c, Band::TwoGhz, 20), None).overlap;
-        assert!((at(7) - 0.8).abs() < 1e-9);
-        assert!((at(4) - 0.6).abs() < 1e-9);
-        assert!((at(2) - 0.2).abs() < 1e-9);
-        assert_eq!(at(1), 0.0, "5 apart is the first non-overlapping pair");
-        assert_eq!(at(11), 0.0);
+        assert!((at(7) - 0.75).abs() < 1e-9);
+        assert!((at(4) - 0.5).abs() < 1e-9);
+        assert!((at(3) - 0.25).abs() < 1e-9);
+        assert_eq!(at(2), 0.0, "4 apart is the first non-overlapping pair");
+        assert_eq!(at(11), 0.0, "the 1/6/11 plan does not overlap");
+    }
+
+    /// A 2.4 GHz radio wider than 20 MHz bonds either up or down and the report
+    /// does not say which, so the larger of the two possible overlaps is taken
+    /// and the confidence drops. Understating a neighbour is the expensive
+    /// error; a confident zero would be a lie either way.
+    #[test]
+    fn two_ghz_wide_channel_admits_both_bondings() {
+        let own = span(1, Band::TwoGhz, 20);
+        let h = overlap_hypothesis(&own, &span(6, Band::TwoGhz, 40), Some(-43));
+        assert!(
+            h.overlap > 0.0,
+            "a 40 MHz radio on 6 bonded downward reaches channel 1: {}",
+            h.overlap
+        );
+        assert_eq!(h.confidence, OverlapConfidence::Low);
     }
 
     #[test]
@@ -320,23 +385,42 @@ mod tests {
         );
     }
 
-    /// A 20 MHz AP inside our 80 MHz channel covers all of the narrower channel:
-    /// the fraction is of the NARROWER span, so it reads 1.0 from either side.
+    /// The 5 GHz grid is nested: a wide channel occupies a fixed block, and a
+    /// 20 MHz channel is either wholly inside it or wholly outside. The reported
+    /// number names the PRIMARY inside that block, which is what makes the
+    /// naive "centre the width on the reported number" model wrong.
     #[test]
     fn five_ghz_narrow_inside_wide_is_total_for_the_narrow_one() {
-        // Our 80 MHz channel centred on 36 spans 5140..5220; channel 40 (5200)
-        // at 20 MHz spans 5190..5210, wholly inside.
+        // 80 MHz advertising primary 36 is bonded 36-48 → 5170..5250.
         let own = span(36, Band::FiveGhz, 80);
-        let h = overlap_hypothesis(&own, &span(40, Band::FiveGhz, 20), Some(-70));
-        assert!((h.overlap - 1.0).abs() < 1e-9);
-        // Symmetric: from the narrow radio's point of view the wide one covers
-        // it just as completely.
-        let h = overlap_hypothesis(&span(40, Band::FiveGhz, 20), &own, Some(-70));
+        // Channel 48 (5240) sits at the far end of that same block. Centring 80
+        // MHz on 36 would have placed us at 5140..5220 and called this disjoint.
+        let h = overlap_hypothesis(&own, &span(48, Band::FiveGhz, 20), Some(-70));
+        assert!(
+            (h.overlap - 1.0).abs() < 1e-9,
+            "channel 48 is inside our block: {}",
+            h.overlap
+        );
+        let h = overlap_hypothesis(&span(48, Band::FiveGhz, 20), &own, Some(-70));
+        assert!((h.overlap - 1.0).abs() < 1e-9, "and symmetrically");
+    }
+
+    /// The real neighbourhood this feature was built for: our 80 MHz on channel
+    /// 56 (block 52-64) against an 80 MHz neighbour advertising 44 (block
+    /// 36-48). The blocks are adjacent and share nothing; the naive model puts
+    /// them 20 MHz into each other and reports a quarter of our channel.
+    #[test]
+    fn five_ghz_adjacent_eighty_mhz_blocks_do_not_touch() {
+        let own = span(56, Band::FiveGhz, 80);
+        let h = overlap_hypothesis(&own, &span(44, Band::FiveGhz, 80), Some(-71));
+        assert_eq!(h.overlap, 0.0, "blocks 52-64 and 36-48 are disjoint");
+        // Same block, however, is a total overlap whichever primary is named.
+        let h = overlap_hypothesis(&own, &span(64, Band::FiveGhz, 80), Some(-71));
         assert!((h.overlap - 1.0).abs() < 1e-9);
     }
 
     #[test]
-    fn five_ghz_adjacent_channels_are_disjoint() {
+    fn five_ghz_adjacent_narrow_channels_are_disjoint() {
         // 36 (5180) and 48 (5240) at 20 MHz: 5170..5190 vs 5230..5250.
         let h = overlap_hypothesis(
             &span(36, Band::FiveGhz, 20),
@@ -346,24 +430,12 @@ mod tests {
         assert_eq!(h.overlap, 0.0);
     }
 
+    /// A 160 MHz block swallows the 80 MHz blocks inside it.
     #[test]
-    fn five_ghz_partial_overlap_is_a_fraction() {
-        // Our 20 MHz on 36 (5170..5190) against a 40 MHz on 38 (5190; 5170..5210):
-        // shared 5170..5190 = 20 of our 20 MHz.
-        let h = overlap_hypothesis(
-            &span(36, Band::FiveGhz, 20),
-            &span(38, Band::FiveGhz, 40),
-            Some(-70),
-        );
-        assert!((h.overlap - 1.0).abs() < 1e-9);
-        // Half-covering case: 40 MHz on 40 (5200; 5180..5220) over our 20 MHz on
-        // 36 (5170..5190) shares 5180..5190 = 10 of 20.
-        let h = overlap_hypothesis(
-            &span(36, Band::FiveGhz, 20),
-            &span(40, Band::FiveGhz, 40),
-            Some(-70),
-        );
-        assert!((h.overlap - 0.5).abs() < 1e-9, "got {}", h.overlap);
+    fn five_ghz_wide_block_covers_the_narrower_one_completely() {
+        let own = span(36, Band::FiveGhz, 160);
+        let h = overlap_hypothesis(&own, &span(56, Band::FiveGhz, 80), Some(-60));
+        assert!((h.overlap - 1.0).abs() < 1e-9, "got {}", h.overlap);
     }
 
     #[test]
