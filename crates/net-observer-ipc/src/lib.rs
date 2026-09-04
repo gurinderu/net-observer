@@ -183,37 +183,45 @@ pub struct IncidentSummary {
 /// [`Request::Subscribe`], to filter which kinds the daemon streams.
 ///
 /// `Copy` so a filter list is cheap to test against per event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum EventKind {
-    Link,
-    Proxy,
-    Dns,
-    Route,
-    Host,
-    Wifi,
-    Neighbors,
-    /// The radio environment: one scan of the foreign access points audible here.
-    Air,
-    Incident,
+///
+/// The variants, their labels and [`EventKind::ALL`] come from ONE list below, so
+/// a kind cannot exist without appearing in the enumeration — the daemon derives
+/// its declared capabilities by walking `ALL`, and a kind missing from it would
+/// be a collector silently announced as absent.
+macro_rules! event_kinds {
+    ($( $(#[$meta:meta])* $variant:ident => $label:literal ),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        pub enum EventKind {
+            $( $(#[$meta])* $variant, )+
+        }
+
+        impl EventKind {
+            /// Every kind this build knows, in declaration order.
+            pub const ALL: &'static [EventKind] = &[ $( EventKind::$variant, )+ ];
+
+            /// The short lowercase label for this kind — the same vocabulary the
+            /// CLI's `--kind` flag accepts and the bar's selector chips render.
+            /// Lives here so every consumer spells the kinds identically.
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $( EventKind::$variant => $label, )+
+                }
+            }
+        }
+    };
 }
 
-impl EventKind {
-    /// The short lowercase label for this kind — the same vocabulary the CLI's
-    /// `--kind` flag accepts and the bar's selector chips render. Lives here so
-    /// every consumer spells the kinds identically.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            EventKind::Link => "link",
-            EventKind::Proxy => "proxy",
-            EventKind::Dns => "dns",
-            EventKind::Route => "route",
-            EventKind::Host => "host",
-            EventKind::Wifi => "wifi",
-            EventKind::Neighbors => "neighbors",
-            EventKind::Air => "air",
-            EventKind::Incident => "incident",
-        }
-    }
+event_kinds! {
+    Link => "link",
+    Proxy => "proxy",
+    Dns => "dns",
+    Route => "route",
+    Host => "host",
+    Wifi => "wifi",
+    Neighbors => "neighbors",
+    /// The radio environment: one scan of the foreign access points audible here.
+    Air => "air",
+    Incident => "incident",
 }
 
 /// One live event pushed over a [`Request::Subscribe`] stream: either a fresh

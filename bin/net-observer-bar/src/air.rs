@@ -93,7 +93,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
@@ -121,6 +121,19 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// Bridge depth. Small on purpose: only the LATEST sample of each kind is kept,
 /// so a backlog has no value — dropping is as correct as queueing.
 const BRIDGE_DEPTH: usize = 32;
+/// How long the button may claim a scan is in progress with nothing arriving.
+///
+/// Both ends of the wait can be lost without a trace: the answer to the press
+/// travels the same bridge as the samples and is dropped when it is full, and the
+/// slice itself is an ordinary event that a subscription drop-and-reconnect can
+/// step over. Neither has a successor to correct it — the air collector is off by
+/// default, so no later event arrives to unstick the button. The deadline is the
+/// only thing that guarantees the busy state ends.
+///
+/// Generous on purpose: the daemon's own minimum gap between scans is 15s and the
+/// radio read costs seconds, so this must never fire on a scan that is merely
+/// slow.
+const SCAN_BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Initial window size (resizable afterwards), gpui logical px.
 const WIN_W: f32 = 620.0;
@@ -212,6 +225,12 @@ pub(crate) enum ScanState {
     Scanning,
     /// The daemon declined, in its own words — never paraphrased here.
     Refused(SharedString),
+    /// The bar waited [`SCAN_BUSY_TIMEOUT`] and no answer or slice arrived, so it
+    /// stopped claiming a scan is in progress. This is the WINDOW speaking, not
+    /// the daemon: the answer may have been dropped by a full bridge, or the
+    /// slice may have fallen into a subscription reconnect. Saying so is honest;
+    /// a button stuck on "Scanning…" for the life of the window is not.
+    LostTrack(SharedString),
     /// This daemon does not know the command at all. Not a refusal: it cannot,
     /// rather than will not.
     Unsupported(SharedString),
@@ -288,9 +307,37 @@ pub(crate) struct AirFeed {
     air_unsupported: bool,
     /// Where the operator-pressed scan has got to.
     scan: ScanState,
+    /// When the current busy state stops being believed. `Some` exactly while
+    /// `scan` is `Asking` or `Scanning`; see [`SCAN_BUSY_TIMEOUT`].
+    scan_deadline: Option<Instant>,
 }
 
 impl AirFeed {
+    /// The ONLY writer of `scan`, so a busy state can never be entered without
+    /// the deadline that ends it.
+    fn set_scan(&mut self, state: ScanState) {
+        self.scan_deadline = match state {
+            ScanState::Asking | ScanState::Scanning => Some(Instant::now() + SCAN_BUSY_TIMEOUT),
+            _ => None,
+        };
+        self.scan = state;
+    }
+
+    /// Give up on a busy state whose deadline has passed. Called on every drain
+    /// tick, so the button cannot outlive the answer it is waiting for.
+    fn expire_scan(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.scan_deadline else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+        self.set_scan(ScanState::LostTrack(
+            "no answer and no slice arrived; the scan may still have run".into(),
+        ));
+        true
+    }
+
     fn apply(&mut self, msg: BridgeMsg) {
         match msg {
             BridgeMsg::Frame(frame) => {
@@ -301,7 +348,7 @@ impl AirFeed {
                         // The slice we were waiting for arrived: the button stops
                         // claiming a scan is in progress.
                         if matches!(self.scan, ScanState::Asking | ScanState::Scanning) {
-                            self.scan = ScanState::Idle;
+                            self.set_scan(ScanState::Idle);
                         }
                     }
                     StreamFrame::Event(Event::Wifi(w)) => {
@@ -334,7 +381,7 @@ impl AirFeed {
             }
             BridgeMsg::Offline(reason) => self.offline = Some(reason.into()),
             BridgeMsg::Widened(widened) => self.air_unsupported = widened,
-            BridgeMsg::Scan(state) => self.scan = state,
+            BridgeMsg::Scan(state) => self.set_scan(state),
         }
     }
 
@@ -1289,7 +1336,7 @@ impl AirView {
     /// and never by optimism here.
     fn request_scan(&self, cx: &mut Context<Self>) {
         self.feed.update(cx, |feed, cx| {
-            feed.scan = ScanState::Asking;
+            feed.set_scan(ScanState::Asking);
             cx.notify();
         });
         let sock = self.socket_path.clone();
@@ -1306,11 +1353,17 @@ impl AirView {
                     Ok(ControlOutcome::Unsupported(m)) => ScanState::Unsupported(m.into()),
                     Err(e) => ScanState::Refused(format!("could not ask: {e}").into()),
                 };
-                bridge_send(&tx, BridgeMsg::Scan(state));
+                // BLOCKING send, unlike the frame path: a sample dropped by a
+                // full bridge is corrected by the next sample, but this state
+                // transition has no successor — dropping it strands the button on
+                // "Asking…". This thread exists only to carry this one answer,
+                // and the drain empties the bridge every DRAIN_POLL, so waiting
+                // here costs nothing anyone can see.
+                let _ = tx.send(BridgeMsg::Scan(state));
             })
         {
             self.feed.update(cx, |feed, cx| {
-                feed.scan = ScanState::Refused(format!("could not ask: {e}").into());
+                feed.set_scan(ScanState::Refused(format!("could not ask: {e}").into()));
                 cx.notify();
             });
         }
@@ -1596,6 +1649,7 @@ fn scan_bar(
             format!("this daemon does not know how to scan the air on demand: {m}").into(),
             theme.warn,
         )),
+        ScanState::LostTrack(m) => Some((format!("stopped waiting: {m}").into(), theme.warn)),
     };
     let mut button = div()
         .id("air-scan-now")
@@ -2011,10 +2065,14 @@ fn open_window(
                 }
             }
             let alive = weak.update(acx, |feed, cx| {
-                if !batch.is_empty() {
-                    for msg in batch {
-                        feed.apply(msg);
-                    }
+                let empty = batch.is_empty();
+                for msg in batch {
+                    feed.apply(msg);
+                }
+                // Checked on EVERY tick, batch or no batch: the failure this
+                // guards against is precisely the one where nothing arrives.
+                let expired = feed.expire_scan(Instant::now());
+                if !empty || expired {
                     cx.notify();
                 }
             });
@@ -2298,6 +2356,46 @@ mod tests {
         )))));
         assert_eq!(feed.scan, ScanState::Idle);
         assert!(feed.air.is_some());
+        // ...and the window is no longer waiting for anything.
+        assert!(feed.scan_deadline.is_none());
+    }
+
+    /// The busy state is bounded. Both things it waits for can vanish without a
+    /// successor — the answer dropped by a full bridge, the slice lost in a
+    /// subscription reconnect — and the air collector is off by default, so no
+    /// later event arrives to unstick the button. After the deadline the window
+    /// says it stopped waiting instead of claiming a scan forever.
+    #[test]
+    fn a_busy_button_cannot_wait_forever() {
+        for busy in [ScanState::Asking, ScanState::Scanning] {
+            let mut feed = AirFeed::default();
+            feed.apply(BridgeMsg::Scan(busy.clone()));
+            assert_eq!(feed.scan, busy);
+            // Nothing arrives; well inside the deadline the state still stands.
+            assert!(!feed.expire_scan(Instant::now()));
+            assert_eq!(feed.scan, busy);
+            // Past it, the button is released and says why.
+            assert!(feed.expire_scan(Instant::now() + SCAN_BUSY_TIMEOUT + Duration::from_secs(1)));
+            assert!(
+                matches!(feed.scan, ScanState::LostTrack(_)),
+                "expected LostTrack, got {:?}",
+                feed.scan
+            );
+            assert!(feed.scan_deadline.is_none());
+            // And it stays released: an expired state is not re-expired.
+            assert!(!feed.expire_scan(Instant::now() + SCAN_BUSY_TIMEOUT * 10));
+        }
+    }
+
+    /// A settled state carries no deadline at all — the timeout guards only the
+    /// waiting, never a refusal the daemon already delivered.
+    #[test]
+    fn a_settled_scan_state_is_never_expired() {
+        let mut feed = AirFeed::default();
+        feed.apply(BridgeMsg::Scan(ScanState::Refused("quiet is on".into())));
+        assert!(feed.scan_deadline.is_none());
+        assert!(!feed.expire_scan(Instant::now() + SCAN_BUSY_TIMEOUT * 10));
+        assert!(matches!(feed.scan, ScanState::Refused(_)));
     }
 
     /// A frame from a newer daemon costs one frame, and the window says which —
