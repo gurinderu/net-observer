@@ -26,14 +26,13 @@
 //! re-renders) and the status-item dot + tooltip. When the daemon is down the
 //! query fails and the shell renders a grey "offline" dot instead of crashing.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, Application, AsyncApp, Bounds, Context, Entity, Pixels, Timer, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px,
-    size,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, point, px, size,
 };
 
 use objc2::rc::Retained;
@@ -169,9 +168,6 @@ pub fn run(config: Option<String>, start: Option<crate::StartWindow>) {
         // the panel off-screen — so we must read the frame on the first click.
         // `Retained::clone` just bumps the refcount (same underlying button).
         let button_for_click = button.clone();
-        // Shared latch stamped by the click-away dismiss, so the same click that
-        // dismissed the panel doesn't immediately reopen it (see `toggle_panel`).
-        let dismissed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
         // 4. Wire the click: button -> ClickTarget.handleClick: -> flip the flag.
         //    Seed it with the panel request so `--open` / `--window panel` pops
@@ -234,14 +230,12 @@ pub fn run(config: Option<String>, start: Option<crate::StartWindow>) {
         // 6. Click task: poll the flag; on a click, toggle the anchored panel.
         cx.spawn({
             let model = model.clone();
-            let dismissed_at = dismissed_at.clone();
             async move |acx: &mut AsyncApp| {
                 // Keep the target alive: NSControl holds its target weakly.
                 let _target = target;
                 // The status-item button; the anchor is computed from its frame at
                 // open time (see `open_panel`), when it is actually laid out.
                 let button = button_for_click;
-                let mut panel: Option<WindowHandle<PanelView>> = None;
                 // The non-panel startup window, opened once on the first poll —
                 // by then the app is up and the model already holds the startup
                 // snapshot, so the window does not render on nothing. Same route
@@ -271,9 +265,7 @@ pub fn run(config: Option<String>, start: Option<crate::StartWindow>) {
                         }
                     }
                     if click_flag.swap(false, Ordering::AcqRel) {
-                        let alive = acx.update(|app| {
-                            toggle_panel(app, &mut panel, &model, &button, &dismissed_at)
-                        });
+                        let alive = acx.update(|app| toggle_panel(app, &model, &button));
                         if alive.is_err() {
                             break;
                         }
@@ -328,89 +320,104 @@ fn apply_glyph(button: &NSStatusBarButton, glance: &Glance) {
 
 /// Toggle the anchored panel: open it if closed, close it if open.
 ///
-/// This is the *click* path. It cooperates with the click-away dismiss (which
-/// closes the window when it loses key focus and stamps `dismissed_at`) to give a
-/// single predictable rule — a click flips the panel's visibility — despite the
-/// two racing on macOS (clicking the status item resigns the popup's key status):
+/// This is the *click* path. It cooperates with every other way the panel can go
+/// away — the click-away dismiss below, and the actions menu closing its parent
+/// from [`crate::menu`] — through one shared state machine on the model: the
+/// live window lives in `Glance::panel_window` and the moment of its dismissal
+/// in `Glance::panel_dismissed_at`. Both are written by [`close_panel`], whoever
+/// calls it, so there is a single predictable rule — a click flips the panel's
+/// visibility — despite the two racing on macOS (clicking the status item
+/// resigns the popup's key status):
 ///
 /// - If we still hold a live window, the click landed before any resign-key
 ///   dismissal: close it in place.
-/// - If the window is already gone, the click-away handler closed it. When that
-///   happened *just now* (within [`REOPEN_GUARD`]), this very click is what
-///   dismissed it, so we leave it closed; otherwise it was dismissed earlier and
-///   the click means "open again".
-fn toggle_panel(
-    cx: &mut App,
-    panel: &mut Option<WindowHandle<PanelView>>,
-    model: &Entity<Glance>,
-    button: &NSStatusBarButton,
-    dismissed_at: &Arc<Mutex<Option<Instant>>>,
-) {
-    if let Some(handle) = panel.take() {
-        // `update` succeeds only while the window is still open.
-        if handle
-            .update(cx, |_, window, _| window.remove_window())
-            .is_ok()
-        {
-            // Closed by this click; leave `panel` cleared.
-            return;
-        }
-        // Already dismissed by click-away. If that just happened, this click is
-        // the dismissing gesture — stay closed.
-        if recently_dismissed(dismissed_at) {
-            return;
-        }
-        // Dismissed a while ago: fall through and reopen.
+/// - If the window is already gone, something else closed it. When that happened
+///   *just now* (within [`REOPEN_GUARD`]), this very click is what dismissed it,
+///   so we leave it closed; otherwise it was dismissed earlier and the click
+///   means "open again".
+fn toggle_panel(cx: &mut App, model: &Entity<Glance>, button: &NSStatusBarButton) {
+    // `close_panel` reports whether a live window was actually removed; `false`
+    // means there was nothing open (or the handle had outlived its window).
+    if close_panel(cx, model) {
+        return;
     }
-    open_panel(cx, panel, model, button, dismissed_at);
+    if recently_dismissed(model, cx) {
+        return;
+    }
+    open_panel(cx, model, button);
 }
 
-/// True if the panel was dismissed by click-away within [`REOPEN_GUARD`].
-fn recently_dismissed(dismissed_at: &Arc<Mutex<Option<Instant>>>) -> bool {
-    dismissed_at
+/// Close the panel through the shared state machine: remove the window, stamp
+/// the dismissal so the click that caused it is not read as a request to reopen,
+/// and clear the handle so nothing later mistakes it for a live window.
+///
+/// This is the only sanctioned way to close the panel from outside this module —
+/// the actions menu closes its parent through it rather than reaching for the
+/// raw handle, which stamped nothing and cleared nothing, so the next click on
+/// the status item reopened the panel the same click had just closed.
+///
+/// Returns whether a live window was actually removed. `false` means there was
+/// no live panel; the handle is cleared either way, but only a real closing is
+/// stamped — a dismissal that already happened carries its own stamp.
+pub(crate) fn close_panel(cx: &mut App, model: &Entity<Glance>) -> bool {
+    let Some(handle) = model.read(cx).panel_window else {
+        return false;
+    };
+    // `update` succeeds only while the window is still open.
+    let closed = handle
+        .update(cx, |_, window, _| window.remove_window())
+        .is_ok();
+    if closed {
+        stamp_dismissal(model, cx);
+    }
+    model.update(cx, |g, _| g.panel_window = None);
+    closed
+}
+
+/// Record that the panel was dismissed now.
+fn stamp_dismissal(model: &Entity<Glance>, cx: &App) {
+    if let Ok(mut guard) = model.read(cx).panel_dismissed_at.lock() {
+        *guard = Some(Instant::now());
+    }
+}
+
+/// True if the panel was dismissed within [`REOPEN_GUARD`], by whichever path
+/// closed it.
+fn recently_dismissed(model: &Entity<Glance>, cx: &App) -> bool {
+    model
+        .read(cx)
+        .panel_dismissed_at
         .lock()
         .ok()
         .and_then(|guard| *guard)
         .is_some_and(|at| at.elapsed() < REOPEN_GUARD)
 }
 
-/// Open the anchored panel and store its handle. Wires the click-away dismiss:
-/// once the popup has been key and then loses it, it stamps `dismissed_at` and
-/// closes itself. Never panics — a failed open is logged, not fatal.
-fn open_panel(
-    cx: &mut App,
-    panel: &mut Option<WindowHandle<PanelView>>,
-    model: &Entity<Glance>,
-    button: &NSStatusBarButton,
-    dismissed_at: &Arc<Mutex<Option<Instant>>>,
-) {
-    let model = model.clone();
-    let dismissed_at = dismissed_at.clone();
-    // Raised while the actions menu owns the focus. Opening that menu takes key
-    // focus from this panel, and losing key focus is exactly what dismisses the
-    // panel — without the latch the panel would vanish the moment its own menu
-    // appeared, taking the menu's parent out from under it.
-    let menu_guard = model.read(cx).menu_focus_guard.clone();
+/// Open the anchored panel and record its handle on the model. Wires the
+/// click-away dismiss: once the popup has been key and then loses it, it stamps
+/// the dismissal and closes itself. Never panics — a failed open is logged, not
+/// fatal.
+fn open_panel(cx: &mut App, model: &Entity<Glance>, button: &NSStatusBarButton) {
+    let model_for_view = model.clone();
+    let model_for_wiring = model.clone();
     // Compute the anchor now, at open time: the button is laid out by now, so its
     // frame is real (a startup capture sees a zero frame and lands off-screen).
     let mtm =
         MainThreadMarker::new().expect("open_panel runs on the main thread (gpui App update)");
     let anchor = compute_anchor_bounds(button, mtm);
-    let model_for_handle = model.clone();
     let options = panel_window_options(anchor);
     let opened = cx.open_window(options, move |window, cx| {
         cx.new(move |cx| {
-            let view = PanelView::new(model, cx);
-            wire_click_away_dismiss(window, cx, menu_guard, dismissed_at);
+            let view = PanelView::new(model_for_view, cx);
+            wire_click_away_dismiss(window, cx, &model_for_wiring);
             view
         })
     });
     match opened {
         Ok(handle) => {
-            *panel = Some(handle);
-            // The menu needs its parent's handle: the click that dismisses the
-            // menu landed outside both, so it closes the panel too.
-            model_for_handle.update(cx, |g, _| g.panel_window = Some(handle.into()));
+            // The one record of the live panel: the click path and the actions
+            // menu both read it, and both clear it through `close_panel`.
+            model.update(cx, |g, _| g.panel_window = Some(handle.into()));
             // Accessory apps don't get key focus for free; activate so the panel
             // comes to the front, is interactive, and can register losing key
             // focus (the click-away dismiss).
@@ -424,10 +431,10 @@ fn open_panel(
 /// popup once it has been active and then resigns key.
 ///
 /// The `was_active` latch skips the opening activation (and any spurious
-/// deactivate before the panel is ever shown). `menu_guard` is raised while the
-/// actions menu owns the focus — opening that menu takes key focus from this
-/// panel, and without the latch the panel would vanish the moment its own menu
-/// appeared, taking the menu's parent out from under it.
+/// deactivate before the panel is ever shown). `Glance::menu_focus_guard` is
+/// raised while the actions menu owns the focus — opening that menu takes key
+/// focus from this panel, and without the latch the panel would vanish the moment
+/// its own menu appeared, taking the menu's parent out from under it.
 ///
 /// `detach` keeps the subscription alive for the window's lifetime — it is
 /// dropped with the window — so we needn't store it, and `PanelView` (ui.rs)
@@ -439,17 +446,22 @@ fn open_panel(
 fn wire_click_away_dismiss(
     window: &mut Window,
     cx: &mut Context<PanelView>,
-    menu_guard: Arc<AtomicBool>,
-    dismissed_at: Arc<Mutex<Option<Instant>>>,
+    model: &Entity<Glance>,
 ) {
+    let menu_guard = model.read(cx).menu_focus_guard.clone();
+    let dismissed_at = model.read(cx).panel_dismissed_at.clone();
+    let model = model.clone();
     let mut was_active = false;
-    cx.observe_window_activation(window, move |_view, window, _cx| {
+    cx.observe_window_activation(window, move |_view, window, cx| {
         if window.is_window_active() {
             was_active = true;
         } else if was_active && !menu_guard.load(Ordering::SeqCst) {
             if let Ok(mut guard) = dismissed_at.lock() {
                 *guard = Some(Instant::now());
             }
+            // Clear the shared handle with the window it names: a handle that
+            // outlives its window reads as a live one everywhere else.
+            model.update(cx, |g, _| g.panel_window = None);
             window.remove_window();
         }
     })
@@ -559,10 +571,15 @@ fn compute_anchor_bounds(button: &NSStatusBarButton, mtm: MainThreadMarker) -> B
 #[cfg(test)]
 mod headless_tests {
     use super::*;
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
     use net_observer_ipc::StatusSnapshot;
+    use std::sync::Mutex;
 
     /// Open a panel window wired exactly as [`open_panel`] wires the real one.
+    ///
+    /// The dismissal stamp comes back out of the model rather than being made
+    /// here: it is shared state now, and a test-owned latch would not be the one
+    /// the closing paths write.
     fn panel(
         cx: &mut TestAppContext,
     ) -> (
@@ -579,13 +596,12 @@ mod headless_tests {
                 )
             })
         });
-        let dismissed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-        let guard = cx.update(|cx| model.read(cx).menu_focus_guard.clone());
+        let dismissed_at = cx.update(|cx| model.read(cx).panel_dismissed_at.clone());
         let for_view = model.clone();
-        let for_wiring = dismissed_at.clone();
+        let for_wiring = model.clone();
         let window = cx.add_window(move |window, cx| {
             let view = PanelView::new(for_view, cx);
-            wire_click_away_dismiss(window, cx, guard, for_wiring);
+            wire_click_away_dismiss(window, cx, &for_wiring);
             view
         });
         cx.update(|cx| {
@@ -662,7 +678,7 @@ mod headless_tests {
     /// never dismisses itself at all.
     #[gpui::test]
     fn the_panel_still_dismisses_on_a_plain_click_away(cx: &mut TestAppContext) {
-        let (_model, window, dismissed) = panel(cx);
+        let (model, window, dismissed) = panel(cx);
         let mut vcx = VisualTestContext::from_window(window.into(), cx);
         vcx.update(|window, _| window.activate_window());
         vcx.run_until_parked();
@@ -677,6 +693,10 @@ mod headless_tests {
             dismissed.lock().expect("dismissal stamp").is_some(),
             "the dismissal must be stamped, so the next status-item click reopens \
              rather than being swallowed as the dismissing gesture"
+        );
+        assert!(
+            cx.update(|cx| model.read(cx).panel_window.is_none()),
+            "the shared handle must go with the window it names"
         );
     }
 
@@ -723,6 +743,71 @@ mod headless_tests {
         assert!(
             is_open(cx, window),
             "the panel must survive the click that dismissed its menu"
+        );
+    }
+
+    /// A click landing outside *both* windows closes both — and closes the panel
+    /// the way the status-item click can read.
+    ///
+    /// The menu closes its parent, and it used to do so through the raw window
+    /// handle: the window went, but the moment of its dismissal was never stamped
+    /// and the shared handle was never cleared. The visible defect was the click
+    /// on the status item that dismissed the pair reopening the panel
+    /// immediately, because nothing recorded that this very click had closed it.
+    ///
+    /// The two things `toggle_panel` reads are asserted directly — it needs a
+    /// real `NSStatusBarButton` for its anchor and so cannot be called headless,
+    /// but its inputs can be: `recently_dismissed` (the click is the dismissing
+    /// gesture, so it must not reopen) and `panel_window` (nothing may still read
+    /// as a live window).
+    #[gpui::test]
+    fn a_click_outside_both_windows_closes_the_panel_through_its_state_machine(
+        cx: &mut TestAppContext,
+    ) {
+        let (model, window, dismissed) = panel(cx);
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, _| window.activate_window());
+        vcx.run_until_parked();
+        let trigger = vcx
+            .debug_bounds("menu-trigger")
+            .expect("the footer's Menu row was laid out");
+        vcx.simulate_click(trigger.center(), Modifiers::none());
+        vcx.run_until_parked();
+        let menu = vcx
+            .update(|_, cx| model.read(cx).menu_window)
+            .expect("precondition: the menu is open");
+        activate_menu(&mut vcx, &model);
+
+        // Past `crate::menu::OPEN_GRACE`, which is wall-clock, so that the menu
+        // stops ignoring the loss of focus.
+        std::thread::sleep(Duration::from_millis(340));
+        // The operator clicks outside both windows: the menu resigns key and the
+        // panel does not take it.
+        let mut menu_cx = VisualTestContext::from_window(menu, cx);
+        menu_cx.deactivate_window();
+        menu_cx.run_until_parked();
+        // `close_panel_unless_it_took_focus` waits on the executor's timer.
+        menu_cx.executor().advance_clock(Duration::from_millis(400));
+        menu_cx.run_until_parked();
+
+        assert!(
+            cx.update(|cx| model.read(cx).menu_window.is_none()),
+            "the menu must close on a click outside both windows"
+        );
+        assert!(!is_open(cx, window), "the panel must close with it");
+        assert!(
+            dismissed.lock().expect("dismissal stamp").is_some(),
+            "the moment of the dismissal must be stamped, or the click that \
+             caused it reopens the panel it just closed"
+        );
+        assert!(
+            cx.update(|cx| recently_dismissed(&model, cx)),
+            "the next status-item click must read this as the dismissing gesture \
+             and leave the panel closed"
+        );
+        assert!(
+            cx.update(|cx| model.read(cx).panel_window.is_none()),
+            "the handle must not outlive the window it names"
         );
     }
 }
