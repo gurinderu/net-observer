@@ -359,7 +359,14 @@ fn role_basis(role: NeighborRole, is_gateway: bool) -> &'static str {
 /// edge (which made `192.168.0.129` read as `192.168.0.12`).
 fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement {
     let dot = node_accent(node, is_gateway, theme);
+    // Test handles only: no-ops unless gpui's `test-support` is on (dev-dependency),
+    // where they make the chip's and the label's laid-out bounds readable, so the
+    // headless UI tests can assert that chips do not overlap each other or the
+    // centre, and that a label stays inside its own chip (see `headless_ui.rs`).
+    let chip_selector = format!("map-chip:{}", node.label);
+    let label_selector = format!("map-label:{}", node.label);
     let mut chip = div()
+        .debug_selector(move || chip_selector)
         .flex()
         .items_center()
         .gap_1()
@@ -404,6 +411,7 @@ fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement
                 // The label is the line that may be shortened: a hostname has
                 // no fixed width and an ellipsis says plainly that it was cut.
                 div()
+                    .debug_selector(move || label_selector)
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
@@ -1833,5 +1841,163 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert!((p[0].0 - 100.0).abs() < 0.001, "x centred");
         assert!((p[0].1 - 50.0).abs() < 0.001, "y above centre");
+    }
+}
+
+/// Headless UI tests for the network map, on gpui's own test platform: layout
+/// and scene construction run for real, rasterization does not.
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+    use crate::ui::Glance;
+    use gpui::{Size, TestAppContext, VisualTestContext};
+    use types::NeighborSource;
+
+    fn obs(host: &str, last_octet: u8) -> NeighborObs {
+        NeighborObs {
+            mac: format!("aa:bb:cc:dd:ee:{last_octet:02x}"),
+            ip: format!("192.168.1.{last_octet}"),
+            source: NeighborSource::Arp,
+            hostname: Some(host.to_string()),
+            role: NeighborRole::Unknown,
+        }
+    }
+
+    /// Chips fit the window, never sit on top of each other or on the centre, and
+    /// every label stays inside its own chip — at a small window and a large one.
+    ///
+    /// The star is laid out from the space the window actually gives it
+    /// ([`plot_for`]), so its correctness is a function of window size, and the
+    /// old failures were exactly size-dependent: chips crowding the gateway at
+    /// the centre, and labels spilling past a chip's edge. Both were caught by
+    /// eye on screenshots, at whatever size the screenshot happened to be.
+    #[gpui::test]
+    fn map_chips_fit_and_never_collide_at_several_window_sizes(cx: &mut TestAppContext) {
+        let neighbors = vec![
+            obs("gw", 1),
+            obs("alpha", 20),
+            obs("bravo", 21),
+            obs("charlie", 22),
+            obs("delta", 23),
+        ];
+        let gateway_mac = neighbors[0].mac.clone();
+        let snapshot = StatusSnapshot {
+            neighbors: Some(NeighborsSample {
+                ts_us: 1,
+                verdict: types::NeighborsVerdict::Ok,
+                reason: None,
+                network_key: Some(gateway_mac),
+                iface: Some("en0".to_string()),
+                neighbors,
+            }),
+            ..Default::default()
+        };
+        let model = cx.update(|cx| {
+            cx.new(|_| {
+                Glance::new(
+                    snapshot.clone(),
+                    None,
+                    "/tmp/net-observer-test.sock".to_string(),
+                )
+            })
+        });
+        let for_view = model.clone();
+        let window = cx.add_window(|_, cx| MapView::new(for_view, cx));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        // The real window is drawn at each size — `MapView::render` fits the star
+        // to `viewport_size()`, so the layout under test is size-dependent by
+        // construction and one size proves nothing about the other.
+        //
+        // `fits` says whether the box is big enough for [`plot_for`] to honour
+        // its own fit: below that the radius is floored at [`min_ring_radius`]
+        // and a chip is *deliberately* allowed past the edge, because overlapping
+        // the gateway would be the worse fault. The map window's own default
+        // (`WIN_W`×`WIN_H`) is in that regime, so containment is asserted only
+        // where the code claims it — never suppressed where it does.
+        for (w, h, fits) in [
+            (WIN_W, WIN_H, false),
+            (460.0_f32, 520.0_f32, true),
+            (900.0_f32, 700.0_f32, true),
+        ] {
+            let viewport = size(px(w), px(h));
+            cx.simulate_resize(viewport);
+            cx.run_until_parked();
+            assert_eq!(
+                cx.update(|window, _| window.viewport_size()),
+                viewport,
+                "the test window must be {w}x{h}"
+            );
+
+            // What this size actually draws: over capacity the surplus is
+            // summarised as "+N more" rather than crammed onto the ring.
+            let plot = plot_for(w - MAP_SIDE_PAD, h - MAP_CHROME_H);
+            let sample = snapshot
+                .neighbors
+                .as_ref()
+                .expect("the fixture carries a neighbours sample");
+            let (gateway, ring, _more) = partition(sample, plot.capacity);
+            let mut expected: Vec<String> = ring.iter().map(|n| n.label.clone()).collect();
+            expected.extend(gateway.iter().map(|n| n.label.clone()));
+
+            let mut chips = Vec::new();
+            for label in &expected {
+                let chip_sel: &'static str =
+                    Box::leak(format!("map-chip:{label}").into_boxed_str());
+                let label_sel: &'static str =
+                    Box::leak(format!("map-label:{label}").into_boxed_str());
+                let chip = cx.debug_bounds(chip_sel).unwrap_or_else(|| {
+                    panic!("chip `{label}` was not laid out at {w}x{h} at all")
+                });
+                assert!(
+                    !fits || contains(viewport, chip),
+                    "chip `{label}` leaves the {w}x{h} window: {chip:?}"
+                );
+                let text = cx
+                    .debug_bounds(label_sel)
+                    .unwrap_or_else(|| panic!("label of `{label}` was not laid out at {w}x{h}"));
+                assert!(
+                    within(chip, text),
+                    "the label of `{label}` spills out of its own chip at {w}x{h}: \
+                     label {text:?} vs chip {chip:?}"
+                );
+                chips.push((label.clone(), chip));
+            }
+
+            for (i, (a_id, a)) in chips.iter().enumerate() {
+                for (b_id, b) in chips.iter().skip(i + 1) {
+                    assert!(
+                        !overlaps(*a, *b),
+                        "chips `{a_id}` and `{b_id}` overlap at {w}x{h}: {a:?} vs {b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `inner` lies wholly inside a viewport of `outer` anchored at the origin.
+    fn contains(outer: Size<Pixels>, inner: Bounds<Pixels>) -> bool {
+        inner.origin.x >= px(0.0)
+            && inner.origin.y >= px(0.0)
+            && inner.origin.x + inner.size.width <= outer.width
+            && inner.origin.y + inner.size.height <= outer.height
+    }
+
+    /// `inner` lies wholly inside `outer`, both in absolute window coordinates.
+    /// A half-pixel of slack absorbs the rounding of a flex layout, not a spill.
+    fn within(outer: Bounds<Pixels>, inner: Bounds<Pixels>) -> bool {
+        let slack = px(0.5);
+        inner.origin.x + slack >= outer.origin.x
+            && inner.origin.y + slack >= outer.origin.y
+            && inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width + slack
+            && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height + slack
+    }
+
+    /// Half-open rectangle intersection: touching edges are not an overlap.
+    fn overlaps(a: Bounds<Pixels>, b: Bounds<Pixels>) -> bool {
+        a.origin.x < b.origin.x + b.size.width
+            && b.origin.x < a.origin.x + a.size.width
+            && a.origin.y < b.origin.y + b.size.height
+            && b.origin.y < a.origin.y + a.size.height
     }
 }

@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext, Application, AsyncApp, Bounds, Entity, Pixels, Timer,
+    App, AppContext, Application, AsyncApp, Bounds, Context, Entity, Pixels, Timer, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px,
     size,
 };
@@ -57,10 +57,10 @@ const REFRESH: Duration = Duration::from_secs(3);
 const CLICK_POLL: Duration = Duration::from_millis(100);
 /// Fixed size of the anchored panel (a compact dropdown, not a resizable
 /// workspace). Width/height in gpui logical pixels.
-const PANEL_W: f64 = 320.0;
+pub(crate) const PANEL_W: f64 = 320.0;
 // Grown by the height of the two sparklines (caption + 28pt plot each, plus their
 // separator) added above the status rows.
-const PANEL_H: f64 = 560.0;
+pub(crate) const PANEL_H: f64 = 560.0;
 /// After a click-away dismissal, a status-item click that arrives within this
 /// window is treated as the gesture that *caused* the dismissal (so the panel
 /// stays closed) rather than a request to reopen it. It must comfortably cover
@@ -401,25 +401,7 @@ fn open_panel(
     let opened = cx.open_window(options, move |window, cx| {
         cx.new(move |cx| {
             let view = PanelView::new(model, cx);
-            // Dismiss-on-click-away via gpui's window-activation observation:
-            // close the popup once it has been active and then resigns key. The
-            // `was_active` latch skips the opening activation (and any spurious
-            // deactivate before the panel is ever shown). `detach` keeps the
-            // subscription alive for the window's lifetime — it is dropped with
-            // the window — so we needn't store it, and `PanelView` (ui.rs) stays
-            // untouched.
-            let mut was_active = false;
-            cx.observe_window_activation(window, move |_view, window, _cx| {
-                if window.is_window_active() {
-                    was_active = true;
-                } else if was_active && !menu_guard.load(std::sync::atomic::Ordering::SeqCst) {
-                    if let Ok(mut guard) = dismissed_at.lock() {
-                        *guard = Some(Instant::now());
-                    }
-                    window.remove_window();
-                }
-            })
-            .detach();
+            wire_click_away_dismiss(window, cx, menu_guard, dismissed_at);
             view
         })
     });
@@ -436,6 +418,42 @@ fn open_panel(
         }
         Err(e) => eprintln!("net-observer-bar: failed to open panel window: {e}"),
     }
+}
+
+/// Dismiss-on-click-away via gpui's window-activation observation: close the
+/// popup once it has been active and then resigns key.
+///
+/// The `was_active` latch skips the opening activation (and any spurious
+/// deactivate before the panel is ever shown). `menu_guard` is raised while the
+/// actions menu owns the focus — opening that menu takes key focus from this
+/// panel, and without the latch the panel would vanish the moment its own menu
+/// appeared, taking the menu's parent out from under it.
+///
+/// `detach` keeps the subscription alive for the window's lifetime — it is
+/// dropped with the window — so we needn't store it, and `PanelView` (ui.rs)
+/// stays untouched.
+///
+/// Split out of [`open_panel`] (whose other half needs a real `NSStatusBarButton`
+/// for the anchor) so the headless UI tests can raise exactly this wiring on a
+/// gpui test window.
+fn wire_click_away_dismiss(
+    window: &mut Window,
+    cx: &mut Context<PanelView>,
+    menu_guard: Arc<AtomicBool>,
+    dismissed_at: Arc<Mutex<Option<Instant>>>,
+) {
+    let mut was_active = false;
+    cx.observe_window_activation(window, move |_view, window, _cx| {
+        if window.is_window_active() {
+            was_active = true;
+        } else if was_active && !menu_guard.load(Ordering::SeqCst) {
+            if let Ok(mut guard) = dismissed_at.lock() {
+                *guard = Some(Instant::now());
+            }
+            window.remove_window();
+        }
+    })
+    .detach();
 }
 
 /// Window options for the anchored dropdown: a borderless, fixed-size
@@ -532,5 +550,179 @@ fn compute_anchor_bounds(button: &NSStatusBarButton, mtm: MainThreadMarker) -> B
             origin: point(px(0.0), px(0.0)),
             size: panel_size,
         },
+    }
+}
+
+/// Headless UI tests for the panel's dismissal wiring, on gpui's own test
+/// platform: real windows, real activation transitions, no display and no
+/// rasterization.
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use net_observer_ipc::StatusSnapshot;
+
+    /// Open a panel window wired exactly as [`open_panel`] wires the real one.
+    fn panel(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Glance>,
+        WindowHandle<PanelView>,
+        Arc<Mutex<Option<Instant>>>,
+    ) {
+        let model = cx.update(|cx| {
+            cx.new(|_| {
+                Glance::new(
+                    StatusSnapshot::default(),
+                    None,
+                    "/tmp/net-observer-test.sock".to_string(),
+                )
+            })
+        });
+        let dismissed_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let guard = cx.update(|cx| model.read(cx).menu_focus_guard.clone());
+        let for_view = model.clone();
+        let for_wiring = dismissed_at.clone();
+        let window = cx.add_window(move |window, cx| {
+            let view = PanelView::new(for_view, cx);
+            wire_click_away_dismiss(window, cx, guard, for_wiring);
+            view
+        });
+        cx.update(|cx| {
+            model.update(cx, |g, _| g.panel_window = Some(window.into()));
+        });
+        (model, window, dismissed_at)
+    }
+
+    /// Give the actions menu the key focus, as the window server does when it
+    /// opens.
+    fn activate_menu(cx: &mut VisualTestContext, model: &Entity<Glance>) {
+        let menu = cx
+            .update(|_, cx| model.read(cx).menu_window)
+            .expect("the actions menu is open");
+        cx.update(|_, cx| {
+            menu.update(cx, |_, window, _| window.activate_window())
+                .expect("the menu window is live");
+        });
+        cx.run_until_parked();
+    }
+
+    fn is_open(cx: &mut TestAppContext, window: WindowHandle<PanelView>) -> bool {
+        let handle: gpui::AnyWindowHandle = window.into();
+        cx.windows().contains(&handle)
+    }
+
+    /// Opening the actions menu must not take the panel down with it.
+    ///
+    /// The panel dismisses itself when it resigns key focus, and opening its own
+    /// menu is exactly that. The regression this pins: the panel vanishing under
+    /// the cursor the instant its menu appeared, which was only ever visible by
+    /// clicking "Menu" and watching.
+    #[gpui::test]
+    fn the_panel_survives_its_own_menu_taking_focus(cx: &mut TestAppContext) {
+        let (model, window, _dismissed) = panel(cx);
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, _| window.activate_window());
+        vcx.run_until_parked();
+
+        let trigger = vcx
+            .debug_bounds("menu-trigger")
+            .expect("the footer's Menu row was laid out");
+        vcx.simulate_click(trigger.center(), Modifiers::none());
+        vcx.run_until_parked();
+
+        assert!(
+            vcx.update(|_, cx| model.read(cx).menu_window.is_some()),
+            "clicking the footer's Menu row must open the actions menu"
+        );
+        assert!(
+            vcx.update(|_, cx| model
+                .read(cx)
+                .menu_focus_guard
+                .load(std::sync::atomic::Ordering::SeqCst)),
+            "the focus guard must be raised while the menu owns the focus"
+        );
+
+        // The menu takes key focus, which is what deactivates the panel — assert
+        // the deactivation really happened, or "the panel survived" would be
+        // true of a panel that was simply never asked to close.
+        activate_menu(&mut vcx, &model);
+        assert!(
+            !vcx.update(|window, _| window.is_window_active()),
+            "precondition: the menu taking focus deactivates the panel"
+        );
+        assert!(
+            is_open(cx, window),
+            "the panel closed when its own menu took the focus"
+        );
+    }
+
+    /// The negative control: with no menu open, resigning key focus *does* close
+    /// the panel. Without this, the test above would still pass on a panel that
+    /// never dismisses itself at all.
+    #[gpui::test]
+    fn the_panel_still_dismisses_on_a_plain_click_away(cx: &mut TestAppContext) {
+        let (_model, window, dismissed) = panel(cx);
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, _| window.activate_window());
+        vcx.run_until_parked();
+        vcx.deactivate_window();
+        vcx.run_until_parked();
+
+        assert!(
+            !is_open(cx, window),
+            "a click away with no menu open must dismiss the panel"
+        );
+        assert!(
+            dismissed.lock().expect("dismissal stamp").is_some(),
+            "the dismissal must be stamped, so the next status-item click reopens \
+             rather than being swallowed as the dismissing gesture"
+        );
+    }
+
+    /// A click landing *in the panel* dismisses the menu and leaves the panel
+    /// alone.
+    ///
+    /// Clicking into the panel deactivates the menu exactly like clicking away
+    /// does, and at that instant the panel is not yet key — which is how the
+    /// panel used to close under the operator's own click. The handoff delay is
+    /// what distinguishes the two, and this drives it end to end.
+    #[gpui::test]
+    fn clicking_into_the_panel_closes_the_menu_but_not_the_panel(cx: &mut TestAppContext) {
+        let (model, window, _dismissed) = panel(cx);
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, _| window.activate_window());
+        vcx.run_until_parked();
+        let trigger = vcx
+            .debug_bounds("menu-trigger")
+            .expect("the footer's Menu row was laid out");
+        vcx.simulate_click(trigger.center(), Modifiers::none());
+        vcx.run_until_parked();
+        assert!(
+            vcx.update(|_, cx| model.read(cx).menu_window.is_some()),
+            "precondition: the menu is open"
+        );
+        activate_menu(&mut vcx, &model);
+
+        // The menu ignores losing focus for `crate::menu::OPEN_GRACE`, and that
+        // grace is wall-clock (`Instant`), not the test executor's simulated
+        // clock — so this one wait is real. It is the only sleep in the suite.
+        std::thread::sleep(Duration::from_millis(340));
+        // The operator clicks in the panel: the panel becomes key, which is the
+        // menu's deactivation.
+        vcx.update(|window, _| window.activate_window());
+        vcx.run_until_parked();
+        // `close_panel_unless_it_took_focus` waits on the executor's timer.
+        vcx.executor().advance_clock(Duration::from_millis(400));
+        vcx.run_until_parked();
+
+        assert!(
+            vcx.update(|_, cx| model.read(cx).menu_window.is_none()),
+            "the menu must close when the click lands in the panel"
+        );
+        assert!(
+            is_open(cx, window),
+            "the panel must survive the click that dismissed its menu"
+        );
     }
 }

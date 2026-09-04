@@ -52,3 +52,8 @@ objc2-app-kit = { version = "0.3", features = [
 
 [dev-dependencies]
 tempfile.workspace = true
+# Headless UI tests: gpui ships a test platform (`src/platform/test/`) whose window
+# implements `draw(&Scene)` as a no-op, so layout and scene construction run for
+# real while rasterization does not. Enabled only here, so a normal
+# `cargo build -p net-observer-bar` never pulls it in.
+gpui = { workspace = true, features = ["test-support"] }
