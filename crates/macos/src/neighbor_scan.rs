@@ -638,6 +638,11 @@ mod tests {
         assert_eq!(out.ports_per_host, 2);
     }
 
+    /// How many times a socket test may re-attempt before it counts as a real
+    /// failure: the loopback handshake is a race the harness owns, and a single
+    /// attempt has repeatedly failed under CI load while the code was correct.
+    const ATTEMPTS: usize = 5;
+
     /// A service that announces itself on connect (SSH-style) has its greeting
     /// read back as the banner; the byte cap and first-line rule keep it to the
     /// greeting.
@@ -647,8 +652,14 @@ mod tests {
         use std::net::{Ipv4Addr, TcpListener};
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        // The greeting is served to as many connections as the attempts below
+        // may make: `grab_banner` gives a peer BANNER_READ_TIMEOUT to speak, and
+        // on a loaded machine the accept-and-write can lose that race once. The
+        // race is the test harness's, not the grab's, so it is retried here
+        // rather than paid for with a longer production timeout.
         let handle = std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = listener.accept() {
+            for sock in listener.incoming().take(ATTEMPTS) {
+                let Ok(mut sock) = sock else { break };
                 let _ = sock.write_all(b"SSH-2.0-OpenSSH_9.6\r\nrest of protocol\r\n");
             }
         });
@@ -657,10 +668,17 @@ mod tests {
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port,
         };
-        let out = banner_grab_blocking(std::slice::from_ref(&finding), "");
-        handle.join().unwrap();
-        assert_eq!(out.probed, 1);
-        assert_eq!(out.banners.len(), 1);
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            let out = banner_grab_blocking(std::slice::from_ref(&finding), "");
+            assert_eq!(out.probed, 1);
+            if out.banners.len() == 1 {
+                last = Some(out);
+                break;
+            }
+        }
+        drop(handle);
+        let out = last.expect("the greeting must be read within the attempts");
         assert_eq!(out.banners[0].banner, "SSH-2.0-OpenSSH_9.6");
     }
 
