@@ -547,6 +547,11 @@ pub fn scan_round_trip_base(
 pub struct PanelView {
     model: Entity<Glance>,
     _observe: Subscription,
+    /// Whether the actions menu is open. The panel is a fixed 320 px popover and
+    /// the controls outgrew a row: laid out in one line the last of them fell
+    /// outside it and simply did not appear. They live in a menu now, so the
+    /// next one costs a menu entry rather than an invisible button.
+    menu_open: bool,
 }
 
 impl PanelView {
@@ -557,6 +562,7 @@ impl PanelView {
         Self {
             model,
             _observe: observe,
+            menu_open: false,
         }
     }
 }
@@ -607,6 +613,7 @@ impl Render for PanelView {
                 now_us,
                 control_msg,
                 protocol_msg,
+                self.menu_open,
                 theme,
                 cx,
             ))
@@ -905,6 +912,22 @@ fn incidents_section(incidents: &[IncidentSummary], now_us: i64, theme: Theme) -
     }
 }
 
+/// One entry of the actions menu: the control itself, stretched to the menu's
+/// width so the whole row is the target rather than the few pixels of its label.
+fn menu_row(control: impl IntoElement) -> impl IntoElement {
+    div().flex().w_full().child(control)
+}
+
+/// A heading inside the actions menu: what the entries under it do.
+fn menu_section(label: &str, theme: Theme) -> impl IntoElement {
+    div()
+        .px_2()
+        .pt_1()
+        .text_size(px(10.0))
+        .text_color(rgb(theme.muted))
+        .child(label.to_string())
+}
+
 /// The footer (pinned at the bottom of the panel): a muted freshness line (+ the
 /// last control-action outcome and any protocol error, if present), and subtle
 /// text actions — "Events" (opens the live event-log window), "Refresh", and
@@ -918,6 +941,7 @@ fn footer(
     now_us: i64,
     control_msg: Option<String>,
     protocol_msg: Option<String>,
+    menu_open: bool,
     theme: Theme,
     cx: &mut Context<PanelView>,
 ) -> impl IntoElement {
@@ -1060,30 +1084,56 @@ fn footer(
         .child("Quit")
         .on_click(|_, _window, cx: &mut App| cx.quit());
 
+    // The panel is a fixed 320 logical pixels wide and the controls outgrew one
+    // row: laid out in a single line the last of them fall outside the panel and
+    // simply do not appear, and a control that cannot be seen is a control that
+    // does not exist. They live in a menu now — the trigger stays one item wide
+    // however many actions there are, and the list is grouped by what an entry
+    // does: windows to open, then the daemon's own controls, then leaving.
+    let trigger = div()
+        .id("menu-trigger")
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        .text_color(rgb(theme.accent))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme.hover)))
+        .child(if menu_open { "Menu ▴" } else { "Menu ▾" })
+        .on_click(cx.listener(|this, _, _window, cx| {
+            this.menu_open = !this.menu_open;
+            cx.notify();
+        }));
+
+    let menu = menu_open.then(|| {
+        div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .mb_1()
+            .p_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgba(theme.edge))
+            .bg(rgba(theme.surface))
+            .child(menu_section("windows", theme))
+            .child(menu_row(events))
+            .child(menu_row(map))
+            .child(menu_row(air))
+            .child(menu_section("daemon", theme))
+            .child(menu_row(freeze))
+            .child(menu_row(quiet))
+            .child(menu_row(scan))
+            .child(menu_section("panel", theme))
+            .child(menu_row(refresh))
+            .child(menu_row(quit))
+    });
+
     let actions = div()
         .flex()
-        .items_center()
-        .justify_between()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(events)
-                .child(map)
-                .child(air)
-                .child(freeze)
-                .child(quiet)
-                .child(scan),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(refresh)
-                .child(quit),
-        );
+        .flex_col()
+        .children(menu)
+        .child(div().flex().items_center().gap_1().child(trigger));
 
     let mut meta = div().flex().flex_col().gap_0p5().child(
         div()
