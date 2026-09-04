@@ -30,12 +30,33 @@
 //! gpui foreground drain) is the same shape as the event-log window's; see
 //! [`crate::events`] for the reasoning behind it.
 //!
+//! ## Talking to a daemon older than this bar
+//!
+//! A daemon built before `EventKind::Air` existed cannot decode that filter and
+//! rejects the WHOLE subscription — so a bar that just gave up would lose the
+//! `Wifi` frames too, and could not even say what channel this Mac is on.
+//! [`net_observer_ipc::subscribe_or_widen`] therefore retries unfiltered (a
+//! request naming no kind at all, which no daemon can fail to read) and this
+//! window filters client-side instead, exactly as the event log already does.
+//!
+//! The narrowing is remembered rather than swallowed: such a daemon cannot
+//! collect the air at all, and the window says THAT instead of "no scan yet".
+//!
 //! ## SKIP, never silence
 //!
-//! Three states are distinguished, because collapsing them would be the exact
-//! lie this daemon exists to avoid: no scan has arrived yet (the collector is off
-//! by default), the scan ran and failed (`Skip` + its reason), and the scan ran
-//! and heard nobody. Only the last one is empty air.
+//! Four states are distinguished, because collapsing them would be the exact
+//! lie this daemon exists to avoid: this daemon cannot collect the air at all,
+//! no scan has arrived yet (the collector is off by default), the scan ran and
+//! failed (`Skip` + its reason), and the scan ran and heard nobody. Only the last
+//! one is empty air.
+//!
+//! ## Scanning on demand
+//!
+//! "Scan now" sends [`ControlCmd::ScanAir`] — self-control, not acting: the
+//! daemon reads its own radio's report and puts nothing on the air. The button
+//! reports only what the daemon said: its refusal verbatim, or the fact that this
+//! daemon does not know the command, which is a different statement from a
+//! refusal.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
@@ -49,7 +70,9 @@ use gpui::{
     rgba, size,
 };
 
-use net_observer_ipc::{Event, EventKind, StreamFrame, SubscriptionHandle};
+use net_observer_ipc::{
+    ControlCmd, ControlOutcome, Event, EventKind, StreamFrame, SubscriptionHandle,
+};
 use types::{
     AirObservation, AirSample, AirVerdict, Band, ChannelOverlapHypothesis, ChannelSpan,
     OverlapConfidence, WifiSample, WifiVerdict, overlap_hypothesis,
@@ -84,6 +107,33 @@ enum BridgeMsg {
     Frame(StreamFrame),
     /// The daemon is down or the stream dropped; the thread will retry.
     Offline(String),
+    /// This daemon could not read our filter, so the subscription was widened to
+    /// every kind and the air kinds are filtered here instead. It also means the
+    /// daemon predates `EventKind::Air` and therefore cannot scan the air at all
+    /// — a different fact from "no scan has happened yet". `false` on a
+    /// subscription the daemon accepted as asked, so an upgraded daemon stops
+    /// being reported as one that cannot scan.
+    Widened(bool),
+    /// What came back from pressing "scan now".
+    Scan(ScanState),
+}
+
+/// Where the operator-pressed scan has got to. Every state is something the
+/// window can say out loud; none of them is a silent button.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) enum ScanState {
+    /// Nothing asked for.
+    #[default]
+    Idle,
+    /// The command is on its way to the daemon.
+    Asking,
+    /// The daemon accepted it; the slice is being read (seconds).
+    Scanning,
+    /// The daemon declined, in its own words — never paraphrased here.
+    Refused(SharedString),
+    /// This daemon does not know the command at all. Not a refusal: it cannot,
+    /// rather than will not.
+    Unsupported(SharedString),
 }
 
 /// The window-scoped cancellation cell shared with the subscription thread.
@@ -148,6 +198,15 @@ pub(crate) struct AirFeed {
     /// Whether the daemon reported collection paused. A pause explains an air
     /// map that stops updating, so it is said rather than left to be inferred.
     paused: bool,
+    /// Set when this daemon could not read a filter naming `EventKind::Air`, so
+    /// it predates the air collector outright.
+    ///
+    /// The window must never render that as "no scan yet": one says the collector
+    /// has produced nothing, the other says this daemon cannot produce anything.
+    /// Reporting the second as the first is a falsehood the operator would act on.
+    air_unsupported: bool,
+    /// Where the operator-pressed scan has got to.
+    scan: ScanState,
 }
 
 impl AirFeed {
@@ -158,6 +217,11 @@ impl AirFeed {
                     StreamFrame::Event(Event::Air(a)) => {
                         self.offline = None;
                         self.air = Some(a);
+                        // The slice we were waiting for arrived: the button stops
+                        // claiming a scan is in progress.
+                        if matches!(self.scan, ScanState::Asking | ScanState::Scanning) {
+                            self.scan = ScanState::Idle;
+                        }
                     }
                     StreamFrame::Event(Event::Wifi(w)) => {
                         self.offline = None;
@@ -177,10 +241,19 @@ impl AirFeed {
                     StreamFrame::Error(e) => {
                         self.offline = Some(format!("daemon: {}", e.message).into())
                     }
+                    // A frame from a newer daemon than this bar. One frame is
+                    // lost, and it is named rather than passed off as silence.
+                    StreamFrame::Unrecognized(u) => {
+                        self.offline = Some(
+                            format!("skipped a frame this bar cannot read: {}", u.detail).into(),
+                        );
+                    }
                     StreamFrame::Gap(_) | StreamFrame::Event(_) => self.offline = None,
                 }
             }
             BridgeMsg::Offline(reason) => self.offline = Some(reason.into()),
+            BridgeMsg::Widened(widened) => self.air_unsupported = widened,
+            BridgeMsg::Scan(state) => self.scan = state,
         }
     }
 
@@ -421,19 +494,68 @@ fn overlap_label(lane: &Lane) -> String {
 /// The root view of the air-map window.
 pub(crate) struct AirView {
     feed: Entity<AirFeed>,
+    /// Where to send the scan command. The bar is a pure socket client: it takes
+    /// the reading itself nowhere near the radio.
+    socket_path: String,
+    /// The bridge back into the model, so a pressed button reports through the
+    /// same path frames arrive on.
+    tx: mpsc::SyncSender<BridgeMsg>,
     _observe: Subscription,
     /// Held so the release hook stays registered for the view's whole life.
     _release: Subscription,
 }
 
 impl AirView {
-    fn new(feed: Entity<AirFeed>, shutdown: Arc<Shutdown>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        feed: Entity<AirFeed>,
+        shutdown: Arc<Shutdown>,
+        socket_path: String,
+        tx: mpsc::SyncSender<BridgeMsg>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let observe = cx.observe(&feed, |_this, _, cx| cx.notify());
         let release = cx.on_release(move |_view, _cx| shutdown.trip());
         Self {
             feed,
+            socket_path,
+            tx,
             _observe: observe,
             _release: release,
+        }
+    }
+
+    /// Ask the daemon for one slice, now.
+    ///
+    /// Off the UI thread: `control` opens a socket and waits on the answer, and
+    /// the gpui main thread must not park on either. The answer comes back
+    /// through the bridge, so the button's state is set by what the daemon said
+    /// and never by optimism here.
+    fn request_scan(&self, cx: &mut Context<Self>) {
+        self.feed.update(cx, |feed, cx| {
+            feed.scan = ScanState::Asking;
+            cx.notify();
+        });
+        let sock = self.socket_path.clone();
+        let tx = self.tx.clone();
+        if let Err(e) = thread::Builder::new()
+            .name("observer-air-scan".to_string())
+            .spawn(move || {
+                let state = match net_observer_ipc::control(&sock, ControlCmd::ScanAir) {
+                    // The daemon's own words, both ways. A refusal here is a
+                    // sentence it wrote — "quiet is on", "try again in 9s" — and
+                    // paraphrasing it would lose the reason.
+                    Ok(ControlOutcome::Ran(r)) if r.ok => ScanState::Scanning,
+                    Ok(ControlOutcome::Ran(r)) => ScanState::Refused(r.message.into()),
+                    Ok(ControlOutcome::Unsupported(m)) => ScanState::Unsupported(m.into()),
+                    Err(e) => ScanState::Refused(format!("could not ask: {e}").into()),
+                };
+                bridge_send(&tx, BridgeMsg::Scan(state));
+            })
+        {
+            self.feed.update(cx, |feed, cx| {
+                feed.scan = ScanState::Refused(format!("could not ask: {e}").into());
+                cx.notify();
+            });
         }
     }
 }
@@ -447,15 +569,29 @@ impl Render for AirView {
         let own = feed.own_span();
         let scanned_at = feed.air.as_ref().map(|a| a.ts_us);
         let own_read_at = feed.own.as_ref().map(|w| w.ts_us);
+        let air_unsupported = feed.air_unsupported;
+        let scan = feed.scan.clone();
 
         let body = match &feed.air {
+            // The daemon itself predates the air collector. Distinct from "no
+            // scan yet", which would claim a capability this daemon lacks.
+            None if feed.air_unsupported => note(
+                "This daemon cannot collect the air.",
+                "It was built before the air collector existed — it rejected a subscription \
+                 naming that kind of event, so the window fell back to everything else it \
+                 does serve. Nothing here is a reading of the radio environment: no scan \
+                 can have happened, which is not the same as one having found nothing.",
+                theme.warn,
+                theme,
+            )
+            .into_any_element(),
             // No scan has arrived. NOT empty air: the air collector is off by
             // default, so this is the state the window must name outright.
             None => note(
                 "No air scan yet.",
                 "Nothing has been heard because nothing has scanned: the air collector is \
                  off by default, and a scan is a slow, separate period rather than a tick. \
-                 This is not a reading of empty air.",
+                 This is not a reading of empty air. Press \"Scan now\" to take one slice.",
                 theme.muted,
                 theme,
             )
@@ -497,7 +633,15 @@ impl Render for AirView {
             .text_color(rgb(theme.fg))
             .font_family(".SystemUIFont")
             .text_size(px(13.0))
-            .child(header(own, paused, scanned_at, own_read_at, theme))
+            .child(header(
+                own,
+                paused,
+                scanned_at,
+                own_read_at,
+                air_unsupported,
+                theme,
+            ))
+            .child(scan_bar(&scan, air_unsupported, theme, cx))
             .children(offline.map(|reason| {
                 div()
                     .px_3()
@@ -556,10 +700,18 @@ struct ProvenanceLines {
 /// The scan and our own association come from different readings on different
 /// cadences; pairing them silently would compute the overlap against a band we
 /// had already left (realm net-observer, node #48).
-fn provenance_lines(scanned_at: Option<i64>, own_read_at: Option<i64>) -> ProvenanceLines {
-    let scanned = match scanned_at {
-        Some(us) => format!("scanned at {}", clock(us)),
-        None => "scanned at an unknown moment".to_string(),
+fn provenance_lines(
+    scanned_at: Option<i64>,
+    own_read_at: Option<i64>,
+    air_unsupported: bool,
+) -> ProvenanceLines {
+    // "Unknown moment" was a lie in the one case it was reached: with no scan at
+    // all there is no moment to be unknown ABOUT. Three states, three sentences —
+    // a scan with a time, no scan yet, and a daemon that cannot scan.
+    let scanned = match (scanned_at, air_unsupported) {
+        (Some(us), _) => format!("scanned at {}", clock(us)),
+        (None, true) => "not scanned: this daemon cannot collect the air".to_string(),
+        (None, false) => "not scanned yet".to_string(),
     };
     let pairing = match (scanned_at, own_read_at) {
         (Some(scan), Some(own_us)) if (scan - own_us).abs() > OWN_CHANNEL_STALE_US => {
@@ -575,6 +727,69 @@ fn provenance_lines(scanned_at: Option<i64>, own_read_at: Option<i64>) -> Proven
     ProvenanceLines { scanned, pairing }
 }
 
+/// The scan strip under the header: one button and one honest sentence about it.
+///
+/// The button never claims an outcome it has not been told. It says "asking"
+/// while the command is in flight, "scanning" only after the daemon accepted,
+/// and shows the daemon's own words on a refusal. A daemon that does not know
+/// the command says so instead of the button going quiet.
+fn scan_bar(
+    scan: &ScanState,
+    air_unsupported: bool,
+    theme: Theme,
+    cx: &mut Context<AirView>,
+) -> impl IntoElement {
+    // A daemon that could not read a filter naming `Air` cannot have the command
+    // either: offer no button rather than one that exists to be refused.
+    let busy = matches!(scan, ScanState::Asking | ScanState::Scanning);
+    let pressable = !air_unsupported && !busy;
+    let label = match scan {
+        _ if air_unsupported => "Scan unavailable",
+        ScanState::Asking => "Asking…",
+        ScanState::Scanning => "Scanning… (a few seconds)",
+        _ => "Scan now",
+    };
+    let note_line: Option<(SharedString, u32)> = match scan {
+        ScanState::Idle | ScanState::Asking => None,
+        ScanState::Scanning => Some((
+            "the daemon accepted; the slice arrives when the radio has been read".into(),
+            theme.muted,
+        )),
+        ScanState::Refused(m) => Some((format!("the daemon declined: {m}").into(), theme.warn)),
+        ScanState::Unsupported(m) => Some((
+            format!("this daemon does not know how to scan the air on demand: {m}").into(),
+            theme.warn,
+        )),
+    };
+    let mut button = div()
+        .id("air-scan-now")
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        .text_color(rgb(if pressable { theme.accent } else { theme.muted }))
+        .child(label);
+    if pressable {
+        button = button
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme.hover)))
+            .on_click(cx.listener(|this, _, _window, cx| this.request_scan(cx)));
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_3()
+        .pb_2()
+        .child(button)
+        .children(note_line.map(|(line, colour)| {
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(colour))
+                .child(line)
+        }))
+}
+
 /// The window header: what this map is, our own association, and the caveat that
 /// governs every number below it (realm net-observer, node #48).
 fn header(
@@ -582,6 +797,7 @@ fn header(
     paused: bool,
     scanned_at: Option<i64>,
     own_read_at: Option<i64>,
+    air_unsupported: bool,
     theme: Theme,
 ) -> impl IntoElement {
     let own_line = match own {
@@ -597,7 +813,7 @@ fn header(
     // A scan is a slice, and a slice with no moment on it cannot deny being
     // "the air right now" — the one claim this window must never make when the
     // socket has been quiet for an hour (realm net-observer, node #48).
-    let lines = provenance_lines(scanned_at, own_read_at);
+    let lines = provenance_lines(scanned_at, own_read_at, air_unsupported);
     let scanned_line = lines.scanned;
     let pairing_line = lines.pairing;
     div()
@@ -807,6 +1023,10 @@ fn open_window(cx: &mut App, socket_path: String) -> Option<WindowHandle<AirView
     let shutdown = Arc::new(Shutdown::default());
 
     let thread_shutdown = Arc::clone(&shutdown);
+    // The button needs a way back into the model too, so it reports through the
+    // same bridge frames arrive on rather than a second path that could disagree.
+    let button_tx = tx.clone();
+    let button_socket = socket_path.clone();
     if let Err(e) = thread::Builder::new()
         .name("observer-air".to_string())
         .spawn(move || run_subscription(&socket_path, &tx, &thread_shutdown))
@@ -854,7 +1074,7 @@ fn open_window(cx: &mut App, socket_path: String) -> Option<WindowHandle<AirView
 
     let options = window_options(cx);
     match cx.open_window(options, move |_window, cx| {
-        cx.new(|cx| AirView::new(feed, shutdown, cx))
+        cx.new(|cx| AirView::new(feed, shutdown, button_socket, button_tx, cx))
     }) {
         Ok(handle) => Some(handle),
         Err(e) => {
@@ -896,8 +1116,16 @@ fn run_subscription(sock_path: &str, tx: &mpsc::SyncSender<BridgeMsg>, shutdown:
         if shutdown.stopped() {
             return;
         }
-        match net_observer_ipc::subscribe(sock_path, Some(&kinds)) {
-            Ok(sub) => {
+        match net_observer_ipc::subscribe_or_widen(sock_path, &kinds) {
+            Ok((sub, widened)) => {
+                // A daemon that cannot read `EventKind::Air` predates the air
+                // collector. Say so, rather than letting the window imply the
+                // collector merely has not run — and say the opposite on a
+                // reconnect that succeeded unfiltered, so a daemon upgraded under
+                // a running bar stops being reported as one that cannot scan.
+                if !bridge_send(tx, BridgeMsg::Widened(widened)) {
+                    return;
+                }
                 if !shutdown.arm(sub.handle().ok()) {
                     return; // the window closed while we were connecting
                 }
@@ -911,6 +1139,14 @@ fn run_subscription(sock_path: &str, tx: &mpsc::SyncSender<BridgeMsg>, shutdown:
                 for item in sub {
                     match item {
                         Ok(frame) => {
+                            // Client-side filter. It is redundant while the
+                            // daemon honoured our `kinds`, and load-bearing once
+                            // the subscription was widened: without it a busy link
+                            // stream would crowd the air frames out of a
+                            // 32-deep bridge that drops rather than blocks.
+                            if !concerns_this_window(&frame) {
+                                continue;
+                            }
                             if !bridge_send(tx, BridgeMsg::Frame(frame)) {
                                 return;
                             }
@@ -939,6 +1175,20 @@ fn run_subscription(sock_path: &str, tx: &mpsc::SyncSender<BridgeMsg>, shutdown:
     }
 }
 
+/// Whether this window has any use for `frame`.
+///
+/// The same rule the daemon applies server-side, restated here for the widened
+/// subscription: an event of a kind this window does not draw is dropped, and
+/// every stream-integrity frame (ack, gap, observing edge, error, and a frame
+/// this build cannot read) is kept whatever the filter — a window that stops
+/// updating needs the reason more than the data.
+fn concerns_this_window(frame: &StreamFrame) -> bool {
+    match frame.event_kind() {
+        None => true,
+        Some(k) => k == EventKind::Air || k == EventKind::Wifi,
+    }
+}
+
 /// Forward one message; `false` means the receiver is gone and the caller must
 /// stop.
 ///
@@ -960,7 +1210,7 @@ mod tests {
     #[test]
     fn the_header_carries_the_moment_of_the_scan_and_of_our_channel() {
         let scanned = 4_000_000_000_i64;
-        let l = provenance_lines(Some(scanned), Some(scanned));
+        let l = provenance_lines(Some(scanned), Some(scanned), false);
         let out: Vec<String> = std::iter::once(l.scanned).chain(l.pairing).collect();
         assert!(
             out.iter().any(|l| l.starts_with("scanned at ")),
@@ -971,7 +1221,7 @@ mod tests {
             "and so is our own reading's: {out:?}"
         );
         // Far apart: the pairing itself becomes the warning.
-        let l = provenance_lines(Some(scanned), Some(scanned - 4 * 3600 * 1_000_000));
+        let l = provenance_lines(Some(scanned), Some(scanned - 4 * 3600 * 1_000_000), false);
         let out: Vec<String> = std::iter::once(l.scanned).chain(l.pairing).collect();
         assert!(
             out.iter().any(|l| l.contains("we may have roamed")),
@@ -994,6 +1244,115 @@ mod tests {
         )));
         let note = feed.offline.clone().expect("the refusal is shown");
         assert!(note.contains("too many subscribers"), "{note}");
+    }
+
+    /// The three states the provenance line must keep apart. "Scanned at an
+    /// unknown moment" was reached only when there was no scan at all — where
+    /// there is no moment to be unknown ABOUT, and where a daemon that cannot
+    /// scan read exactly like one that simply had not yet.
+    #[test]
+    fn a_missing_scan_is_not_a_scan_at_an_unknown_moment() {
+        let none_yet = provenance_lines(None, None, false).scanned;
+        let cannot = provenance_lines(None, None, true).scanned;
+        let scanned = provenance_lines(Some(4_000_000_000), None, false).scanned;
+
+        assert!(!none_yet.contains("unknown moment"), "{none_yet}");
+        assert!(!cannot.contains("unknown moment"), "{cannot}");
+        assert!(none_yet.contains("not scanned yet"), "{none_yet}");
+        assert!(cannot.contains("cannot collect the air"), "{cannot}");
+        assert_ne!(none_yet, cannot, "the two facts must not read the same");
+        assert!(scanned.starts_with("scanned at "), "{scanned}");
+    }
+
+    /// A daemon that could not read a filter naming `Air` predates the air
+    /// collector. That fact must reach the model, because the window says
+    /// something different about it than about "nothing has scanned yet".
+    #[test]
+    fn a_widened_subscription_records_that_this_daemon_cannot_collect_air() {
+        let mut feed = AirFeed::default();
+        assert!(!feed.air_unsupported);
+        feed.apply(BridgeMsg::Widened(true));
+        assert!(feed.air_unsupported);
+        // ...and a later reconnect the daemon accepted as asked takes it back:
+        // an upgraded daemon must stop being reported as one that cannot scan.
+        feed.apply(BridgeMsg::Widened(false));
+        assert!(!feed.air_unsupported);
+    }
+
+    /// Once the subscription is widened the daemon sends every kind. The window
+    /// keeps only what it draws — and every stream-integrity frame, because a
+    /// window that stops updating needs the reason more than the data.
+    #[test]
+    fn the_widened_stream_is_filtered_down_to_what_this_window_draws() {
+        assert!(concerns_this_window(&StreamFrame::Event(Event::Air(scan(
+            vec![]
+        )))));
+        assert!(concerns_this_window(&StreamFrame::Gap(
+            net_observer_ipc::Gap {
+                ts_us: 1,
+                skipped: 3,
+            }
+        )));
+        assert!(concerns_this_window(&StreamFrame::Unrecognized(
+            net_observer_ipc::Unrecognized {
+                ts_us: 1,
+                detail: "unknown variant".to_string(),
+            }
+        )));
+        assert!(!concerns_this_window(&StreamFrame::Event(Event::Incident(
+            net_observer_ipc::IncidentSummary::default()
+        ))));
+    }
+
+    /// The button must never claim an outcome it was not told. A refusal shows
+    /// the daemon's own sentence; an unknown command is `Unsupported`, which is
+    /// a different statement from a refusal and must not be flattened into one.
+    #[test]
+    fn the_scan_button_reports_what_the_daemon_said() {
+        let mut feed = AirFeed::default();
+        assert_eq!(feed.scan, ScanState::Idle);
+
+        feed.apply(BridgeMsg::Scan(ScanState::Refused(
+            "an air scan ran moments ago; try again in 9s".into(),
+        )));
+        match &feed.scan {
+            ScanState::Refused(m) => assert!(m.contains("9s"), "{m}"),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+
+        feed.apply(BridgeMsg::Scan(ScanState::Unsupported(
+            "bad request: unknown variant `ScanAir`".into(),
+        )));
+        assert!(matches!(feed.scan, ScanState::Unsupported(_)));
+    }
+
+    /// While a scan is in flight the window says so — and stops saying so the
+    /// moment the slice it was waiting for arrives, rather than on a timer.
+    #[test]
+    fn an_arriving_slice_ends_the_scanning_state() {
+        let mut feed = AirFeed::default();
+        feed.apply(BridgeMsg::Scan(ScanState::Scanning));
+        assert_eq!(feed.scan, ScanState::Scanning);
+        feed.apply(BridgeMsg::Frame(StreamFrame::Event(Event::Air(scan(
+            vec![],
+        )))));
+        assert_eq!(feed.scan, ScanState::Idle);
+        assert!(feed.air.is_some());
+    }
+
+    /// A frame from a newer daemon costs one frame, and the window says which —
+    /// it must not pass for a quiet stream.
+    #[test]
+    fn an_unreadable_frame_is_named_rather_than_swallowed() {
+        let mut feed = AirFeed::default();
+        feed.apply(BridgeMsg::Frame(StreamFrame::Unrecognized(
+            net_observer_ipc::Unrecognized {
+                ts_us: 1,
+                detail: "unknown variant `Ether`".to_string(),
+            },
+        )));
+        let note = feed.offline.clone().expect("the lost frame is named");
+        assert!(note.contains("Ether"), "{note}");
     }
 
     use super::*;

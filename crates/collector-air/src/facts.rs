@@ -3,6 +3,8 @@
 //! The real adapter (`system_profiler -json SPAirPortDataType`) lives in the
 //! `macos` crate.
 
+use std::future::Future;
+
 use collector_core::Readiness;
 use types::AirObservation;
 
@@ -31,7 +33,15 @@ pub enum AirRead {
 pub trait AirFacts: Send + Sync {
     /// Scan once. Never fails: an unusable radio is an [`AirRead::Unavailable`]
     /// carrying its reason, not an `Err` and never a missing period.
-    async fn read(&self) -> AirRead;
+    ///
+    /// Spelled out as `impl Future + Send` rather than `async fn` because a
+    /// consumer spawns it onto the multi-threaded runtime: an operator-pressed
+    /// scan runs as its own task so the control socket answers immediately
+    /// instead of holding the connection for the seconds the report costs.
+    /// `async fn` in a trait promises nothing about `Send`, and the bound cannot
+    /// be added at the call site, so it belongs here — where the port states what
+    /// its callers need. Implementors may still write a plain `async fn`.
+    fn read(&self) -> impl Future<Output = AirRead> + Send;
     /// Runtime capability probe: Ready iff the report can be produced here/now,
     /// else `Unavailable(reason)`.
     async fn preflight(&self) -> Readiness;

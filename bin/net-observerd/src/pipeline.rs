@@ -587,6 +587,140 @@ pub trait NeighborScanner: Send + Sync {
     fn scan(&self, opts: &net_observer_ipc::ScanOptions) -> Option<ScanReport>;
 }
 
+/// The shortest gap allowed between two on-demand air scans.
+///
+/// The system wireless report costs seconds per call (realm net-observer, node
+/// #47), so a held-down button must not turn into a queue of overlapping reads.
+/// A refusal inside this window is honest and says how long is left; it is never
+/// a silent no-op and never a deferred scan that fires later — one press, one
+/// scan, or one stated reason why not.
+pub const AIR_SCAN_MIN_INTERVAL: Duration = Duration::from_secs(15);
+
+/// One operator-pressed air scan behind a trait, so `api` holds no platform code
+/// and the control path is testable without a radio. The production impl is
+/// [`OnDemandAirScan`].
+pub trait AirScanner: Send + Sync {
+    /// Ask for ONE scan now. Returns as soon as the request is *accepted* or
+    /// refused — never after the scan, which takes seconds and whose product
+    /// arrives on the sample stream like any other reading.
+    fn request_scan(&self) -> AirScanRequest;
+}
+
+/// What asking for a scan produced. Every refusal carries its reason: the
+/// operator pressed a button and is owed a fact, not silence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AirScanRequest {
+    /// Accepted; a sample will follow on the stream.
+    Started,
+    /// A previous on-demand scan is still running. One press, one scan: a second
+    /// is refused rather than run in parallel with the first.
+    AlreadyRunning,
+    /// Inside [`AIR_SCAN_MIN_INTERVAL`] of the last accepted scan, with this many
+    /// whole seconds left to wait.
+    ///
+    /// There is deliberately no "unavailable" arm: a host with no scanner has no
+    /// [`AirScanner`] at all, and the control path answers that from the absent
+    /// port rather than from a variant this impl could never return.
+    TooSoon { retry_in_s: u64 },
+}
+
+/// The production [`AirScanner`]: reads the system's own wireless report once and
+/// pushes the resulting [`Sample::Air`] onto the ordinary sample stream.
+///
+/// Going through the same `mpsc::Sender<Sample>` the periodic collector uses is
+/// the point — the scan is persisted, mirrored into the snapshot, published on
+/// the bus and shown to the triggers by exactly one code path
+/// ([`run`]), so an operator-pressed slice is the same row as a periodic one and
+/// cannot drift from it.
+///
+/// **SKIP, never silence**: a radio that cannot be read yields
+/// `AirRead::Unavailable`, which [`collector_air::build_air_sample`] maps to a
+/// `Skip` sample carrying the reason. The scan that failed still leaves a row.
+pub struct OnDemandAirScan<F: collector_air::AirFacts + 'static> {
+    facts: Arc<F>,
+    tx: mpsc::Sender<Sample>,
+    /// Single-flight latch: `true` while a scan is in the air. A second press
+    /// during those seconds is refused, never queued.
+    running: Arc<AtomicBool>,
+    /// When the last accepted scan STARTED, in monotonic time — a wall-clock
+    /// stamp would let an NTP step or a manual `date` erase the interval.
+    last_start: Mutex<Option<Instant>>,
+}
+
+impl<F: collector_air::AirFacts + 'static> OnDemandAirScan<F> {
+    /// Wire a scanner onto the same sample stream the collectors feed.
+    pub fn new(facts: Arc<F>, tx: mpsc::Sender<Sample>) -> Self {
+        Self {
+            facts,
+            tx,
+            running: Arc::new(AtomicBool::new(false)),
+            last_start: Mutex::new(None),
+        }
+    }
+
+    /// The rate decision, pure over the clock reading handed in so a test can
+    /// drive it without sleeping. `None` = go ahead.
+    fn too_soon(&self, now: Instant) -> Option<AirScanRequest> {
+        let last = (*self.last_start.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let waited = now.saturating_duration_since(last);
+        if waited >= AIR_SCAN_MIN_INTERVAL {
+            return None;
+        }
+        // Round UP, so "wait 1s" never means "wait 1.9s" and a client that obeys
+        // the number is not refused again for obeying it.
+        let left = AIR_SCAN_MIN_INTERVAL - waited;
+        let retry_in_s = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+        Some(AirScanRequest::TooSoon { retry_in_s })
+    }
+}
+
+impl<F: collector_air::AirFacts + 'static> AirScanner for OnDemandAirScan<F> {
+    fn request_scan(&self) -> AirScanRequest {
+        let now = Instant::now();
+        // Claim the single-flight latch FIRST, with a compare-exchange rather
+        // than a load-then-store: two presses racing at the boundary must not
+        // both see "idle" and both spawn a read of the same radio.
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return AirScanRequest::AlreadyRunning;
+        }
+        if let Some(refusal) = self.too_soon(now) {
+            // Release the latch we just claimed: this press starts nothing.
+            self.running.store(false, Ordering::Release);
+            return refusal;
+        }
+        *self.last_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+
+        let facts = Arc::clone(&self.facts);
+        let tx = self.tx.clone();
+        let running = Arc::clone(&self.running);
+        tokio::spawn(async move {
+            // The latch is released however this task leaves — including on a
+            // panic inside the read — so one failed scan cannot wedge the button
+            // for the life of the daemon.
+            let _guard = LatchGuard(running);
+            let read = facts.read().await;
+            let sample = Sample::Air(collector_air::build_air_sample(types::now_us(), read));
+            if let Err(e) = tx.send(sample).await {
+                tracing::warn!(error = %e, "on-demand air scan produced a sample the pipeline could not take");
+            }
+        });
+        AirScanRequest::Started
+    }
+}
+
+/// Releases the single-flight latch on every exit path of the scan task.
+struct LatchGuard(Arc<AtomicBool>);
+
+impl Drop for LatchGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// What one scan did and found, in the shape the control path needs: the
 /// entities to upsert, and the durable rows saying the daemon spoke.
 #[derive(Debug, Clone, PartialEq)]
@@ -1007,6 +1141,140 @@ impl Handler for SnapshotHandler {
 mod tests {
 
     use macos::neighbor_scan::{MdnsOutcome, SweepStats};
+
+    mod air_on_demand {
+        use super::super::*;
+        use collector_air::{AirFacts, AirRead};
+        use collector_core::Readiness;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::Notify;
+
+        /// A radio that answers only when released, so a scan can be held in
+        /// flight while a second press is tested against it.
+        struct HeldAir {
+            release: Arc<Notify>,
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl AirFacts for HeldAir {
+            async fn read(&self) -> AirRead {
+                self.release.notified().await;
+                self.reads.fetch_add(1, Ordering::AcqRel);
+                AirRead::Scan(Vec::new())
+            }
+            async fn preflight(&self) -> Readiness {
+                Readiness::Ready
+            }
+        }
+
+        /// A radio that cannot be read at all.
+        struct DeadAir;
+
+        impl AirFacts for DeadAir {
+            async fn read(&self) -> AirRead {
+                AirRead::Unavailable("Wi-Fi powered off".into())
+            }
+            async fn preflight(&self) -> Readiness {
+                Readiness::Ready
+            }
+        }
+
+        /// One press, one scan. A second press while the first is still reading
+        /// the radio is REFUSED — never a second parallel read of the same
+        /// device, and never a queued one that fires later.
+        #[tokio::test]
+        async fn a_second_press_during_a_scan_is_refused_not_run_in_parallel() {
+            let release = Arc::new(Notify::new());
+            let reads = Arc::new(AtomicUsize::new(0));
+            let (tx, mut rx) = mpsc::channel::<Sample>(4);
+            let scanner = OnDemandAirScan::new(
+                Arc::new(HeldAir {
+                    release: Arc::clone(&release),
+                    reads: Arc::clone(&reads),
+                }),
+                tx,
+            );
+
+            assert_eq!(scanner.request_scan(), AirScanRequest::Started);
+            // The first scan is parked inside `read()`; press again.
+            assert_eq!(scanner.request_scan(), AirScanRequest::AlreadyRunning);
+            assert_eq!(scanner.request_scan(), AirScanRequest::AlreadyRunning);
+
+            release.notify_one();
+            let sample = rx.recv().await.expect("the accepted scan yields a sample");
+            assert!(matches!(sample, Sample::Air(_)));
+            // Exactly one read of the radio, for three presses.
+            assert_eq!(reads.load(Ordering::Acquire), 1);
+            // ...and no second sample behind it.
+            assert!(rx.try_recv().is_err());
+        }
+
+        /// The refusal inside the minimum interval says how long is left, and
+        /// the number is rounded UP: a client that waits exactly as long as it
+        /// was told must not be refused again for obeying.
+        #[test]
+        fn the_interval_refusal_states_a_wait_that_is_long_enough() {
+            let (tx, _rx) = mpsc::channel::<Sample>(1);
+            let scanner = OnDemandAirScan::new(Arc::new(DeadAir), tx);
+            let now = Instant::now();
+            *scanner.last_start.lock().unwrap() = Some(now);
+
+            match scanner.too_soon(now + Duration::from_millis(1500)) {
+                Some(AirScanRequest::TooSoon { retry_in_s }) => {
+                    // 13.5s left, rounded up: waiting 14s clears the interval.
+                    assert_eq!(retry_in_s, 14);
+                }
+                other => panic!("expected TooSoon, got {other:?}"),
+            }
+            // Exactly at the boundary the scan is allowed again.
+            assert_eq!(scanner.too_soon(now + AIR_SCAN_MIN_INTERVAL), None);
+            assert_eq!(
+                scanner.too_soon(now + AIR_SCAN_MIN_INTERVAL + Duration::from_secs(1)),
+                None
+            );
+        }
+
+        /// The first press is never too soon: nothing has run yet.
+        #[test]
+        fn a_first_press_is_never_inside_the_interval() {
+            let (tx, _rx) = mpsc::channel::<Sample>(1);
+            let scanner = OnDemandAirScan::new(Arc::new(DeadAir), tx);
+            assert_eq!(scanner.too_soon(Instant::now()), None);
+        }
+
+        /// SKIP, never silence: a scan that could not read the radio still
+        /// leaves a sample, carrying the reason — a pressed button that produced
+        /// nothing at all would be indistinguishable from empty air.
+        #[tokio::test]
+        async fn a_scan_that_cannot_read_the_radio_still_leaves_a_skip_sample() {
+            let (tx, mut rx) = mpsc::channel::<Sample>(4);
+            let scanner = OnDemandAirScan::new(Arc::new(DeadAir), tx);
+            assert_eq!(scanner.request_scan(), AirScanRequest::Started);
+            match rx.recv().await.expect("a failed scan is still a row") {
+                Sample::Air(a) => {
+                    assert_eq!(a.air, types::AirVerdict::Skip);
+                    assert_eq!(a.reason.as_deref(), Some("Wi-Fi powered off"));
+                    assert!(a.aps.is_empty());
+                }
+                other => panic!("expected an air sample, got {other:?}"),
+            }
+        }
+
+        /// A finished scan releases the latch, so the button is not wedged for
+        /// the life of the daemon by one read.
+        #[tokio::test]
+        async fn the_latch_is_released_once_the_scan_finishes() {
+            let (tx, mut rx) = mpsc::channel::<Sample>(4);
+            let scanner = OnDemandAirScan::new(Arc::new(DeadAir), tx);
+            assert_eq!(scanner.request_scan(), AirScanRequest::Started);
+            rx.recv().await.expect("the scan produced its sample");
+            // The interval, not the latch, is what refuses the next press now.
+            assert!(matches!(
+                scanner.request_scan(),
+                AirScanRequest::TooSoon { .. }
+            ));
+        }
+    }
 
     fn arp_obs(mac: &str, ip: &str) -> types::NeighborObs {
         types::NeighborObs {

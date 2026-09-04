@@ -46,8 +46,8 @@ use triggers::handlers::{Handler, RecordHandler};
 use types::Sample;
 
 use pipeline::{
-    FreezePcapHandler, NeighborScanner, PcapFreezer, PcapRingSlot, ScanReport, SnapshotHandler,
-    run, spawn_event_collector, spawn_interval_collector,
+    AirScanner, FreezePcapHandler, NeighborScanner, OnDemandAirScan, PcapFreezer, PcapRingSlot,
+    ScanReport, SnapshotHandler, run, spawn_event_collector, spawn_interval_collector,
 };
 
 /// How often the pcap supervisor re-checks the ring. Bounded on purpose: every
@@ -375,6 +375,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     record_startup_edge(store.as_ref(), &events_tx, types::now_us());
 
     let (tx, rx) = mpsc::channel::<Sample>(CHANNEL_CAP);
+    // A sender for the control socket's on-demand air scan, taken BEFORE the
+    // collectors' own `tx` is dropped below: an operator-pressed slice must reach
+    // the same consumer loop every periodic sample does.
+    let api_tx = tx.clone();
 
     // Resolve the physical interface once, for the pcap ring. `phys_iface` is a
     // native `async fn` (it may shell out to `route -n get default`), so it is
@@ -602,6 +606,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             store.clone(),
             events_tx.clone(),
             oui.clone(),
+            api_tx,
         );
         tokio::spawn(async move {
             if let Err(e) = server.serve().await {
@@ -1190,6 +1195,9 @@ fn build_api_server(
     store: Arc<DuckdbStore>,
     events_tx: tokio::sync::broadcast::Sender<EncodedFrame>,
     oui: Option<Arc<oui_db::OuiDb>>,
+    // The SAME sample stream the collectors feed, so an operator-pressed air scan
+    // is persisted, published and shown to the triggers by exactly one code path.
+    samples_tx: mpsc::Sender<Sample>,
 ) -> api::ApiServer {
     let socket_path = cfg.socket_path.clone();
     let socket_mode = cfg.socket_mode;
@@ -1239,6 +1247,16 @@ fn build_api_server(
                 .map(std::path::PathBuf::from),
             oui.clone(),
         )) as Arc<dyn NeighborScanner>),
+        // Built unconditionally, exactly like the neighbour scanner: whether the
+        // radio can be read is decided per request (and answered as a `Skip`
+        // sample with its reason), not once at boot. It is NOT tied to
+        // `collectors.air.enabled` — that switch governs the slow PERIOD, and an
+        // operator asking for one slice is a different act from standing
+        // collection.
+        air_scanner: Some(Arc::new(OnDemandAirScan::new(
+            Arc::new(SystemProfilerAir::new()),
+            samples_tx,
+        )) as Arc<dyn AirScanner>),
         // The config permission ceiling for the active scan.
         scan_permission: net_observer_ipc::ScanOptions {
             ports: cfg.collectors.neighbors.scan.ports,
@@ -1571,6 +1589,7 @@ mod tests {
         // A broadcast channel needs no runtime, so this whole test is a plain
         // `#[test]`.
         let (events_tx, _events_rx) = tokio::sync::broadcast::channel::<EncodedFrame>(4);
+        let (samples_tx, _samples_rx) = mpsc::channel::<Sample>(4);
 
         let srv = build_api_server(
             &cfg,
@@ -1584,6 +1603,15 @@ mod tests {
             store.clone(),
             events_tx.clone(),
             None,
+            samples_tx.clone(),
+        );
+
+        // An operator-pressed air scan must exist and must feed the SAME sample
+        // stream the collectors do: a scanner wired onto a private channel would
+        // read the radio and drop the slice on the floor.
+        assert!(
+            srv.air_scanner.is_some(),
+            "the air scan button must have something to call"
         );
 
         // The config reaches the socket verbatim.

@@ -185,6 +185,7 @@ impl Row {
                 f,
                 StreamFrame::Gap(_)
                     | StreamFrame::Error(_)
+                    | StreamFrame::Unrecognized(_)
                     | StreamFrame::Event(Event::Incident(_))
             ),
         }
