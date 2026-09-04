@@ -355,13 +355,26 @@ impl CollectorRow {
 /// gets a menu row, and which of those rows admits that nothing is being
 /// collected.
 ///
-/// `None` — no row — is reserved for a daemon that CANNOT collect this: absent
-/// from its declaration, or a daemon too old to have made one. A daemon that has
-/// the collector and was told not to run it keeps its row, marked `off`, because
-/// that row is the only place the operator would look for the switch.
+/// `None` — no row — is reserved for the ONE state that is a settled negative:
+/// the daemon answered, declared its collectors, and this one is not among them.
+/// That is the only case where hiding the row states a fact.
+///
+/// `Unknown` keeps its row. It is not "cannot": it is the state of a daemon that
+/// is unreachable, has not answered yet, or predates the declaration — and the
+/// bar seeds an all-default snapshot (`capabilities: None`) when the first read
+/// fails, so a dead daemon lands here. Dropping the row there would render an
+/// ERROR as a missing capability, and would also take the only route to the
+/// window (and its "Scan now") away from an older daemon that can in fact
+/// collect. The row is drawn unmarked, and the window behind it says honestly
+/// what it knows.
+///
+/// A daemon that has the collector and was told not to run it keeps its row,
+/// marked `off`, because that row is the only place the operator would look for
+/// the switch.
 pub(crate) fn collector_row(availability: CollectorAvailability) -> Option<CollectorRow> {
     match availability {
-        CollectorAvailability::Absent | CollectorAvailability::Unknown => None,
+        CollectorAvailability::Absent => None,
+        CollectorAvailability::Unknown => Some(CollectorRow { off: false }),
         CollectorAvailability::Disabled => Some(CollectorRow { off: true }),
         CollectorAvailability::Enabled => Some(CollectorRow { off: false }),
     }
@@ -539,9 +552,14 @@ mod tests {
         // Cannot: no row at all, so the interface never offers a window that can
         // never fill.
         assert_eq!(collector_row(CollectorAvailability::Absent), None);
-        // A daemon too old to say is treated as cannot for DRAWING purposes — but
-        // it reached here as its own state, never folded into "switched off".
-        assert_eq!(collector_row(CollectorAvailability::Unknown), None);
+        // Unknown is NOT cannot: an unreachable daemon, one that has not answered
+        // yet, and one too old to declare all land here. The row stays, unmarked
+        // — hiding it would show an error as a missing capability, and would take
+        // the only route to the window from a daemon that may well have it.
+        let unknown = collector_row(CollectorAvailability::Unknown)
+            .expect("an unknown daemon must not be reported as unable");
+        assert!(!unknown.off, "unknown is not 'switched off' either");
+        assert_eq!(unknown.text("Air"), "Air");
 
         // Switched off: the row stays, marked, because it is where the operator
         // goes to turn it on. Hiding it would hide the switch.
@@ -669,6 +687,37 @@ mod headless_tests {
             "a daemon without the air collector must not be offered the row"
         );
         assert_eq!(laid_out.len(), FIXED_ROWS);
+    }
+
+    /// The bar started while the daemon was down: `menubar` seeds the model with
+    /// `StatusSnapshot::default()`, whose `capabilities` is `None`. That is an
+    /// unreachable daemon, not a daemon without an air collector — so the row is
+    /// there, and the window behind it stays reachable.
+    #[gpui::test]
+    fn an_unreachable_daemon_keeps_the_air_row(cx: &mut TestAppContext) {
+        let laid_out = lay_out_menu(cx, StatusSnapshot::default(), MenuComposition::new(true));
+        assert!(
+            laid_out.iter().any(|(id, _)| *id == "menu-row:air"),
+            "a daemon that has said nothing must not be rendered as unable"
+        );
+        assert_eq!(laid_out.len(), FIXED_ROWS + 1);
+    }
+
+    /// A daemon that HAS the air collector but was told not to run it keeps the
+    /// row, and the row admits it.
+    #[gpui::test]
+    fn a_disabled_collector_keeps_a_marked_row(cx: &mut TestAppContext) {
+        let snapshot = StatusSnapshot {
+            capabilities: Some(Capabilities::from_pairs([(EventKind::Air.as_str(), false)])),
+            ..StatusSnapshot::default()
+        };
+        let laid_out = lay_out_menu(cx, snapshot, MenuComposition::new(true));
+        assert!(
+            laid_out.iter().any(|(id, _)| *id == "menu-row:air"),
+            "the switch lives on this row; hiding it hides the switch"
+        );
+        assert_eq!(laid_out.len(), FIXED_ROWS + 1);
+        assert!(collector_row(CollectorAvailability::Disabled).is_some_and(|r| r.off));
     }
 
     /// Draw the menu for `snapshot` in a window of exactly the height
