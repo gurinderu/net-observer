@@ -1946,9 +1946,9 @@ mod headless_tests {
                     Box::leak(format!("map-chip:{label}").into_boxed_str());
                 let label_sel: &'static str =
                     Box::leak(format!("map-label:{label}").into_boxed_str());
-                let chip = cx.debug_bounds(chip_sel).unwrap_or_else(|| {
-                    panic!("chip `{label}` was not laid out at {w}x{h} at all")
-                });
+                let chip = cx
+                    .debug_bounds(chip_sel)
+                    .unwrap_or_else(|| panic!("chip `{label}` was not laid out at {w}x{h} at all"));
                 assert!(
                     !fits || contains(viewport, chip),
                     "chip `{label}` leaves the {w}x{h} window: {chip:?}"
