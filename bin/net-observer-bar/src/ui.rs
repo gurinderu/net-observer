@@ -748,6 +748,9 @@ fn warn_offline(reason: String, theme: Theme) -> impl IntoElement {
     ));
     div()
         .id("offline-warn")
+        // Test handle only: lets a headless test say the hint is drawn — and,
+        // in a window opened online, that it is not.
+        .debug_selector(|| "offline-warn".into())
         .text_size(px(13.0))
         .text_color(rgb(theme.warn))
         .child("\u{26A0}") // ⚠
@@ -1309,6 +1312,10 @@ fn spark_color(value: f64, threshold: f64, theme: Theme) -> Rgba {
 /// A hairline separator between sections — a 1px full-width rule, no borders.
 pub(crate) fn separator(theme: Theme) -> impl IntoElement {
     div()
+        // Test handle only (no-op without gpui's `test-support`): the hairline
+        // has no other identity, and its whole contract is a height a headless
+        // test can read back.
+        .debug_selector(|| "separator".into())
         .h(px(MENU_SEPARATOR_H))
         // A hairline that is allowed to shrink is a hairline that disappears in
         // a tight column.
@@ -1816,8 +1823,36 @@ mod tests {
 mod headless_tests {
     use super::*;
     use crate::menubar::{PANEL_H, PANEL_W};
-    use gpui::{TestAppContext, VisualTestContext, size};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowAppearance, size};
     use net_observer_ipc::StatusSnapshot;
+
+    /// A fresh panel window over a model in a chosen state.
+    ///
+    /// Fresh per test on purpose: gpui's debug-bounds map only ever grows over a
+    /// window's life, so a window that once drew an element can never say it is
+    /// gone. Absence is assertable only in a window opened already in the state
+    /// under test.
+    fn panel(
+        cx: &mut TestAppContext,
+        snapshot: StatusSnapshot,
+        error: Option<GlanceError>,
+    ) -> (Entity<Glance>, VisualTestContext) {
+        let model = cx.update(|cx| {
+            cx.new(|_| {
+                Glance::new(
+                    snapshot,
+                    error,
+                    "/tmp/net-observer-test-absent.sock".to_string(),
+                )
+            })
+        });
+        let for_view = model.clone();
+        let window = cx.add_window(|_, cx| PanelView::new(for_view, cx));
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_resize(size(px(PANEL_W as f32), px(PANEL_H as f32)));
+        vcx.run_until_parked();
+        (model, vcx)
+    }
 
     /// Every control the panel draws must be laid out **inside** the panel.
     ///
@@ -1874,5 +1909,159 @@ mod headless_tests {
                 panel.height
             );
         }
+    }
+
+    /// The offline hint is drawn, and drawn **in the light theme**.
+    ///
+    /// gpui's test window reports [`WindowAppearance::Light`], so this carrier
+    /// exercises the light token set — the one every direct-`Theme` unit test in
+    /// this crate skips, because they all pass `WindowAppearance::Dark` by hand.
+    /// The appearance is asserted rather than assumed: if gpui ever flipped its
+    /// test window to dark, this test would go on passing while proving the
+    /// opposite of its name.
+    #[gpui::test]
+    fn the_offline_hint_is_drawn_in_the_light_theme(cx: &mut TestAppContext) {
+        let (_model, mut cx) = panel(
+            cx,
+            StatusSnapshot::default(),
+            Some(GlanceError::Unreachable("no such file".to_string())),
+        );
+        assert!(
+            matches!(
+                cx.update(|window, _| window.appearance()),
+                WindowAppearance::Light | WindowAppearance::VibrantLight
+            ),
+            "this test claims the light theme; the window must actually be in it"
+        );
+
+        let hint = cx
+            .debug_bounds("offline-warn")
+            .expect("an unreachable daemon must be stated in the header, not silently");
+        assert!(
+            hint.size.width > px(0.0) && hint.size.height > px(0.0),
+            "the offline hint was laid out with no area at all: {hint:?}"
+        );
+        assert!(
+            hint.origin.x >= px(0.0)
+                && hint.origin.x + hint.size.width <= px(PANEL_W as f32)
+                && hint.origin.y >= px(0.0)
+                && hint.origin.y + hint.size.height <= px(PANEL_H as f32),
+            "the offline hint is laid out outside the panel, where nothing is \
+             painted: {hint:?}"
+        );
+    }
+
+    /// The negative control for the test above, in a window that was **never**
+    /// offline: a reachable daemon draws no warning at all. Without this, the
+    /// hint test would pass equally well on a panel that warns permanently.
+    #[gpui::test]
+    fn a_reachable_daemon_draws_no_offline_hint(cx: &mut TestAppContext) {
+        let (_model, mut cx) = panel(cx, StatusSnapshot::default(), None);
+        assert!(
+            cx.debug_bounds("offline-warn").is_none(),
+            "a panel that never went offline drew the offline warning anyway"
+        );
+    }
+
+    /// A disabled control is inert **and** reads as off.
+    ///
+    /// Offline is the one state where the switch is not a control: there is no
+    /// daemon to accept a `SetObserving`. The failure this pins is the switch
+    /// that still flips under the cursor and reports nothing — a panel claiming
+    /// collection was turned off when nothing was ever asked.
+    #[gpui::test]
+    fn an_offline_toggle_neither_flips_nor_reports_an_attempt(cx: &mut TestAppContext) {
+        // A daemon that WAS observing, then went unreachable: the stale snapshot
+        // still says `observing: true`, so a switch that acted locally would be
+        // visible as a flip to false.
+        let snapshot = StatusSnapshot {
+            observing: true,
+            ..Default::default()
+        };
+        let (model, mut cx) = panel(
+            cx,
+            snapshot,
+            Some(GlanceError::Unreachable("no such file".to_string())),
+        );
+
+        // Looks off, by the code that decides it rather than by the pixels: the
+        // header hands the switch `observing && online`, and offline is not
+        // online however the stale snapshot reads.
+        let (observing, online) =
+            cx.update(|_, cx| (model.read(cx).snapshot.observing, model.read(cx).online()));
+        assert!(observing, "precondition: the stale snapshot still says ON");
+        assert!(!online, "precondition: the daemon is unreachable");
+        assert!(
+            !(observing && online),
+            "the header must draw the switch OFF while the daemon is unreachable"
+        );
+
+        let toggle = cx
+            .debug_bounds("observing-toggle")
+            .expect("the switch is drawn offline too, just not as a control");
+        cx.simulate_click(toggle.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(
+            cx.update(|_, cx| model.read(cx).control_msg.is_none()),
+            "clicking a disabled switch reported an attempt: {:?}",
+            cx.update(|_, cx| model.read(cx).control_msg.clone())
+        );
+        assert!(
+            cx.update(|_, cx| model.read(cx).snapshot.observing),
+            "the click flipped the local snapshot without asking any daemon"
+        );
+    }
+
+    /// A column that squeezes whatever is put in it: a fixed 400px block above
+    /// the element under test, in a window far shorter than that. Everything in
+    /// the column is over budget, so a flex child that is allowed to shrink is
+    /// shrunk — a 1px rule all the way to 0px.
+    ///
+    /// The pressure has to be supplied here because the panel's own column does
+    /// not apply it: measured on this layout, the panel's separator holds 1px at
+    /// every window height from 200px down to 1px whether it carries `flex_none`
+    /// or not, because the header and body absorb the whole deficit first. A
+    /// check written against the live panel is therefore green however the
+    /// separator is declared — it proves nothing. The element under test is
+    /// still the product's own [`separator`]; only the squeeze is the test's.
+    struct SqueezedColumn(Theme);
+
+    impl Render for SqueezedColumn {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(div().h(px(400.0)))
+                .child(separator(self.0))
+        }
+    }
+
+    /// The panel's hairline separator does not shrink.
+    ///
+    /// A separator is a flex child, and a flex child shrinks: without
+    /// `flex_none` a 1px rule in an overflowing column is squeezed to 0px and
+    /// the sections silently run together — no error, no gap, just two blocks
+    /// that now read as one. The sibling checks in `map.rs` show what the
+    /// retyped copies of this function do under the same squeeze.
+    #[gpui::test]
+    fn the_panel_separator_keeps_its_hairline_under_shrink_pressure(cx: &mut TestAppContext) {
+        let theme = Theme::for_appearance(gpui::WindowAppearance::Light);
+        let window = cx.add_window(|_, _| SqueezedColumn(theme));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(size(px(PANEL_W as f32), px(100.0)));
+        cx.run_until_parked();
+
+        let rule = cx
+            .debug_bounds("separator")
+            .expect("the separator was not laid out at all");
+        assert!(
+            rule.size.height >= px(MENU_SEPARATOR_H),
+            "the separator was squeezed below its hairline ({:?} < {:?}) — a rule \
+             that is allowed to shrink disappears in a tight column",
+            rule.size.height,
+            px(MENU_SEPARATOR_H)
+        );
     }
 }
