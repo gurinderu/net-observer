@@ -39,8 +39,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
 use gpui::{
-    App, AsyncApp, Context, Entity, Rgba, SharedString, Subscription, Window, WindowAppearance,
-    div, px, rgb, rgba,
+    AsyncApp, Context, Entity, Rgba, SharedString, Subscription, Window, WindowAppearance, div, px,
+    rgb, rgba,
 };
 
 use net_observer_ipc::{
@@ -561,11 +561,6 @@ pub fn scan_round_trip_base(
 pub struct PanelView {
     model: Entity<Glance>,
     _observe: Subscription,
-    /// Whether the actions menu is open. The panel is a fixed 320 px popover and
-    /// the controls outgrew a row: laid out in one line the last of them fell
-    /// outside it and simply did not appear. They live in a menu now, so the
-    /// next one costs a menu entry rather than an invisible button.
-    menu_open: bool,
 }
 
 impl PanelView {
@@ -576,7 +571,6 @@ impl PanelView {
         Self {
             model,
             _observe: observe,
-            menu_open: false,
         }
     }
 }
@@ -596,6 +590,10 @@ impl Render for PanelView {
         // A protocol failure is NOT offline: the daemon answered, so the toggle
         // stays live and the message goes to the footer instead.
         let online = glance.online();
+        // Read from the shared model rather than kept as view state: the flyout
+        // window clears `menu_window` when it dismisses itself, so the parent
+        // row's highlight goes out with the menu instead of outliving it.
+        let menu_open = glance.menu_window.is_some();
         let (offline_msg, protocol_msg) = match &glance.error {
             Some(GlanceError::Unreachable(m)) => (Some(m.clone()), None),
             Some(GlanceError::Protocol(m)) => (None, Some(m.clone())),
@@ -627,7 +625,7 @@ impl Render for PanelView {
                 now_us,
                 control_msg,
                 protocol_msg,
-                self.menu_open,
+                menu_open,
                 theme,
                 cx,
             )))
@@ -952,21 +950,27 @@ fn incidents_section(incidents: &[IncidentSummary], now_us: i64, theme: Theme) -
 /// window. The panel is a fixed height; beyond this the rest is counted.
 const INCIDENTS_IN_GLANCE: usize = 5;
 
-/// One entry of the actions menu: the control itself, stretched to the menu's
-/// width so the whole row is the target rather than the few pixels of its label.
-fn menu_row(control: impl IntoElement) -> impl IntoElement {
-    div().flex().w_full().child(control)
-}
+// ---- menu row metrics ------------------------------------------------------
+//
+// One set of numbers for the footer's submenu trigger and for every row of the
+// flyout window ([`crate::menu`]), so the row a submenu opens from and the rows
+// it opens into are the same object at the same size. They are the metrics of a
+// native macOS menu item: a full-width row about 28pt tall, 13pt label, 10pt of
+// side padding, and the small corner radius the system highlight is drawn with.
+// Colours are never hardcoded alongside them — those come from [`Theme`], so
+// light and dark both follow the system appearance.
 
-/// A heading inside the actions menu: what the entries under it do.
-fn menu_section(label: &str, theme: Theme) -> impl IntoElement {
-    div()
-        .px_2()
-        .pt_1()
-        .text_size(px(10.0))
-        .text_color(rgb(theme.muted))
-        .child(label.to_string())
-}
+/// Height of one menu row, in gpui logical pixels.
+pub(crate) const MENU_ROW_H: f32 = 28.0;
+/// Horizontal padding inside a menu row.
+pub(crate) const MENU_ROW_PX: f32 = 10.0;
+/// Corner radius of a menu row's highlight.
+pub(crate) const MENU_ROW_RADIUS: f32 = 5.0;
+/// Label size inside a menu row.
+pub(crate) const MENU_ROW_TEXT: f32 = 13.0;
+/// The submenu chevron. A text glyph on purpose: an icon here would mean a font
+/// or asset dependency for one character.
+pub(crate) const MENU_CHEVRON: &str = "›";
 
 /// The footer (pinned at the bottom of the panel): a muted freshness line (+ the
 /// last control-action outcome and any protocol error, if present), and subtle
@@ -985,210 +989,54 @@ fn footer(
     theme: Theme,
     cx: &mut Context<PanelView>,
 ) -> impl IntoElement {
-    let events = div()
-        .id("events")
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_size(px(12.0))
-        .text_color(rgb(theme.accent))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme.hover)))
-        .child("Events")
-        .on_click(cx.listener(|this, _, _window, cx| {
-            let socket = this.model.read(cx).socket_path.clone();
-            let model = this.model.clone();
-            crate::events::open_or_focus(cx, &model, socket);
-        }));
-
-    // "Map" opens the live network map in its own window, exactly like "Events"
-    // opens the event log. The map reads the shared snapshot, so it needs no
-    // socket path — only the model to observe and stash its handle on.
-    let map = div()
-        .id("map")
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_size(px(12.0))
-        .text_color(rgb(theme.accent))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme.hover)))
-        .child("Map")
-        .on_click(cx.listener(|this, _, _window, cx| {
-            let model = this.model.clone();
-            crate::map::open_or_focus(cx, &model);
-        }));
-
-    // "Air" opens the radio-environment map: a map of its own, not a layer on the
-    // network map — that one carries L2 devices, this one frequency bands
-    // (realm net-observer, node #48). It reads its own subscription, so unlike
-    // "Map" it needs the socket path.
-    let air = div()
-        .id("air")
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_size(px(12.0))
-        .text_color(rgb(theme.accent))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme.hover)))
-        .child("Air")
-        .on_click(cx.listener(|this, _, _window, cx| {
-            let socket = this.model.read(cx).socket_path.clone();
-            let model = this.model.clone();
-            crate::air::open_or_focus(cx, &model, socket);
-        }));
-
-    let refresh = div()
-        .id("refresh")
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_size(px(12.0))
-        .text_color(rgb(theme.accent))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme.hover)))
-        .child("Refresh")
-        .on_click(cx.listener(|this, _, _window, cx| {
-            this.model.update(cx, |g, cx| {
-                g.refresh();
-                cx.notify();
-            });
-        }));
-
-    // "Freeze pcap now" and the quiet toggle: the two operator control actions
-    // besides pause/resume. Both are benign self-control — the freeze copies files
-    // the daemon already owns, quiet only suppresses a probe the daemon itself
-    // sends — so neither is gated by `acting.enabled`, and both run their socket
-    // round-trips on the background executor for the same reason the header
-    // toggle does: a daemon that accepts but never answers must not park the bar.
-    let freeze = div()
-        .id("freeze-pcap")
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_size(px(12.0))
-        .text_color(rgb(theme.accent))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme.hover)))
-        .child("Freeze pcap")
-        .on_click(cx.listener(|this, _, _window, cx| {
-            spawn_control(this, cx, freeze_round_trip);
-        }));
-
-    // The label states what the click will DO, and the color states which state
-    // the daemon is in now: warn-colored while quiet, because a suppressed probe
-    // is a deliberate hole in the measurement and should not look routine.
-    let quiet_on = snapshot.quiet;
-    let quiet = div()
-        .id("quiet-toggle")
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_size(px(12.0))
-        .text_color(rgb(if quiet_on { theme.warn } else { theme.accent }))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme.hover)))
-        .child(if quiet_on { "Unquiet" } else { "Quiet" })
-        .on_click(cx.listener(|this, _, _window, cx| {
-            spawn_control(this, cx, quiet_round_trip);
-        }));
-
-    // Scan sits apart from the two above: it is the only button here that
-    // addresses other machines, so it is acting-class and refused by default.
-    // Warn-colored for the same reason the quiet toggle is — this one is not
-    // routine either.
-    let scan = div()
-        .id("scan-neighbors")
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_size(px(12.0))
-        .text_color(rgb(theme.warn))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme.hover)))
-        .child("Scan")
-        .on_click(cx.listener(|this, _, _window, cx| {
-            spawn_control(this, cx, scan_round_trip_base);
-        }));
-
-    let quit = div()
-        .id("quit")
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_size(px(12.0))
-        .text_color(rgb(theme.bad))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme.hover)))
-        .child("Quit")
-        .on_click(|_, _window, cx: &mut App| cx.quit());
-
     // The panel is a fixed 320 logical pixels wide and the controls outgrew one
     // row: laid out in a single line the last of them fall outside the panel and
     // simply do not appear, and a control that cannot be seen is a control that
-    // does not exist. They live in a menu now — the trigger stays one item wide
-    // however many actions there are, and the list is grouped by what an entry
-    // does: windows to open, then the daemon's own controls, then leaving.
-    let trigger = div()
+    // does not exist. They live in the flyout menu window ([`crate::menu`]) now —
+    // this trigger stays one row tall however many actions there are.
+    //
+    // It is drawn as a full-width menu row rather than a chip, on the metrics
+    // every row of the flyout uses: a native submenu opens from a row of its
+    // parent menu, highlighted edge to edge, with a chevron saying which way the
+    // submenu comes out. While the menu is open the row keeps that highlight, so
+    // where the flyout came from stays visible.
+    let trigger_ink = if menu_open { theme.knob } else { theme.accent };
+    let mut trigger = div()
         .id("menu-trigger")
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_size(px(12.0))
-        .text_color(rgb(theme.accent))
+        .flex()
+        .items_center()
+        .justify_between()
+        .w_full()
+        .h(px(MENU_ROW_H))
+        .px(px(MENU_ROW_PX))
+        .rounded(px(MENU_ROW_RADIUS))
+        .text_size(px(MENU_ROW_TEXT))
+        .text_color(rgb(trigger_ink))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme.hover)))
-        .child("Menu ▸")
+        .hover(|s| s.bg(rgb(theme.accent)).text_color(rgb(theme.knob)))
+        .child("Menu")
+        .child(MENU_CHEVRON)
         .on_click(cx.listener(|this, _, window, cx| {
             // The menu is its own window, so it needs where this one is and how
-            // much display there is to fly out into.
+            // much display there is to fly out into. Without a display there is
+            // no room to compute against: falling back to the panel's own bounds
+            // makes "no space on the right" true by construction and clamps the
+            // menu onto the panel's own coordinates, i.e. silently on top of it.
+            // So the menu does not open, and says why.
             let panel = window.bounds();
-            let screen = window
-                .display(cx)
-                .map_or(panel, |d| d.bounds().map(|p| px(f32::from(p))));
+            let Some(display) = window.display(cx) else {
+                eprintln!(
+                    "net-observer-bar: not opening the actions menu — the panel reports no display, so there is no room to place it against"
+                );
+                return;
+            };
+            let screen = display.bounds().map(|p| px(f32::from(p)));
             let model = this.model.clone();
             crate::menu::open_or_focus(cx, &model, panel, screen);
         }));
-
-    // A flyout, not a stack: the menu floats over the panel body beside its
-    // trigger instead of pushing the footer around. It cannot leave the window —
-    // gpui draws nothing outside it — so it opens rightward from the trigger and
-    // upward from the footer, which is where the room is.
-    let menu = menu_open.then(|| {
-        div()
-            .absolute()
-            .bottom(px(26.0))
-            .left(px(52.0))
-            .w(px(150.0))
-            .flex()
-            .flex_col()
-            .gap_0p5()
-            .p_1()
-            .shadow_lg()
-            .rounded_md()
-            .border_1()
-            .border_color(rgba(theme.edge))
-            .bg(rgba(theme.surface))
-            .child(menu_section("windows", theme))
-            .child(menu_row(events))
-            .child(menu_row(map))
-            .child(menu_row(air))
-            .child(menu_section("daemon", theme))
-            .child(menu_row(freeze))
-            .child(menu_row(quiet))
-            .child(menu_row(scan))
-            .child(menu_section("panel", theme))
-            .child(menu_row(refresh))
-            .child(menu_row(quit))
-    });
-
-    let actions = div()
-        .relative()
-        .flex()
-        .flex_col()
-        .children(menu)
-        .child(div().flex().items_center().gap_1().child(trigger));
+    if menu_open {
+        trigger = trigger.bg(rgb(theme.accent));
+    }
 
     let mut meta = div().flex().flex_col().gap_0p5().child(
         div()
@@ -1217,9 +1065,9 @@ fn footer(
         .flex()
         .flex_col()
         .gap_1()
-        .px_3()
+        .px_2()
         .py_2()
-        .child(actions)
+        .child(trigger)
         .child(meta)
 }
 
@@ -1238,10 +1086,10 @@ type ControlRoundTrip = fn(
 /// Run one blocking control round-trip on the background executor and apply its
 /// outcome to the shared model on the foreground.
 ///
-/// The single place the panel's control actions touch the socket, so "never block
-/// the gpui main thread" and "a daemon that is not there is a message, not a
-/// crash" are decided once rather than per button. The model is held weakly, so a
-/// shut-down app just drops the result.
+/// The single place a control action touches the socket, so "never block the gpui
+/// main thread" and "a daemon that is not there is a message, not a crash" are
+/// decided once rather than per button. The model is held weakly, so a shut-down
+/// app just drops the result.
 pub(crate) fn spawn_control_on<V: 'static>(
     glance: &Entity<Glance>,
     cx: &mut Context<V>,
@@ -1261,12 +1109,6 @@ pub(crate) fn spawn_control_on<V: 'static>(
             .ok();
     })
     .detach();
-}
-
-/// The panel's own spelling of [`spawn_control_on`].
-fn spawn_control(view: &PanelView, cx: &mut Context<PanelView>, round_trip: ControlRoundTrip) {
-    let glance = view.model.clone();
-    spawn_control_on(&glance, cx, round_trip);
 }
 
 // ---- sparklines ------------------------------------------------------------
@@ -1437,7 +1279,7 @@ fn spark_color(value: f64, threshold: f64, theme: Theme) -> Rgba {
 // ---- small element helpers -------------------------------------------------
 
 /// A hairline separator between sections — a 1px full-width rule, no borders.
-fn separator(theme: Theme) -> impl IntoElement {
+pub(crate) fn separator(theme: Theme) -> impl IntoElement {
     div().h(px(1.0)).w_full().bg(rgb(theme.separator))
 }
 

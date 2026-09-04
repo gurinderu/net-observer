@@ -10,41 +10,95 @@
 //! nothing outside the one it is in, so a menu that leaves the panel's edge
 //! cannot be an element inside the panel.
 //!
-//! Two consequences are handled here rather than discovered later:
+//! It is drawn on the metrics of a native macOS menu — [`MENU_ROW_H`] and its
+//! neighbours in [`crate::ui`], shared with the footer row this flies out of —
+//! and its groups are told apart by the same hairline [`separator`] the panel
+//! uses, so a change of theme moves both lines together.
+//!
+//! Three consequences are handled here rather than discovered later:
 //! * Opening this window takes key focus from the panel, and the panel closes
 //!   when it resigns key — hence [`Glance::menu_focus_guard`], raised for as long
-//!   as the menu owns the focus.
+//!   as the menu owns the focus. The guard is lowered on every path out of this
+//!   window, including the one where the window never became active: a guard left
+//!   raised would make the panel undismissable for the rest of the process.
+//! * Losing key focus does not by itself mean "the operator clicked away". The
+//!   click may have landed *in the panel*, which deactivates this window just the
+//!   same — so the menu closes at once but the panel is only closed after a short
+//!   settling delay, and only if it did not become active in the meantime.
 //! * A flyout that lands half off the display is worse than a stacked one, so
 //!   the anchor is clamped to the screen: it prefers the panel's right side,
 //!   flips to the left when there is no room, and slides up to fit.
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, StatefulInteractiveElement, Styled, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, px, rgb, rgba,
-    size,
+    AnyElement, App, AppContext, AsyncApp, Bounds, Context, Entity, InteractiveElement,
+    IntoElement, ParentElement, Pixels, Render, StatefulInteractiveElement, Styled, Subscription,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, px,
+    rgb, rgba, size,
 };
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::ui::{
-    Glance, Theme, freeze_round_trip, quiet_round_trip, scan_round_trip_base, spawn_control_on,
+    Glance, MENU_ROW_H, MENU_ROW_PX, MENU_ROW_RADIUS, MENU_ROW_TEXT, Theme, freeze_round_trip,
+    quiet_round_trip, scan_round_trip_base, separator, spawn_control_on,
 };
 
 /// Menu size in gpui logical pixels. Wide enough for the longest label
-/// ("Freeze pcap"), tall enough for the entries and their three headings.
-const MENU_W: f32 = 168.0;
-const MENU_H: f32 = 250.0;
+/// ("Freeze pcap") at [`MENU_ROW_TEXT`], tall enough for eight rows, three
+/// headings and the two rules between the groups.
+const MENU_W: f32 = 184.0;
+const MENU_H: f32 = 328.0;
 
 /// Gap between the panel's edge and the menu, so the two read as separate
 /// surfaces rather than one torn one.
 const GAP: f32 = 6.0;
 
+/// How long a freshly opened menu ignores losing key focus.
+///
+/// The dismiss rule cannot simply be "any deactivation closes me": the opening
+/// itself can deliver a spurious deactivation before the window is ever shown.
+/// The previous latch — ignore everything until the first activation — made that
+/// robust at the price of a window that never activates never being able to
+/// close, and so a focus guard raised for the rest of the process. A grace
+/// window is bounded in both directions instead.
+const OPEN_GRACE: Duration = Duration::from_millis(300);
+
+/// How long the panel is given to become active before the menu decides that the
+/// dismissing click landed outside both windows.
+///
+/// Clicking *into the panel* deactivates this menu exactly like clicking away
+/// does, and at that instant the panel is not yet key. Without this delay the
+/// panel closed under the operator's cursor on his own click.
+const PANEL_HANDOFF: Duration = Duration::from_millis(150);
+
 /// The actions menu view: every control that used to crowd the footer.
 pub(crate) struct MenuView {
     model: Entity<Glance>,
+    /// Re-render on every change of the shared model. Without it the quiet row
+    /// keeps the label and colour it was born with, and since the label states
+    /// what the *next* click will do, the next click does the opposite of what it
+    /// says.
+    _observe: Subscription,
+    /// Lowered when this view is dropped — i.e. whenever the window goes away,
+    /// however it went away.
+    focus_guard: Arc<AtomicBool>,
+}
+
+impl Drop for MenuView {
+    fn drop(&mut self) {
+        self.focus_guard.store(false, Ordering::SeqCst);
+    }
 }
 
 impl MenuView {
+    /// One row of the menu, on the native metrics: full width, the whole row is
+    /// the target, and hovering fills it with the accent rather than washing the
+    /// few pixels under the label.
+    ///
+    /// `color` is the row's own ink — the semantic colour of what it does. On the
+    /// highlight it gives way to [`Theme::knob`], because the accent fill decides
+    /// the contrast there and a warn-coloured label on it would be unreadable.
     fn entry(
         &self,
         id: &'static str,
@@ -57,14 +111,15 @@ impl MenuView {
         div()
             .id(id)
             .flex()
+            .items_center()
             .w_full()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .text_size(px(12.0))
+            .h(px(MENU_ROW_H))
+            .px(px(MENU_ROW_PX))
+            .rounded(px(MENU_ROW_RADIUS))
+            .text_size(px(MENU_ROW_TEXT))
             .text_color(rgb(color))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(theme.hover)))
+            .hover(|s| s.bg(rgb(theme.accent)).text_color(rgb(theme.knob)))
             .child(label.into())
             .on_click(cx.listener(move |this, _, _window, cx| {
                 on_click(this, cx);
@@ -72,10 +127,14 @@ impl MenuView {
             .into_any_element()
     }
 
+    /// A group heading: what the rows under it do. Deliberately small and muted,
+    /// with no hover and no row metrics, so it cannot be mistaken for something
+    /// clickable — the rule above it is what actually separates the groups.
     fn heading(label: &'static str, theme: Theme) -> AnyElement {
         div()
-            .px_2()
+            .px(px(MENU_ROW_PX))
             .pt_1()
+            .pb_0p5()
             .text_size(px(10.0))
             .text_color(rgb(theme.muted))
             .child(label)
@@ -159,10 +218,12 @@ impl Render for MenuView {
             .child(events)
             .child(map)
             .child(air)
+            .child(separator(theme))
             .child(Self::heading("daemon", theme))
             .child(freeze)
             .child(quiet)
             .child(scan)
+            .child(separator(theme))
             .child(Self::heading("panel", theme))
             .child(refresh)
             .child(quit)
@@ -214,14 +275,17 @@ pub(crate) fn open_or_focus(
         {
             return;
         }
-        model.update(cx, |g, _| g.menu_window = None);
+        model.update(cx, |g, cx| {
+            g.menu_window = None;
+            cx.notify();
+        });
     }
 
     let guard = model.read(cx).menu_focus_guard.clone();
-    let panel_window = model.read(cx).panel_window;
     guard.store(true, Ordering::SeqCst);
 
     let model_for_view = model.clone();
+    let guard_for_view = guard.clone();
     let opened = cx.open_window(
         WindowOptions {
             window_background: WindowBackgroundAppearance::Blurred,
@@ -237,29 +301,30 @@ pub(crate) fn open_or_focus(
         },
         move |window, cx| {
             cx.new(move |cx| {
+                let observe = cx.observe(&model_for_view, |_, _, cx| cx.notify());
                 let view = MenuView {
                     model: model_for_view,
+                    _observe: observe,
+                    focus_guard: guard_for_view,
                 };
-                // Dismiss on click-away, exactly like the panel: close once the
-                // menu has been active and then resigns key. Closing the menu
-                // also lowers the guard and takes the panel with it, because the
-                // click that dismissed the menu landed outside both.
-                let mut was_active = false;
+                // Dismiss on click-away. Losing key focus is the only signal
+                // there is, and it does not distinguish the two clicks that
+                // produce it: one landing outside both windows, and one landing
+                // in the panel. The menu goes either way; the panel is closed
+                // only after [`PANEL_HANDOFF`] and only if it did not become key
+                // in the meantime — otherwise the operator's own click on the
+                // panel took it out from under him.
+                let opened_at = Instant::now();
                 cx.observe_window_activation(window, move |this: &mut MenuView, window, cx| {
-                    if window.is_window_active() {
-                        was_active = true;
+                    if window.is_window_active() || opened_at.elapsed() < OPEN_GRACE {
                         return;
                     }
-                    if !was_active {
-                        return;
-                    }
-                    this.model.update(cx, |g, _| {
+                    this.model.update(cx, |g, cx| {
                         g.menu_window = None;
                         g.menu_focus_guard.store(false, Ordering::SeqCst);
+                        cx.notify();
                     });
-                    if let Some(panel) = panel_window {
-                        panel.update(cx, |_, window, _| window.remove_window()).ok();
-                    }
+                    close_panel_unless_it_took_focus(cx, this.model.clone());
                     window.remove_window();
                 })
                 .detach();
@@ -270,7 +335,10 @@ pub(crate) fn open_or_focus(
 
     match opened {
         Ok(handle) => {
-            model.update(cx, |g, _| g.menu_window = Some(handle.into()));
+            model.update(cx, |g, cx| {
+                g.menu_window = Some(handle.into());
+                cx.notify();
+            });
             cx.activate(true);
         }
         Err(e) => {
@@ -278,6 +346,38 @@ pub(crate) fn open_or_focus(
             eprintln!("net-observer-bar: failed to open the actions menu: {e}");
         }
     }
+}
+
+/// Close the panel after [`PANEL_HANDOFF`], unless it became key in the meantime.
+///
+/// Spawned on the app rather than on the menu's own view, because the menu window
+/// is removed immediately after this is scheduled and a view-scoped task would go
+/// with it. The handle is cleared whether the panel is closed here or found dead:
+/// a handle that outlived its window reads as a live one everywhere else.
+fn close_panel_unless_it_took_focus(cx: &mut App, model: Entity<Glance>) {
+    let app: &mut App = cx;
+    app.spawn(async move |acx: &mut AsyncApp| {
+        acx.background_executor().timer(PANEL_HANDOFF).await;
+        acx.update(|acx| {
+            let Some(panel) = model.read(acx).panel_window else {
+                return;
+            };
+            // `update` succeeds only while the window is still open, so `Err`
+            // means the panel is already gone.
+            match panel.update(acx, |_, window, _| window.is_window_active()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    panel
+                        .update(acx, |_, window, _| window.remove_window())
+                        .ok();
+                    model.update(acx, |g, _| g.panel_window = None);
+                }
+                Err(_) => model.update(acx, |g, _| g.panel_window = None),
+            }
+        })
+        .ok();
+    })
+    .detach();
 }
 
 #[cfg(test)]
