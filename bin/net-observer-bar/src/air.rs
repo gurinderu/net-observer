@@ -1056,16 +1056,26 @@ fn ring_mark_label(lane: &Lane) -> String {
     s
 }
 
+/// One neighbour as the rings view handles it: the band it was heard in, and
+/// the lane carrying its reading.
+type BandLane = (Band, Lane);
+
+/// The split [`ring_marks`] returns.
+struct RingMarks {
+    /// Neighbours with a reported signal — each has a ring to sit on.
+    placed: Vec<BandLane>,
+    /// Neighbours with no reported signal — no ring can carry them, so they are
+    /// named outside the drawing instead.
+    unplaceable: Vec<BandLane>,
+}
+
 /// The neighbours the rings can carry, in the window's own ranking order, and
 /// the ones that must be named outside the drawing instead.
 ///
 /// A neighbour with no reported signal has no ring to sit on. Drawing it
 /// anywhere would be inventing the reading the whole view is made of, so it is
 /// counted and said instead — SKIP, never silence.
-fn ring_marks(
-    sample: &AirSample,
-    own: Option<ChannelSpan>,
-) -> (Vec<(Band, Lane)>, Vec<(Band, Lane)>) {
+fn ring_marks(sample: &AirSample, own: Option<ChannelSpan>) -> RingMarks {
     let mut placed = Vec::new();
     let mut unplaceable = Vec::new();
     for g in group(sample, own) {
@@ -1077,7 +1087,10 @@ fn ring_marks(
             }
         }
     }
-    (placed, unplaceable)
+    RingMarks {
+        placed,
+        unplaceable,
+    }
 }
 
 /// The rings view: this Mac at the centre, concentric rings labelled in dBm, and
@@ -1094,7 +1107,10 @@ fn rings_section(
     d: f32,
     theme: Theme,
 ) -> impl IntoElement {
-    let (placed, unplaceable) = ring_marks(sample, own);
+    let RingMarks {
+        placed,
+        unplaceable,
+    } = ring_marks(sample, own);
 
     let mut plot = div()
         .debug_selector(|| "air-rings".to_string())
@@ -2624,10 +2640,13 @@ mod tests {
     #[test]
     fn a_neighbour_without_a_signal_sits_on_no_ring() {
         let sample = scan(vec![
-            ap(36, "5", Some(80), Some(-55)),
-            ap(40, "5", Some(20), None),
+            ap(36, "5ghz", Some(80), Some(-55)),
+            ap(40, "5ghz", Some(20), None),
         ]);
-        let (placed, unplaceable) = ring_marks(&sample, Some(own(36, "5", 80)));
+        let RingMarks {
+            placed,
+            unplaceable,
+        } = ring_marks(&sample, Some(own(36, "5ghz", 80)));
         assert_eq!(placed.len(), 1);
         assert_eq!(unplaceable.len(), 1, "it must be counted, never dropped");
         assert!(
@@ -2638,8 +2657,8 @@ mod tests {
 
     #[test]
     fn a_mark_names_its_channel_its_width_and_a_distance_range() {
-        let sample = scan(vec![ap(36, "5", Some(80), Some(-62))]);
-        let (placed, _) = ring_marks(&sample, Some(own(36, "5", 80)));
+        let sample = scan(vec![ap(36, "5ghz", Some(80), Some(-62))]);
+        let RingMarks { placed, .. } = ring_marks(&sample, Some(own(36, "5ghz", 80)));
         let label = ring_mark_label(&placed[0].1);
         assert!(label.contains("-62 dBm"), "{label}");
         assert!(label.contains("ch 36"), "{label}");
@@ -2672,7 +2691,6 @@ mod tests {
 /// slice the window was first run against, and the one it was unreadable on. It
 /// is parsed by `macos::air::parse_air_report`, the daemon's own parser, so what
 /// these tests draw is what production would hand the window.
-
 #[cfg(test)]
 mod headless_tests {
     use super::*;
@@ -3024,7 +3042,7 @@ mod headless_tests {
             assert!(within(plot, ring), "the {level} dBm ring spills: {ring:?}");
         }
 
-        let (placed, _) = ring_marks(&live_sample(), Some(live_own()));
+        let RingMarks { placed, .. } = ring_marks(&live_sample(), Some(live_own()));
         assert!(
             placed.len() > 5,
             "the fixture must be crowded to prove this"
@@ -3073,7 +3091,7 @@ mod headless_tests {
     /// one number that could be read as a measurement.
     #[test]
     fn every_drawn_neighbour_is_given_a_distance_range_and_never_a_figure() {
-        let (placed, _) = ring_marks(&live_sample(), Some(live_own()));
+        let RingMarks { placed, .. } = ring_marks(&live_sample(), Some(live_own()));
         assert!(!placed.is_empty(), "the fixture must place neighbours");
         for (_band, lane) in &placed {
             let label = ring_mark_label(lane);
@@ -3113,7 +3131,10 @@ mod headless_tests {
             bounds(&mut cx, &format!("air-axis:{here}")).is_none(),
             "the axis view is still drawn under the rings"
         );
-        let (placed, unplaceable) = ring_marks(&live_sample(), Some(own));
+        let RingMarks {
+            placed,
+            unplaceable,
+        } = ring_marks(&live_sample(), Some(own));
         let drawn: usize = groups.iter().map(|g| g.lanes.len()).sum();
         assert_eq!(
             placed.len() + unplaceable.len(),

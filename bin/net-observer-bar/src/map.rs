@@ -1686,7 +1686,7 @@ mod tests {
 
         // A frame that named no port carries the decoder's literal "?": the card
         // must then say nothing about a port, not trail a separator.
-        let mut l = link("sw", "?", None, LearnedVia::Lldp);
+        let mut l = topology_link("sw", "?", None, LearnedVia::Lldp);
         l.capabilities = String::new();
         let node = UplinkNode::from_link(&l);
         let line = join_parts(&[uplink_via_label(node.via), ""]);
@@ -1694,7 +1694,7 @@ mod tests {
         assert!(!line.contains("port"), "{line}");
 
         // And an uplink heard on no named interface does not trail one either.
-        let mut anon = UplinkNode::from_link(&link("sw", "Gi0/1", None, LearnedVia::Lldp));
+        let mut anon = UplinkNode::from_link(&topology_link("sw", "Gi0/1", None, LearnedVia::Lldp));
         anon.iface = String::new();
         let seen = uplink_seen_line(&anon, anon.ts_us);
         assert!(
@@ -1785,7 +1785,12 @@ mod tests {
         );
     }
 
-    fn link(chassis: &str, port: &str, name: Option<&str>, via: LearnedVia) -> TopologyLink {
+    pub(super) fn topology_link(
+        chassis: &str,
+        port: &str,
+        name: Option<&str>,
+        via: LearnedVia,
+    ) -> TopologyLink {
         TopologyLink {
             iface: "en0".into(),
             remote_chassis: chassis.into(),
@@ -1803,14 +1808,14 @@ mod tests {
     fn uplinks_prefer_the_name_dedup_and_cap() {
         let mut snap = StatusSnapshot {
             topology: vec![
-                link(
+                topology_link(
                     "00:11:22:33:44:55",
                     "Gi0/1",
                     Some("core-sw"),
                     LearnedVia::Lldp,
                 ),
                 // Same switch+port advertised again (e.g. via CDP too): one node.
-                link(
+                topology_link(
                     "00:11:22:33:44:55",
                     "Gi0/1",
                     Some("core-sw"),
@@ -1828,7 +1833,7 @@ mod tests {
         // More distinct uplinks than the cap: capped, remainder reported.
         let many: Vec<TopologyLink> = (0..MAX_UPLINKS + 2)
             .map(|i| {
-                link(
+                topology_link(
                     &format!("sw{i}"),
                     &format!("Gi0/{i}"),
                     None,
@@ -1849,7 +1854,7 @@ mod tests {
     /// capabilities split out of their comma-joined wire form.
     #[test]
     fn an_uplink_node_carries_the_whole_advertisement() {
-        let mut l = link(
+        let mut l = topology_link(
             "00:11:22:33:44:55",
             "Gi0/1",
             Some("core-sw"),
@@ -1865,12 +1870,12 @@ mod tests {
         assert_eq!(node.caps, vec!["bridge", "wlan_ap"]);
 
         // Without a system name the label IS the chassis, so no duplicate line.
-        let anon = UplinkNode::from_link(&link("sw-x", "Gi0/2", None, LearnedVia::Lldp));
+        let anon = UplinkNode::from_link(&topology_link("sw-x", "Gi0/2", None, LearnedVia::Lldp));
         assert!(!anon.has_name());
         // No advertised capabilities means no claims line, not an empty one.
         assert!(
             UplinkNode::from_link(&{
-                let mut e = link("sw-y", "Gi0/3", None, LearnedVia::Lldp);
+                let mut e = topology_link("sw-y", "Gi0/3", None, LearnedVia::Lldp);
                 e.capabilities = String::new();
                 e
             })
@@ -1898,7 +1903,7 @@ mod tests {
             "{unknown}"
         );
 
-        let node = UplinkNode::from_link(&link("sw", "Gi0/1", None, LearnedVia::Lldp));
+        let node = UplinkNode::from_link(&topology_link("sw", "Gi0/1", None, LearnedVia::Lldp));
         let seen = uplink_seen_line(&node, node.ts_us + 120_000_000);
         assert!(seen.starts_with("heard on en0"), "{seen}");
         assert!(seen.contains("2m ago"), "{seen}");
@@ -1913,7 +1918,7 @@ mod tests {
     #[test]
     fn a_snapshot_with_only_uplinks_is_not_empty() {
         let snap = StatusSnapshot {
-            topology: vec![link(
+            topology: vec![topology_link(
                 "00:11:22:33:44:55",
                 "Gi0/1",
                 Some("core-sw"),
@@ -1944,6 +1949,7 @@ mod tests {
 /// and scene construction run for real, rasterization does not.
 #[cfg(test)]
 mod headless_tests {
+    use super::tests::topology_link;
     use super::*;
     use crate::ui::Glance;
     use gpui::{Size, TestAppContext, VisualTestContext};
@@ -2166,7 +2172,7 @@ mod headless_tests {
     /// joined on the identity triple — never from the sighting `ts_us`.
     #[test]
     fn an_uplink_takes_its_first_seen_from_the_matching_lifetime() {
-        let l = link("sw-1", "Gi0/1", None, LearnedVia::Lldp);
+        let l = topology_link("sw-1", "Gi0/1", None, LearnedVia::Lldp);
         let snap = StatusSnapshot {
             topology: vec![l.clone()],
             topology_lifetimes: vec![types::TopologyLifetime {
