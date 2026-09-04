@@ -42,15 +42,78 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::ui::{
-    Glance, MENU_ROW_H, MENU_ROW_PX, MENU_ROW_RADIUS, MENU_ROW_TEXT, Theme, freeze_round_trip,
-    quiet_round_trip, scan_round_trip_base, separator, spawn_control_on,
+    Glance, MENU_HEADING_H, MENU_HEADING_TEXT, MENU_ROW_H, MENU_ROW_PX, MENU_ROW_RADIUS,
+    MENU_ROW_TEXT, MENU_SEPARATOR_H, Theme, freeze_round_trip, quiet_round_trip,
+    scan_round_trip_base, separator, spawn_control_on,
 };
 
-/// Menu size in gpui logical pixels. Wide enough for the longest label
-/// ("Freeze pcap") at [`MENU_ROW_TEXT`], tall enough for eight rows, three
-/// headings and the two rules between the groups.
+/// Menu width in gpui logical pixels. Wide enough for the longest label
+/// ("Freeze pcap") at [`MENU_ROW_TEXT`].
+///
+/// There is deliberately no matching height constant: the menu's composition is
+/// not fixed — a row is dropped for a collector this daemon cannot run — so a
+/// constant tall enough for one composition is silently too short for another,
+/// and gpui draws nothing outside the window. The height is computed from what
+/// the menu is about to draw; see [`MenuComposition`].
 const MENU_W: f32 = 184.0;
-const MENU_H: f32 = 328.0;
+
+/// The menu window's own chrome, per side: the 1px border and the `p_1` padding
+/// of the flyout's root element. Both are outside the stacked children, so both
+/// count twice towards the window's height.
+const MENU_BORDER: f32 = 1.0;
+const MENU_PAD: f32 = 4.0;
+/// The `gap_0p5` between two stacked children of the flyout's root.
+const MENU_GAP: f32 = 2.0;
+
+/// The rows every daemon gets, whatever it can collect: events, map, freeze,
+/// quiet, scan, refresh, quit. Only the collector rows come and go.
+const FIXED_ROWS: usize = 7;
+/// The group headings ("windows", "daemon", "panel") and the two rules between
+/// the three groups.
+const HEADINGS: usize = 3;
+const SEPARATORS: usize = 2;
+
+/// What the flyout is about to draw, counted by the three kinds of thing that
+/// take vertical room. The window's height is derived from this and nothing
+/// else, so a row that appears or disappears moves the window with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MenuComposition {
+    rows: usize,
+    headings: usize,
+    separators: usize,
+}
+
+impl MenuComposition {
+    /// The composition of a menu whose air row is drawn (`air_row`) or dropped,
+    /// which is the only thing that varies today.
+    fn new(air_row: bool) -> Self {
+        Self {
+            rows: FIXED_ROWS + usize::from(air_row),
+            headings: HEADINGS,
+            separators: SEPARATORS,
+        }
+    }
+
+    /// The window height this composition needs: every child's own height, the
+    /// gap between each neighbouring pair, and the root's border and padding on
+    /// both sides.
+    fn height(self) -> f32 {
+        let items = self.rows + self.headings + self.separators;
+        let gaps = items.saturating_sub(1) as f32 * MENU_GAP;
+        let content = self.rows as f32 * MENU_ROW_H
+            + self.headings as f32 * MENU_HEADING_H
+            + self.separators as f32 * MENU_SEPARATOR_H
+            + gaps;
+        content + 2.0 * (MENU_BORDER + MENU_PAD)
+    }
+}
+
+/// The composition the daemon behind `model` calls for, read from the live
+/// snapshot.
+fn composition_for(model: &Entity<Glance>, cx: &App) -> MenuComposition {
+    let air = collector_row(model.read(cx).snapshot.collector(EventKind::Air)).is_some();
+    MenuComposition::new(air)
+}
 
 /// Gap between the panel's edge and the menu, so the two read as separate
 /// surfaces rather than one torn one.
@@ -120,6 +183,10 @@ impl MenuView {
             .items_center()
             .w_full()
             .h(px(MENU_ROW_H))
+            // Never shrink: a menu window too short for its rows must push them
+            // out, where the fit test sees it, rather than quietly squashing
+            // every row a few pixels and looking fine.
+            .flex_none()
             .px(px(MENU_ROW_PX))
             .rounded(px(MENU_ROW_RADIUS))
             .text_size(px(MENU_ROW_TEXT))
@@ -138,10 +205,15 @@ impl MenuView {
     /// clickable — the rule above it is what actually separates the groups.
     fn heading(label: &'static str, theme: Theme) -> AnyElement {
         div()
+            .flex()
+            .items_center()
             .px(px(MENU_ROW_PX))
-            .pt_1()
-            .pb_0p5()
-            .text_size(px(10.0))
+            // An explicit height rather than the text's own line box: the window
+            // is sized from the sum of what it draws, and only a declared height
+            // can be added up before the window exists.
+            .h(px(MENU_HEADING_H))
+            .flex_none()
+            .text_size(px(MENU_HEADING_TEXT))
             .text_color(rgb(theme.muted))
             .child(label)
             .into_any_element()
@@ -233,8 +305,10 @@ impl Render for MenuView {
             .flex()
             .flex_col()
             .size_full()
-            .gap_0p5()
-            .p_1()
+            // Spelled in pixels, not in the spacing scale, because these two are
+            // summands of the window's computed height.
+            .gap(px(MENU_GAP))
+            .p(px(MENU_PAD))
             .rounded(px(10.0))
             .border_1()
             .border_color(rgba(theme.edge))
@@ -300,8 +374,11 @@ pub(crate) fn collector_row(availability: CollectorAvailability) -> Option<Colle
 /// the menu flips to the left rather than hanging off the screen. Vertically it
 /// is bottom-aligned with the panel and then slid up if that would take it below
 /// the display's edge.
-fn menu_bounds(panel: Bounds<Pixels>, screen: Bounds<Pixels>) -> Bounds<Pixels> {
-    let menu = size(px(MENU_W), px(MENU_H));
+/// `height` is the composed height of the menu about to be drawn
+/// ([`MenuComposition::height`]), never a constant: the clamping below is only
+/// as honest as the height it is given.
+fn menu_bounds(panel: Bounds<Pixels>, screen: Bounds<Pixels>, height: f32) -> Bounds<Pixels> {
+    let menu = size(px(MENU_W), px(height));
     let right_edge = f32::from(panel.origin.x) + f32::from(panel.size.width) + GAP;
     let fits_right =
         right_edge + MENU_W <= f32::from(screen.origin.x) + f32::from(screen.size.width);
@@ -314,8 +391,8 @@ fn menu_bounds(panel: Bounds<Pixels>, screen: Bounds<Pixels>) -> Bounds<Pixels> 
     // Bottom-aligned with the panel, then clamped into the display.
     let panel_bottom = f32::from(panel.origin.y) + f32::from(panel.size.height);
     let screen_bottom = f32::from(screen.origin.y) + f32::from(screen.size.height);
-    let y = (panel_bottom - MENU_H)
-        .min(screen_bottom - MENU_H)
+    let y = (panel_bottom - height)
+        .min(screen_bottom - height)
         .max(f32::from(screen.origin.y));
 
     Bounds {
@@ -347,12 +424,17 @@ pub(crate) fn open_or_focus(
     let guard = model.read(cx).menu_focus_guard.clone();
     guard.store(true, Ordering::SeqCst);
 
+    // Sized from the composition this daemon calls for, read now: the window is
+    // not resizable, so a row that appears while it is open waits for the next
+    // opening rather than being drawn outside the window.
+    let height = composition_for(model, cx).height();
+
     let model_for_view = model.clone();
     let guard_for_view = guard.clone();
     let opened = cx.open_window(
         WindowOptions {
             window_background: WindowBackgroundAppearance::Blurred,
-            window_bounds: Some(WindowBounds::Windowed(menu_bounds(panel, screen))),
+            window_bounds: Some(WindowBounds::Windowed(menu_bounds(panel, screen, height))),
             titlebar: None,
             kind: WindowKind::PopUp,
             is_resizable: false,
@@ -472,6 +554,25 @@ mod tests {
         assert_eq!(on.text("Air"), "Air");
     }
 
+    /// The reason there is no `MENU_H`: a menu missing a row is a shorter menu,
+    /// not the same window with slack in it. A height that did not move with the
+    /// composition would be a constant again, and the next row to appear would be
+    /// drawn outside the window.
+    #[test]
+    fn the_height_moves_with_the_composition() {
+        let with_air = MenuComposition::new(true).height();
+        let without_air = MenuComposition::new(false).height();
+        assert!(
+            with_air > without_air,
+            "the fuller menu must be the taller one: {with_air} vs {without_air}"
+        );
+        // Exactly one row and the gap above it, nothing else.
+        assert!(
+            (with_air - without_air - (MENU_ROW_H + MENU_GAP)).abs() < f32::EPSILON,
+            "the difference must be the dropped row itself: {with_air} vs {without_air}"
+        );
+    }
+
     fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
         Bounds {
             origin: point(px(x), px(y)),
@@ -488,7 +589,7 @@ mod tests {
         // Panel near the right edge — the usual menu-bar case: no room to the
         // right, so the menu flips to the panel's left.
         let panel = bounds(1150.0, 24.0, 320.0, 560.0);
-        let m = menu_bounds(panel, screen);
+        let m = menu_bounds(panel, screen, MenuComposition::new(true).height());
         assert!(
             f32::from(m.origin.x) + MENU_W <= 1470.0,
             "must not hang off the right: {m:?}"
@@ -497,7 +598,7 @@ mod tests {
 
         // Panel on the left — room to the right, so it opens there.
         let panel = bounds(40.0, 24.0, 320.0, 560.0);
-        let m = menu_bounds(panel, screen);
+        let m = menu_bounds(panel, screen, MenuComposition::new(true).height());
         assert!(f32::from(m.origin.x) > 360.0, "opens rightward: {m:?}");
         assert!(f32::from(m.origin.x) + MENU_W <= 1470.0, "{m:?}");
     }
@@ -508,9 +609,10 @@ mod tests {
     fn the_menu_slides_up_rather_than_off_the_bottom() {
         let screen = bounds(0.0, 0.0, 1470.0, 956.0);
         let panel = bounds(40.0, 700.0, 320.0, 560.0);
-        let m = menu_bounds(panel, screen);
+        let height = MenuComposition::new(true).height();
+        let m = menu_bounds(panel, screen, height);
         assert!(
-            f32::from(m.origin.y) + MENU_H <= 956.0,
+            f32::from(m.origin.y) + height <= 956.0,
             "the whole menu is on screen: {m:?}"
         );
         assert!(f32::from(m.origin.y) >= 0.0, "{m:?}");
@@ -525,27 +627,62 @@ mod headless_tests {
     use super::*;
     use crate::ui::Glance;
     use gpui::{TestAppContext, VisualTestContext};
-    use net_observer_ipc::StatusSnapshot;
+    use net_observer_ipc::{Capabilities, StatusSnapshot};
 
     /// Every row of the menu lands inside the menu window, and no two rows sit on
-    /// top of each other.
+    /// top of each other — for a daemon that declares the air collector, so the
+    /// menu is at its tallest.
     ///
-    /// The menu window is a fixed [`MENU_W`]×[`MENU_H`], so `MENU_H` is a claim
-    /// about eight rows plus three headings and two rules — a claim nothing
-    /// checked while the rows were counted by eye on a screenshot. gpui paints
-    /// nothing outside a window, so a row that does not fit is not clipped or
-    /// scrolled to: it is simply absent. This is the shape of the defect that
-    /// used to hit the footer when all eight actions sat in one row there.
+    /// The window is sized from [`MenuComposition::height`], and this is what
+    /// makes that a claim rather than an assertion: gpui paints nothing outside a
+    /// window, so a row that does not fit is not clipped or scrolled to — it is
+    /// simply absent. This is the shape of the defect that used to hit the footer
+    /// when all eight actions sat in one row there.
     #[gpui::test]
     fn menu_rows_stay_inside_the_menu_window(cx: &mut TestAppContext) {
+        let snapshot = StatusSnapshot {
+            capabilities: Some(Capabilities::from_pairs([(EventKind::Air.as_str(), true)])),
+            ..StatusSnapshot::default()
+        };
+        let laid_out = lay_out_menu(cx, snapshot, MenuComposition::new(true));
+        assert!(
+            laid_out.iter().any(|(id, _)| *id == "menu-row:air"),
+            "a daemon that declares the air collector gets the air row"
+        );
+        assert_eq!(laid_out.len(), FIXED_ROWS + 1);
+    }
+
+    /// The same, for a daemon that declares no air collector: one row fewer, and
+    /// the window is a matching amount shorter rather than the same height with
+    /// slack in it.
+    #[gpui::test]
+    fn menu_rows_stay_inside_the_shorter_menu_window(cx: &mut TestAppContext) {
+        let snapshot = StatusSnapshot {
+            capabilities: Some(Capabilities::default()),
+            ..StatusSnapshot::default()
+        };
+        let laid_out = lay_out_menu(cx, snapshot, MenuComposition::new(false));
+        assert!(
+            !laid_out.iter().any(|(id, _)| *id == "menu-row:air"),
+            "a daemon without the air collector must not be offered the row"
+        );
+        assert_eq!(laid_out.len(), FIXED_ROWS);
+    }
+
+    /// Draw the menu for `snapshot` in a window of exactly the height
+    /// `composition` computes, and return every row that was laid out, having
+    /// checked that each lies inside the window and none overlaps another.
+    ///
+    /// The window is drawn rather than the element measured by hand: every row is
+    /// wired with `cx.listener`, which only resolves inside the window's own
+    /// render pass.
+    fn lay_out_menu(
+        cx: &mut TestAppContext,
+        snapshot: StatusSnapshot,
+        composition: MenuComposition,
+    ) -> Vec<(&'static str, Bounds<Pixels>)> {
         let model = cx.update(|cx| {
-            cx.new(|_| {
-                Glance::new(
-                    StatusSnapshot::default(),
-                    None,
-                    "/tmp/net-observer-test.sock".to_string(),
-                )
-            })
+            cx.new(|_| Glance::new(snapshot, None, "/tmp/net-observer-test.sock".to_string()))
         });
         let for_view = model.clone();
         let guard = Arc::new(AtomicBool::new(false));
@@ -560,19 +697,18 @@ mod headless_tests {
         });
         let mut cx = VisualTestContext::from_window(window.into(), cx);
 
-        // Draw the window itself at the menu's real size, rather than the element
-        // by hand: every row is wired with `cx.listener`, which only resolves
-        // inside the window's own render pass.
-        let menu = size(px(MENU_W), px(MENU_H));
+        let height = composition.height();
+        let menu = size(px(MENU_W), px(height));
         cx.simulate_resize(menu);
         cx.run_until_parked();
         assert_eq!(
             cx.update(|window, _| window.viewport_size()),
             menu,
-            "the test window must be the menu's own size"
+            "the test window must be the menu's own computed size"
         );
 
-        // Every action the panel's footer used to carry, in flyout order.
+        // Every action the panel's footer used to carry, in flyout order. The air
+        // row is the only one a daemon can be without.
         let rows: [&'static str; 8] = [
             "menu-row:events",
             "menu-row:map",
@@ -585,9 +721,10 @@ mod headless_tests {
         ];
         let mut laid_out = Vec::new();
         for id in rows {
-            let b = cx
-                .debug_bounds(id)
-                .unwrap_or_else(|| panic!("`{id}` was not laid out at all"));
+            let Some(b) = cx.debug_bounds(id) else {
+                assert_eq!(id, "menu-row:air", "`{id}` was not laid out at all");
+                continue;
+            };
             assert!(
                 b.origin.x >= px(0.0) && b.origin.y >= px(0.0),
                 "`{id}` starts outside the menu: {b:?}"
@@ -598,7 +735,7 @@ mod headless_tests {
             );
             assert!(
                 b.origin.y + b.size.height <= menu.height,
-                "`{id}` runs past the menu's bottom edge: {b:?} (the menu is {MENU_H}px tall)"
+                "`{id}` runs past the menu's bottom edge: {b:?} (the menu is {height}px tall)"
             );
             laid_out.push((id, b));
         }
@@ -611,6 +748,7 @@ mod headless_tests {
                 );
             }
         }
+        laid_out
     }
 
     /// Half-open rectangle intersection: touching edges are not an overlap.
