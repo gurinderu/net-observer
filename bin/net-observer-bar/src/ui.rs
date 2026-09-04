@@ -608,7 +608,7 @@ impl Render for PanelView {
             .child(separator(theme))
             .child(status_body(&snapshot, &history, now_us, theme))
             .child(separator(theme))
-            .child(footer(
+            .child(div().flex_shrink_0().child(footer(
                 &snapshot,
                 now_us,
                 control_msg,
@@ -616,7 +616,7 @@ impl Render for PanelView {
                 self.menu_open,
                 theme,
                 cx,
-            ))
+            )))
     }
 }
 
@@ -631,8 +631,14 @@ fn status_body(
     theme: Theme,
 ) -> impl IntoElement {
     div()
+        .id("panel-body")
         .flex()
         .flex_col()
+        // The panel's height is fixed, so a long body used to push the footer —
+        // and with it the only way to reach any action — past the bottom edge.
+        // The body takes the leftover room and scrolls inside it instead.
+        .flex_1()
+        .overflow_y_scroll()
         // Trend before state: the gateway fails as a ramp, so the slope is
         // read first and the current verdicts underneath it.
         .child(sparklines_section(history, theme))
@@ -901,16 +907,36 @@ fn incidents_section(incidents: &[IncidentSummary], now_us: i64, theme: Theme) -
                 .child("no recent incidents"),
         )
     } else {
-        base.children(incidents.iter().map(move |i| {
+        // The glance is a glance: a long run of incidents belongs in the events
+        // window, not in a panel whose height is fixed. What does not fit is
+        // counted rather than dropped, so the tail is never silently absent.
+        let shown = incidents.len().min(INCIDENTS_IN_GLANCE);
+        let hidden = incidents.len() - shown;
+        let listed = base.children(incidents.iter().take(shown).map(move |i| {
             let (state, color) = match i.closed_us {
                 Some(_) => ("closed", theme.muted),
                 None => ("open", theme.bad),
             };
             let value = format!("{state} \u{00b7} {}", age_str(i.opened_us, now_us));
             row(i.trigger_id.clone(), value, rgb(color), theme)
-        }))
+        }));
+        if hidden == 0 {
+            listed
+        } else {
+            listed.child(
+                div()
+                    .py_1()
+                    .text_size(px(11.0))
+                    .text_color(rgb(theme.muted))
+                    .child(format!("+{hidden} older \u{2014} see Events")),
+            )
+        }
     }
 }
+
+/// How many incidents the glance itself lists before deferring to the events
+/// window. The panel is a fixed height; beyond this the rest is counted.
+const INCIDENTS_IN_GLANCE: usize = 5;
 
 /// One entry of the actions menu: the control itself, stretched to the menu's
 /// width so the whole row is the target rather than the few pixels of its label.
