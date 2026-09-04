@@ -39,8 +39,8 @@ use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
 use types::{
-    AirSample, DnsSample, HostSample, LinkSample, NeighborsSample, ObservingEdge, ProxySample,
-    RouteEvent, TopologyLink, WifiSample,
+    AirSample, DnsSample, HostSample, LinkSample, NeighborLifetime, NeighborsSample, ObservingEdge,
+    ProxySample, RouteEvent, TopologyLifetime, TopologyLink, WifiSample,
 };
 
 /// A request from a client (the bar or cli) to the daemon.
@@ -684,6 +684,31 @@ pub struct StatusSnapshot {
     /// still decodes in a newer bar — an empty list, never a decode failure.
     #[serde(default)]
     pub topology: Vec<TopologyLink>,
+    /// Since-when for each neighbour in [`Self::neighbors`], read from the
+    /// store's long-lived `neighbor` rows.
+    ///
+    /// The reading and the record answer different questions, so they are
+    /// different fields: `neighbors` is what this tick saw, this is what the
+    /// database remembers across restarts. Joined by MAC.
+    ///
+    /// A neighbour with no entry here has an **unknown** lifetime — a store
+    /// write may have failed, or the peer may predate this field. A reader must
+    /// never render that as "first seen now". (realm net-observer, node #43)
+    ///
+    /// `serde(default)` — an empty list — so a pre-lifetimes daemon's answer
+    /// still decodes in a newer bar, and a newer daemon's extra field does not
+    /// break an older one.
+    #[serde(default)]
+    pub neighbor_lifetimes: Vec<NeighborLifetime>,
+    /// Since-when for each uplink in [`Self::topology`], read from the store's
+    /// `topology_link` rows. The same shape and the same rules as
+    /// [`Self::neighbor_lifetimes`], joined by the identity triple
+    /// (`iface`, `remote_chassis`, `remote_port`) via
+    /// [`TopologyLifetime::bounds`]. `TopologyLink::ts_us` is a *sighting*, not
+    /// a first-seen — this field is the only thing that carries first-seen onto
+    /// the socket. (realm net-observer, node #43)
+    #[serde(default)]
+    pub topology_lifetimes: Vec<TopologyLifetime>,
     pub incidents: Vec<IncidentSummary>,
     /// Whether the daemon is actively collecting. `true` (the default) = collectors
     /// run and samples flow; `false` = collection is paused (the daemon stays alive
@@ -757,6 +782,8 @@ impl Default for StatusSnapshot {
             wifi: None,
             neighbors: None,
             topology: Vec::new(),
+            neighbor_lifetimes: Vec::new(),
+            topology_lifetimes: Vec::new(),
             incidents: Vec::new(),
             observing: observing_default(),
             quiet: false,
@@ -1352,6 +1379,8 @@ mod tests {
             wifi: None,
             neighbors: None,
             topology: Vec::new(),
+            neighbor_lifetimes: Vec::new(),
+            topology_lifetimes: Vec::new(),
             incidents: vec![IncidentSummary {
                 id: "inc-1".into(),
                 opened_us: 1000,
@@ -2056,5 +2085,79 @@ mod tests {
         );
         // The unknown one is carried, not rejected, and simply never asked about.
         assert_eq!(snap.capabilities.expect("declared").collectors.len(), 2);
+    }
+
+    /// A snapshot from a daemon that predates the lifetime lists must still
+    /// decode — the OLD-daemon / NEW-bar half of the compatibility contract. The
+    /// missing fields become empty lists, which every reader must render as
+    /// "unknown", not as "first seen now".
+    #[test]
+    fn a_pre_lifetimes_snapshot_decodes_with_empty_lists() {
+        let older = r#"{"generated_us":7,"link":null,"proxy":null,"dns":null,"host":null,
+            "incidents":[],"observing":true}"#;
+        let snap: StatusSnapshot = serde_json::from_str(older).expect("must decode");
+        assert_eq!(snap.generated_us, 7);
+        assert!(snap.neighbor_lifetimes.is_empty());
+        assert!(snap.topology_lifetimes.is_empty());
+    }
+
+    /// The NEW-daemon / OLD-bar half: an older reader's shape has no lifetime
+    /// fields at all, and serde must ignore the extra ones rather than fail the
+    /// whole `Response`. Modelled by decoding a new snapshot's JSON into a struct
+    /// that lacks them — exactly what an un-upgraded bar's `StatusSnapshot` is.
+    #[test]
+    fn a_pre_lifetimes_reader_ignores_the_new_fields() {
+        #[derive(serde::Deserialize)]
+        struct OldSnapshot {
+            generated_us: i64,
+            observing: bool,
+        }
+        let snap = StatusSnapshot {
+            generated_us: 11,
+            neighbor_lifetimes: vec![types::NeighborLifetime {
+                mac: "a4:83:e7:1b:2c:3d".into(),
+                first_seen_us: 1,
+                last_seen_us: 9,
+            }],
+            topology_lifetimes: vec![types::TopologyLifetime {
+                iface: "en0".into(),
+                remote_chassis: "sw-1".into(),
+                remote_port: "Gi0/1".into(),
+                first_seen_us: 2,
+                last_seen_us: 8,
+            }],
+            ..Default::default()
+        };
+        let wire = serde_json::to_string(&snap).unwrap();
+        let old: OldSnapshot = serde_json::from_str(&wire).expect("an older reader must decode");
+        assert_eq!(old.generated_us, 11);
+        assert!(old.observing);
+    }
+
+    /// Round-trip: both lifetime lists survive the wire intact, joined by the
+    /// keys their readers join on (MAC; the identity triple).
+    #[test]
+    fn lifetimes_round_trip_on_the_wire() {
+        let lt = types::NeighborLifetime {
+            mac: "a4:83:e7:1b:2c:3d".into(),
+            first_seen_us: 100,
+            last_seen_us: 900,
+        };
+        let up = types::TopologyLifetime {
+            iface: "en0".into(),
+            remote_chassis: "sw-1".into(),
+            remote_port: "Gi0/1".into(),
+            first_seen_us: 5,
+            last_seen_us: 50,
+        };
+        let snap = StatusSnapshot {
+            neighbor_lifetimes: vec![lt.clone()],
+            topology_lifetimes: vec![up.clone()],
+            ..Default::default()
+        };
+        let back: StatusSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
+        assert_eq!(back.neighbor_lifetimes, vec![lt]);
+        assert_eq!(back.topology_lifetimes, vec![up]);
     }
 }

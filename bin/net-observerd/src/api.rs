@@ -1221,13 +1221,18 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
         tracing::error!(error = %e, "store write failed; scan findings not recorded (gap logged)");
         note = format!("{note} (findings not recorded: {e})");
     }
+    let Sample::Neighbors(scanned) = &sample else {
+        unreachable!("just constructed as Neighbors")
+    };
+    // Read the record's since-when for what the scan found, BEFORE taking the
+    // snapshot lock — the socket path waits on that mutex and a DB read must not
+    // happen under it. (realm net-observer, node #43)
+    let lifetimes = crate::pipeline::neighbor_lifetimes_for(cx.store, scanned);
     {
         let mut snap = cx.snapshot.lock().unwrap_or_else(|e| e.into_inner());
         snap.generated_us = report.ts_us;
-        let Sample::Neighbors(n) = &sample else {
-            unreachable!("just constructed as Neighbors")
-        };
-        snap.neighbors = Some(n.clone());
+        snap.neighbors = Some(scanned.clone());
+        snap.neighbor_lifetimes = lifetimes;
     }
     if cx.events_tx.receiver_count() > 0 {
         let Sample::Neighbors(n) = &sample else {

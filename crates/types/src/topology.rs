@@ -97,6 +97,47 @@ pub struct TopologyLink {
     pub ts_us: i64,
 }
 
+/// How long an uplink has been on record: the lifetime bounds the store keeps
+/// for one `topology_link` row.
+///
+/// A **sibling** of [`TopologyLink`], for the same reason [`NeighborLifetime`]
+/// is a sibling of `NeighborObs`: a link on the socket is a *sighting*
+/// (`ts_us` is when the patrol last heard the advertisement), while `first_seen`
+/// is what the record remembers. The daemon reads these from `topology_link` and
+/// puts them on the status snapshot beside the links, so the bar can say "this
+/// uplink has been there since X" without opening the database.
+///
+/// An uplink on the snapshot may have NO lifetime here — the store write may
+/// have failed, or the daemon may predate this field. Render that as *unknown*,
+/// never as *now*. (realm net-observer, node #43)
+///
+/// [`NeighborLifetime`]: crate::neighbor::NeighborLifetime
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyLifetime {
+    /// The local interface — first third of the identity triple this bounds.
+    pub iface: String,
+    /// The remote chassis identity — second third of the triple.
+    pub remote_chassis: String,
+    /// The remote port — final third of the triple.
+    pub remote_port: String,
+    /// When this uplink was first written. Never reset by a later sighting.
+    pub first_seen_us: i64,
+    /// When it was most recently heard, as the record has it.
+    pub last_seen_us: i64,
+}
+
+impl TopologyLifetime {
+    /// Whether this lifetime bounds `link` — the identity triple, compared as a
+    /// whole. The one place the join is spelled, so no consumer invents a looser
+    /// match.
+    #[must_use]
+    pub fn bounds(&self, link: &TopologyLink) -> bool {
+        self.iface == link.iface
+            && self.remote_chassis == link.remote_chassis
+            && self.remote_port == link.remote_port
+    }
+}
+
 /// Map a captured **raw Ethernet frame** (starting at the destination MAC) to a
 /// [`TopologyLink`], or `None` when it is not an LLDP/CDP frame this machine can
 /// turn into an uplink edge.
@@ -239,6 +280,34 @@ fn caps_tokens(set: &CapabilitySet) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::TopologyLifetime;
+
+    /// The lifetime join is the WHOLE identity triple. A link that shares two of
+    /// the three is a different uplink and must not borrow its neighbour's
+    /// first-seen.
+    #[test]
+    fn bounds_matches_only_the_full_identity_triple() {
+        let lt = TopologyLifetime {
+            iface: "en0".into(),
+            remote_chassis: "sw-1".into(),
+            remote_port: "Gi0/1".into(),
+            first_seen_us: 1,
+            last_seen_us: 2,
+        };
+        let mut link = super::TopologyLink {
+            iface: "en0".into(),
+            remote_chassis: "sw-1".into(),
+            remote_port: "Gi0/1".into(),
+            remote_system_name: None,
+            capabilities: String::new(),
+            learned_via: super::LearnedVia::Lldp,
+            ts_us: 5,
+        };
+        assert!(lt.bounds(&link));
+        link.remote_port = "Gi0/2".into();
+        assert!(!lt.bounds(&link));
+    }
+
     use super::*;
 
     /// Prepend a synthetic Ethernet header (dst, src, EtherType) to a payload so

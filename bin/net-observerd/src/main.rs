@@ -245,8 +245,26 @@ fn spawn_topology_patrol(
             }
 
             if !latest.is_empty() {
+                // The record's first/last seen for the uplinks, read before the
+                // snapshot lock is taken — `TopologyLink::ts_us` is only this
+                // patrol's sighting, so this read is the sole path by which
+                // `first_seen_us` reaches the socket. A failed read yields no
+                // bounds, which the bar renders as "unknown" rather than as a
+                // freshly-discovered uplink. (realm net-observer, node #43)
+                let lifetimes = match store.topology_lifetimes() {
+                    Ok(l) => l
+                        .into_iter()
+                        .filter(|lt| latest.iter().any(|k| lt.bounds(k)))
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!(error = %e,
+                            "topology lifetime read failed; snapshot carries no first/last seen");
+                        Vec::new()
+                    }
+                };
                 let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
                 snap.topology = latest;
+                snap.topology_lifetimes = lifetimes;
             }
         }
     })
