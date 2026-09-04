@@ -975,6 +975,17 @@ pub(crate) const MENU_ROW_TEXT: f32 = 13.0;
 /// The submenu chevron. A text glyph on purpose: an icon here would mean a font
 /// or asset dependency for one character.
 pub(crate) const MENU_CHEVRON: &str = "›";
+/// Height of a group heading in the flyout menu.
+///
+/// Declared rather than left to the text's own line box: the flyout's window
+/// height is COMPUTED from what the menu draws, and a height that only the font
+/// knows cannot be added up before the window is opened.
+pub(crate) const MENU_HEADING_H: f32 = 18.0;
+/// Label size of a group heading — small and muted, well inside
+/// [`MENU_HEADING_H`].
+pub(crate) const MENU_HEADING_TEXT: f32 = 10.0;
+/// Thickness of the hairline rule between groups, drawn by [`separator`].
+pub(crate) const MENU_SEPARATOR_H: f32 = 1.0;
 
 /// The footer (pinned at the bottom of the panel): a muted freshness line (+ the
 /// last control-action outcome and any protocol error, if present), and subtle
@@ -1288,7 +1299,13 @@ fn spark_color(value: f64, threshold: f64, theme: Theme) -> Rgba {
 
 /// A hairline separator between sections — a 1px full-width rule, no borders.
 pub(crate) fn separator(theme: Theme) -> impl IntoElement {
-    div().h(px(1.0)).w_full().bg(rgb(theme.separator))
+    div()
+        .h(px(MENU_SEPARATOR_H))
+        // A hairline that is allowed to shrink is a hairline that disappears in
+        // a tight column.
+        .flex_none()
+        .w_full()
+        .bg(rgb(theme.separator))
 }
 
 /// One label→value list row: a muted label on the left, a colored value on the
