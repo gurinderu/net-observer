@@ -1,5 +1,24 @@
 //! The **air map** window: the foreign access points this radio can hear, drawn
-//! as bands on a channel axis, with our own association drawn underneath them.
+//! as bands on a shared channel axis with our own association highlighted across
+//! it.
+//!
+//! ## The form, and why it is this one
+//!
+//! Each band gets ONE axis, labelled with the channel numbers a person changes
+//! an access point to (2.4 GHz: 1…13; 5 GHz: 36, 40, 44, …), and every neighbour
+//! heard in that band is a band on it, packed into shared rows so that two of
+//! them cross on the page exactly where they cross in the air. The frequency
+//! range stays a small caption: the geometry is linear in MHz — the same
+//! arithmetic the overlap hypothesis is computed from — while the labels are
+//! channels, so the picture and the number cannot disagree.
+//!
+//! The first form was one private strip per access point, one under another.
+//! With fifteen neighbours audible that is a screen and a half of scrolling, and
+//! the question the map exists for — who is standing in *my* channel — was not
+//! answerable from it at all. The details are now one line each, under the
+//! drawing, ordered by who is most likely in our band; and the caveat below is
+//! said once in the header rather than under every neighbour, where repetition
+//! turned it into furniture (realm net-observer, node #48).
 //!
 //! A map of its own, deliberately not a layer on the network map: that one shows
 //! L2 devices, this one shows frequency bands, and mixing them hides the one
@@ -1224,11 +1243,7 @@ fn band_section(group: &BandGroup, theme: Theme) -> impl IntoElement + use<> {
     let band = band_label(group.band);
     // Placed in ranked order, so a row's index in the table is the same index as
     // its band on the axis and the two can be read against each other.
-    let placed: Vec<Option<(f32, f32)>> = group
-        .lanes
-        .iter()
-        .map(|l| place(l.span, axis))
-        .collect::<Vec<_>>();
+    let placed: Vec<Option<(f32, f32)>> = group.lanes.iter().map(|l| place(l.span, axis)).collect();
     let drawable: Vec<(f32, f32)> = placed.iter().filter_map(|p| *p).collect();
     let rows = pack_rows(&drawable);
     let row_count = rows.iter().copied().max().map_or(0, |r| r + 1);
@@ -1305,7 +1320,7 @@ fn band_section(group: &BandGroup, theme: Theme) -> impl IntoElement + use<> {
                 .w(px(w))
                 .h(px(BAR_H))
                 .rounded_sm()
-                .bg(rgba(with_alpha(theme.fg, weight(lane_rssi(group, i))))),
+                .bg(rgba(with_alpha(theme.fg, weight(group.lanes[i].rssi_dbm)))),
         );
     }
 
@@ -1397,12 +1412,6 @@ fn band_section(group: &BandGroup, theme: Theme) -> impl IntoElement + use<> {
         );
     }
     section.into_any_element()
-}
-
-/// The signal of the `i`th lane in a group — the only thing a drawn band's ink
-/// encodes.
-fn lane_rssi(group: &BandGroup, i: usize) -> Option<i32> {
-    group.lanes.get(i).and_then(|l| l.rssi_dbm)
 }
 
 /// One row of a band section's table: everything known about one foreign AP on a
@@ -2157,10 +2166,14 @@ mod headless_tests {
                     ts_us: 1_700_000_000_000_000,
                     wifi: WifiVerdict::Ok,
                     reason: None,
+                    rssi_dbm: Some(-50),
+                    noise_dbm: Some(-96),
+                    snr_db: Some(46),
+                    tx_rate_mbps: Some(216.0),
+                    phy_mode: Some("11ax".to_string()),
                     channel: Some(own.channel),
-                    channel_band: Some(own.band.as_str().to_string()),
                     channel_width_mhz: Some(own.width_mhz),
-                    ..Default::default()
+                    channel_band: Some(own.band.as_str().to_string()),
                 }),
                 ..Default::default()
             })
@@ -2178,7 +2191,7 @@ mod headless_tests {
                 cx,
             )
         });
-        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        let vcx = VisualTestContext::from_window(window.into(), cx);
         let viewport = size(px(WIN_W), px(WIN_H));
         vcx.simulate_resize(viewport);
         vcx.run_until_parked();
@@ -2210,7 +2223,7 @@ mod headless_tests {
             let axis = bounds(&mut cx, &format!("air-axis:{band}"))
                 .unwrap_or_else(|| panic!("the {band} section drew no shared axis"));
             assert!(
-                (axis.size.width.0 - AXIS_W).abs() < 0.51,
+                (axis.size.width - px(AXIS_W)).abs() < px(0.51),
                 "the {band} axis is not the full drawn width: {axis:?}"
             );
 
@@ -2315,15 +2328,15 @@ mod headless_tests {
             !text.is_empty(),
             "the fixture must produce labels for this to prove anything"
         );
+        // The token itself first, so a failure names the defect rather than
+        // whichever line happened to be ranked first.
         for line in &text {
             assert!(
                 !line.contains("pairport"),
                 "a raw system_profiler token reached the window: {line}"
             );
-            assert!(
-                !line.contains("spairport"),
-                "a raw system_profiler token reached the window: {line}"
-            );
+        }
+        for line in &text {
             assert!(
                 !line.contains('_'),
                 "a platform identifier reached the window unspaced: {line}"
