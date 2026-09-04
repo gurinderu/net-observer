@@ -1205,6 +1205,10 @@ fn empty_state(
 ) -> gpui::AnyElement {
     base.child(
         div()
+            // Test handle only: an empty state that is not drawn is a blank
+            // area, and a blank area is exactly what this function exists to
+            // prevent — so a headless test must be able to find it.
+            .debug_selector(|| "map-empty".into())
             .py_1()
             .text_color(rgb(theme.muted))
             .child(message.into()),
@@ -1214,7 +1218,12 @@ fn empty_state(
 
 /// A hairline separator — a 1px full-width rule, matching the event window.
 fn separator(theme: Theme) -> impl IntoElement {
-    div().h(px(1.0)).w_full().bg(rgb(theme.separator))
+    div()
+        // Test handle only — see `crate::ui::separator`.
+        .debug_selector(|| "separator".into())
+        .h(px(1.0))
+        .w_full()
+        .bg(rgb(theme.separator))
 }
 
 /// The root view of the **network-map window**. Holds a handle to the shared
@@ -1754,35 +1763,46 @@ mod tests {
         );
     }
 
-    /// The list renders from a sample with neighbours, and its empty states are
-    /// honest rather than blank.
+    /// Building the list never panics — at any size, and in either theme.
+    ///
+    /// The name this carried before ("…and states its absences") promised an
+    /// assertion the body never made: `neighbour_list` returns an opaque
+    /// `AnyElement`, so nothing here can see whether an empty state was drawn or
+    /// a blank area was. That claim is real, and it is now made where it can be
+    /// observed — `the_map_states_its_emptiness_rather_than_going_blank` in
+    /// `headless_tests`, which finds the drawn element by selector. What is left
+    /// here is what this carrier can actually say, and the name now says only
+    /// that: three shapes of input, no panic. Both themes, because the tokens
+    /// are an input to the builder like any other.
     #[test]
-    fn the_list_renders_every_neighbour_and_states_its_absences() {
-        let theme = Theme::for_appearance(gpui::WindowAppearance::Dark);
-        let many: Vec<NeighborObs> = (0..MAX_RING + 20)
-            .map(|i| {
-                obs(
-                    &format!("{i:02x}:{i:02x}:{i:02x}:{i:02x}:{i:02x}:{i:02x}"),
-                    "192.168.0.129",
-                    NeighborSource::Arp,
-                    None,
-                )
-            })
-            .collect();
-        let snap = StatusSnapshot {
-            neighbors: Some(sample(None, many)),
-            ..Default::default()
-        };
-        // The list has no geometry to run out of: building it must not panic.
-        let _ = neighbour_list(&snap, theme);
-        let _ = neighbour_list(&StatusSnapshot::default(), theme);
-        let _ = neighbour_list(
-            &StatusSnapshot {
-                neighbors: Some(sample(None, vec![])),
+    fn building_the_neighbour_list_never_panics() {
+        for appearance in [gpui::WindowAppearance::Dark, gpui::WindowAppearance::Light] {
+            let theme = Theme::for_appearance(appearance);
+            let many: Vec<NeighborObs> = (0..MAX_RING + 20)
+                .map(|i| {
+                    obs(
+                        &format!("{i:02x}:{i:02x}:{i:02x}:{i:02x}:{i:02x}:{i:02x}"),
+                        "192.168.0.129",
+                        NeighborSource::Arp,
+                        None,
+                    )
+                })
+                .collect();
+            let snap = StatusSnapshot {
+                neighbors: Some(sample(None, many)),
                 ..Default::default()
-            },
-            theme,
-        );
+            };
+            // The list has no geometry to run out of: building it must not panic.
+            let _ = neighbour_list(&snap, theme);
+            let _ = neighbour_list(&StatusSnapshot::default(), theme);
+            let _ = neighbour_list(
+                &StatusSnapshot {
+                    neighbors: Some(sample(None, vec![])),
+                    ..Default::default()
+                },
+                theme,
+            );
+        }
     }
 
     pub(super) fn topology_link(
@@ -1952,7 +1972,7 @@ mod headless_tests {
     use super::tests::topology_link;
     use super::*;
     use crate::ui::Glance;
-    use gpui::{Size, TestAppContext, VisualTestContext};
+    use gpui::{Entity, Size, TestAppContext, VisualTestContext};
     use types::NeighborSource;
 
     fn obs(host: &str, last_octet: u8) -> NeighborObs {
@@ -2101,6 +2121,230 @@ mod headless_tests {
             && b.origin.x < a.origin.x + a.size.width
             && a.origin.y < b.origin.y + b.size.height
             && b.origin.y < a.origin.y + a.size.height
+    }
+
+    /// A window over a model in a chosen state, opened ALREADY in `mode`.
+    ///
+    /// Opened in the mode rather than switched into it: gpui's debug-bounds map
+    /// only grows over a window's life (`Frame::clear()` leaves it alone), so a
+    /// window that has drawn the graph can never afterwards say the graph is
+    /// gone. A fresh window per state is the only carrier an absence has.
+    fn map_window(
+        cx: &mut TestAppContext,
+        snapshot: StatusSnapshot,
+        error: Option<crate::ui::GlanceError>,
+        mode: MapMode,
+        viewport: Size<Pixels>,
+    ) -> (Entity<Glance>, VisualTestContext) {
+        let model = cx.update(|cx| {
+            cx.new(|_| {
+                Glance::new(
+                    snapshot,
+                    error,
+                    "/tmp/net-observer-map-test.sock".to_string(),
+                )
+            })
+        });
+        let for_view = model.clone();
+        let window = cx.add_window(|_, cx| {
+            let mut view = MapView::new(for_view, cx);
+            // Before the first paint, so this window never draws the other mode.
+            view.mode = mode;
+            view
+        });
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_resize(viewport);
+        vcx.run_until_parked();
+        (model, vcx)
+    }
+
+    /// A neighbours sample the daemon answered with, carrying nobody.
+    fn empty_reading(reason: Option<&str>) -> NeighborsSample {
+        NeighborsSample {
+            ts_us: 1,
+            verdict: types::NeighborsVerdict::Ok,
+            reason: reason.map(str::to_string),
+            network_key: None,
+            iface: Some("en0".to_string()),
+            neighbors: vec![],
+        }
+    }
+
+    /// With nothing to draw, both readings of the map say so — they never leave
+    /// a blank area that reads as "nothing is wrong here".
+    ///
+    /// Three emptinesses, and each is a different fact: no reading has run yet,
+    /// a reading ran and answered nobody, a reading refused with a reason. Each
+    /// gets its own fresh window, in the mode under test.
+    #[gpui::test]
+    fn the_map_states_its_emptiness_rather_than_going_blank(cx: &mut TestAppContext) {
+        let viewport = size(px(WIN_W), px(WIN_H));
+        let states = [
+            ("no reading yet", StatusSnapshot::default()),
+            (
+                "a reading that found nobody",
+                StatusSnapshot {
+                    neighbors: Some(empty_reading(None)),
+                    ..Default::default()
+                },
+            ),
+            (
+                "a reading that refused",
+                StatusSnapshot {
+                    neighbors: Some(empty_reading(Some("interface down"))),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (what, snapshot) in states {
+            for mode in [MapMode::Graph, MapMode::List] {
+                let (_model, mut vcx) = map_window(cx, snapshot.clone(), None, mode, viewport);
+                let empty = vcx.debug_bounds("map-empty").unwrap_or_else(|| {
+                    panic!("{mode:?} drew a blank area for `{what}` instead of saying so")
+                });
+                assert!(
+                    empty.size.height > px(0.0),
+                    "the {mode:?} empty state for `{what}` has no height: {empty:?}"
+                );
+                assert!(
+                    empty.origin.y + empty.size.height <= viewport.height,
+                    "the {mode:?} empty state for `{what}` is laid out past the \
+                     window's bottom edge, where nothing is painted: {empty:?}"
+                );
+            }
+        }
+    }
+
+    /// The negative control: a window with neighbours to draw draws no empty
+    /// state. Without it, the test above would pass on a map that is always blank.
+    #[gpui::test]
+    fn a_map_with_neighbours_draws_no_empty_state(cx: &mut TestAppContext) {
+        let snapshot = StatusSnapshot {
+            neighbors: Some(NeighborsSample {
+                ts_us: 1,
+                verdict: types::NeighborsVerdict::Ok,
+                reason: None,
+                network_key: None,
+                iface: Some("en0".to_string()),
+                neighbors: vec![obs("alpha", 20)],
+            }),
+            ..Default::default()
+        };
+        for mode in [MapMode::Graph, MapMode::List] {
+            let (_model, mut vcx) =
+                map_window(cx, snapshot.clone(), None, mode, size(px(WIN_W), px(WIN_H)));
+            assert!(
+                vcx.debug_bounds("map-empty").is_none(),
+                "{mode:?} drew an empty state over a reading that found a neighbour"
+            );
+        }
+    }
+
+    /// **KNOWN DEFECT, pinned rather than fixed.**
+    ///
+    /// When the daemon is unreachable the map draws the last topology it holds
+    /// with nothing to say that it is stale. `MapView::render` reads only
+    /// `snapshot` and `control_msg` from the shared [`Glance`]; it never reads
+    /// `error` or [`Glance::online`], so a star from an hour ago is presented
+    /// exactly as a star from this second. That is the reading this project
+    /// calls unbracketed silence: the operator cannot tell a live map from a
+    /// dead one, and "the network looked fine" is precisely the claim a
+    /// forensics tool must not make on stale data.
+    ///
+    /// The panel already states this (`offline-warn`); this window does not.
+    /// The fix belongs with whoever owns the map's chrome, so this test stands
+    /// as the record of the gap rather than being quietly deleted.
+    #[gpui::test]
+    #[ignore = "known defect: the map draws stale topology with no offline marker \
+                (MapView::render never reads Glance::error / online) — this test \
+                is the record of the gap, not a fix"]
+    fn the_map_marks_its_topology_as_stale_when_the_daemon_is_unreachable(cx: &mut TestAppContext) {
+        let snapshot = StatusSnapshot {
+            neighbors: Some(NeighborsSample {
+                ts_us: 1,
+                verdict: types::NeighborsVerdict::Ok,
+                reason: None,
+                network_key: None,
+                iface: Some("en0".to_string()),
+                neighbors: vec![obs("alpha", 20), obs("bravo", 21)],
+            }),
+            ..Default::default()
+        };
+        let (model, mut vcx) = map_window(
+            cx,
+            snapshot,
+            Some(crate::ui::GlanceError::Unreachable(
+                "no such file".to_string(),
+            )),
+            MapMode::Graph,
+            size(px(WIN_W), px(WIN_H)),
+        );
+        assert!(
+            !vcx.update(|_, cx| model.read(cx).online()),
+            "precondition: the model must be offline"
+        );
+        // Precondition the defect itself: the stale star IS drawn.
+        assert!(
+            vcx.debug_bounds("map-chip:alpha").is_some(),
+            "precondition: the stale topology is still on screen"
+        );
+        assert!(
+            vcx.debug_bounds("map-offline").is_some(),
+            "the map shows an hour-old topology as though it were live: nothing \
+             on screen says the daemon stopped answering"
+        );
+    }
+
+    /// The same squeeze the panel's separator is held to, over the map's own
+    /// retyped copy. See `crate::ui::headless_tests::SqueezedColumn` for why the
+    /// pressure is supplied by the harness rather than by the real window.
+    struct SqueezedColumn(Theme);
+
+    impl Render for SqueezedColumn {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(div().h(px(400.0)))
+                .child(separator(self.0))
+        }
+    }
+
+    /// **KNOWN DEFECT, pinned rather than fixed.**
+    ///
+    /// The map window's [`separator`] is a retyped copy of
+    /// [`crate::ui::separator`] that dropped its `.flex_none()` — and with it the
+    /// comment saying why the original has one: "a hairline that is allowed to
+    /// shrink is a hairline that disappears in a tight column". The same loss is
+    /// in `events.rs` and `air.rs`; the panel's original is the only copy that
+    /// still holds it, and
+    /// `the_panel_separator_keeps_its_hairline_under_shrink_pressure` guards it.
+    ///
+    /// Under the squeeze this copy collapses to 0px, which is what the panel's
+    /// `flex_none` exists to prevent. The map's live layout does not currently
+    /// apply that pressure, so nothing is broken on screen today — the copy is
+    /// simply carrying no guarantee, and the day a section above it grows, it
+    /// vanishes with no error.
+    #[gpui::test]
+    #[ignore = "known defect: map.rs (and events.rs, air.rs) retyped ui::separator \
+                without its .flex_none(), so the hairline collapses to 0px under \
+                shrink pressure — this test is the record of the gap, not a fix"]
+    fn the_map_separator_keeps_its_hairline_under_shrink_pressure(cx: &mut TestAppContext) {
+        let theme = Theme::for_appearance(gpui::WindowAppearance::Light);
+        let window = cx.add_window(|_, _| SqueezedColumn(theme));
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_resize(size(px(320.0), px(100.0)));
+        vcx.run_until_parked();
+
+        let rule = vcx
+            .debug_bounds("separator")
+            .expect("the separator was not laid out at all");
+        assert!(
+            rule.size.height >= px(1.0),
+            "the map's separator was squeezed below its hairline ({:?} < 1px)",
+            rule.size.height
+        );
     }
 
     /// The cell is the whole reason the lifetimes are a separate field: a
