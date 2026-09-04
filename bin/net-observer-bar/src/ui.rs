@@ -1076,7 +1076,7 @@ fn footer(
 /// for. Both halves are fallible and fail differently — the command can be
 /// refused (`String`) while the follow-up read can find no daemon at all
 /// (`GlanceError`) — so neither collapses into the other.
-type ControlRoundTrip = fn(
+pub(crate) type ControlRoundTrip = fn(
     &str,
 ) -> (
     Result<ControlResult, String>,
@@ -1086,27 +1086,29 @@ type ControlRoundTrip = fn(
 /// Run one blocking control round-trip on the background executor and apply its
 /// outcome to the shared model on the foreground.
 ///
-/// The single place a control action touches the socket, so "never block the gpui
-/// main thread" and "a daemon that is not there is a message, not a crash" are
-/// decided once rather than per button. The model is held weakly, so a shut-down
-/// app just drops the result.
+/// The single place a control action touches the socket, for any view holding
+/// the shared model: the menu's entries and the map window's Rescan.
+///
+/// The wiring stays in one place on purpose: "never block the gpui main thread",
+/// "a daemon that is not there is a message, not a crash", and "the acting gate's
+/// refusal is surfaced verbatim" are decided once for every control button in the
+/// app, not re-decided per window.
 pub(crate) fn spawn_control_on<V: 'static>(
-    glance: &Entity<Glance>,
+    model: &Entity<Glance>,
     cx: &mut Context<V>,
     round_trip: ControlRoundTrip,
 ) {
-    let model = glance.downgrade();
-    let socket = glance.read(cx).socket_path.clone();
+    let weak = model.downgrade();
+    let socket = model.read(cx).socket_path.clone();
     cx.spawn(async move |_view, acx: &mut AsyncApp| {
         let (control, fresh) = acx
             .background_spawn(async move { round_trip(&socket) })
             .await;
-        model
-            .update(acx, |g, cx| {
-                g.apply_toggle_result(control, fresh);
-                cx.notify();
-            })
-            .ok();
+        weak.update(acx, |g, cx| {
+            g.apply_toggle_result(control, fresh);
+            cx.notify();
+        })
+        .ok();
     })
     .detach();
 }
@@ -1338,7 +1340,10 @@ pub fn now_us() -> i64 {
 }
 
 /// A short "12s ago" / "3m ago" string from a microsecond timestamp.
-fn age_str(ts_us: i64, now_us: i64) -> String {
+///
+/// `pub(crate)` so the map's uplink cards date a sighting in the same words the
+/// rest of the panel does, rather than growing a second age formatter.
+pub(crate) fn age_str(ts_us: i64, now_us: i64) -> String {
     if ts_us <= 0 {
         return "-".to_string();
     }

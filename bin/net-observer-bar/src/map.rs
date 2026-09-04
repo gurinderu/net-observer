@@ -37,7 +37,7 @@ use gpui::{
 };
 
 use net_observer_ipc::StatusSnapshot;
-use types::{LearnedVia, NeighborObs, NeighborRole, NeighborsSample, TopologyLink};
+use types::{LearnedVia, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence, TopologyLink};
 
 use crate::ui::{Glance, Theme};
 
@@ -52,22 +52,88 @@ const WIN_H: f32 = 320.0;
 /// net-observer, node #34, #36).
 const MAX_RING: usize = 12;
 
-/// The fixed height of the map's plot area, in gpui logical pixels. Tall enough
-/// for a ring of chips around a centred gateway without the corner chips colliding
-/// with the section padding.
-const MAP_H: f32 = 232.0;
+/// The **smallest** the map's plot area is allowed to get, in gpui logical
+/// pixels. It is a floor, not the size: the plot grows with the window (see
+/// [`plot_for`]), so a maximised window draws a large star rather than a small
+/// one pinned to the top-left corner.
+const MAP_MIN_H: f32 = 232.0;
 
 /// Chip footprint. Nodes are positioned by their centre, so these are used to
 /// convert a centre into a top-left inset.
-const CHIP_W: f32 = 84.0;
-const CHIP_H: f32 = 34.0;
-
-/// Ring radius from the gateway at the centre to each neighbour chip's centre.
-/// Sized to the available [`MAP_H`] (diameter plus a chip still fits the plot).
-const RING_R: f32 = 88.0;
+///
+/// The width is sized to the widest thing a chip must show **without losing a
+/// character**: a full dotted-quad address (`192.168.100.129`, 15 chars) at the
+/// 9px address size, plus the role glyph, the gaps and the horizontal padding.
+/// An address with a digit cut off is not a smaller address, it is a different
+/// device — so the chip is sized for it and the *label* above it is the line
+/// allowed to ellipsize. The height is a floor only ([`node_chip`] uses
+/// `min_h`), so a chip grows to its content instead of clipping it.
+const CHIP_W: f32 = 118.0;
+const CHIP_H: f32 = 40.0;
 
 /// Minimum clear gap between adjacent chips on the ring.
 const CHIP_GAP: f32 = 8.0;
+
+/// The smallest ring radius at which a ring chip cannot overlap the **centre**
+/// (gateway) chip, whatever angle it sits at.
+///
+/// Two centre-aligned rectangles miss each other when their centres differ by at
+/// least `CHIP_W + CHIP_GAP` horizontally **or** `CHIP_H + CHIP_GAP` vertically.
+/// For a chip at angle θ off the top, those offsets are `r·sin θ` and `r·cos θ`,
+/// and the worst angle is the one where both constraints bind at once; solving it
+/// gives `r ≥ hypot(CHIP_W + CHIP_GAP, CHIP_H + CHIP_GAP)`.
+///
+/// [`ring_capacity`] only ever spaced chips from *each other*, which is why a
+/// "gateway ?" placeholder could sit under the neighbour above it. This is the
+/// missing constraint, applied as a floor in [`plot_for`].
+fn min_ring_radius() -> f32 {
+    ((CHIP_W + CHIP_GAP).powi(2) + (CHIP_H + CHIP_GAP).powi(2)).sqrt()
+}
+
+/// The star's geometry for one render, derived from the space the window actually
+/// gives it rather than from a fixed constant.
+///
+/// Everything the layout needs is decided here and nowhere else, so the rule
+/// "a bigger window shows a bigger star and hides fewer nodes" is one pure,
+/// tested function instead of a scatter of magic numbers. (realm net-observer,
+/// node #34)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Plot {
+    /// Plot area size in gpui logical px.
+    w: f32,
+    h: f32,
+    /// Centre of the star — where the gateway chip goes.
+    cx: f32,
+    cy: f32,
+    /// Ring radius from the centre to each neighbour chip's centre.
+    r: f32,
+    /// How many ring chips this radius can hold without overlap.
+    capacity: usize,
+}
+
+/// Fit the star to an available `w` × `h` of plot area.
+///
+/// The radius is the largest that keeps a whole chip inside the box on every
+/// side, floored at [`min_ring_radius`] so the ring can never collide with the
+/// centre chip — even in a window too small to honour it, where a chip
+/// overflowing the box is the lesser fault against overlapping the gateway.
+/// Capacity follows the radius, so widening the window admits nodes that a
+/// smaller one summarised as "+N more".
+fn plot_for(w: f32, h: f32) -> Plot {
+    let w = w.max(CHIP_W + CHIP_GAP);
+    let h = h.max(MAP_MIN_H);
+    // Half the box, less the half-chip that must stay inside the edge.
+    let fit = (w / 2.0 - CHIP_W / 2.0).min(h / 2.0 - CHIP_H / 2.0);
+    let r = fit.max(min_ring_radius());
+    Plot {
+        w,
+        h,
+        cx: w / 2.0,
+        cy: h / 2.0,
+        r,
+        capacity: ring_capacity(r),
+    }
+}
 
 /// A neighbour reduced to what the map draws: a stable identity, a short label and
 /// which reading produced it. Derived purely from a [`NeighborObs`] so the render
@@ -148,7 +214,7 @@ fn short_mac(mac: &str) -> String {
 /// the sample's `network_key` (the gateway's MAC is the segment's identity). When
 /// no such neighbour is present the gateway slot is `None` and the caller draws a
 /// placeholder — the ring is still the segment.
-fn partition(sample: &NeighborsSample) -> (Option<MapNode>, Vec<MapNode>, usize) {
+fn partition(sample: &NeighborsSample, capacity: usize) -> (Option<MapNode>, Vec<MapNode>, usize) {
     let key = sample.network_key.as_deref();
     let mut gateway = None;
     let mut ring = Vec::new();
@@ -159,9 +225,11 @@ fn partition(sample: &NeighborsSample) -> (Option<MapNode>, Vec<MapNode>, usize)
             ring.push(MapNode::from_obs(obs));
         }
     }
-    // Cap by what the ring can actually hold without overlap, never above the
-    // first-version ceiling; the remainder is summarised as "+N more".
-    let cap = ring_capacity(RING_R).min(MAX_RING);
+    // Cap by what the ring at THIS window's radius can hold without overlap,
+    // never above the first-version ceiling; the remainder is summarised as
+    // "+N more" — and is always fully visible in the list view, which has no
+    // geometry to run out of.
+    let cap = capacity.min(MAX_RING);
     let dropped = ring.len().saturating_sub(cap);
     ring.truncate(cap);
     (gateway, ring, dropped)
@@ -217,9 +285,78 @@ fn node_accent(node: &MapNode, is_gateway: bool, theme: Theme) -> Rgba {
     }
 }
 
-/// One node chip: a coloured dot and a short, single-line label. The gateway is
+/// The text glyph standing for a role hypothesis. Deliberately a plain character
+/// (no icon font, no new dependency) and deliberately paired everywhere with the
+/// role's own words — [`role_label`] and [`role_basis`] — so the glyph is a
+/// shorthand for a hypothesis the reader can unfold, never a badge asserting a
+/// device type as fact. (realm net-observer, nodes #33, #36)
+fn role_glyph(role: NeighborRole, is_gateway: bool) -> &'static str {
+    if is_gateway {
+        return "\u{21C5}";
+    }
+    match role {
+        // Up/down arrows: everything leaves the segment through here.
+        NeighborRole::Gateway => "\u{21C5}",
+        // A framed square, echoing the uplink marker: network gear.
+        NeighborRole::Infra { .. } => "\u{25A3}",
+        NeighborRole::Host => "\u{25CF}",
+        // Not a guess dressed as one.
+        NeighborRole::Unknown => "?",
+    }
+}
+
+/// The role in words, always hedged where the daemon hedges it.
+fn role_label(role: NeighborRole, is_gateway: bool) -> String {
+    if is_gateway {
+        return "gateway".to_string();
+    }
+    match role {
+        NeighborRole::Gateway => "gateway".to_string(),
+        NeighborRole::Infra { confidence } => format!(
+            "infra? ({})",
+            match confidence {
+                RoleConfidence::Low => "low",
+                RoleConfidence::Medium => "medium",
+                RoleConfidence::High => "high",
+            }
+        ),
+        NeighborRole::Host => "host".to_string(),
+        NeighborRole::Unknown => "unknown".to_string(),
+    }
+}
+
+/// What the role hypothesis rests on — the answer to "why does it say that?",
+/// so the glyph is never the only thing the operator has to go on. Mirrors the
+/// derivation documented on [`NeighborRole`]; the gateway is the one near-certain
+/// classification because it needs no vendor guess.
+fn role_basis(role: NeighborRole, is_gateway: bool) -> &'static str {
+    if is_gateway {
+        return "its MAC is the segment key";
+    }
+    match role {
+        NeighborRole::Gateway => "its MAC is the segment key",
+        NeighborRole::Infra {
+            confidence: RoleConfidence::Low,
+        } => "guess: an infra vendor OUI alone",
+        NeighborRole::Infra {
+            confidence: RoleConfidence::Medium,
+        } => "guess: a management port answered",
+        NeighborRole::Infra {
+            confidence: RoleConfidence::High,
+        } => "guess: infra vendor OUI and a management port",
+        NeighborRole::Host => "vendor is not network gear",
+        NeighborRole::Unknown => "randomized MAC, or no vendor data",
+    }
+}
+
+/// One node chip: a role glyph and a short label over the address. The gateway is
 /// filled and bold so the segment's identity reads first; a neighbour is a light
 /// outlined chip.
+///
+/// The chip's height is a **floor**, not a fixed size, and both text lines are
+/// single-line with an ellipsis: a long hostname is shortened visibly, and an
+/// address is never wrapped onto a second line and cut off by the chip's bottom
+/// edge (which made `192.168.0.129` read as `192.168.0.12`).
 fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement {
     let dot = node_accent(node, is_gateway, theme);
     let mut chip = div()
@@ -227,8 +364,9 @@ fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement
         .items_center()
         .gap_1()
         .w(px(CHIP_W))
-        .h(px(CHIP_H))
+        .min_h(px(CHIP_H))
         .px_1p5()
+        .py_0p5()
         .rounded_md()
         .overflow_hidden();
     if is_gateway {
@@ -250,9 +388,10 @@ fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement
     };
     chip.child(
         div()
-            .text_size(px(8.0))
+            .flex_shrink_0()
+            .text_size(px(10.0))
             .text_color(dot_color)
-            .child("\u{25CF}"),
+            .child(role_glyph(node.role, is_gateway)),
     )
     .child(
         // Identity on top, address beneath — the node is named AND addressed.
@@ -262,8 +401,12 @@ fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement
             .flex()
             .flex_col()
             .child(
+                // The label is the line that may be shortened: a hostname has
+                // no fixed width and an ellipsis says plainly that it was cut.
                 div()
                     .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .text_size(px(11.0))
                     .when(is_gateway, |d| d.font_weight(gpui::FontWeight::BOLD))
                     .child(node.label.clone()),
@@ -272,6 +415,8 @@ fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement
                 d.child(
                     div()
                         .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .text_size(px(9.0))
                         .text_color(ip_color)
                         .child(node.ip.clone()),
@@ -285,36 +430,66 @@ fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement
 /// (several VLAN sub-interfaces, say) and does not need to all fit at once.
 const MAX_UPLINKS: usize = 3;
 
-/// Height of the uplink strip drawn above the neighbour star, in gpui logical px.
-const UPLINK_H: f32 = 58.0;
+/// Width of the left gutter the uplink tree's rail and stubs occupy, in gpui
+/// logical px — the visual edge from the "this Mac" anchor down to each uplink.
+const UPLINK_RAIL_W: f32 = 14.0;
 
-/// One LLDP/CDP-discovered uplink reduced to what the strip draws: which
-/// switch/AP this machine connects to and on which of that device's ports.
-/// Derived purely from a [`TopologyLink`] so the render carries no parsing.
+/// One LLDP/CDP-discovered uplink reduced to what the tree draws: which switch/AP
+/// this machine connects to, on which of that device's ports, over which local
+/// interface, by which protocol, with what it said about itself and when it was
+/// last heard. Derived purely from a [`TopologyLink`] so the render carries no
+/// parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UplinkNode {
     /// The switch/AP's human label: its advertised system name, else its chassis
     /// identity.
     label: String,
+    /// The chassis identity as advertised. Shown as its own line when the label
+    /// came from a system name, so the identity behind a friendly name stays
+    /// visible — a spoofed name is only recognisable against its chassis id.
+    chassis: String,
     /// The remote device's port this machine is plugged into.
     port: String,
+    /// The local interface the frame arrived on — the machine's end of the edge.
+    iface: String,
+    /// The device's advertised capability tokens (`bridge`, `wlan_ap`, ...),
+    /// split from the comma-joined wire form. Empty when it advertised none.
+    caps: Vec<String>,
     /// Whether LLDP or CDP carried the advertisement.
     via: LearnedVia,
+    /// When the daemon last received an advertisement for this uplink.
+    ///
+    /// This is a **sighting** time, not a first-seen time: `first_seen` lives in
+    /// the store's `topology_link` row and is served by the offline reader, not
+    /// on the socket, so the bar — a pure socket client — cannot draw it.
+    /// (realm net-observer, node #43)
+    ts_us: i64,
 }
 
 impl UplinkNode {
     fn from_link(link: &TopologyLink) -> Self {
-        let label = link
-            .remote_system_name
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&link.remote_chassis)
-            .to_string();
+        let named = link.remote_system_name.as_deref().filter(|s| !s.is_empty());
         Self {
-            label,
+            label: named.unwrap_or(&link.remote_chassis).to_string(),
+            chassis: link.remote_chassis.clone(),
             port: link.remote_port.clone(),
+            iface: link.iface.clone(),
+            caps: link
+                .capabilities
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
             via: link.learned_via,
+            ts_us: link.ts_us,
         }
+    }
+
+    /// True when [`Self::label`] is an advertised system name rather than the
+    /// chassis id — the chassis then deserves its own line.
+    fn has_name(&self) -> bool {
+        self.label != self.chassis
     }
 }
 
@@ -337,62 +512,88 @@ fn uplinks(snapshot: &StatusSnapshot) -> (Vec<UplinkNode>, usize) {
     (nodes, dropped)
 }
 
-/// The strip of uplink switch/AP nodes drawn above the neighbour star: each a
-/// distinctly-marked chip (a square glyph in the infra tint, deliberately unlike
-/// the round neighbour dots) joined by an edge down to a shared "this Mac"
-/// anchor. The edge is the discovered physical path — a hypothesis LLDP/CDP
-/// advertised, drawn subtly, never a hard claim. (realm net-observer, node #42)
-fn uplink_strip(nodes: &[UplinkNode], dropped: usize, theme: Theme) -> impl IntoElement {
-    let n = nodes.len();
-    // Chip centres spread evenly across the top; the anchor sits bottom-centre.
-    let width = 296.0;
-    let anchor = (width / 2.0, UPLINK_H - 6.0);
-    let xs: Vec<f32> = (0..n)
-        .map(|i| {
-            let step = width / (n as f32 + 1.0);
-            step * (i as f32 + 1.0)
-        })
-        .collect();
-    let top_y = 6.0 + CHIP_H / 2.0;
+/// Join the non-empty parts of a line with the map's " · " separator.
+///
+/// The separator belongs BETWEEN two things that exist. Formatting it in
+/// unconditionally is what left a chip reading `Bridge0 ·` with nothing after the
+/// dot — a field that was absent rendered as a field that was lost. Every
+/// multi-field line in this module goes through here.
+fn join_parts(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" \u{00b7} ")
+}
 
-    let edge_color = rgb(theme.track_on);
-    let targets: Vec<(f32, f32)> = xs.iter().map(|x| (*x, top_y)).collect();
-    let edges = canvas(
-        move |_bounds, _window, _cx| {},
-        move |bounds: Bounds<Pixels>, _prepaint: (), window, _cx| {
-            let mut builder = gpui::PathBuilder::stroke(px(1.0));
-            let origin = bounds.origin;
-            let a = point(origin.x + px(anchor.0), origin.y + px(anchor.1));
-            for (tx, ty) in &targets {
-                builder.move_to(a);
-                builder.line_to(point(origin.x + px(*tx), origin.y + px(*ty)));
-            }
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, edge_color);
-            }
-        },
-    );
-
-    let mut area = div()
-        .relative()
-        .w_full()
-        .h(px(UPLINK_H))
-        .child(div().absolute().size_full().child(edges));
-
-    for (node, x) in nodes.iter().zip(xs.iter()) {
-        area = area.child(
-            div()
-                .absolute()
-                .left(px(x - CHIP_W / 2.0))
-                .top(px(6.0))
-                .child(uplink_chip(node, theme)),
-        );
+/// How the uplink was learned, said so a reader can weigh it: the protocol that
+/// carried the advertisement, never bare.
+fn uplink_via_label(via: LearnedVia) -> &'static str {
+    match via {
+        LearnedVia::Lldp => "advertised over LLDP",
+        LearnedVia::Cdp => "advertised over CDP",
+        // A protocol a newer daemon learned this uplink by that this bar does not
+        // know — do not name an unbacked protocol.
+        LearnedVia::Unknown => "advertised over an unknown protocol",
     }
-    let caption = if dropped > 0 {
-        format!("uplinks \u{00b7} LLDP/CDP \u{00b7} +{dropped} more")
+}
+
+/// The provenance line under an uplink: which local interface heard it and how
+/// long ago. Deliberately says *heard*, not *connected since*: the socket carries
+/// the latest sighting, while `first_seen` is a store column the bar never reads.
+/// (realm net-observer, node #43)
+fn uplink_seen_line(node: &UplinkNode, now_us: i64) -> String {
+    let where_ = if node.iface.is_empty() {
+        String::new()
     } else {
-        "uplinks \u{00b7} LLDP/CDP".to_string()
+        format!("heard on {}", node.iface)
     };
+    join_parts(&[&where_, &crate::ui::age_str(node.ts_us, now_us)])
+}
+
+/// The caption above the uplink tree. It names the reading as a hypothesis in the
+/// same voice the channel-overlap and vulnerability hypotheses use: an LLDP/CDP
+/// frame is unauthenticated and spoofable, so an edge here is what the wire
+/// claimed, never a proven physical connection. (realm net-observer, node #43)
+fn uplink_caption(dropped: usize) -> String {
+    let base =
+        "uplink hypothesis \u{00b7} what LLDP/CDP frames claimed, not a proven physical link";
+    if dropped > 0 {
+        format!("{base} \u{00b7} +{dropped} more")
+    } else {
+        base.to_string()
+    }
+}
+
+/// The uplink tree drawn above the neighbour star: a "this Mac" anchor at the
+/// top and, hanging off a left rail, one card per discovered switch/AP carrying
+/// what identified it (LLDP or CDP), the chassis and port it named, what it says
+/// it can do, and which of this machine's interfaces heard it.
+///
+/// Everything here is a hypothesis the caption names as one — the frames are
+/// unauthenticated. (realm net-observer, node #43)
+fn uplink_strip(nodes: &[UplinkNode], dropped: usize, theme: Theme) -> impl IntoElement {
+    let now = crate::ui::now_us();
+    let rail = div()
+        .absolute()
+        .left(px(UPLINK_RAIL_W / 2.0))
+        .top(px(10.0))
+        .bottom(px(10.0))
+        .w(px(1.0))
+        .bg(rgb(theme.track_on));
+
+    let mut tree = div()
+        .relative()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(rail)
+        .child(uplink_anchor(nodes, theme));
+    for node in nodes {
+        tree = tree.child(uplink_card(node, now, theme));
+    }
+
     div()
         .flex()
         .flex_col()
@@ -401,59 +602,138 @@ fn uplink_strip(nodes: &[UplinkNode], dropped: usize, theme: Theme) -> impl Into
                 .text_size(px(11.0))
                 .text_color(rgb(theme.muted))
                 .pb_1()
-                .child(caption),
+                .child(uplink_caption(dropped)),
         )
-        .child(area)
+        .child(tree)
 }
 
-/// One uplink chip: a square marker (distinct from the round neighbour dots) in
-/// the infra tint, the switch/AP label, and its port beneath.
-fn uplink_chip(node: &UplinkNode, theme: Theme) -> impl IntoElement {
-    let port_line = match node.via {
-        LearnedVia::Lldp => format!("{} \u{00b7} lldp", node.port),
-        LearnedVia::Cdp => format!("{} \u{00b7} cdp", node.port),
-        // A protocol a newer daemon learned this uplink by that this bar does not
-        // know — show the port without an unbacked protocol claim.
-        LearnedVia::Unknown => node.port.clone(),
+/// The tree's root row: this Mac, and the interfaces the uplinks were heard on —
+/// the machine's own end of every edge below it.
+fn uplink_anchor(nodes: &[UplinkNode], theme: Theme) -> impl IntoElement {
+    let mut ifaces: Vec<&str> = Vec::new();
+    for n in nodes {
+        if !ifaces.contains(&n.iface.as_str()) {
+            ifaces.push(&n.iface);
+        }
+    }
+    let label = if ifaces.is_empty() {
+        "this Mac".to_string()
+    } else {
+        format!("this Mac \u{00b7} {}", ifaces.join(", "))
     };
     div()
         .flex()
         .items_center()
         .gap_1()
-        .w(px(CHIP_W))
-        .h(px(CHIP_H))
-        .px_1p5()
-        .rounded_md()
-        .overflow_hidden()
-        .bg(rgba(theme.surface))
-        .border_1()
-        .border_color(rgb(theme.track_on))
-        .text_color(rgb(theme.fg))
         .child(
             div()
+                .w(px(UPLINK_RAIL_W))
+                .flex()
+                .justify_center()
                 .text_size(px(9.0))
-                .text_color(rgb(theme.track_on))
-                .child("\u{25A0}"),
+                .text_color(rgb(theme.accent))
+                .child("\u{25CF}"),
         )
         .child(
             div()
-                .flex_1()
+                .text_size(px(11.0))
+                .text_color(rgb(theme.fg))
+                .child(label),
+        )
+}
+
+/// One uplink card: a square marker (distinct from the round neighbour dots) in
+/// the infra tint, the switch/AP label, and beneath it the chassis identity, the
+/// protocol and remote port, the advertised capabilities, and where and when the
+/// advertisement was heard.
+fn uplink_card(node: &UplinkNode, now_us: i64, theme: Theme) -> impl IntoElement {
+    // "?" is the decoder's literal for "the frame named no port at all", and an
+    // empty port is no port either: neither earns a "port" clause, let alone a
+    // separator introducing one.
+    let port = if node.port.is_empty() || node.port == "?" {
+        String::new()
+    } else {
+        format!("port {}", node.port)
+    };
+    let port_line = join_parts(&[uplink_via_label(node.via), &port]);
+    let mut body = div().flex_1().overflow_hidden().flex().flex_col().child(
+        div()
+            .overflow_hidden()
+            .text_size(px(11.0))
+            .child(node.label.clone()),
+    );
+    if node.has_name() {
+        body = body.child(
+            div()
                 .overflow_hidden()
+                .text_size(px(9.0))
+                .text_color(rgb(theme.muted))
+                .child(format!("chassis {}", node.chassis)),
+        );
+    }
+    body = body.child(
+        div()
+            .overflow_hidden()
+            .text_size(px(9.0))
+            .text_color(rgb(theme.muted))
+            .child(port_line),
+    );
+    if !node.caps.is_empty() {
+        body = body.child(
+            div()
+                .overflow_hidden()
+                .text_size(px(9.0))
+                .text_color(rgb(theme.track_on))
+                .child(format!("claims {}", node.caps.join(", "))),
+        );
+    }
+    body = body.child(
+        div()
+            .overflow_hidden()
+            .text_size(px(9.0))
+            .text_color(rgb(theme.muted))
+            .child(uplink_seen_line(node, now_us)),
+    );
+
+    div()
+        .flex()
+        .items_start()
+        .gap_1()
+        // The horizontal stub joining this card to the rail on the left.
+        .child(
+            div()
+                .w(px(UPLINK_RAIL_W))
+                .h(px(CHIP_H / 2.0))
                 .flex()
-                .flex_col()
+                .items_center()
+                .justify_end()
                 .child(
                     div()
-                        .overflow_hidden()
-                        .text_size(px(11.0))
-                        .child(node.label.clone()),
-                )
-                .child(
-                    div()
-                        .overflow_hidden()
-                        .text_size(px(9.0))
-                        .text_color(rgb(theme.muted))
-                        .child(port_line),
+                        .w(px(UPLINK_RAIL_W / 2.0))
+                        .h(px(1.0))
+                        .bg(rgb(theme.track_on)),
                 ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .gap_1()
+                .flex_1()
+                .p_1p5()
+                .rounded_md()
+                .overflow_hidden()
+                .bg(rgba(theme.surface))
+                .border_1()
+                .border_color(rgb(theme.track_on))
+                .text_color(rgb(theme.fg))
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(rgb(theme.track_on))
+                        .child("\u{25A0}"),
+                )
+                .child(body),
         )
 }
 
@@ -477,7 +757,11 @@ fn placed_chip(
 ///
 /// Renders an honest empty state when there is no sample yet, the reading could
 /// not run, or nobody answered — never a blank panel.
-pub fn network_map_section(snapshot: &StatusSnapshot, theme: Theme) -> impl IntoElement {
+pub(crate) fn network_map_section(
+    snapshot: &StatusSnapshot,
+    plot: Plot,
+    theme: Theme,
+) -> impl IntoElement {
     let base = div().flex().flex_col().px_3().py_2();
 
     // Uplinks are independent of the neighbour star: an LLDP/CDP-discovered
@@ -509,13 +793,14 @@ pub fn network_map_section(snapshot: &StatusSnapshot, theme: Theme) -> impl Into
     }
     let sample = sample.expect("neighbours non-empty implies a sample");
 
-    let (gateway, ring, dropped) = partition(sample);
+    let (gateway, ring, dropped) = partition(sample, plot.capacity);
 
-    // Centre of the plot area. The section spans the panel's content width
-    // (~296pt after the px_3 padding); the ring radius keeps corner chips inside it.
-    let center_x = 148.0;
-    let center_y = MAP_H / 2.0;
-    let positions = ring_positions(ring.len(), center_x, center_y, RING_R);
+    // Centre and radius come from the window's real size (see `plot_for`), so a
+    // maximised window spreads the star over it instead of pinning a fixed-size
+    // picture to the top-left corner.
+    let center_x = plot.cx;
+    let center_y = plot.cy;
+    let positions = ring_positions(ring.len(), center_x, center_y, plot.r);
 
     // Edges: one stroked path from the gateway centre to each neighbour centre,
     // painted under the nodes. Captured by value so the canvas closure owns them.
@@ -540,7 +825,7 @@ pub fn network_map_section(snapshot: &StatusSnapshot, theme: Theme) -> impl Into
     let mut area = div()
         .relative()
         .w_full()
-        .h(px(MAP_H))
+        .h(px(plot.h))
         .child(div().absolute().size_full().child(edges));
 
     // The gateway at the centre — its real chip, or a muted placeholder when the
@@ -585,10 +870,37 @@ pub fn network_map_section(snapshot: &StatusSnapshot, theme: Theme) -> impl Into
             div()
                 .text_size(px(11.0))
                 .text_color(rgb(theme.muted))
-                .child(format!("+{dropped} more not shown")),
+                .child(format!(
+                    "+{dropped} that the ring has no room for \u{00b7} the list shows every one"
+                )),
         );
     }
+    section = section.child(role_legend(theme));
     section.into_any_element()
+}
+
+/// The glyph key under the star, and the sentence that keeps it a hypothesis.
+///
+/// Without this the glyphs are an unexplained alphabet, and a `▣` reads as a
+/// measured fact about a device. The roles are inferred from the OUI vendor and
+/// from behaviour, never measured. (realm net-observer, node #36)
+fn role_legend(theme: Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .pt_1()
+        .text_size(px(10.0))
+        .text_color(rgb(theme.muted))
+        .child(div().child(join_parts(&[
+            "\u{21C5} gateway",
+            "\u{25A3} infra?",
+            "\u{25CF} host",
+            "? unknown",
+        ])))
+        .child(div().child(
+            "role is inferred from vendor OUI and behaviour, not measured \u{00b7} \
+                 the list gives the grounds for each",
+        ))
 }
 
 /// The one-line caption above the star: the interface and how many devices the
@@ -627,6 +939,160 @@ fn caption(
         )
 }
 
+/// The neighbour **list**: every device the latest reading returned, one row each.
+///
+/// This is the star's complement, not a decoration. The ring is bounded by
+/// geometry and summarises the overflow as "+N more"; the list has no geometry to
+/// run out of, so whatever the ring could not seat is still readable here. It is
+/// also where a role glyph is unfolded into the grounds it rests on
+/// ([`role_basis`]), which a chip has no room for.
+///
+/// Columns are what the socket actually carries: role, identity, address, MAC and
+/// which reading found it. There is deliberately **no first/last-seen column** —
+/// `NeighborObs` carries no lifetime bounds, those live in the store's `neighbor`
+/// table and reach only the offline reader, and the bar is a pure socket client.
+/// (realm net-observer, node #43)
+fn neighbour_list(snapshot: &StatusSnapshot, theme: Theme) -> gpui::AnyElement {
+    let base = div().flex().flex_col().px_3().py_2();
+    let Some(sample) = snapshot.neighbors.as_ref() else {
+        return empty_state(base, "no neighbour reading yet", theme);
+    };
+    if sample.neighbors.is_empty() {
+        let msg = match &sample.reason {
+            Some(reason) => format!("no neighbours: {reason}"),
+            None => "no neighbours seen \u{00b7} press Rescan to look".to_string(),
+        };
+        return empty_state(base, msg, theme);
+    }
+
+    let key = sample.network_key.as_deref();
+    let mut rows = div().flex().flex_col().w_full();
+    rows = rows.child(
+        div()
+            .flex()
+            .w_full()
+            .pb_1()
+            .text_size(px(10.0))
+            .text_color(rgb(theme.muted))
+            .child(div().w(px(96.0)).flex_shrink_0().child("role"))
+            .child(div().flex_1().min_w(px(80.0)).child("name"))
+            .child(div().w(px(120.0)).flex_shrink_0().child("address"))
+            .child(div().w(px(140.0)).flex_shrink_0().child("MAC"))
+            .child(div().w(px(64.0)).flex_shrink_0().child("via")),
+    );
+    rows = rows.child(separator(theme));
+
+    for obs in &sample.neighbors {
+        let is_gateway = key.is_some_and(|k| k.eq_ignore_ascii_case(&obs.mac));
+        let node = MapNode::from_obs(obs);
+        let accent = node_accent(&node, is_gateway, theme);
+        let name = obs
+            .hostname
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .map_or_else(|| node.label.clone(), str::to_string);
+        rows = rows.child(
+            div()
+                .flex()
+                .w_full()
+                .py_0p5()
+                .items_start()
+                .text_size(px(11.0))
+                .child(
+                    div()
+                        .w(px(96.0))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_color(accent)
+                                .child(role_glyph(node.role, is_gateway)),
+                        )
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(role_label(node.role, is_gateway)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(80.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(name),
+                        )
+                        // The grounds for the role, so the glyph is never the
+                        // whole story.
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_size(px(9.0))
+                                .text_color(rgb(theme.muted))
+                                .child(role_basis(node.role, is_gateway)),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(120.0))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(obs.ip.clone()),
+                )
+                .child(
+                    div()
+                        .w(px(140.0))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(rgb(theme.muted))
+                        .child(obs.mac.clone()),
+                )
+                .child(
+                    div()
+                        .w(px(64.0))
+                        .flex_shrink_0()
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme.muted))
+                        .child(format!("{:?}", obs.source).to_lowercase()),
+                ),
+        );
+    }
+
+    base.child(
+        div()
+            .pb_1()
+            .text_size(px(11.0))
+            .text_color(rgb(theme.muted))
+            .child(join_parts(&[
+                sample.iface.as_deref().unwrap_or("segment"),
+                &format!(
+                    "{} neighbour{}",
+                    sample.neighbors.len(),
+                    if sample.neighbors.len() == 1 { "" } else { "s" }
+                ),
+                "no first/last seen on the socket \u{2014} that is a store column",
+            ])),
+    )
+    .child(rows)
+    .into_any_element()
+}
+
 /// A muted, single-line honest empty state — shown instead of a blank map area.
 fn empty_state(
     base: gpui::Div,
@@ -655,8 +1121,29 @@ fn separator(theme: Theme) -> impl IntoElement {
 /// [`network_map_section`]).
 pub(crate) struct MapView {
     model: Entity<Glance>,
+    /// Which of the two readings of the same sample is on screen. The star is the
+    /// shape of the segment; the list is its full contents.
+    mode: MapMode,
     _observe: Subscription,
 }
+
+/// The two ways this window shows one neighbour sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapMode {
+    /// The gateway-centred star.
+    Graph,
+    /// Every neighbour as a row (see [`neighbour_list`]).
+    List,
+}
+
+/// Vertical space the window's own chrome (header row, control line, captions,
+/// legend and the uplink tree) takes before the star gets any, in gpui logical
+/// px. Subtracted from the viewport so the plot is sized to what is actually
+/// left rather than to the whole window.
+const MAP_CHROME_H: f32 = 150.0;
+
+/// Horizontal padding the section applies (`px_3` on both sides).
+const MAP_SIDE_PAD: f32 = 24.0;
 
 impl MapView {
     fn new(model: Entity<Glance>, cx: &mut Context<Self>) -> Self {
@@ -665,6 +1152,7 @@ impl MapView {
         let observe = cx.observe(&model, |_, _, cx| cx.notify());
         Self {
             model,
+            mode: MapMode::Graph,
             _observe: observe,
         }
     }
@@ -673,7 +1161,23 @@ impl MapView {
 impl Render for MapView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
-        let snapshot = self.model.read(cx).snapshot.clone();
+        let glance = self.model.read(cx);
+        let snapshot = glance.snapshot.clone();
+        let control_msg = glance.control_msg.clone();
+        let mode = self.mode;
+
+        // The star is fitted to the space this window actually has right now.
+        let viewport = window.viewport_size();
+        let plot = plot_for(
+            f32::from(viewport.width) - MAP_SIDE_PAD,
+            f32::from(viewport.height) - MAP_CHROME_H,
+        );
+
+        let body = match mode {
+            MapMode::Graph => network_map_section(&snapshot, plot, theme).into_any_element(),
+            MapMode::List => neighbour_list(&snapshot, theme),
+        };
+
         div()
             .flex()
             .flex_col()
@@ -682,9 +1186,94 @@ impl Render for MapView {
             .text_color(rgb(theme.fg))
             .font_family(".SystemUIFont")
             .text_size(px(13.0))
+            .child(map_toolbar(mode, control_msg, theme, cx))
             .child(separator(theme))
-            .child(network_map_section(&snapshot, theme))
+            .child(body)
     }
+}
+
+/// The map window's own controls: the graph/list switch and Rescan.
+///
+/// Rescan runs the **same** acting-gated round-trip the panel's "Scan" button
+/// runs ([`crate::ui::scan_round_trip_base`]) — a neighbour sweep addresses other
+/// machines, so a daemon without `acting.enabled` refuses it and answers
+/// `ok: false` with a reason, which lands in the line below the buttons as
+/// `failed: …`. There is no timer behind it: it fires on a click and only on a
+/// click. (v1 = observe, never act — this is the one operator-initiated exception
+/// the daemon itself gates.)
+fn map_toolbar(
+    mode: MapMode,
+    control_msg: Option<String>,
+    theme: Theme,
+    cx: &mut Context<MapView>,
+) -> impl IntoElement {
+    let tab = |label: &'static str, this: MapMode, theme: Theme, cx: &mut Context<MapView>| {
+        let selected = mode == this;
+        div()
+            .id(label)
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .text_size(px(12.0))
+            .cursor_pointer()
+            .text_color(rgb(if selected { theme.accent } else { theme.muted }))
+            .when(selected, |d| d.bg(rgb(theme.hover)))
+            .hover(|s| s.bg(rgb(theme.hover)))
+            .child(label)
+            .on_click(cx.listener(move |view, _, _window, cx| {
+                view.mode = this;
+                cx.notify();
+            }))
+    };
+
+    let rescan = div()
+        .id("map-rescan")
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        // Warn-coloured for the same reason the panel's Scan is: this one is not
+        // routine, it addresses machines that are not this one.
+        .text_color(rgb(theme.warn))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme.hover)))
+        .child("Rescan")
+        .on_click(cx.listener(|view, _, _window, cx| {
+            crate::ui::spawn_control_on(&view.model, cx, crate::ui::scan_round_trip_base);
+        }));
+
+    div()
+        .flex()
+        .flex_col()
+        .px_3()
+        .py_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(tab("Graph", MapMode::Graph, theme, cx))
+                        .child(tab("List", MapMode::List, theme, cx)),
+                )
+                .child(rescan),
+        )
+        // The outcome of the last control action, shown verbatim: a refusal
+        // ("acting disabled") must read as a refusal, never as a silent no-op.
+        .when_some(control_msg, |d, msg| {
+            let failed = msg.starts_with("failed");
+            d.child(
+                div()
+                    .pt_1()
+                    .text_size(px(10.0))
+                    .text_color(rgb(if failed { theme.warn } else { theme.muted }))
+                    .child(msg),
+            )
+        })
 }
 
 /// Open the network-map window, or bring the already-open one to the front.
@@ -859,7 +1448,7 @@ mod tests {
                 ),
             ],
         );
-        let (gateway, ring, dropped) = partition(&s);
+        let (gateway, ring, dropped) = partition(&s, test_plot().capacity);
         assert_eq!(gateway.unwrap().mac, "gg:gg:gg:gg:gg:gg");
         assert_eq!(ring.len(), 1);
         assert_eq!(ring[0].mac, "11:11:11:11:11:11");
@@ -877,7 +1466,7 @@ mod tests {
                 None,
             )],
         );
-        let (gateway, ring, _) = partition(&s);
+        let (gateway, ring, _) = partition(&s, test_plot().capacity);
         assert!(gateway.is_none());
         assert_eq!(ring.len(), 1);
     }
@@ -896,8 +1485,9 @@ mod tests {
                 )
             })
             .collect();
-        let (_gw, ring, dropped) = partition(&sample(None, neighbors));
-        let cap = ring_capacity(RING_R).min(MAX_RING);
+        let plot = test_plot();
+        let (_gw, ring, dropped) = partition(&sample(None, neighbors), plot.capacity);
+        let cap = plot.capacity.min(MAX_RING);
         assert_eq!(
             ring.len(),
             cap,
@@ -914,10 +1504,11 @@ mod tests {
     /// centres are at least a chip-plus-gap apart, so nothing overlaps.
     #[test]
     fn the_ring_capacity_never_lets_chips_overlap() {
-        let n = ring_capacity(RING_R);
+        let r = test_plot().r;
+        let n = ring_capacity(r);
         assert!(n >= 1);
         if n >= 2 {
-            let p = ring_positions(n, 0.0, 0.0, RING_R);
+            let p = ring_positions(n, 0.0, 0.0, r);
             let (dx, dy) = (p[1].0 - p[0].0, p[1].1 - p[0].1);
             let spacing = (dx * dx + dy * dy).sqrt();
             assert!(
@@ -926,6 +1517,168 @@ mod tests {
                 CHIP_W + CHIP_GAP
             );
         }
+    }
+
+    /// The geometry of a default-sized map window — the layout the pre-resize
+    /// tests were written against.
+    fn test_plot() -> Plot {
+        plot_for(WIN_W - MAP_SIDE_PAD, WIN_H - MAP_CHROME_H)
+    }
+
+    /// A ring chip can never land on top of the centre (gateway) chip, at any
+    /// angle and at any window size — the collision the owner saw between
+    /// "gateway ?" and the node above it.
+    #[test]
+    fn no_ring_chip_can_overlap_the_gateway() {
+        // Includes a window far too small to honour the radius: the floor still
+        // holds, because overlapping the gateway is the worse failure.
+        for (w, h) in [
+            (80.0, 60.0),
+            (336.0, 170.0),
+            (1440.0, 900.0),
+            (3000.0, 1800.0),
+        ] {
+            let plot = plot_for(w, h);
+            let n = plot.capacity.clamp(1, MAX_RING);
+            for (x, y) in ring_positions(n, plot.cx, plot.cy, plot.r) {
+                let dx = (x - plot.cx).abs();
+                let dy = (y - plot.cy).abs();
+                assert!(
+                    dx >= CHIP_W + CHIP_GAP - 0.01 || dy >= CHIP_H + CHIP_GAP - 0.01,
+                    "chip at ({x},{y}) overlaps the centre in a {w}x{h} window",
+                );
+            }
+        }
+    }
+
+    /// A bigger window is a bigger star that hides fewer nodes — the defect was a
+    /// fixed-size picture in the corner of a maximised window, summarising nodes
+    /// as "+N more" with room to spare.
+    #[test]
+    fn the_plot_grows_with_the_window() {
+        let small = plot_for(336.0, 170.0);
+        let large = plot_for(1440.0, 900.0);
+        assert!(large.r > small.r, "radius follows the window");
+        assert!(large.cx > small.cx, "the star stays centred, not cornered");
+        assert!(large.cy > small.cy);
+        assert!(
+            large.capacity > small.capacity,
+            "more room must mean more nodes shown: {} vs {}",
+            large.capacity,
+            small.capacity
+        );
+        // The floor is never breached, however small the window gets.
+        assert!(plot_for(10.0, 10.0).r >= min_ring_radius() - 0.01);
+    }
+
+    /// A separator is only ever written between two fields that exist — the
+    /// `Bridge0 ·` defect.
+    #[test]
+    fn an_absent_field_leaves_no_dangling_separator() {
+        assert_eq!(join_parts(&["a", "b"]), "a \u{00b7} b");
+        assert_eq!(join_parts(&["a", ""]), "a");
+        assert_eq!(join_parts(&["", "b"]), "b");
+        assert_eq!(join_parts(&["", "  "]), "");
+
+        // A frame that named no port carries the decoder's literal "?": the card
+        // must then say nothing about a port, not trail a separator.
+        let mut l = link("sw", "?", None, LearnedVia::Lldp);
+        l.capabilities = String::new();
+        let node = UplinkNode::from_link(&l);
+        let line = join_parts(&[uplink_via_label(node.via), ""]);
+        assert!(!line.ends_with('\u{00b7}'), "{line}");
+        assert!(!line.contains("port"), "{line}");
+
+        // And an uplink heard on no named interface does not trail one either.
+        let mut anon = UplinkNode::from_link(&link("sw", "Gi0/1", None, LearnedVia::Lldp));
+        anon.iface = String::new();
+        let seen = uplink_seen_line(&anon, anon.ts_us);
+        assert!(
+            !seen.starts_with('\u{00b7}') && !seen.ends_with('\u{00b7}'),
+            "{seen}"
+        );
+    }
+
+    /// Every role glyph is paired with words, and no hedged role is ever stated
+    /// flatly: an inferred role must not read as a measured one.
+    #[test]
+    fn a_role_glyph_never_stands_as_a_fact() {
+        let roles = [
+            NeighborRole::Gateway,
+            NeighborRole::Infra {
+                confidence: RoleConfidence::Low,
+            },
+            NeighborRole::Infra {
+                confidence: RoleConfidence::High,
+            },
+            NeighborRole::Host,
+            NeighborRole::Unknown,
+        ];
+        for role in roles {
+            assert!(!role_glyph(role, false).is_empty());
+            assert!(!role_label(role, false).is_empty());
+            assert!(
+                !role_basis(role, false).is_empty(),
+                "every role must say what it rests on"
+            );
+        }
+        // The one near-certain classification is the only one stated plainly.
+        assert_eq!(role_label(NeighborRole::Gateway, true), "gateway");
+        // An inference is marked as one and carries its confidence.
+        let infra = role_label(
+            NeighborRole::Infra {
+                confidence: RoleConfidence::Low,
+            },
+            false,
+        );
+        assert!(infra.contains('?'), "{infra}");
+        assert!(infra.contains("low"), "{infra}");
+        assert!(
+            role_basis(
+                NeighborRole::Infra {
+                    confidence: RoleConfidence::Low
+                },
+                false
+            )
+            .contains("guess"),
+            "an infra hypothesis names itself a guess"
+        );
+        // The gateway flag wins over whatever role the observation carried.
+        assert_eq!(
+            role_glyph(NeighborRole::Host, true),
+            role_glyph(NeighborRole::Gateway, false)
+        );
+    }
+
+    /// The list renders from a sample with neighbours, and its empty states are
+    /// honest rather than blank.
+    #[test]
+    fn the_list_renders_every_neighbour_and_states_its_absences() {
+        let theme = Theme::for_appearance(gpui::WindowAppearance::Dark);
+        let many: Vec<NeighborObs> = (0..MAX_RING + 20)
+            .map(|i| {
+                obs(
+                    &format!("{i:02x}:{i:02x}:{i:02x}:{i:02x}:{i:02x}:{i:02x}"),
+                    "192.168.0.129",
+                    NeighborSource::Arp,
+                    None,
+                )
+            })
+            .collect();
+        let snap = StatusSnapshot {
+            neighbors: Some(sample(None, many)),
+            ..Default::default()
+        };
+        // The list has no geometry to run out of: building it must not panic.
+        let _ = neighbour_list(&snap, theme);
+        let _ = neighbour_list(&StatusSnapshot::default(), theme);
+        let _ = neighbour_list(
+            &StatusSnapshot {
+                neighbors: Some(sample(None, vec![])),
+                ..Default::default()
+            },
+            theme,
+        );
     }
 
     fn link(chassis: &str, port: &str, name: Option<&str>, via: LearnedVia) -> TopologyLink {
@@ -987,6 +1740,70 @@ mod tests {
         assert_eq!(nodes[0].label, "sw0");
     }
 
+    /// An uplink node carries everything the card draws: the identity behind a
+    /// friendly name, the port, the local interface, and the advertised
+    /// capabilities split out of their comma-joined wire form.
+    #[test]
+    fn an_uplink_node_carries_the_whole_advertisement() {
+        let mut l = link(
+            "00:11:22:33:44:55",
+            "Gi0/1",
+            Some("core-sw"),
+            LearnedVia::Cdp,
+        );
+        l.capabilities = "bridge, wlan_ap".into();
+        l.ts_us = 5_000_000;
+        let node = UplinkNode::from_link(&l);
+        assert_eq!(node.label, "core-sw");
+        assert_eq!(node.chassis, "00:11:22:33:44:55");
+        assert!(node.has_name(), "a named switch shows its chassis too");
+        assert_eq!(node.iface, "en0");
+        assert_eq!(node.caps, vec!["bridge", "wlan_ap"]);
+
+        // Without a system name the label IS the chassis, so no duplicate line.
+        let anon = UplinkNode::from_link(&link("sw-x", "Gi0/2", None, LearnedVia::Lldp));
+        assert!(!anon.has_name());
+        // No advertised capabilities means no claims line, not an empty one.
+        assert!(
+            UplinkNode::from_link(&{
+                let mut e = link("sw-y", "Gi0/3", None, LearnedVia::Lldp);
+                e.capabilities = String::new();
+                e
+            })
+            .caps
+            .is_empty()
+        );
+    }
+
+    /// Every line the card writes names the reading as an advertisement, never
+    /// as a proven physical connection — and the sighting is dated as *heard*,
+    /// since `first_seen` is a store column the bar cannot reach.
+    #[test]
+    fn uplink_text_stays_a_hypothesis() {
+        let caption = uplink_caption(0);
+        assert!(caption.contains("hypothesis"), "{caption}");
+        assert!(caption.contains("not a proven physical link"), "{caption}");
+        assert!(uplink_caption(2).contains("+2 more"));
+
+        assert!(uplink_via_label(LearnedVia::Lldp).contains("LLDP"));
+        assert!(uplink_via_label(LearnedVia::Cdp).contains("CDP"));
+        // An unrecognised protocol must not be reported as LLDP or CDP.
+        let unknown = uplink_via_label(LearnedVia::Unknown);
+        assert!(
+            !unknown.contains("LLDP") && !unknown.contains("CDP"),
+            "{unknown}"
+        );
+
+        let node = UplinkNode::from_link(&link("sw", "Gi0/1", None, LearnedVia::Lldp));
+        let seen = uplink_seen_line(&node, node.ts_us + 120_000_000);
+        assert!(seen.starts_with("heard on en0"), "{seen}");
+        assert!(seen.contains("2m ago"), "{seen}");
+        assert!(
+            !seen.contains("since"),
+            "a sighting is not a first-seen: {seen}"
+        );
+    }
+
     /// A snapshot with uplinks but no neighbour reading still renders the strip
     /// instead of the empty state — the map is not blank when a switch is known.
     #[test]
@@ -1003,7 +1820,11 @@ mod tests {
         // Building the element must not panic and must see the uplink.
         let (nodes, _) = uplinks(&snap);
         assert_eq!(nodes.len(), 1);
-        let _ = network_map_section(&snap, Theme::for_appearance(gpui::WindowAppearance::Dark));
+        let _ = network_map_section(
+            &snap,
+            test_plot(),
+            Theme::for_appearance(gpui::WindowAppearance::Dark),
+        );
     }
 
     #[test]
