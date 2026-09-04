@@ -36,7 +36,7 @@ use tokio::sync::broadcast;
 use types::{NeighborsSample, NeighborsVerdict, ObservingCause, ObservingEdge, Sample};
 
 use crate::acting;
-use crate::pipeline::{NeighborScanner, PcapRingSlot};
+use crate::pipeline::{AirScanRequest, AirScanner, NeighborScanner, PcapRingSlot};
 
 /// The uid `root` runs as. Always authorised for control: root can already stop
 /// and reconfigure the daemon, so refusing it would be theatre.
@@ -343,6 +343,13 @@ impl ControlAuthority {
             // machines that are not its own, so it takes the stronger gate even
             // though it changes nothing.
             ControlCmd::ScanNeighbors(_) => Self::Acting,
+            // Reading the operating system's report about the daemon's OWN radio
+            // originates nothing on the air — no probe request of this daemon's
+            // making, no host addressed. Same class as a pause or a freeze, and
+            // deliberately NOT the class `ScanNeighbors` takes: what separates
+            // them is whether the daemon speaks to machines that are not this
+            // one (realm net-observer, node #47).
+            ControlCmd::ScanAir => Self::SelfControl,
         }
     }
 }
@@ -401,6 +408,9 @@ pub struct ApiServer {
     /// The neighbour scanner, when one could be built for this host. `None`
     /// makes `ScanNeighbors` a refusal with a message, never a silent success.
     pub scanner: Option<Arc<dyn NeighborScanner>>,
+    /// The on-demand air scanner, when the platform has one. `None` makes
+    /// `ScanAir` a refusal with a message, never a silent success.
+    pub air_scanner: Option<Arc<dyn AirScanner>>,
     /// What the active scan is PERMITTED to do, from config. A run's requested
     /// options are intersected with this ceiling; every field is off by default.
     pub scan_permission: ScanOptions,
@@ -666,6 +676,7 @@ async fn handle_conn(
                 quiet: &srv.quiet,
                 freezer: &srv.freezer,
                 scanner: srv.scanner.as_deref(),
+                air_scanner: srv.air_scanner.as_deref(),
                 scan_permission: &srv.scan_permission,
                 scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
                 blob_dir: &srv.blob_dir,
@@ -881,6 +892,8 @@ pub(crate) struct ControlCtx<'a> {
     pub freezer: &'a PcapRingSlot,
     /// The neighbour scanner, when one could be built for this host.
     pub scanner: Option<&'a dyn NeighborScanner>,
+    /// The on-demand air scanner, when the platform has one.
+    pub air_scanner: Option<&'a dyn AirScanner>,
     /// The config permission ceiling for the active scan.
     pub scan_permission: &'a ScanOptions,
     /// The configured CVE snapshot directory, when one is set (see the field of
@@ -1065,6 +1078,7 @@ fn control_response(
         }
         ControlCmd::FreezePcap => freeze_now(cx),
         ControlCmd::ScanNeighbors(opts) => scan_now(cx, &opts, Some(authorized.uid())),
+        ControlCmd::ScanAir => air_scan_now(cx, authorized.uid()),
         ControlCmd::KickstartProxy => match acting::kickstart_proxy(&cx.acting.singbox_service) {
             Ok(message) => ControlResult { ok: true, message },
             Err(message) => ControlResult { ok: false, message },
@@ -1237,6 +1251,52 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
         ok: true,
         message: format!("{}{note}", report.message),
     }
+}
+
+/// Read the radio environment once on operator demand.
+///
+/// Self-control, not acting: the daemon asks the OS for its own radio's report
+/// and puts nothing on the air (realm net-observer, node #47). So there is no
+/// `acting.enabled` gate here and — unlike [`scan_now`] — no `quiet` refusal
+/// either: quiet means this daemon addresses no packet at the gateway, and a
+/// reading that transmits nothing does not contradict it.
+///
+/// A PAUSE still refuses, for the reason it refuses a neighbour scan: the pause
+/// is bracketed silence, and a sample stamped inside that bracket would make the
+/// `observing_edge` row and the data disagree about the same seconds.
+///
+/// Returns as soon as the scan is accepted. Its product is an ordinary
+/// `Sample::Air` on the pipeline — persisted, published, `Skip` with a reason if
+/// the radio could not be read.
+fn air_scan_now(cx: &ControlCtx<'_>, peer_uid: u32) -> ControlResult {
+    if !cx.observing.load(Ordering::Acquire) {
+        return ControlResult {
+            ok: false,
+            message: "observation is paused; resume before scanning the air".to_string(),
+        };
+    }
+    let Some(scanner) = cx.air_scanner else {
+        return ControlResult {
+            ok: false,
+            message: "air scanning not available on this host".to_string(),
+        };
+    };
+    let (ok, message) = match scanner.request_scan() {
+        AirScanRequest::Started => (
+            true,
+            "air scan started; the slice will arrive as an air event".to_string(),
+        ),
+        AirScanRequest::AlreadyRunning => (
+            false,
+            "an air scan is already running; one press, one scan".to_string(),
+        ),
+        AirScanRequest::TooSoon { retry_in_s } => (
+            false,
+            format!("an air scan ran moments ago; try again in {retry_in_s}s"),
+        ),
+    };
+    tracing::info!(ok, peer_uid, %message, "air scan requested via control socket");
+    ControlResult { ok, message }
 }
 
 /// Copy the pcap ring out on operator demand, into a timestamped freeze
@@ -1441,6 +1501,7 @@ mod tests {
             quiet: Arc::new(AtomicBool::new(false)),
             freezer: Arc::new(PcapRingSlot::empty()),
             scanner: None,
+            air_scanner: None,
             scan_permission: ScanOptions::default(),
             scan_cve_snapshot: None,
             blob_dir: std::env::temp_dir().join("net-observerd-test-blobs"),
@@ -1463,6 +1524,7 @@ mod tests {
             quiet: &srv.quiet,
             freezer: &srv.freezer,
             scanner: srv.scanner.as_deref(),
+            air_scanner: srv.air_scanner.as_deref(),
             scan_permission: &srv.scan_permission,
             scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
             blob_dir: &srv.blob_dir,
@@ -1472,6 +1534,132 @@ mod tests {
             events_tx: &srv.events_tx,
             refusals: &srv.control_refusals,
         }
+    }
+
+    /// A scanner that records what it was asked and answers as told.
+    struct FakeAirScanner {
+        answer: AirScanRequest,
+        asked: Arc<AtomicUsize>,
+    }
+
+    impl crate::pipeline::AirScanner for FakeAirScanner {
+        fn request_scan(&self) -> AirScanRequest {
+            self.asked.fetch_add(1, Ordering::AcqRel);
+            self.answer.clone()
+        }
+    }
+
+    fn with_air(srv: &mut ApiServer, answer: AirScanRequest) -> Arc<AtomicUsize> {
+        let asked = Arc::new(AtomicUsize::new(0));
+        srv.air_scanner = Some(Arc::new(FakeAirScanner {
+            answer,
+            asked: Arc::clone(&asked),
+        }) as Arc<dyn crate::pipeline::AirScanner>);
+        asked
+    }
+
+    /// The classification decision, asserted as a decision.
+    ///
+    /// Reading the OS's report about this daemon's OWN radio originates nothing
+    /// on the air, so it takes the same class as a pause or a pcap freeze — NOT
+    /// the class the neighbour sweep takes, which addresses machines that are not
+    /// this one. If this ever flips, the button silently stops working on every
+    /// default config, which is the failure this test exists to catch.
+    #[test]
+    fn scanning_the_air_is_self_control_not_acting() {
+        assert_eq!(
+            ControlAuthority::of(&ControlCmd::ScanAir),
+            ControlAuthority::SelfControl
+        );
+        assert_eq!(
+            ControlAuthority::of(&ControlCmd::ScanNeighbors(ScanOptions::default())),
+            ControlAuthority::Acting
+        );
+    }
+
+    /// ...and the classification has teeth: with acting DISABLED (the default),
+    /// the command still reaches the scanner.
+    #[test]
+    fn an_air_scan_runs_with_acting_disabled() {
+        let mut srv = test_server(
+            "/tmp/unused-air-1.sock",
+            test_acting(false),
+            TEST_DAEMON_UID,
+        );
+        let asked = with_air(&mut srv, AirScanRequest::Started);
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
+        assert!(r.ok, "{}", r.message);
+        assert_eq!(asked.load(Ordering::Acquire), 1);
+    }
+
+    /// Quiet suppresses a packet this daemon would put AT the gateway. An air
+    /// read puts nothing anywhere, so quiet does not refuse it — unlike the
+    /// neighbour sweep, which quiet must refuse.
+    #[test]
+    fn quiet_does_not_refuse_an_air_scan() {
+        let mut srv = test_server("/tmp/unused-air-2.sock", test_acting(true), TEST_DAEMON_UID);
+        let asked = with_air(&mut srv, AirScanRequest::Started);
+        srv.quiet.store(true, Ordering::Release);
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
+        assert!(r.ok, "{}", r.message);
+        assert_eq!(asked.load(Ordering::Acquire), 1);
+    }
+
+    /// A pause DOES refuse: the pause is bracketed silence, and a sample stamped
+    /// inside the bracket would make the `observing_edge` row and the data
+    /// disagree about the same seconds. Nothing is asked of the radio.
+    #[test]
+    fn a_paused_daemon_refuses_an_air_scan_without_touching_the_radio() {
+        let mut srv = test_server("/tmp/unused-air-3.sock", test_acting(true), TEST_DAEMON_UID);
+        let asked = with_air(&mut srv, AirScanRequest::Started);
+        srv.observing.store(false, Ordering::Release);
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
+        assert!(!r.ok);
+        assert!(r.message.contains("paused"), "{}", r.message);
+        assert_eq!(asked.load(Ordering::Acquire), 0);
+    }
+
+    /// Every refusal carries the reason, and a rate refusal carries the wait.
+    /// The operator pressed a button and is owed a fact, never a silent no-op.
+    #[test]
+    fn each_air_scan_refusal_says_why() {
+        for (answer, needle) in [
+            (AirScanRequest::AlreadyRunning, "already running"),
+            (AirScanRequest::TooSoon { retry_in_s: 9 }, "9s"),
+        ] {
+            let mut srv = test_server("/tmp/unused-air-4.sock", test_acting(true), TEST_DAEMON_UID);
+            with_air(&mut srv, answer.clone());
+            let cx = test_ctx(&srv);
+            let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
+            assert!(!r.ok, "{answer:?} must not report success");
+            assert!(r.message.contains(needle), "{answer:?}: {}", r.message);
+        }
+    }
+
+    /// No scanner wired at all is a refusal with a message, never a silent
+    /// success — the same rule `FreezePcap` follows for an absent ring.
+    #[test]
+    fn an_air_scan_without_a_scanner_is_a_refusal_with_a_reason() {
+        let srv = test_server("/tmp/unused-air-5.sock", test_acting(true), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
+        assert!(!r.ok);
+        assert!(r.message.contains("not available"), "{}", r.message);
+    }
+
+    /// Self-control is not no-control: an unauthorised peer is still refused,
+    /// and the radio is not read for it.
+    #[test]
+    fn an_unauthorised_peer_cannot_scan_the_air() {
+        let mut srv = test_server("/tmp/unused-air-6.sock", test_acting(true), TEST_DAEMON_UID);
+        let asked = with_air(&mut srv, AirScanRequest::Started);
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanAir, None, &cx);
+        assert!(!r.ok, "{}", r.message);
+        assert_eq!(asked.load(Ordering::Acquire), 0);
     }
 
     /// A scratch directory for a socket-bound test.
@@ -1660,6 +1848,7 @@ mod tests {
             ControlCmd::FreezePcap,
             ControlCmd::KickstartProxy,
             ControlCmd::ScanNeighbors(ScanOptions::default()),
+            ControlCmd::ScanAir,
         ] {
             // Exhaustive on purpose — a new variant breaks this arm list.
             match cmd {
@@ -1667,7 +1856,8 @@ mod tests {
                 | ControlCmd::SetQuiet(_)
                 | ControlCmd::FreezePcap
                 | ControlCmd::KickstartProxy
-                | ControlCmd::ScanNeighbors(_) => {}
+                | ControlCmd::ScanNeighbors(_)
+                | ControlCmd::ScanAir => {}
             }
             // Acting is ENABLED, so a refusal here can only come from the peer
             // gate, never from the acting switch.
@@ -1746,6 +1936,7 @@ mod tests {
             ControlCmd::SetObserving(false),
             ControlCmd::KickstartProxy,
             ControlCmd::ScanNeighbors(ScanOptions::default()),
+            ControlCmd::ScanAir,
         ] {
             // Exhaustive on purpose — a new variant breaks this arm list.
             let expected = match cmd {
@@ -1754,6 +1945,8 @@ mod tests {
                 ControlCmd::FreezePcap => ControlAuthority::SelfControl,
                 ControlCmd::KickstartProxy => ControlAuthority::Acting,
                 ControlCmd::ScanNeighbors(_) => ControlAuthority::Acting,
+                // Reading this daemon's OWN radio report addresses nobody.
+                ControlCmd::ScanAir => ControlAuthority::SelfControl,
             };
             assert_eq!(
                 ControlAuthority::of(&cmd),

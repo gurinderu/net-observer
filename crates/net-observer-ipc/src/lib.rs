@@ -110,6 +110,23 @@ pub enum ControlCmd {
     /// by config; a requested-but-unpermitted rung is dropped and the result
     /// message says so.
     ScanNeighbors(ScanOptions),
+    /// Read the radio environment ONCE, now — the same slice the `air` collector
+    /// produces on its slow period, taken on operator demand instead.
+    ///
+    /// **Self-control, like [`ControlCmd::FreezePcap`] and [`ControlCmd::SetQuiet`],
+    /// and deliberately NOT acting-class.** The daemon asks the operating system
+    /// for its own radio's report; it addresses no host and originates no frame of
+    /// its own on the air. That is the whole difference from
+    /// [`ControlCmd::ScanNeighbors`], which speaks to machines that are not this
+    /// one and therefore takes the stronger gate.
+    ///
+    /// One press, one scan: the daemon starts at most one on-demand scan at a
+    /// time and refuses a second while the first runs, or too soon after it — the
+    /// report costs seconds. The command returns as soon as the scan is
+    /// *accepted*, not when it finishes; the resulting sample arrives on the bus
+    /// as an ordinary [`Event::Air`] (a `Skip` one, with its reason, when the
+    /// radio could not be read — never silence).
+    ScanAir,
 }
 
 /// Which rungs of an operator-pressed scan a single run should include.
@@ -143,7 +160,7 @@ pub struct ScanOptions {
 
 /// The outcome of a [`ControlCmd`]: whether the action ran successfully plus a
 /// human-readable message the client surfaces to the operator.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ControlResult {
     /// `true` iff the action ran and succeeded. A refusal (acting disabled) or a
     /// failed action is `false`.
@@ -355,6 +372,28 @@ pub enum StreamFrame {
     Observing(ObservingEdge),
     /// A daemon-side failure, reported IN BAND instead of a bare close.
     Error(StreamError),
+    /// A well-formed JSON frame this build cannot name — typically an
+    /// [`Event`] kind a NEWER daemon knows and this client does not.
+    ///
+    /// **Never sent by anyone.** It is produced by [`decode_stream_frame`] on the
+    /// receiving side, so a forward-compatible client renders "one frame I could
+    /// not read" instead of tearing the whole stream down over an enum variant it
+    /// has never heard of. Absence of a signal is itself diagnostic: the frame is
+    /// counted and named, never silently dropped.
+    #[serde(skip)]
+    Unrecognized(Unrecognized),
+}
+
+/// One frame that decoded as JSON but not as any [`StreamFrame`] this build
+/// knows. Constructed only by [`decode_stream_frame`]; it never travels the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Unrecognized {
+    /// The receiving client's clock when the frame arrived — the frame's own
+    /// timestamp is inside a shape we could not read.
+    pub ts_us: i64,
+    /// The decoder's complaint, kept verbatim so an operator can see WHICH
+    /// variant was unknown.
+    pub detail: String,
 }
 
 /// The daemon's acknowledgement of a subscription — the first frame on every
@@ -439,6 +478,7 @@ impl StreamFrame {
             StreamFrame::Gap(g) => g.ts_us,
             StreamFrame::Observing(o) => o.ts_us,
             StreamFrame::Error(e) => e.ts_us,
+            StreamFrame::Unrecognized(u) => u.ts_us,
         }
     }
 
@@ -451,6 +491,7 @@ impl StreamFrame {
             StreamFrame::Gap(_) => "gap",
             StreamFrame::Observing(_) => "observing",
             StreamFrame::Error(_) => "error",
+            StreamFrame::Unrecognized(_) => "unrecognized",
         }
     }
 
@@ -472,6 +513,9 @@ impl StreamFrame {
                 format!("collection {}", if o.observing { "on" } else { "off" })
             }
             StreamFrame::Error(e) => format!("{}: {}", e.code.as_str(), e.message),
+            StreamFrame::Unrecognized(u) => {
+                format!("a frame this build cannot read: {}", u.detail)
+            }
         }
     }
 
@@ -483,7 +527,8 @@ impl StreamFrame {
             StreamFrame::Ready(_)
             | StreamFrame::Gap(_)
             | StreamFrame::Observing(_)
-            | StreamFrame::Error(_) => None,
+            | StreamFrame::Error(_)
+            | StreamFrame::Unrecognized(_) => None,
         }
     }
 }
@@ -720,7 +765,7 @@ impl Iterator for Subscription {
     type Item = std::io::Result<StreamFrame>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match read_frame(&mut self.reader) {
+        match read_stream_frame(&mut self.reader) {
             Ok(frame) => Some(Ok(frame)),
             // The daemon closed the connection cleanly — the stream is over.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
@@ -766,23 +811,144 @@ pub fn subscribe(sock_path: &str, kinds: Option<&[EventKind]>) -> std::io::Resul
     let mut writer = &stream;
     write_frame(&mut writer, &req)?;
     let mut reader = BufReader::new(stream);
-    let first: StreamFrame = read_frame(&mut reader)?;
+    let line = read_line(&mut reader)?;
     // Handshake over: a live stream must block, not time out.
     reader.get_ref().set_read_timeout(None)?;
     reader.get_ref().set_write_timeout(None)?;
-    match first {
-        StreamFrame::Ready(ready) => Ok(Subscription { reader, ready }),
-        StreamFrame::Error(e) => Err(std::io::Error::other(format!(
+    match decode_handshake(&line) {
+        Handshake::Ready(ready) => Ok(Subscription { reader, ready }),
+        Handshake::Refused(e) => Err(std::io::Error::other(format!(
             "net-observerd refused the subscription ({}): {}",
             e.code.as_str(),
             e.message
         ))),
+        // The daemon could not READ the request. Its own words, verbatim — this
+        // is the one place a client used to substitute its deserializer's
+        // complaint about `StreamError` for what the daemon actually said.
+        Handshake::BadRequest(message) => Err(std::io::Error::other(format!(
+            "{BAD_REQUEST_PREFIX}{message}"
+        ))),
+        Handshake::Unexpected(what) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("expected a Ready ack as the first frame, got {what}"),
+        )),
+    }
+}
+
+/// What the daemon's FIRST line on a `Subscribe` connection turned out to be.
+///
+/// A subscription is answered by a [`StreamFrame`] when the daemon understood the
+/// request — and by a one-shot [`Response::Error`] when it did not, because a
+/// request it cannot decode never reaches the streaming path at all. Both shapes
+/// spell `Error` on the wire (`{"Error": …}`), one carrying a [`StreamError`]
+/// struct and one a bare string, so a client that tries only the former reports
+/// its own deserializer's complaint and buries the daemon's message inside it.
+/// Deciding between them lives here, once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Handshake {
+    Ready(Ready),
+    Refused(StreamError),
+    /// The daemon answered `Response::Error`: it could not decode the request —
+    /// an [`EventKind`] added after that daemon was built, most likely. Carries
+    /// the daemon's own message.
+    BadRequest(String),
+    /// Something decodable but not an opening: names what arrived.
+    Unexpected(String),
+}
+
+/// Classify the first line of a `Subscribe` connection: stream frame first, then
+/// the one-shot [`Response`] an older daemon answers a request it cannot read
+/// with.
+fn decode_handshake(line: &str) -> Handshake {
+    if let Ok(frame) = serde_json::from_str::<StreamFrame>(line) {
+        return match frame {
+            StreamFrame::Ready(r) => Handshake::Ready(r),
+            StreamFrame::Error(e) => Handshake::Refused(e),
+            other => Handshake::Unexpected(format!("a {} frame", other.label())),
+        };
+    }
+    match serde_json::from_str::<Response>(line) {
+        Ok(Response::Error(message)) => Handshake::BadRequest(message),
+        Ok(other) => Handshake::Unexpected(format!("a one-shot {other:?} response")),
+        Err(e) => Handshake::Unexpected(format!("an undecodable frame: {e}")),
+    }
+}
+
+/// Subscribe to `kinds`, and if this daemon cannot READ that filter, subscribe to
+/// everything instead rather than going silent.
+///
+/// The failure this exists for: a client built after a new [`EventKind`] was added
+/// sends it in the filter, and a daemon built before it rejects the WHOLE
+/// subscription — so the window loses not just the new kind but every kind it
+/// asked for. `serde(default)` rescues a new *field*; nothing rescues a new
+/// *variant* travelling from a new sender to an old receiver, so the client must
+/// notice the refusal and narrow its own ask.
+///
+/// The fallback is `kinds: None`, deliberately, rather than the same list minus
+/// the kinds we guess this daemon lacks: `None` carries no [`EventKind`] at all,
+/// so no daemon — however old — can fail to decode it. The caller then filters
+/// client-side, which the bar's event window already does.
+///
+/// Returns the subscription and whether the narrowing happened. `true` is a fact
+/// worth surfacing: it means this daemon does not know some kind that was asked
+/// for, which is a different statement from "that kind has produced nothing yet",
+/// and a window that conflates the two tells the operator a falsehood.
+pub fn subscribe_or_widen(
+    sock_path: &str,
+    kinds: &[EventKind],
+) -> std::io::Result<(Subscription, bool)> {
+    match subscribe(sock_path, Some(kinds)) {
+        Ok(sub) => Ok((sub, false)),
+        Err(e) if is_bad_request(&e) => subscribe(sock_path, None).map(|sub| (sub, true)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The marker [`subscribe`] puts on a daemon-side "I cannot read this request",
+/// so [`subscribe_or_widen`] can recognise it without a second error type.
+const BAD_REQUEST_PREFIX: &str = "net-observerd rejected the subscription: ";
+
+/// Whether `e` is the refusal [`subscribe`] raises for a request the daemon could
+/// not decode.
+fn is_bad_request(e: &std::io::Error) -> bool {
+    e.to_string().starts_with(BAD_REQUEST_PREFIX)
+}
+
+/// The outcome of a [`Request::Control`]: what the daemon DID, kept apart from
+/// what it could not understand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlOutcome {
+    /// The daemon ran the command (or refused it on its own terms) and said so.
+    Ran(ControlResult),
+    /// The daemon could not decode the request — the command did not exist when
+    /// it was built. Carries the daemon's own message.
+    ///
+    /// Distinct from `Ran(ControlResult { ok: false, .. })`: "this daemon cannot
+    /// do that" and "this daemon declined to do that" are different facts, and a
+    /// client that renders them the same misreports an old daemon as a refusing
+    /// one.
+    Unsupported(String),
+}
+
+/// Send one [`ControlCmd`] and classify the answer.
+///
+/// The forward-compatibility counterpart of [`subscribe_or_widen`] on the
+/// one-shot path: a command added after this daemon was built comes back as
+/// [`ControlOutcome::Unsupported`] carrying the daemon's own words, never as a
+/// client-side deserializer complaint and never as a silent failure.
+pub fn control(sock_path: &str, cmd: ControlCmd) -> std::io::Result<ControlOutcome> {
+    classify_control(query(sock_path, &Request::Control(cmd))?)
+}
+
+/// The pure half of [`control`]: which outcome a given [`Response`] means.
+/// Separated so the classification is testable without a socket.
+fn classify_control(response: Response) -> std::io::Result<ControlOutcome> {
+    match response {
+        Response::Control(result) => Ok(ControlOutcome::Ran(result)),
+        Response::Error(message) => Ok(ControlOutcome::Unsupported(message)),
         other => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "expected a Ready ack as the first frame, got a {} frame",
-                other.label()
-            ),
+            format!("expected a Control response, got {other:?}"),
         )),
     }
 }
@@ -807,6 +973,51 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, v: &T) -> std::io::Result<
     w.flush()
 }
 
+/// Decode one already-read line as a [`StreamFrame`], tolerating a variant this
+/// build does not know.
+///
+/// Three outcomes, kept apart on purpose:
+/// * a frame this build knows — returned as itself;
+/// * valid JSON in a shape this build cannot name (`serde_json::error::Category::Data`
+///   — an [`Event`] kind a newer daemon added, say) — returned as
+///   [`StreamFrame::Unrecognized`], so ONE frame is lost instead of the stream;
+/// * malformed JSON (`Syntax`/`Eof`/`Io`) — an `Err`, because a daemon killed
+///   mid-write is a real transport failure and must not be papered over.
+///
+/// The forward-compatibility rule for the *receiving* side lives here, in one
+/// place, the way [`EncodedFrame::passes`] holds the filtering rule.
+pub fn decode_stream_frame(line: &str) -> std::io::Result<StreamFrame> {
+    match serde_json::from_str::<StreamFrame>(line) {
+        Ok(frame) => Ok(frame),
+        Err(e) if e.classify() == serde_json::error::Category::Data => {
+            Ok(StreamFrame::Unrecognized(Unrecognized {
+                ts_us: types::now_us(),
+                detail: e.to_string(),
+            }))
+        }
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+    }
+}
+
+/// Read one newline-terminated frame from a live subscription, via
+/// [`decode_stream_frame`]. `UnexpectedEof` on a clean close, exactly like
+/// [`read_frame`].
+pub fn read_stream_frame<R: BufRead>(r: &mut R) -> std::io::Result<StreamFrame> {
+    decode_stream_frame(&read_line(r)?)
+}
+
+/// Read one newline-terminated line, or `UnexpectedEof` if the peer closed first.
+fn read_line<R: BufRead>(r: &mut R) -> std::io::Result<String> {
+    let mut line = String::new();
+    if r.read_line(&mut line)? == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed before a full frame was read",
+        ));
+    }
+    Ok(line)
+}
+
 /// Read one newline-terminated JSON frame into a value.
 ///
 /// Returns an `UnexpectedEof` error if the stream closes before a full frame —
@@ -815,14 +1026,7 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, v: &T) -> std::io::Result<
 /// category as `UnexpectedEof`, which [`Subscription::next`] reads as a clean
 /// close and would silently swallow a daemon killed mid-write.
 pub fn read_frame<R: BufRead, T: DeserializeOwned>(r: &mut R) -> std::io::Result<T> {
-    let mut line = String::new();
-    let n = r.read_line(&mut line)?;
-    if n == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "connection closed before a full frame was read",
-        ));
-    }
+    let line = read_line(r)?;
     serde_json::from_str(&line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
@@ -830,6 +1034,200 @@ pub fn read_frame<R: BufRead, T: DeserializeOwned>(r: &mut R) -> std::io::Result
 mod tests {
     use super::*;
     use types::{DnsVerdict, GwVerdict, TcpVerdict};
+
+    /// The live failure this branch exists for, reproduced without a daemon.
+    ///
+    /// A bar built after `EventKind::Air` asks an older daemon for it; that
+    /// daemon cannot decode the request at all, so it answers the ONE-SHOT
+    /// `Response::Error` and closes. The client must read that as the daemon's
+    /// own words, never as its own deserializer's complaint about `StreamError`
+    /// — both spell `{"Error": …}` on the wire, which is exactly the trap.
+    #[test]
+    fn an_old_daemons_bad_request_is_read_as_the_daemons_own_words() {
+        let line = serde_json::to_string(&Response::Error(
+            "bad request: unknown variant `Air`, expected one of `Link`, `Proxy`".to_string(),
+        ))
+        .unwrap();
+
+        // The naive read — what produced the nested error in the live window.
+        assert!(serde_json::from_str::<StreamFrame>(&line).is_err());
+
+        match decode_handshake(&line) {
+            Handshake::BadRequest(message) => {
+                assert!(
+                    message.starts_with("bad request: unknown variant `Air`"),
+                    "{message}"
+                );
+                // The client's own diagnostics must not be what the operator reads.
+                assert!(
+                    !message.contains("expected struct StreamError"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// An in-band `StreamFrame::Error` and a one-shot `Response::Error` share the
+    /// `{"Error": …}` shape; they must not be confused for one another.
+    #[test]
+    fn an_in_band_refusal_is_not_read_as_a_bad_request() {
+        let line = serde_json::to_string(&StreamFrame::Error(StreamError {
+            ts_us: 7,
+            code: StreamErrorCode::TooManySubscribers,
+            message: "at the cap".to_string(),
+        }))
+        .unwrap();
+        match decode_handshake(&line) {
+            Handshake::Refused(e) => {
+                assert_eq!(e.code, StreamErrorCode::TooManySubscribers);
+                assert_eq!(e.message, "at the cap");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ready_ack_is_the_ordinary_handshake() {
+        let line = serde_json::to_string(&StreamFrame::Ready(Ready {
+            ts_us: 1,
+            kinds: Some(vec![EventKind::Air, EventKind::Wifi]),
+            observing: true,
+        }))
+        .unwrap();
+        match decode_handshake(&line) {
+            Handshake::Ready(r) => {
+                assert_eq!(r.kinds_label(), "air,wifi");
+                assert!(r.observing);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    /// The reverse direction of the same incompatibility: a NEWER daemon pushes
+    /// an event kind this build has never heard of. One frame must be lost, not
+    /// the stream — and the loss must be named, never silent.
+    #[test]
+    fn an_event_kind_the_receiver_does_not_know_costs_one_frame_not_the_stream() {
+        let unknown = r#"{"Event":{"Ether":{"ts_us":5}}}"#;
+        let frame =
+            decode_stream_frame(unknown).expect("a shape we cannot name is not a hard error");
+        assert_eq!(frame.label(), "unrecognized");
+        assert_eq!(frame.event_kind(), None);
+        match frame {
+            StreamFrame::Unrecognized(u) => assert!(u.detail.contains("Ether"), "{}", u.detail),
+            other => panic!("expected Unrecognized, got {other:?}"),
+        }
+    }
+
+    /// ...but genuine corruption still fails. A daemon killed mid-write must not
+    /// be rendered as "a frame from a newer build".
+    #[test]
+    fn a_malformed_frame_is_still_a_transport_failure() {
+        let e = decode_stream_frame("{\"Event\":{\"Link\"").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A known frame still decodes untouched through the lenient path.
+    #[test]
+    fn known_frames_survive_the_lenient_decoder_unchanged() {
+        let gap = StreamFrame::Gap(Gap {
+            ts_us: 3,
+            skipped: 9,
+        });
+        let line = String::from_utf8(encode_frame(&gap).unwrap()).unwrap();
+        let back = decode_stream_frame(&line).unwrap();
+        assert_eq!(back.ts_us(), 3);
+        assert_eq!(back.label(), "gap");
+        assert_eq!(back.event_kind(), None);
+    }
+
+    /// An `Unrecognized` frame is a decoding artifact: stream-integrity
+    /// information, never filtered away as if it were an event of some kind.
+    #[test]
+    fn an_unrecognized_frame_is_stream_integrity_not_an_event() {
+        let f = StreamFrame::Unrecognized(Unrecognized {
+            ts_us: 11,
+            detail: "unknown variant `Ether`".to_string(),
+        });
+        assert_eq!(f.event_kind(), None);
+        assert!(f.detail().contains("cannot read"), "{}", f.detail());
+        let encoded = EncodedFrame::encode(&StreamFrame::Gap(Gap {
+            ts_us: 1,
+            skipped: 0,
+        }))
+        .unwrap();
+        assert!(encoded.passes(Some(&[EventKind::Air])));
+    }
+
+    /// Every `EventKind` must round-trip, so a filter list never changes meaning
+    /// between the client that writes it and the daemon that echoes it back.
+    #[test]
+    fn every_event_kind_round_trips_in_a_subscribe_request() {
+        let all = [
+            EventKind::Link,
+            EventKind::Proxy,
+            EventKind::Dns,
+            EventKind::Route,
+            EventKind::Host,
+            EventKind::Wifi,
+            EventKind::Neighbors,
+            EventKind::Air,
+            EventKind::Incident,
+        ];
+        let req = Request::Subscribe {
+            kinds: Some(all.to_vec()),
+        };
+        let line = String::from_utf8(encode_frame(&req).unwrap()).unwrap();
+        match serde_json::from_str::<Request>(&line).unwrap() {
+            Request::Subscribe { kinds: Some(ks) } => assert_eq!(ks, all.to_vec()),
+            other => panic!("expected a filtered Subscribe, got {other:?}"),
+        }
+    }
+
+    /// The widening fallback must be a request NO daemon can fail to decode:
+    /// `kinds: None` carries no `EventKind` at all. This guards the CHOICE —
+    /// narrowing to a guessed subset would still put a variant on the wire.
+    #[test]
+    fn the_widened_fallback_carries_no_event_kind_at_all() {
+        let line =
+            String::from_utf8(encode_frame(&Request::Subscribe { kinds: None }).unwrap()).unwrap();
+        for kind in ["Link", "Air", "Wifi", "Incident"] {
+            assert!(!line.contains(kind), "{line} must not name {kind}");
+        }
+    }
+
+    /// A control command this daemon never heard of is `Unsupported`, carrying
+    /// the daemon's words — never a refusal, which would claim the daemon CAN do
+    /// it and chose not to.
+    #[test]
+    fn an_unknown_control_command_is_unsupported_not_refused() {
+        let refused = Response::Control(ControlResult {
+            ok: false,
+            message: "acting disabled".to_string(),
+        });
+        match classify_control(refused).unwrap() {
+            ControlOutcome::Ran(r) => assert!(!r.ok),
+            other => panic!("expected Ran, got {other:?}"),
+        }
+        let unknown = Response::Error("bad request: unknown variant `ScanAir`".to_string());
+        match classify_control(unknown).unwrap() {
+            ControlOutcome::Unsupported(m) => assert!(m.contains("ScanAir"), "{m}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// `ScanAir` must survive the wire intact next to the commands that already
+    /// exist — the bar's button and the daemon's dispatch read the same variant.
+    #[test]
+    fn scan_air_round_trips_as_a_control_command() {
+        let line = String::from_utf8(encode_frame(&Request::Control(ControlCmd::ScanAir)).unwrap())
+            .unwrap();
+        match serde_json::from_str::<Request>(&line).unwrap() {
+            Request::Control(ControlCmd::ScanAir) => {}
+            other => panic!("expected ScanAir, got {other:?}"),
+        }
+    }
 
     #[test]
     fn frame_round_trip_status_snapshot() {

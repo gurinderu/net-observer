@@ -58,6 +58,12 @@ One surface here has more than one consumer, and it is derived from the code, no
 
 Do not keep a consumer list in this file — walk the graph. Three consumers exist today: `net-observerd` serves, `net-observer-cli` and `net-observer-bar` call. The bar is the one that used to break silently, because nothing built it; `cargo build --all` inside `nix develop` now covers it, and CI has a step for it whose outcome on a GitHub runner is still unproven. Run the `--all` gate when you touch these types, or the bar is back to breaking out of sight. `serde(default)` on new fields is the standing mitigation — it kept a pre-quiet daemon decodable — but it does not save a *sender* that forgot a field.
 
+It also does not save a new **enum variant** sent by a new sender to an old receiver, and that failure has now been observed live: a current bar asked a deployed pre-air daemon for `EventKind::Air`, and that daemon rejected the whole subscription — so the window lost `Wifi` too. Two mitigations now sit in `net-observer-ipc` and are the ones to reach for:
+- **`subscribe_or_widen`** — on a daemon-side "cannot read this request", retry with `kinds: None` (a request naming no variant at all) and filter client-side. It reports whether it narrowed, because "this daemon cannot produce that kind" and "that kind has produced nothing yet" are different facts and a window must not conflate them.
+- **`control`** → `ControlOutcome::Unsupported` — a `ControlCmd` an older daemon cannot decode, distinguished from one it decoded and refused.
+
+A `Subscribe` connection can be answered by a one-shot `Response::Error` (the request never reached the streaming path) or by an in-band `StreamFrame::Error`. Both spell `{"Error": …}`; `decode_handshake` is the single place that tells them apart, so a client shows the daemon's message rather than its own deserializer's complaint. In the other direction `decode_stream_frame` turns a frame whose *shape* is unknown into `StreamFrame::Unrecognized` — one frame lost and named, never the whole stream.
+
 Touching this surface obliges the walk; adding a consumer obliges the edge, or the next walk will not know it exists.
 
 ## External surfaces — what you use and do not own
