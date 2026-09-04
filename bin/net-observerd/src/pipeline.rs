@@ -35,7 +35,7 @@ use tokio::time::{self, MissedTickBehavior};
 use triggers::engine::TriggerEngine;
 use triggers::handlers::Handler;
 use triggers::window::RecentWindow;
-use types::{BlobRef, Sample};
+use types::{BlobRef, NeighborLifetime, NeighborsSample, Sample};
 
 /// Capacity of the recent-sample window handed to the trigger engine.
 const WINDOW_CAP: usize = 64;
@@ -263,6 +263,36 @@ impl ResumeGate {
 /// still published on the bus; the first drop of an episode and the episode total
 /// are logged at `warn`, and the process total on the consumer's exit line. The
 /// failure mode is "briefly over-accept", never "silently stop detecting".
+/// The record's since-when for exactly the neighbours a reading returned.
+///
+/// The reading and the record are separate facts and stay separate fields on the
+/// wire; this is the join the daemon performs once so the bar — a pure socket
+/// client that never opens the database — can show them side by side.
+///
+/// Bounded to the macs actually in `sample`, so the snapshot never carries the
+/// whole segment's history. A store read that fails is logged and yields an
+/// EMPTY list: the reader then says "unknown", which is true, rather than being
+/// handed a stale or invented bound. (realm net-observer, node #43)
+pub(crate) fn neighbor_lifetimes_for(
+    store: &dyn Store,
+    sample: &NeighborsSample,
+) -> Vec<NeighborLifetime> {
+    if sample.neighbors.is_empty() {
+        return Vec::new();
+    }
+    match store.neighbor_lifetimes(sample.network_key.as_deref()) {
+        Ok(all) => all
+            .into_iter()
+            .filter(|lt| sample.neighbors.iter().any(|n| n.mac == lt.mac))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "neighbour lifetime read failed; snapshot carries no first/last seen");
+            Vec::new()
+        }
+    }
+}
+
 pub async fn run(
     store: Arc<DuckdbStore>,
     mut engine: TriggerEngine,
@@ -286,6 +316,13 @@ pub async fn run(
         if let Err(e) = store.write_sample(&sample) {
             tracing::warn!(error = %e, "store write failed; sample dropped from DB (gap logged)");
         }
+        // The record's lifetime bounds for this reading, read BEFORE the snapshot
+        // lock is taken — a DB read must never happen under the mutex the socket
+        // path also waits on.
+        let lifetimes = match &sample {
+            Sample::Neighbors(n) => Some(neighbor_lifetimes_for(store.as_ref(), n)),
+            _ => None,
+        };
         // Mirror the latest sample into the in-memory snapshot the socket serves.
         {
             let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
@@ -296,7 +333,10 @@ pub async fn run(
                 Sample::Dns(d) => snap.dns = Some(d.clone()),
                 Sample::Host(h) => snap.host = Some(h.clone()),
                 Sample::Wifi(w) => snap.wifi = Some(w.clone()),
-                Sample::Neighbors(n) => snap.neighbors = Some(n.clone()),
+                Sample::Neighbors(n) => {
+                    snap.neighbors = Some(n.clone());
+                    snap.neighbor_lifetimes = lifetimes.unwrap_or_default();
+                }
                 // The air map is not a "latest sample" field of the status
                 // snapshot either: a scan is a slice of many access points, read
                 // from the store by the reader that computes overlap against our

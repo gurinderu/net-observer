@@ -923,6 +923,8 @@ mod tests {
             wifi: None,
             neighbors: None,
             topology: Vec::new(),
+            neighbor_lifetimes: Vec::new(),
+            topology_lifetimes: Vec::new(),
             incidents: vec![
                 incident("i1", "wedge", 80, None),
                 incident("i2", "gw-drop", 60, Some(70)),

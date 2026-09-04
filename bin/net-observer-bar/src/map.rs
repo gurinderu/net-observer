@@ -37,7 +37,10 @@ use gpui::{
 };
 
 use net_observer_ipc::StatusSnapshot;
-use types::{LearnedVia, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence, TopologyLink};
+use types::{
+    LearnedVia, NeighborLifetime, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence,
+    TopologyLink,
+};
 
 use crate::ui::{Glance, Theme};
 
@@ -467,11 +470,15 @@ struct UplinkNode {
     via: LearnedVia,
     /// When the daemon last received an advertisement for this uplink.
     ///
-    /// This is a **sighting** time, not a first-seen time: `first_seen` lives in
-    /// the store's `topology_link` row and is served by the offline reader, not
-    /// on the socket, so the bar — a pure socket client — cannot draw it.
-    /// (realm net-observer, node #43)
+    /// This is a **sighting** time, not a first-seen time. The first-seen bound
+    /// lives in the store's `topology_link` row and reaches the socket as a
+    /// separate `StatusSnapshot::topology_lifetimes` entry — see
+    /// [`Self::first_seen_us`]. (realm net-observer, node #43)
     ts_us: i64,
+    /// When the record first saw this uplink, when the daemon sent a lifetime
+    /// for it. `None` means **unknown** — an older daemon that carries no
+    /// lifetimes, or a store read that failed — never "first seen just now".
+    first_seen_us: Option<i64>,
 }
 
 impl UplinkNode {
@@ -491,6 +498,10 @@ impl UplinkNode {
                 .collect(),
             via: link.learned_via,
             ts_us: link.ts_us,
+            // Not knowable from the sighting alone: filled by [`uplinks`] from
+            // the snapshot's separate lifetime list, and left unknown when the
+            // daemon sent none.
+            first_seen_us: None,
         }
     }
 
@@ -507,7 +518,12 @@ impl UplinkNode {
 fn uplinks(snapshot: &StatusSnapshot) -> (Vec<UplinkNode>, usize) {
     let mut nodes: Vec<UplinkNode> = Vec::new();
     for link in &snapshot.topology {
-        let node = UplinkNode::from_link(link);
+        let mut node = UplinkNode::from_link(link);
+        node.first_seen_us = snapshot
+            .topology_lifetimes
+            .iter()
+            .find(|lt| lt.bounds(link))
+            .map(|lt| lt.first_seen_us);
         if !nodes
             .iter()
             .any(|n| n.label == node.label && n.port == node.port)
@@ -547,17 +563,29 @@ fn uplink_via_label(via: LearnedVia) -> &'static str {
     }
 }
 
-/// The provenance line under an uplink: which local interface heard it and how
-/// long ago. Deliberately says *heard*, not *connected since*: the socket carries
-/// the latest sighting, while `first_seen` is a store column the bar never reads.
-/// (realm net-observer, node #43)
+/// The provenance line under an uplink: which local interface heard it, how long
+/// ago, and — when the daemon sent the record's bound — since when it has been
+/// there at all.
+///
+/// The two times are kept apart in words as well as in fields: *heard* is this
+/// patrol's sighting, *first seen* is the store's `first_seen_us`. A daemon that
+/// sends no lifetime simply contributes no first-seen clause; the line never
+/// invents one from the sighting. (realm net-observer, node #43)
 fn uplink_seen_line(node: &UplinkNode, now_us: i64) -> String {
     let where_ = if node.iface.is_empty() {
         String::new()
     } else {
         format!("heard on {}", node.iface)
     };
-    join_parts(&[&where_, &crate::ui::age_str(node.ts_us, now_us)])
+    let known_since = match node.first_seen_us {
+        Some(us) if us > 0 => format!("first seen {}", crate::ui::age_str(us, now_us)),
+        _ => String::new(),
+    };
+    join_parts(&[
+        &where_,
+        &crate::ui::age_str(node.ts_us, now_us),
+        &known_since,
+    ])
 }
 
 /// The caption above the uplink tree. It names the reading as a hypothesis in the
@@ -947,6 +975,51 @@ fn caption(
         )
 }
 
+/// The record's lifetime bounds for one neighbour, or `None` when the daemon sent
+/// none for it.
+///
+/// The join is on the MAC, compared case-insensitively: the store normalises to
+/// lowercase but a reader must not be broken by a peer that does not.
+fn lifetime_for<'a>(snapshot: &'a StatusSnapshot, mac: &str) -> Option<&'a NeighborLifetime> {
+    snapshot
+        .neighbor_lifetimes
+        .iter()
+        .find(|lt| lt.mac.eq_ignore_ascii_case(mac))
+}
+
+/// One since-when cell: the bound rendered as an age, or the word `unknown`.
+///
+/// `unknown` is the whole point of the column being separate from the reading. A
+/// missing bound means the record was not readable (an older daemon, a failed
+/// store read) — NOT that the device appeared this instant, which is what
+/// falling back to the sample's `ts_us` would have said. A non-positive bound is
+/// treated the same way: a zero timestamp is a placeholder, not a moment.
+/// (realm net-observer, node #43)
+fn lifetime_cell(bound: Option<i64>, now_us: i64) -> String {
+    match bound {
+        Some(us) if us > 0 => crate::ui::age_str(us, now_us),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// The list's header caption clause about lifetimes: it says plainly when the
+/// daemon supplied none at all, so an all-`unknown` column is attributable to the
+/// daemon rather than read as "these devices have no history".
+fn lifetime_caption(sample: &NeighborsSample, snapshot: &StatusSnapshot) -> String {
+    let known = sample
+        .neighbors
+        .iter()
+        .filter(|obs| lifetime_for(snapshot, &obs.mac).is_some())
+        .count();
+    if known == 0 {
+        "no first/last seen from this daemon".to_string()
+    } else if known < sample.neighbors.len() {
+        format!("first/last seen for {known} of {}", sample.neighbors.len())
+    } else {
+        "first/last seen from the record".to_string()
+    }
+}
+
 /// The neighbour **list**: every device the latest reading returned, one row each.
 ///
 /// This is the star's complement, not a decoration. The ring is bounded by
@@ -955,11 +1028,14 @@ fn caption(
 /// also where a role glyph is unfolded into the grounds it rests on
 /// ([`role_basis`]), which a chip has no room for.
 ///
-/// Columns are what the socket actually carries: role, identity, address, MAC and
-/// which reading found it. There is deliberately **no first/last-seen column** —
-/// `NeighborObs` carries no lifetime bounds, those live in the store's `neighbor`
-/// table and reach only the offline reader, and the bar is a pure socket client.
-/// (realm net-observer, node #43)
+/// Columns are what the socket actually carries: role, identity, address, MAC,
+/// which reading found it, and — from the snapshot's separate
+/// `neighbor_lifetimes` list — when the **record** first and last saw it.
+///
+/// The lifetimes are a different fact from the reading and arrive as a different
+/// field, joined here by MAC. A neighbour with no lifetime entry (an older
+/// daemon, or a store read that failed) reads `unknown`; it must never read as
+/// though it were first seen on this tick. (realm net-observer, node #43)
 fn neighbour_list(snapshot: &StatusSnapshot, theme: Theme) -> gpui::AnyElement {
     let base = div().flex().flex_col().px_3().py_2();
     let Some(sample) = snapshot.neighbors.as_ref() else {
@@ -974,6 +1050,7 @@ fn neighbour_list(snapshot: &StatusSnapshot, theme: Theme) -> gpui::AnyElement {
     }
 
     let key = sample.network_key.as_deref();
+    let now = crate::ui::now_us();
     let mut rows = div().flex().flex_col().w_full();
     rows = rows.child(
         div()
@@ -986,11 +1063,14 @@ fn neighbour_list(snapshot: &StatusSnapshot, theme: Theme) -> gpui::AnyElement {
             .child(div().flex_1().min_w(px(80.0)).child("name"))
             .child(div().w(px(120.0)).flex_shrink_0().child("address"))
             .child(div().w(px(140.0)).flex_shrink_0().child("MAC"))
-            .child(div().w(px(64.0)).flex_shrink_0().child("via")),
+            .child(div().w(px(64.0)).flex_shrink_0().child("via"))
+            .child(div().w(px(84.0)).flex_shrink_0().child("first seen"))
+            .child(div().w(px(84.0)).flex_shrink_0().child("last seen")),
     );
     rows = rows.child(separator(theme));
 
     for obs in &sample.neighbors {
+        let lifetime = lifetime_for(snapshot, &obs.mac);
         let is_gateway = key.is_some_and(|k| k.eq_ignore_ascii_case(&obs.mac));
         let node = MapNode::from_obs(obs);
         let accent = node_accent(&node, is_gateway, theme);
@@ -1078,6 +1158,22 @@ fn neighbour_list(snapshot: &StatusSnapshot, theme: Theme) -> gpui::AnyElement {
                         .text_size(px(10.0))
                         .text_color(rgb(theme.muted))
                         .child(format!("{:?}", obs.source).to_lowercase()),
+                )
+                .child(
+                    div()
+                        .w(px(84.0))
+                        .flex_shrink_0()
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme.muted))
+                        .child(lifetime_cell(lifetime.map(|lt| lt.first_seen_us), now)),
+                )
+                .child(
+                    div()
+                        .w(px(84.0))
+                        .flex_shrink_0()
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme.muted))
+                        .child(lifetime_cell(lifetime.map(|lt| lt.last_seen_us), now)),
                 ),
         );
     }
@@ -1094,7 +1190,7 @@ fn neighbour_list(snapshot: &StatusSnapshot, theme: Theme) -> gpui::AnyElement {
                     sample.neighbors.len(),
                     if sample.neighbors.len() == 1 { "" } else { "s" }
                 ),
-                "no first/last seen on the socket \u{2014} that is a store column",
+                &lifetime_caption(sample, snapshot),
             ])),
     )
     .child(rows)
@@ -1999,5 +2095,102 @@ mod headless_tests {
             && b.origin.x < a.origin.x + a.size.width
             && a.origin.y < b.origin.y + b.size.height
             && b.origin.y < a.origin.y + a.size.height
+    }
+
+    /// The cell is the whole reason the lifetimes are a separate field: a
+    /// neighbour the daemon sent no bound for reads `unknown`. Rendering the
+    /// sample's own tick there would claim the device appeared this instant.
+    #[test]
+    fn a_missing_bound_reads_unknown_not_now() {
+        let now = 10_000_000i64;
+        assert_eq!(lifetime_cell(None, now), "unknown");
+        assert_eq!(lifetime_cell(Some(0), now), "unknown");
+        assert_eq!(lifetime_cell(Some(-1), now), "unknown");
+        assert_eq!(lifetime_cell(Some(now - 5_000_000), now), "5s ago");
+    }
+
+    /// The join is by MAC and case-insensitive: a peer that did not normalise
+    /// its MACs must not blank the column.
+    #[test]
+    fn a_lifetime_is_found_by_mac_whatever_its_case() {
+        let snap = StatusSnapshot {
+            neighbor_lifetimes: vec![NeighborLifetime {
+                mac: "a4:83:e7:1b:2c:3d".into(),
+                first_seen_us: 1,
+                last_seen_us: 2,
+            }],
+            ..Default::default()
+        };
+        assert!(lifetime_for(&snap, "A4:83:E7:1B:2C:3D").is_some());
+        assert!(lifetime_for(&snap, "00:00:00:00:00:00").is_none());
+    }
+
+    /// An older daemon sends no lifetimes at all. The caption must say that
+    /// plainly, so a column of `unknown` is read as "this daemon does not tell
+    /// me" rather than "these devices have no history".
+    #[test]
+    fn the_caption_names_a_daemon_that_sent_no_lifetimes() {
+        let obs = |mac: &str| NeighborObs {
+            mac: mac.into(),
+            ip: "192.168.1.5".into(),
+            source: NeighborSource::Arp,
+            hostname: None,
+            role: NeighborRole::Unknown,
+        };
+        let s = NeighborsSample {
+            ts_us: 1,
+            verdict: types::NeighborsVerdict::Ok,
+            reason: None,
+            network_key: None,
+            iface: Some("en0".into()),
+            neighbors: vec![obs("aa:bb:cc:dd:ee:01"), obs("aa:bb:cc:dd:ee:02")],
+        };
+        let none = StatusSnapshot::default();
+        assert_eq!(
+            lifetime_caption(&s, &none),
+            "no first/last seen from this daemon"
+        );
+
+        let partial = StatusSnapshot {
+            neighbor_lifetimes: vec![NeighborLifetime {
+                mac: "aa:bb:cc:dd:ee:01".into(),
+                first_seen_us: 1,
+                last_seen_us: 2,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(lifetime_caption(&s, &partial), "first/last seen for 1 of 2");
+    }
+
+    /// The uplink's first-seen comes from the snapshot's separate lifetime list,
+    /// joined on the identity triple — never from the sighting `ts_us`.
+    #[test]
+    fn an_uplink_takes_its_first_seen_from_the_matching_lifetime() {
+        let l = link("sw-1", "Gi0/1", None, LearnedVia::Lldp);
+        let snap = StatusSnapshot {
+            topology: vec![l.clone()],
+            topology_lifetimes: vec![types::TopologyLifetime {
+                iface: l.iface.clone(),
+                remote_chassis: l.remote_chassis.clone(),
+                remote_port: l.remote_port.clone(),
+                first_seen_us: 1_000_000,
+                last_seen_us: 2_000_000,
+            }],
+            ..Default::default()
+        };
+        let (nodes, _) = uplinks(&snap);
+        assert_eq!(nodes[0].first_seen_us, Some(1_000_000));
+        let line = uplink_seen_line(&nodes[0], 4_000_000);
+        assert!(line.contains("first seen 3s ago"), "got {line}");
+
+        // A daemon that sent no lifetimes contributes no first-seen clause at
+        // all — the line never manufactures one from the sighting.
+        let bare = StatusSnapshot {
+            topology: vec![l],
+            ..Default::default()
+        };
+        let (bare_nodes, _) = uplinks(&bare);
+        assert_eq!(bare_nodes[0].first_seen_us, None);
+        assert!(!uplink_seen_line(&bare_nodes[0], 4_000_000).contains("first seen"));
     }
 }

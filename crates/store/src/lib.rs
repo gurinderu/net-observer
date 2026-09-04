@@ -5,7 +5,10 @@ mod schema;
 pub use duckdb_store::{
     DuckdbStore, NeighborPort, NeighborScan, NeighborVuln, QueryTable, StoreError,
 };
-use types::{BlobRef, Incident, ObservingEdge, Sample, TopologyLink, TriggerFired};
+use types::{
+    BlobRef, Incident, NeighborLifetime, ObservingEdge, Sample, TopologyLifetime, TopologyLink,
+    TriggerFired,
+};
 
 pub trait Store {
     fn write_sample(&self, s: &Sample) -> Result<(), StoreError>;
@@ -41,5 +44,22 @@ pub trait Store {
     /// `(iface, remote_chassis, remote_port)`, preserving `first_seen_us`. Every
     /// row is a hypothesis — LLDP/CDP are unauthenticated — never an asserted fact.
     fn write_topology_link(&self, l: &TopologyLink) -> Result<(), StoreError>;
+    /// The lifetime bounds the record keeps for every neighbour on one segment
+    /// (`network_key`; `None` folds to the same "unidentified network" key the
+    /// writer uses).
+    ///
+    /// The read half of what [`Store::write_sample`] upserts into `neighbor`.
+    /// It exists so the daemon can put since-when onto the status snapshot: the
+    /// bar is a pure socket client and never opens the database, so without this
+    /// the fact is recorded but unreachable to the only reader that wants it.
+    /// (realm net-observer, node #43)
+    fn neighbor_lifetimes(
+        &self,
+        network_key: Option<&str>,
+    ) -> Result<Vec<NeighborLifetime>, StoreError>;
+    /// The lifetime bounds the record keeps for every discovered uplink — the
+    /// read half of [`Store::write_topology_link`], and the only path by which
+    /// `topology_link.first_seen_us` reaches the socket.
+    fn topology_lifetimes(&self) -> Result<Vec<TopologyLifetime>, StoreError>;
     fn query_scalar_i64(&self, sql: &str) -> Result<i64, StoreError>;
 }

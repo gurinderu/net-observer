@@ -1,7 +1,10 @@
 use crate::{Store, schema::SCHEMA_SQL};
 use duckdb::{Connection, params};
 use std::sync::Mutex;
-use types::{BlobRef, Incident, ObservingEdge, Sample, TopologyLink, TriggerFired};
+use types::{
+    BlobRef, Incident, NeighborLifetime, ObservingEdge, Sample, TopologyLifetime, TopologyLink,
+    TriggerFired,
+};
 
 /// `network_key` for a segment whose gateway MAC could not be read. Neighbours
 /// still get recorded — under a key that says plainly the network was not
@@ -447,6 +450,48 @@ impl Store for DuckdbStore {
         )?;
         Ok(())
     }
+    fn neighbor_lifetimes(
+        &self,
+        network_key: Option<&str>,
+    ) -> Result<Vec<NeighborLifetime>, StoreError> {
+        // The same `None -> UNKNOWN_NETWORK` folding the writer applies, so a
+        // segment with no readable gateway ARP entry reads back what it wrote
+        // rather than nothing.
+        let key = network_key.unwrap_or(UNKNOWN_NETWORK);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT mac, first_seen_us, last_seen_us FROM neighbor WHERE network_key = ?",
+        )?;
+        let rows = stmt.query_map(params![key], |r| {
+            Ok(NeighborLifetime {
+                mac: r.get(0)?,
+                first_seen_us: r.get(1)?,
+                last_seen_us: r.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    fn topology_lifetimes(&self) -> Result<Vec<TopologyLifetime>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT iface, remote_chassis, remote_port, first_seen_us, last_seen_us
+             FROM topology_link",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TopologyLifetime {
+                iface: r.get(0)?,
+                remote_chassis: r.get(1)?,
+                remote_port: r.get(2)?,
+                first_seen_us: r.get(3)?,
+                last_seen_us: r.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     fn query_scalar_i64(&self, sql: &str) -> Result<i64, StoreError> {
         Ok(self.conn.lock().unwrap().query_row(sql, [], |r| r.get(0))?)
     }
@@ -483,6 +528,95 @@ mod tests {
                 role: NeighborRole::Unknown,
             }],
         })
+    }
+
+    /// The read half of what the upsert writes: the same bounds the row keeps,
+    /// scoped to one segment. Without this the fact is recorded and unreachable
+    /// to the socket. (realm net-observer, node #43)
+    #[test]
+    fn neighbor_lifetimes_read_back_the_bounds_the_upsert_kept() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&neighbors_tick(
+            1000,
+            "11:22:33:44:55:66",
+            "192.168.1.5",
+            None,
+            NeighborSource::Arp,
+        ))
+        .unwrap();
+        s.write_sample(&neighbors_tick(
+            2000,
+            "11:22:33:44:55:66",
+            "192.168.1.9",
+            None,
+            NeighborSource::Arp,
+        ))
+        .unwrap();
+
+        let lts = s.neighbor_lifetimes(Some("aa:bb:cc:dd:ee:ff")).unwrap();
+        assert_eq!(lts.len(), 1);
+        assert_eq!(lts[0].mac, "11:22:33:44:55:66");
+        assert_eq!(lts[0].first_seen_us, 1000);
+        assert_eq!(lts[0].last_seen_us, 2000);
+
+        // A different segment is a different record — never another network's
+        // history rendered as this one's.
+        assert!(
+            s.neighbor_lifetimes(Some("00:00:00:00:00:00"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `None` must read back what `None` wrote: the writer folds an unidentified
+    /// segment onto the `unknown` key, and the reader must fold it the same way
+    /// or a gatewayless segment silently loses its whole history.
+    #[test]
+    fn an_unidentified_segment_reads_back_under_the_same_key() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Neighbors(NeighborsSample {
+            ts_us: 42,
+            verdict: NeighborsVerdict::Ok,
+            reason: None,
+            network_key: None,
+            iface: Some("en0".into()),
+            neighbors: vec![NeighborObs {
+                mac: "11:22:33:44:55:66".into(),
+                ip: "192.168.1.5".into(),
+                source: NeighborSource::Arp,
+                hostname: None,
+                role: NeighborRole::Unknown,
+            }],
+        }))
+        .unwrap();
+        let lts = s.neighbor_lifetimes(None).unwrap();
+        assert_eq!(lts.len(), 1);
+        assert_eq!(lts[0].first_seen_us, 42);
+    }
+
+    /// The topology read half, against the same upsert that preserves
+    /// `first_seen_us`: a second sighting moves last-seen and leaves first-seen.
+    #[test]
+    fn topology_lifetimes_read_back_first_seen_across_sightings() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let mut link = TopologyLink {
+            iface: "en0".into(),
+            remote_chassis: "sw-1".into(),
+            remote_port: "Gi0/1".into(),
+            remote_system_name: Some("switch".into()),
+            capabilities: "bridge".into(),
+            learned_via: types::LearnedVia::Lldp,
+            ts_us: 500,
+        };
+        s.write_topology_link(&link).unwrap();
+        link.ts_us = 1500;
+        s.write_topology_link(&link).unwrap();
+
+        let lts = s.topology_lifetimes().unwrap();
+        assert_eq!(lts.len(), 1);
+        assert_eq!(lts[0].first_seen_us, 500);
+        assert_eq!(lts[0].last_seen_us, 1500);
+        assert!(lts[0].bounds(&link));
     }
 
     /// The whole reason `neighbor` is not a per-tick table: a device seen twice

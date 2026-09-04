@@ -104,6 +104,31 @@ impl NeighborObs {
     }
 }
 
+/// How long a neighbour has been on record: the lifetime bounds the store keeps
+/// for one `(network_key, mac)` row.
+///
+/// A **sibling** of [`NeighborObs`], deliberately not a field of it. An obs is
+/// what a single reading saw; a lifetime is what the record remembers across
+/// every reading and every restart, and the two answer different questions. The
+/// daemon reads these from the `neighbor` table and puts them on the status
+/// snapshot beside the reading, so a pure socket client (the bar) can show
+/// "since when" without ever opening the database.
+///
+/// A neighbour present in a reading may have NO lifetime here — the store write
+/// may have failed, or the daemon may predate this field. A reader must render
+/// that as *unknown*, never as *now*. (realm net-observer, node #43)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeighborLifetime {
+    /// The neighbour this bounds, by the same normalised MAC [`NeighborObs::mac`]
+    /// carries — the key a reader joins on.
+    pub mac: String,
+    /// When this `(network_key, mac)` was first written. Never reset by a later
+    /// sighting.
+    pub first_seen_us: i64,
+    /// When it was most recently sighted, as the record has it.
+    pub last_seen_us: i64,
+}
+
 /// One tick of the `neighbors` collector.
 ///
 /// `network_key` is what separates the coworking segment from the home one: the
