@@ -497,8 +497,15 @@ pub(crate) fn open_or_focus(
 ///
 /// Spawned on the app rather than on the menu's own view, because the menu window
 /// is removed immediately after this is scheduled and a view-scoped task would go
-/// with it. The handle is cleared whether the panel is closed here or found dead:
-/// a handle that outlived its window reads as a live one everywhere else.
+/// with it.
+///
+/// The closing goes through [`crate::menubar::close_panel`], never through the
+/// raw handle: that is the panel's own state machine, and it does two things this
+/// path used to skip. It stamps the moment of dismissal, so the click on the
+/// status item that dismissed both windows is not then read as a request to
+/// reopen the panel; and it clears the shared handle, which otherwise outlives
+/// its window and reads as a live one everywhere else. A handle found dead is
+/// cleared by the same call.
 fn close_panel_unless_it_took_focus(cx: &mut App, model: Entity<Glance>) {
     let app: &mut App = cx;
     app.spawn(async move |acx: &mut AsyncApp| {
@@ -508,17 +515,12 @@ fn close_panel_unless_it_took_focus(cx: &mut App, model: Entity<Glance>) {
                 return;
             };
             // `update` succeeds only while the window is still open, so `Err`
-            // means the panel is already gone.
-            match panel.update(acx, |_, window, _| window.is_window_active()) {
-                Ok(true) => {}
-                Ok(false) => {
-                    panel
-                        .update(acx, |_, window, _| window.remove_window())
-                        .ok();
-                    model.update(acx, |g, _| g.panel_window = None);
-                }
-                Err(_) => model.update(acx, |g, _| g.panel_window = None),
+            // means the panel is already gone — and a live panel that took the
+            // focus is the operator's own click landing in it, not a dismissal.
+            if let Ok(true) = panel.update(acx, |_, window, _| window.is_window_active()) {
+                return;
             }
+            crate::menubar::close_panel(acx, &model);
         })
         .ok();
     })

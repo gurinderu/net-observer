@@ -375,8 +375,16 @@ pub struct Glance {
     /// would vanish the moment its own menu appeared.
     pub menu_focus_guard: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The panel window itself, so the menu can close its parent when the click
-    /// that dismisses the menu lands outside both.
+    /// that dismisses the menu lands outside both. This is the *only* record of
+    /// the live panel: the status-item click reads it too, so a window closed
+    /// from anywhere is closed everywhere.
     pub panel_window: Option<gpui::AnyWindowHandle>,
+    /// When the panel was last dismissed, so the status-item click that caused
+    /// the dismissal is not read as a request to reopen. Shared rather than owned
+    /// by the click task, because the menu closes the panel too and a dismissal
+    /// it did not stamp reopens under the next click
+    /// (see [`crate::menubar::close_panel`]).
+    pub panel_dismissed_at: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// The panel's own bounded history of the last [`HISTORY_LEN`] refresh ticks,
     /// oldest first — the series behind the sparklines. Appended by
     /// [`Glance::record_tick`] from the refresh timer *only*, so one column is one
@@ -397,6 +405,7 @@ impl Glance {
             menu_window: None,
             menu_focus_guard: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             panel_window: None,
+            panel_dismissed_at: std::sync::Arc::new(std::sync::Mutex::new(None)),
             history: VecDeque::with_capacity(HISTORY_LEN),
         }
     }
