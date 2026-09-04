@@ -37,6 +37,7 @@
 //! The GUI cannot run headlessly, so it is verified by compiling + clippy; the
 //! tested surface stays the data/render layer.
 
+mod air;
 mod events;
 mod map;
 mod menubar;

@@ -362,6 +362,10 @@ pub struct Glance {
     /// panel re-opens) so a second "Map" click focuses the existing window instead
     /// of opening a duplicate; a stale handle re-opens (see [`crate::map`]).
     pub map_window: Option<gpui::AnyWindowHandle>,
+    /// The live air-map window, if one is open. Stashed like `map_window` so a
+    /// second "Air" click focuses the existing window instead of opening a
+    /// second subscription (see [`crate::air`]).
+    pub air_window: Option<gpui::AnyWindowHandle>,
     /// The panel's own bounded history of the last [`HISTORY_LEN`] refresh ticks,
     /// oldest first — the series behind the sparklines. Appended by
     /// [`Glance::record_tick`] from the refresh timer *only*, so one column is one
@@ -378,6 +382,7 @@ impl Glance {
             control_msg: None,
             events_window: None,
             map_window: None,
+            air_window: None,
             history: VecDeque::with_capacity(HISTORY_LEN),
         }
     }
@@ -950,6 +955,26 @@ fn footer(
             crate::map::open_or_focus(cx, &model);
         }));
 
+    // "Air" opens the radio-environment map: a map of its own, not a layer on the
+    // network map — that one carries L2 devices, this one frequency bands
+    // (realm net-observer, node #48). It reads its own subscription, so unlike
+    // "Map" it needs the socket path.
+    let air = div()
+        .id("air")
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        .text_color(rgb(theme.accent))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme.hover)))
+        .child("Air")
+        .on_click(cx.listener(|this, _, _window, cx| {
+            let socket = this.model.read(cx).socket_path.clone();
+            let model = this.model.clone();
+            crate::air::open_or_focus(cx, &model, socket);
+        }));
+
     let refresh = div()
         .id("refresh")
         .px_2()
@@ -1046,6 +1071,7 @@ fn footer(
                 .gap_1()
                 .child(events)
                 .child(map)
+                .child(air)
                 .child(freeze)
                 .child(quiet)
                 .child(scan),
