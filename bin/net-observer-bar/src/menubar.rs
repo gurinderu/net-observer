@@ -359,11 +359,17 @@ fn open_panel(
 ) {
     let model = model.clone();
     let dismissed_at = dismissed_at.clone();
+    // Raised while the actions menu owns the focus. Opening that menu takes key
+    // focus from this panel, and losing key focus is exactly what dismisses the
+    // panel — without the latch the panel would vanish the moment its own menu
+    // appeared, taking the menu's parent out from under it.
+    let menu_guard = model.read(cx).menu_focus_guard.clone();
     // Compute the anchor now, at open time: the button is laid out by now, so its
     // frame is real (a startup capture sees a zero frame and lands off-screen).
     let mtm =
         MainThreadMarker::new().expect("open_panel runs on the main thread (gpui App update)");
     let anchor = compute_anchor_bounds(button, mtm);
+    let model_for_handle = model.clone();
     let options = panel_window_options(anchor);
     let opened = cx.open_window(options, move |window, cx| {
         cx.new(move |cx| {
@@ -379,7 +385,7 @@ fn open_panel(
             cx.observe_window_activation(window, move |_view, window, _cx| {
                 if window.is_window_active() {
                     was_active = true;
-                } else if was_active {
+                } else if was_active && !menu_guard.load(std::sync::atomic::Ordering::SeqCst) {
                     if let Ok(mut guard) = dismissed_at.lock() {
                         *guard = Some(Instant::now());
                     }
@@ -393,6 +399,9 @@ fn open_panel(
     match opened {
         Ok(handle) => {
             *panel = Some(handle);
+            // The menu needs its parent's handle: the click that dismisses the
+            // menu landed outside both, so it closes the panel too.
+            model_for_handle.update(cx, |g, _| g.panel_window = Some(handle.into()));
             // Accessory apps don't get key focus for free; activate so the panel
             // comes to the front, is interactive, and can register losing key
             // focus (the click-away dismiss).

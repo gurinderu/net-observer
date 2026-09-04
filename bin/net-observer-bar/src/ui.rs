@@ -366,6 +366,17 @@ pub struct Glance {
     /// second "Air" click focuses the existing window instead of opening a
     /// second subscription (see [`crate::air`]).
     pub air_window: Option<gpui::AnyWindowHandle>,
+    /// The open actions menu, if any. It is its own window — a menu that flies
+    /// out past the panel's edge cannot be an element inside it, because gpui
+    /// draws nothing outside a window.
+    pub menu_window: Option<gpui::AnyWindowHandle>,
+    /// Set while the actions menu holds focus. The panel closes when it resigns
+    /// key, and opening the menu is exactly that — without this latch the panel
+    /// would vanish the moment its own menu appeared.
+    pub menu_focus_guard: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The panel window itself, so the menu can close its parent when the click
+    /// that dismisses the menu lands outside both.
+    pub panel_window: Option<gpui::AnyWindowHandle>,
     /// The panel's own bounded history of the last [`HISTORY_LEN`] refresh ticks,
     /// oldest first — the series behind the sparklines. Appended by
     /// [`Glance::record_tick`] from the refresh timer *only*, so one column is one
@@ -383,6 +394,9 @@ impl Glance {
             events_window: None,
             map_window: None,
             air_window: None,
+            menu_window: None,
+            menu_focus_guard: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            panel_window: None,
             history: VecDeque::with_capacity(HISTORY_LEN),
         }
     }
@@ -1125,10 +1139,16 @@ fn footer(
         .text_color(rgb(theme.accent))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(theme.hover)))
-        .child(if menu_open { "Menu ▴" } else { "Menu ▾" })
-        .on_click(cx.listener(|this, _, _window, cx| {
-            this.menu_open = !this.menu_open;
-            cx.notify();
+        .child("Menu ▸")
+        .on_click(cx.listener(|this, _, window, cx| {
+            // The menu is its own window, so it needs where this one is and how
+            // much display there is to fly out into.
+            let panel = window.bounds();
+            let screen = window
+                .display(cx)
+                .map_or(panel, |d| d.bounds().map(|p| px(f32::from(p))));
+            let model = this.model.clone();
+            crate::menu::open_or_focus(cx, &model, panel, screen);
         }));
 
     // A flyout, not a stack: the menu floats over the panel body beside its
@@ -1222,9 +1242,13 @@ type ControlRoundTrip = fn(
 /// the gpui main thread" and "a daemon that is not there is a message, not a
 /// crash" are decided once rather than per button. The model is held weakly, so a
 /// shut-down app just drops the result.
-fn spawn_control(view: &PanelView, cx: &mut Context<PanelView>, round_trip: ControlRoundTrip) {
-    let model = view.model.downgrade();
-    let socket = view.model.read(cx).socket_path.clone();
+pub(crate) fn spawn_control_on<V: 'static>(
+    glance: &Entity<Glance>,
+    cx: &mut Context<V>,
+    round_trip: ControlRoundTrip,
+) {
+    let model = glance.downgrade();
+    let socket = glance.read(cx).socket_path.clone();
     cx.spawn(async move |_view, acx: &mut AsyncApp| {
         let (control, fresh) = acx
             .background_spawn(async move { round_trip(&socket) })
@@ -1237,6 +1261,12 @@ fn spawn_control(view: &PanelView, cx: &mut Context<PanelView>, round_trip: Cont
             .ok();
     })
     .detach();
+}
+
+/// The panel's own spelling of [`spawn_control_on`].
+fn spawn_control(view: &PanelView, cx: &mut Context<PanelView>, round_trip: ControlRoundTrip) {
+    let glance = view.model.clone();
+    spawn_control_on(&glance, cx, round_trip);
 }
 
 // ---- sparklines ------------------------------------------------------------

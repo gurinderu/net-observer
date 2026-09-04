@@ -40,6 +40,7 @@
 mod air;
 mod events;
 mod map;
+mod menu;
 mod menubar;
 mod status;
 mod ui;
