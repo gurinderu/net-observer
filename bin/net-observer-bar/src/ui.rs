@@ -1131,13 +1131,21 @@ fn footer(
             cx.notify();
         }));
 
+    // A flyout, not a stack: the menu floats over the panel body beside its
+    // trigger instead of pushing the footer around. It cannot leave the window —
+    // gpui draws nothing outside it — so it opens rightward from the trigger and
+    // upward from the footer, which is where the room is.
     let menu = menu_open.then(|| {
         div()
+            .absolute()
+            .bottom(px(26.0))
+            .left(px(52.0))
+            .w(px(150.0))
             .flex()
             .flex_col()
             .gap_0p5()
-            .mb_1()
             .p_1()
+            .shadow_lg()
             .rounded_md()
             .border_1()
             .border_color(rgba(theme.edge))
@@ -1156,6 +1164,7 @@ fn footer(
     });
 
     let actions = div()
+        .relative()
         .flex()
         .flex_col()
         .children(menu)
