@@ -374,8 +374,39 @@ fn status_rows(snapshot: &StatusSnapshot, now_us: i64, theme: Theme) -> impl Int
         .child(row("proxy", proxy_age, rgb(theme.muted), theme))
 }
 
-/// The incidents section: a compact list of `trigger_id → state · age` rows, or a
-/// single muted "no recent incidents" line when there are none.
+/// The panel is a fixed 320 logical pixels wide, so a signature is elided rather
+/// than allowed to push the layout: it is the *only* place the daemon's own
+/// sentence about the incident reaches the operator, and a row that overflows the
+/// window shows nothing at all.
+///
+/// Elision counts `char`s, not bytes — a multi-byte signature must never be cut
+/// mid-codepoint — and the ellipsis replaces the tail rather than being appended,
+/// so the result is never longer than `max`. A signature that already fits is
+/// returned untouched, and an all-whitespace one is treated as absent.
+pub(crate) fn elide(signature: &str, max: usize) -> Option<String> {
+    let s = signature.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.chars().count() <= max {
+        return Some(s.to_string());
+    }
+    // `max` is always well above 1 here (see `SIGNATURE_CHARS`), so there is
+    // room for at least one character before the ellipsis.
+    let keep = max.saturating_sub(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('\u{2026}');
+    Some(out)
+}
+
+/// How many characters of a signature the 320px panel can show on one line.
+/// Measured against the panel's 11px muted line: beyond this the text wraps or
+/// clips, and either way the row stops being a glance.
+const SIGNATURE_CHARS: usize = 44;
+
+/// The incidents section: a compact list of `trigger_id → state · age` rows, each
+/// followed by the daemon's own signature for that incident, or a single muted
+/// "no recent incidents" line when there are none.
 fn incidents_section(incidents: &[IncidentSummary], now_us: i64, theme: Theme) -> impl IntoElement {
     let base = div().flex().flex_col().px_3().py_1();
     if incidents.is_empty() {
@@ -397,7 +428,24 @@ fn incidents_section(incidents: &[IncidentSummary], now_us: i64, theme: Theme) -
                 None => ("open", theme.bad),
             };
             let value = format!("{state} \u{00b7} {}", age_str(i.opened_us, now_us));
-            row(i.trigger_id.clone(), value, rgb(color), theme)
+            // The signature is the sentence the daemon wrote about this
+            // incident; it sits under the row rather than beside it, because
+            // beside it there is no room.
+            div()
+                .flex()
+                .flex_col()
+                .child(row(i.trigger_id.clone(), value, rgb(color), theme))
+                .children(elide(&i.signature, SIGNATURE_CHARS).map(|sig| {
+                    div()
+                        .w_full()
+                        // Never let a long sentence widen the panel: the text is
+                        // already elided, and this pins the fallback.
+                        .overflow_hidden()
+                        .pb_1()
+                        .text_size(px(11.0))
+                        .text_color(rgb(theme.muted))
+                        .child(sig)
+                }))
         }));
         if hidden == 0 {
             listed
@@ -723,6 +771,49 @@ fn freshness_line(snapshot: &StatusSnapshot, now_us: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The panel is a fixed 320 logical pixels wide: an over-long signature must
+    /// be shortened to fit, never allowed to push the row past the window edge.
+    /// The elided form is never longer than the budget (the ellipsis replaces
+    /// the tail, it is not appended to it).
+    #[test]
+    fn signature_is_elided_to_the_panel_budget() {
+        let long = "a".repeat(SIGNATURE_CHARS * 3);
+        let out = elide(&long, SIGNATURE_CHARS).expect("a non-empty signature is shown");
+        assert!(
+            out.chars().count() <= SIGNATURE_CHARS,
+            "elided to {} chars, budget is {SIGNATURE_CHARS}: {out}",
+            out.chars().count()
+        );
+        assert!(out.ends_with('\u{2026}'), "the cut must be marked: {out}");
+        assert!(out.len() < long.len());
+    }
+
+    /// A signature that already fits is shown whole — no ellipsis, no loss.
+    #[test]
+    fn short_signature_is_shown_whole() {
+        assert_eq!(
+            elide("tun dead", SIGNATURE_CHARS).as_deref(),
+            Some("tun dead")
+        );
+    }
+
+    /// The cut is by `char`, so a multi-byte signature is never split
+    /// mid-codepoint (a byte-wise cut would panic or corrupt the text).
+    #[test]
+    fn multibyte_signature_is_cut_on_char_boundaries() {
+        let long = "\u{0448}".repeat(SIGNATURE_CHARS * 2);
+        let out = elide(&long, SIGNATURE_CHARS).expect("shown");
+        assert_eq!(out.chars().count(), SIGNATURE_CHARS);
+        assert!(out.chars().all(|c| c == '\u{0448}' || c == '\u{2026}'));
+    }
+
+    /// An empty (or whitespace-only) signature is absent, not a blank line.
+    #[test]
+    fn blank_signature_is_absent() {
+        assert_eq!(elide("", SIGNATURE_CHARS), None);
+        assert_eq!(elide("   ", SIGNATURE_CHARS), None);
+    }
 
     /// The plot scale never falls below the threshold (so the rule is always
     /// visible) and never below the data (so no bar overflows the plot area).
