@@ -1223,7 +1223,7 @@ fn empty_state(
 /// tooltip, which a window carrying its own header row has no place for. It
 /// names the transport reason the daemon gave *and* what the reader is
 /// therefore looking at: the last topology, not the current one.
-fn offline_note(reason: &str, theme: Theme) -> impl IntoElement {
+fn offline_note(reason: &str, theme: Theme) -> impl IntoElement + use<> {
     div()
         // Test handle only: a stale map with no marker is exactly the defect
         // this line exists to prevent, so a headless test must be able to find
