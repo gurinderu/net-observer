@@ -82,6 +82,7 @@ Only the rows below are settled; the owner has not yet named carriers for the re
 | Compiles and lints clean | the default-member build | `cargo build` then `cargo clippy --all-targets --all-features -- -D warnings`, each exit code read separately | agent |
 | The menu bar compiles and lints | a compiled `net-observer-bar` | inside `nix develop`: `cargo build -p net-observer-bar`, `cargo clippy -p net-observer-bar --all-targets -- -D warnings` | agent |
 | A bar element is drawn where the layout says (presence, position, containment) | the bar's headless windows on gpui's test platform | inside `nix develop`: `cargo test -p net-observer-bar` — `debug_selector` + `VisualTestContext::debug_bounds` | agent |
+| The words a bar tooltip shows | the same headless window, hovered | `simulate_mouse_move` onto the element, `advance_clock` past the hover delay, then `debug_bounds` for a selector carrying the tip's own text — so a claim moved into a tooltip stays as checkable as one left on screen | agent |
 | A bar element is NOT drawn in a view (absence) | a headless window opened ALREADY in that mode | same run, but in a fresh window: gpui's debug-bounds map only grows over a window's life (`Frame::clear()` leaves it alone), so a window that once drew the element can never say it is gone | agent |
 
 **Ceiling** — claim classes with no reachable observation, and why:
