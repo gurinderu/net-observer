@@ -42,7 +42,7 @@ use types::{
     TopologyLink,
 };
 
-use crate::ui::{Dating, Glance, PROVENANCE_TEXT, Theme, dated, moments_diverge, separator};
+use crate::ui::{Dating, Glance, PROVENANCE_TEXT, Theme, dated, hint, moments_diverge, separator};
 
 /// Initial size of the network-map window (resizable afterwards), gpui logical px.
 const WIN_W: f32 = 360.0;
@@ -555,11 +555,14 @@ fn join_parts(parts: &[&str]) -> String {
 /// carried the advertisement, never bare.
 fn uplink_via_label(via: LearnedVia) -> &'static str {
     match via {
-        LearnedVia::Lldp => "advertised over LLDP",
-        LearnedVia::Cdp => "advertised over CDP",
+        // "advertised over" is dropped: the tree's caption already says the whole
+        // strip is an advertisement, and repeating it on every card is the prose
+        // this pass exists to remove. The protocol itself stays.
+        LearnedVia::Lldp => "LLDP",
+        LearnedVia::Cdp => "CDP",
         // A protocol a newer daemon learned this uplink by that this bar does not
         // know — do not name an unbacked protocol.
-        LearnedVia::Unknown => "advertised over an unknown protocol",
+        LearnedVia::Unknown => "unknown protocol",
     }
 }
 
@@ -597,14 +600,19 @@ fn uplink_seen_line(node: &UplinkNode, now_us: i64) -> String {
 /// frame is unauthenticated and spoofable, so an edge here is what the wire
 /// claimed, never a proven physical connection. (realm net-observer, node #43)
 fn uplink_caption(dropped: usize) -> String {
-    let base =
-        "uplink hypothesis \u{00b7} what LLDP/CDP frames claimed, not a proven physical link";
+    let base = "uplink hypothesis";
     if dropped > 0 {
         format!("{base} \u{00b7} +{dropped} more")
     } else {
         base.to_string()
     }
 }
+
+/// Why the tree is a hypothesis, said on hover. The word "hypothesis" itself
+/// never leaves the screen — only this reasoning does.
+const UPLINK_IS_A_HYPOTHESIS: &str = "What LLDP/CDP frames claimed, not a proven physical link. \
+     The frames are unauthenticated: anything on the segment can send them, and a switch that \
+     sends none is simply absent from this tree rather than absent from the wire.";
 
 /// The uplink tree drawn above the neighbour star: a "this Mac" anchor at the
 /// top and, hanging off a left rail, one card per discovered switch/AP carrying
@@ -637,13 +645,12 @@ fn uplink_strip(nodes: &[UplinkNode], dropped: usize, theme: Theme) -> impl Into
     div()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .text_size(px(11.0))
-                .text_color(rgb(theme.muted))
-                .pb_1()
-                .child(uplink_caption(dropped)),
-        )
+        .child(div().pb_1().child(hint(
+            "map-uplink-caption",
+            uplink_caption(dropped),
+            UPLINK_IS_A_HYPOTHESIS,
+            rgb(theme.muted),
+        )))
         .child(tree)
 }
 
@@ -921,14 +928,16 @@ pub(crate) fn network_map_section(
     }
     section = section.child(area);
     if dropped > 0 {
-        section = section.child(
-            div()
-                .text_size(px(11.0))
-                .text_color(rgb(theme.muted))
-                .child(format!(
-                    "+{dropped} that the ring has no room for \u{00b7} the list shows every one"
-                )),
-        );
+        section = section.child(hint(
+            "map-dropped",
+            format!("+{dropped} not drawn"),
+            format!(
+                "{dropped} further neighbour(s) were read but the ring has no room for \
+                     them. They are missing from this drawing only — the list view shows \
+                     every one."
+            ),
+            rgb(theme.muted),
+        ));
     }
     section = section.child(role_legend(theme));
     section.into_any_element()
@@ -1282,6 +1291,12 @@ fn empty_state(
 /// tooltip, which a window carrying its own header row has no place for. It
 /// names the transport reason the daemon gave *and* what the reader is
 /// therefore looking at: the last topology, not the current one.
+/// The visible half of [`offline_note`]: both facts the reader must not have to
+/// hover for — that nothing answered, and that what is drawn is therefore stale.
+fn offline_line(reason: &str) -> String {
+    format!("offline: {reason} \u{00b7} stale")
+}
+
 fn offline_note(reason: &str, theme: Theme) -> impl IntoElement + use<> {
     div()
         // Test handle only: a stale map with no marker is exactly the defect
@@ -1291,10 +1306,17 @@ fn offline_note(reason: &str, theme: Theme) -> impl IntoElement + use<> {
         .px_3()
         .py_1()
         .flex_none()
-        .text_size(px(11.0))
-        .text_color(rgb(theme.warn))
-        .child(format!(
-            "offline: {reason} \u{00b7} showing the last topology received, not the current one"
+        // Both facts stay visible — that we are offline, and that what is drawn
+        // is therefore stale. Only why-and-what-follows moved into the hint.
+        .child(hint(
+            "map-offline-hint",
+            offline_line(reason),
+            format!(
+                "The daemon did not answer ({reason}). The topology below is the last one \
+                 received, not the current one: a neighbour that has since left is still \
+                 drawn, and one that has arrived is missing."
+            ),
+            rgb(theme.warn),
         ))
 }
 
@@ -1991,10 +2013,25 @@ mod tests {
     /// since `first_seen` is a store column the bar cannot reach.
     #[test]
     fn uplink_text_stays_a_hypothesis() {
+        // The status word stays on the screen; the reasoning moved into the
+        // caption's hint, and is asserted there rather than dropped.
         let caption = uplink_caption(0);
         assert!(caption.contains("hypothesis"), "{caption}");
-        assert!(caption.contains("not a proven physical link"), "{caption}");
+        assert!(
+            UPLINK_IS_A_HYPOTHESIS.contains("not a proven physical link"),
+            "{UPLINK_IS_A_HYPOTHESIS}"
+        );
         assert!(uplink_caption(2).contains("+2 more"));
+
+        // Shortening the offline note must not cost either of the two facts it
+        // carries: that nothing answered, and that the picture is therefore old.
+        let off = offline_line("connection refused");
+        assert!(off.contains("offline"), "{off}");
+        assert!(off.contains("connection refused"), "{off}");
+        assert!(
+            off.contains("stale"),
+            "a stale map that does not say it is stale is the defect this line exists for: {off}"
+        );
 
         assert!(uplink_via_label(LearnedVia::Lldp).contains("LLDP"));
         assert!(uplink_via_label(LearnedVia::Cdp).contains("CDP"));

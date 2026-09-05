@@ -111,7 +111,7 @@ use types::{
     OverlapConfidence, WifiSample, WifiVerdict, overlap_hypothesis,
 };
 
-use crate::ui::{Glance, PROVENANCE_TEXT, Theme, clock, moments_diverge, separator};
+use crate::ui::{Glance, PROVENANCE_TEXT, Theme, clock, hint, moments_diverge, separator};
 
 /// How often the foreground bridge task drains the channel into the model. The
 /// air scan is a slow period (seconds per scan), so this only has to feel prompt.
@@ -868,10 +868,38 @@ fn share_label(overlap: f64) -> String {
 ///
 /// Where an overlap *is* computable the sentence is [`overlap_label`]'s, so
 /// there is one wording and not two that can drift apart.
-fn overlap_cell(lane: &Lane) -> Option<String> {
+fn overlap_cell(lane: &Lane) -> Option<OverlapCell> {
     match lane.overlap {
         Overlap::OwnChannelUnknown | Overlap::OwnBandElsewhere(_) => None,
-        Overlap::Computed(_) => Some(overlap_label(lane)),
+        Overlap::Computed(h) => Some(OverlapCell {
+            // The status word travels WITH the number. A bare "43%" whose status
+            // appeared only on hover is the silent-wrong-data failure.
+            text: format!("{HYPOTHESIS_MARKER} {}", share_label(h.overlap)),
+            alpha: confidence_alpha(h.confidence),
+            tip: overlap_label(lane),
+        }),
+    }
+}
+
+/// The overlap figure as one cell: the status word and the share always on the
+/// screen, the confidence carried by ink, the sentence carried by a hint.
+struct OverlapCell {
+    text: String,
+    alpha: f32,
+    tip: String,
+}
+
+/// Confidence as saturation rather than as three more words under every
+/// neighbour. A weak hypothesis is literally fainter than a strong one, and the
+/// level is still named in words in the cell's hint.
+///
+/// The floor is well clear of zero: a low-confidence figure must stay legible,
+/// because "we believe this weakly" is a reading and not an absence.
+fn confidence_alpha(c: OverlapConfidence) -> f32 {
+    match c {
+        OverlapConfidence::Low => 0.40,
+        OverlapConfidence::Medium => 0.65,
+        OverlapConfidence::High => 0.95,
     }
 }
 
@@ -879,18 +907,35 @@ fn overlap_cell(lane: &Lane) -> Option<String> {
 /// top of the section, instead of under every neighbour in it.
 fn band_relation(group: &BandGroup) -> Option<String> {
     match (group.own, group.own_elsewhere) {
-        (Some(s), _) => Some(format!(
-            "this Mac is here, on ch {} — the highlighted column",
-            s.channel
-        )),
+        (Some(s), _) => Some(format!("this Mac: ch {} (highlighted)", s.channel)),
         (None, Some(b)) => Some(format!(
-            "this Mac is on {}, not on this band: nothing here can overlap our channel",
+            "this Mac is on {} — no overlap here",
             band_label(b)
         )),
-        (None, None) => Some(
-            "this Mac's own channel is unknown, so no overlap can be computed against it"
-                .to_string(),
+        (None, None) => Some("own channel unknown — no overlap computable".to_string()),
+    }
+}
+
+/// The elaboration behind [`band_relation`], shown on hover. The visible line
+/// already carries which of the three cases holds; this only says what follows
+/// from it.
+fn band_relation_tip(group: &BandGroup) -> String {
+    match (group.own, group.own_elsewhere) {
+        (Some(s), _) => format!(
+            "This Mac is associated on channel {} in this band — the highlighted column across \
+             the axis. Every overlap figure in this section is computed against it.",
+            s.channel
         ),
+        (None, Some(b)) => format!(
+            "This Mac is associated on {}, not on this band. Nothing heard here can overlap our \
+             channel, so no overlap figure is offered under these neighbours — which is a \
+             different fact from our channel being unknown.",
+            band_label(b)
+        ),
+        (None, None) => "This Mac's own channel was not reported, so there is nothing to compute \
+             an overlap against. The neighbours below are still real readings; only the \
+             relation to us is missing."
+            .to_string(),
     }
 }
 
@@ -1017,8 +1062,20 @@ fn lane_distance(lane: &Lane) -> Option<DistanceHypothesis> {
     distance_hypothesis(lane.rssi_dbm?, centre_mhz(lane.span)?)
 }
 
-/// The sentence that governs the whole rings view, kept on screen rather than
-/// in a tooltip: the angle of a mark carries nothing at all.
+/// The word that stays on the screen wherever an overlap figure is shown. It is
+/// the *status* of every such figure, so it is never moved into a hint — only
+/// the elaboration below it is (realm net-observer, node #48).
+const HYPOTHESIS_MARKER: &str = "hypothesis";
+
+/// Why the overlap figures are a hypothesis, said once and on hover.
+const OVERLAP_IS_A_HYPOTHESIS: &str = "Overlap is a HYPOTHESIS about where the bands sit, not \
+     measured interference: macOS reports channel occupancy (CCA / airtime) to nobody. Confidence \
+     drops when a channel width or a 2.4 GHz bonding direction had to be assumed, or when a signal \
+     strength was not reported — and the highest confidence is still a hypothesis. Foreign APs \
+     carry no BSSID, so this is one slice: the same AP cannot be followed between scans.";
+
+/// The sentence that governs the whole rings view — now the hint behind a
+/// permanent marker: the angle of a mark carries nothing at all.
 const ANGLE_MEANS_NOTHING: &str = "The angle of a mark means nothing: one antenna gives no \
      bearing, so a neighbour's direction is not observable here. Marks are spread around each \
      ring by rank alone. Only the distance from the centre — the ring, in dBm — is a reading.";
@@ -1253,29 +1310,41 @@ fn rings_section(
         .gap_2()
         .px_3()
         .py_2()
+        // Two paragraphs became two markers. Each still says, without a hover,
+        // what its quantity IS — "the angle is nothing", "metres are a
+        // hypothesis" — and only the reasoning is behind the hint.
         .child(
             div()
                 .debug_selector(|| "air-rings-angle-caveat".to_string())
-                .text_size(px(11.0))
-                .text_color(rgb(theme.warn))
-                .child(ANGLE_MEANS_NOTHING),
-        )
-        .child(
-            div()
-                .text_size(px(11.0))
-                .text_color(rgb(theme.muted))
-                .child(METRES_ARE_A_GUESS),
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(hint(
+                    "air-rings-angle",
+                    "angle means nothing",
+                    ANGLE_MEANS_NOTHING,
+                    rgb(theme.warn),
+                ))
+                .child(hint(
+                    "air-rings-metres",
+                    "metres: hypothesis",
+                    METRES_ARE_A_GUESS,
+                    rgb(theme.muted),
+                )),
         )
         .child(plot)
         .children((!unplaceable.is_empty()).then(|| {
-            div()
-                .text_size(px(11.0))
-                .text_color(rgb(theme.muted))
-                .child(format!(
-                    "{} further access point(s) reported no signal and sit on no ring — heard, \
-                     but not placeable here.",
+            hint(
+                "air-rings-unplaceable",
+                format!("+{} heard, no signal reported", unplaceable.len()),
+                format!(
+                    "{} further access point(s) were heard but reported no signal strength. \
+                     The ring is the signal, so they sit on no ring — absent from the drawing, \
+                     not absent from the air.",
                     unplaceable.len()
-                ))
+                ),
+                rgb(theme.muted),
+            )
         }))
 }
 
@@ -1511,11 +1580,20 @@ impl Render for AirView {
 /// The two provenance lines under the header: when the slice was taken, and
 /// when the channel it is compared against was read.
 struct ProvenanceLines {
+    /// Always on the screen, and as short as it can be while still keeping "a
+    /// scan at this moment", "nothing scanned yet" and "this daemon cannot scan"
+    /// three visibly different facts.
     scanned: String,
-    /// `Some` when our own channel has a moment of its own; carries a warning
-    /// instead of a note when the two readings are far enough apart that we may
-    /// have roamed between them.
+    /// The elaboration of `scanned`, shown on hover.
+    scanned_tip: String,
+    /// `Some` when our own channel has a moment of its own. Short; when the two
+    /// readings are far enough apart that we may have roamed, the warning stays
+    /// *in this visible line* rather than moving into the hint.
     pairing: Option<String>,
+    /// The elaboration of `pairing`.
+    pairing_tip: Option<String>,
+    /// Whether `pairing` is a warning about divergent moments rather than a note.
+    skewed: bool,
 }
 
 /// Say when each half of the picture was read.
@@ -1531,26 +1609,65 @@ fn provenance_lines(
     // "Unknown moment" was a lie in the one case it was reached: with no scan at
     // all there is no moment to be unknown ABOUT. Three states, three sentences —
     // a scan with a time, no scan yet, and a daemon that cannot scan.
-    let scanned = match (scanned_at, air_unsupported) {
-        (Some(us), _) => format!("scanned at {}", clock(us)),
-        (None, true) => "not scanned: this daemon cannot collect the air".to_string(),
-        (None, false) => "not scanned yet".to_string(),
+    let (scanned, scanned_tip) = match (scanned_at, air_unsupported) {
+        (Some(us), _) => (
+            format!("scan {}", clock(us)),
+            format!(
+                "The slice below was read at {}. A scan is one moment, not a live picture: \
+                 nothing here updates until the next one.",
+                clock(us)
+            ),
+        ),
+        (None, true) => (
+            "scan unsupported".to_string(),
+            "This daemon cannot collect the air at all — it predates the air collector. \
+             Nothing has been scanned and nothing will be, which is a different fact from \
+             a scan that has simply not happened yet."
+                .to_string(),
+        ),
+        (None, false) => (
+            "no scan yet".to_string(),
+            "This daemon collects the air, but nothing has been scanned yet in this session. \
+             That is a different fact from a daemon with no air collector at all."
+                .to_string(),
+        ),
     };
     // The divergence itself is the shared rule (`ui::moments_diverge`); only the
     // sentence around it is this window's, because only this window knows that
     // the consequence of a stale pairing here is "we may have roamed".
-    let pairing = match (scanned_at, own_read_at) {
-        (Some(scan), Some(own_us)) => Some(match moments_diverge(scan, own_us) {
-            Some(gap) => format!(
-                "our channel was read at {} — {gap} apart from the scan, so we may have roamed between them",
-                clock(own_us),
-            ),
-            None => format!("our channel read at {}", clock(own_us)),
-        }),
-        (_, Some(own_us)) => Some(format!("our channel read at {}", clock(own_us))),
-        (_, None) => None,
+    let skew = scanned_at.and_then(|scan| own_read_at.and_then(|own| moments_diverge(scan, own)));
+    let (pairing, pairing_tip) = match (own_read_at, skew.as_deref()) {
+        (Some(own_us), Some(gap)) => (
+            // The warning itself stays visible — shortened, never hidden.
+            Some(format!(
+                "own ch {} · {gap} apart — may have roamed",
+                clock(own_us)
+            )),
+            Some(format!(
+                "Our own channel was read at {}, {gap} away from the scan. The two readings \
+                 come from different collectors on different cadences, so this Mac may have \
+                 roamed to another channel between them — every overlap figure below is \
+                 computed against a channel we may no longer be on.",
+                clock(own_us)
+            )),
+        ),
+        (Some(own_us), None) => (
+            Some(format!("own ch {}", clock(own_us))),
+            Some(format!(
+                "Our own channel was read at {} — close enough to the scan to be treated as \
+                 the same moment. The overlap figures below are computed against it.",
+                clock(own_us)
+            )),
+        ),
+        (None, _) => (None, None),
     };
-    ProvenanceLines { scanned, pairing }
+    ProvenanceLines {
+        scanned,
+        scanned_tip,
+        pairing,
+        pairing_tip,
+        skewed: skew.is_some(),
+    }
 }
 
 /// The scan strip under the header: one button and one honest sentence about it.
@@ -1677,8 +1794,6 @@ fn header(
     // "the air right now" — the one claim this window must never make when the
     // socket has been quiet for an hour (realm net-observer, node #48).
     let lines = provenance_lines(scanned_at, own_read_at, air_unsupported);
-    let scanned_line = lines.scanned;
-    let pairing_line = lines.pairing;
     div()
         .flex()
         .flex_col()
@@ -1697,36 +1812,58 @@ fn header(
                 .text_color(rgb(theme.muted))
                 .child(own_line),
         )
+        // The two provenance readings on ONE row: each short, each carrying its
+        // own long explanation on hover. A divergence warning is still spelled
+        // out in the visible half — only its reasoning moved.
         .child(
             div()
-                .debug_selector(|| "air-provenance".into())
-                .text_size(px(PROVENANCE_TEXT))
-                .text_color(rgb(theme.muted))
-                .child(scanned_line),
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().debug_selector(|| "air-provenance".into()).child(hint(
+                    "air-scanned",
+                    lines.scanned,
+                    lines.scanned_tip,
+                    rgb(theme.muted),
+                )))
+                .children(lines.pairing.zip(lines.pairing_tip).map(|(line, tip)| {
+                    let color = if lines.skewed {
+                        theme.warn
+                    } else {
+                        theme.muted
+                    };
+                    div().debug_selector(|| "air-skew".into()).child(hint(
+                        "air-own-read",
+                        line,
+                        tip,
+                        rgb(color),
+                    ))
+                })),
         )
-        .children(pairing_line.map(|line| {
+        // The epistemic boundary. The paragraph is now a hint; what stays on the
+        // screen is the word that carries the status of every overlap figure
+        // below — never the figures alone.
+        .child(
             div()
-                .debug_selector(|| "air-skew".into())
-                .text_size(px(PROVENANCE_TEXT))
-                .text_color(rgb(theme.warn))
-                .child(line)
-        }))
-        // The epistemic boundary, stated in the window and not only in the docs.
-        .child(div().text_size(px(11.0)).text_color(rgb(theme.warn)).child(
-            "Overlap is a HYPOTHESIS about where the bands sit, not measured \
-                     interference: macOS reports channel occupancy (CCA / airtime) to \
-                     nobody. Confidence drops when a channel width or a 2.4 GHz bonding \
-                     direction had to be assumed, or when a signal strength was not \
-                     reported — and the highest confidence is still a hypothesis. Foreign \
-                     APs carry no BSSID, so this is one slice — the same AP cannot be \
-                     followed between scans. Said once here, not under every neighbour.",
-        ))
-        .children(paused.then(|| {
-            div()
-                .text_size(px(11.0))
-                .text_color(rgb(theme.warn))
-                .child("Collection is paused — this slice will not update.")
-        }))
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(hint(
+                    "air-hypothesis",
+                    HYPOTHESIS_MARKER,
+                    OVERLAP_IS_A_HYPOTHESIS,
+                    rgb(theme.warn),
+                ))
+                .children(paused.then(|| {
+                    hint(
+                        "air-paused",
+                        "paused",
+                        "Collection is paused: the daemon is not reading the air, so this \
+                         slice will not update until it is resumed.",
+                        rgb(theme.warn),
+                    )
+                })),
+        )
 }
 
 /// One band's section: ONE channel axis, every band in this band drawn on it,
@@ -1903,10 +2040,12 @@ fn band_section(group: &BandGroup, theme: Theme) -> impl IntoElement + use<> {
                 ),
         )
         .children(band_relation(group).map(|line| {
-            div()
-                .text_size(px(10.0))
-                .text_color(rgb(theme.muted))
-                .child(line)
+            hint(
+                format!("air-band-relation:{band}"),
+                line,
+                band_relation_tip(group),
+                rgb(theme.muted),
+            )
         }))
         .child(plot);
 
@@ -1948,11 +2087,15 @@ fn lane_row(band: Band, i: usize, lane: &Lane, theme: Theme) -> impl IntoElement
                 .child(lane_label(lane)),
         )
         .children(overlap_cell(lane).map(|cell| {
-            div()
-                .flex_none()
-                .text_size(px(10.0))
-                .text_color(rgb(theme.muted))
-                .child(cell)
+            let sel = format!("air-overlap:{}:{i}", band_label(band));
+            div().debug_selector(move || sel).flex_none().child(hint(
+                // Unique per row: gpui keys hover state by this id, and two
+                // rows sharing one would hover as a single element.
+                format!("air-overlap-hint:{}:{i}", band_label(band)),
+                cell.text,
+                cell.tip,
+                rgba(with_alpha(theme.fg, cell.alpha)),
+            ))
         }))
 }
 
@@ -2201,22 +2344,72 @@ mod tests {
         let scanned = 4_000_000_000_i64;
         let l = provenance_lines(Some(scanned), Some(scanned), false);
         let out: Vec<String> = std::iter::once(l.scanned).chain(l.pairing).collect();
+        // Short now — but each moment is still a moment on the screen, not a
+        // sentence that moved into a hint.
         assert!(
-            out.iter().any(|l| l.starts_with("scanned at ")),
+            out.iter().any(|l| l.contains(&clock(scanned))),
             "the scan's moment is always shown: {out:?}"
         );
         assert!(
-            out.iter().any(|l| l.starts_with("our channel read at ")),
+            out.iter().any(|l| l.starts_with("own ch ")),
             "and so is our own reading's: {out:?}"
         );
-        // Far apart: the pairing itself becomes the warning.
+        // Far apart: the pairing itself becomes the warning, and the warning
+        // stays in the VISIBLE line — a divergence a reader must hover to find
+        // is a divergence he will not find.
         let l = provenance_lines(Some(scanned), Some(scanned - 4 * 3600 * 1_000_000), false);
-        let out: Vec<String> = std::iter::once(l.scanned).chain(l.pairing).collect();
+        assert!(l.skewed, "a four-hour gap is a divergence");
+        let visible = l.pairing.clone().expect("the pairing line is shown");
         assert!(
-            out.iter().any(|l| l.contains("we may have roamed")),
-            "a scan paired with a four-hour-old channel must say so: {out:?}"
+            visible.contains("may have roamed"),
+            "a scan paired with a four-hour-old channel must say so without a hover: {visible}"
         );
-        assert!(out.iter().any(|l| l.contains("4h")), "{out:?}");
+        assert!(visible.contains("4h"), "{visible}");
+    }
+
+    /// Every explanation moved off the screen must still be an explanation the
+    /// window really carries. These are the hints' texts, asserted at the same
+    /// place they are handed to [`crate::ui::hint`].
+    #[test]
+    fn the_hints_behind_the_short_provenance_still_carry_the_long_fact() {
+        let scanned = 4_000_000_000_i64;
+
+        let cannot = provenance_lines(None, None, true);
+        assert!(
+            cannot.scanned_tip.contains("cannot collect the air"),
+            "{}",
+            cannot.scanned_tip
+        );
+        let none_yet = provenance_lines(None, None, false);
+        assert!(
+            none_yet
+                .scanned_tip
+                .contains("nothing has been scanned yet"),
+            "{}",
+            none_yet.scanned_tip
+        );
+        assert_ne!(
+            cannot.scanned_tip, none_yet.scanned_tip,
+            "'cannot scan' and 'has not scanned' must not explain the same"
+        );
+        // The sharp end of that distinction: a daemon that simply has not
+        // scanned yet must never be explained as one that cannot. Being unequal
+        // is not enough — the wrong claim must be absent.
+        assert!(
+            !none_yet.scanned_tip.contains("cannot"),
+            "a daemon that has not scanned yet is described as one that cannot: {}",
+            none_yet.scanned_tip
+        );
+        assert!(
+            cannot.scanned_tip.contains("cannot"),
+            "and one that truly cannot must say so: {}",
+            cannot.scanned_tip
+        );
+
+        let skewed = provenance_lines(Some(scanned), Some(scanned - 4 * 3600 * 1_000_000), false);
+        let tip = skewed.pairing_tip.expect("a divergence is explained");
+        assert!(tip.contains("roamed"), "{tip}");
+        assert!(tip.contains("4h"), "{tip}");
     }
 
     /// An error frame is the daemon refusing, not the daemon working: it must
@@ -2247,10 +2440,64 @@ mod tests {
 
         assert!(!none_yet.contains("unknown moment"), "{none_yet}");
         assert!(!cannot.contains("unknown moment"), "{cannot}");
-        assert!(none_yet.contains("not scanned yet"), "{none_yet}");
-        assert!(cannot.contains("cannot collect the air"), "{cannot}");
+        // The three stay apart in the SHORT visible line, not only in the hint:
+        // "cannot" / "not yet" / "a moment" is a distinction the reader must not
+        // have to hover for.
+        assert!(none_yet.contains("no scan yet"), "{none_yet}");
+        assert!(cannot.contains("unsupported"), "{cannot}");
         assert_ne!(none_yet, cannot, "the two facts must not read the same");
-        assert!(scanned.starts_with("scanned at "), "{scanned}");
+        assert!(scanned.contains(&clock(4_000_000_000)), "{scanned}");
+        assert_ne!(scanned, none_yet);
+        assert_ne!(scanned, cannot);
+    }
+
+    /// The border the owner drew: a figure that is a hypothesis says so on the
+    /// screen. The share and the status word travel together, and the
+    /// confidence — which the cell carries as ink, not as words — is still named
+    /// in full in the cell's hint.
+    #[test]
+    fn an_overlap_figure_never_appears_without_its_status() {
+        let s = scan(vec![
+            ap(36, "5ghz", Some(80), Some(-55)),
+            ap(40, "5ghz", Some(20), None),
+            ap(44, "5ghz", Some(40), Some(-80)),
+        ]);
+        let groups = group(&s, Some(own(36, "5ghz", 80)));
+        let mut seen = 0usize;
+        for g in &groups {
+            for lane in &g.lanes {
+                let Some(cell) = overlap_cell(lane) else {
+                    continue;
+                };
+                seen += 1;
+                assert!(
+                    cell.text.contains(HYPOTHESIS_MARKER),
+                    "a bare overlap figure reached the screen: {}",
+                    cell.text
+                );
+                // The share is still there — shortening must not cost the number.
+                assert!(
+                    cell.text.chars().any(|c| c.is_ascii_digit()) || cell.text.contains("<1%"),
+                    "the overlap share was lost: {}",
+                    cell.text
+                );
+                assert!(
+                    cell.tip.contains("confidence"),
+                    "the confidence level must still be named in words: {}",
+                    cell.tip
+                );
+            }
+        }
+        assert!(seen > 0, "the fixture must produce computable overlaps");
+
+        // Ink separates the three levels, and none of them is invisible.
+        let (lo, md, hi) = (
+            confidence_alpha(OverlapConfidence::Low),
+            confidence_alpha(OverlapConfidence::Medium),
+            confidence_alpha(OverlapConfidence::High),
+        );
+        assert!(lo < md && md < hi, "{lo} {md} {hi}");
+        assert!(lo >= 0.35, "a weak hypothesis must stay legible: {lo}");
     }
 
     /// A daemon that could not read a filter naming `Air` predates the air
@@ -2770,7 +3017,7 @@ mod tests {
 #[cfg(test)]
 mod headless_tests {
     use super::*;
-    use crate::ui::Glance;
+    use crate::ui::{Glance, HINT_TIP_SELECTOR};
     use gpui::{Bounds, Pixels, Size, TestAppContext, VisualTestContext};
     use net_observer_ipc::StatusSnapshot;
 
@@ -2902,6 +3149,52 @@ mod headless_tests {
         cx.debug_bounds(sel)
     }
 
+    /// The border this whole shortening pass may not cross: the paragraph moved
+    /// into a hint, but the word that says every overlap figure is a HYPOTHESIS
+    /// did not. It is on the screen with no pointer anywhere near the window.
+    ///
+    /// The hint is then proved to carry the explanation — by its own words, so a
+    /// hint wired to the wrong sentence fails here rather than passing as "some
+    /// tooltip exists".
+    #[gpui::test]
+    fn the_hypothesis_marker_is_visible_without_hovering_and_its_reason_is_not(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut cx, _viewport) = live_window(cx);
+
+        let marker = bounds(&mut cx, "hint:air-hypothesis")
+            .expect("the hypothesis marker must be drawn without a hover");
+        let tip_sel = format!("{HINT_TIP_SELECTOR}{OVERLAP_IS_A_HYPOTHESIS}");
+        assert!(
+            bounds(&mut cx, &tip_sel).is_none(),
+            "the paragraph must not be on the screen before a hover"
+        );
+
+        cx.simulate_mouse_move(marker.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.simulate_mouse_move(marker.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            bounds(&mut cx, &tip_sel).is_some(),
+            "the reason the figures are a hypothesis is no longer reachable at all"
+        );
+    }
+
+    /// The moment of the reading, and the divergence warning, stay visible in the
+    /// header — shortened, never hidden behind a pointer.
+    #[gpui::test]
+    fn the_moment_of_the_scan_stays_on_the_screen(cx: &mut TestAppContext) {
+        let (mut cx, _viewport) = live_window(cx);
+        assert!(
+            bounds(&mut cx, "air-provenance").is_some(),
+            "the window stopped saying when it was read"
+        );
+    }
+
     /// Each band section draws ONE axis, and every band and every channel number
     /// in that section lies inside it — the axis is the section, not a decoration
     /// beside it.
@@ -3004,10 +3297,16 @@ mod headless_tests {
         for g in group(&live_sample(), Some(own)) {
             out.push(band_label(g.band).to_string());
             out.extend(band_relation(&g));
+            // A hint's words are still words the reader is shown, so a platform
+            // token that hides in one is not a token that got away.
+            out.push(band_relation_tip(&g));
             for lane in &g.lanes {
                 out.push(lane_label(lane));
                 out.push(overlap_label(lane));
-                out.extend(overlap_cell(lane));
+                if let Some(cell) = overlap_cell(lane) {
+                    out.push(cell.text);
+                    out.push(cell.tip);
+                }
             }
         }
         out
