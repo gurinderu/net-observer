@@ -111,7 +111,7 @@ use types::{
     OverlapConfidence, WifiSample, WifiVerdict, overlap_hypothesis,
 };
 
-use crate::ui::{Glance, Theme};
+use crate::ui::{Glance, Theme, separator};
 
 /// How often the foreground bridge task drains the channel into the model. The
 /// air scan is a slow period (seconds per scan), so this only has to feel prompt.
@@ -2002,10 +2002,6 @@ fn note(head: &str, body: &str, color: u32, theme: Theme) -> impl IntoElement + 
                 .text_color(rgb(theme.muted))
                 .child(body.to_string()),
         )
-}
-
-fn separator(theme: Theme) -> impl IntoElement {
-    div().h(px(1.0)).w_full().bg(rgb(theme.separator))
 }
 
 /// Open the air map, or focus it if it is already open. Mirrors
