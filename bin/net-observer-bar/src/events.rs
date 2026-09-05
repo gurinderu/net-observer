@@ -247,9 +247,13 @@ pub(crate) struct EventLogView {
     /// The selected type filter; `None` = all kinds.
     filter: Option<EventKind>,
     scroll: UniformListScrollHandle,
-    /// Set when the model changed (or the filter changed) so the next render
-    /// autoscrolls to the tail; cleared once applied.
-    want_scroll: bool,
+    /// Set when a *new frame arrived*: the next render follows the tail only if
+    /// the reader is still standing at it. Cleared once considered.
+    follow_tail: bool,
+    /// Set when the reader themselves asked to be at the tail (the window just
+    /// opened, or the filter changed under them): the next render scrolls
+    /// regardless of where the viewport sits. Cleared once applied.
+    force_scroll: bool,
     _observe: Subscription,
     /// Held so the release hook stays registered for the view's whole life
     /// (dropping a [`Subscription`] unregisters it).
@@ -258,8 +262,10 @@ pub(crate) struct EventLogView {
 
 impl EventLogView {
     fn new(log: Entity<EventLog>, shutdown: Arc<Shutdown>, cx: &mut Context<Self>) -> Self {
+        // An arriving frame requests the tail, it does not command it: a reader
+        // who has scrolled up stays where they are (see `should_scroll_to_tail`).
         let observe = cx.observe(&log, |this, _, cx| {
-            this.want_scroll = true;
+            this.follow_tail = true;
             cx.notify();
         });
         // Closing the window releases this view; that is the one point where we
@@ -269,7 +275,8 @@ impl EventLogView {
             log,
             filter: None,
             scroll: UniformListScrollHandle::new(),
-            want_scroll: true,
+            follow_tail: false,
+            force_scroll: true,
             _observe: observe,
             _release: release,
         }
@@ -300,15 +307,28 @@ impl Render for EventLogView {
 
         let count = visible.len();
 
-        // Autoscroll to the newest visible row when the model or filter changed.
+        // Autoscroll to the newest visible row — but only when the reader is
+        // still standing at the tail, or asked for it outright. The viewport
+        // geometry read here is the one measured at the *previous* layout, i.e.
+        // before the arriving row extended the content, which is exactly the
+        // question being asked: was the reader at the tail of what they last saw?
+        //
         // The request is deferred to the list's next layout, which is why it can
         // be issued before the element exists.
-        if self.want_scroll {
-            if let Some(last) = count.checked_sub(1) {
-                self.scroll.scroll_to_item(last, ScrollStrategy::Bottom);
-            }
-            self.want_scroll = false;
+        let pinned = {
+            let state = self.scroll.0.borrow();
+            at_tail(
+                f32::from(state.base_handle.offset().y),
+                f32::from(state.base_handle.max_offset().height),
+            )
+        };
+        if should_scroll_to_tail(self.force_scroll, self.follow_tail, pinned)
+            && let Some(last) = count.checked_sub(1)
+        {
+            self.scroll.scroll_to_item(last, ScrollStrategy::Bottom);
         }
+        self.force_scroll = false;
+        self.follow_tail = false;
 
         // Only the rows in `range` are ever built; `visible` maps a list index to
         // the model index behind it.
@@ -375,7 +395,9 @@ fn selector_row(
 }
 
 /// One selector chip: filled with the accent when selected, a muted hover target
-/// otherwise. Clicking it sets the filter and requests an autoscroll.
+/// otherwise. Clicking it sets the filter and jumps to the tail unconditionally:
+/// the reader changed what they are looking at, so the old viewport position is
+/// meaningless.
 fn chip(
     id: &'static str,
     label: &'static str,
@@ -401,7 +423,7 @@ fn chip(
     el.child(label)
         .on_click(cx.listener(move |this, _, _window, cx| {
             this.filter = kind;
-            this.want_scroll = true;
+            this.force_scroll = true;
             cx.notify();
         }))
 }
@@ -701,9 +723,86 @@ fn bridge_send(tx: &mpsc::SyncSender<BridgeMsg>, msg: BridgeMsg, dropped: &mut u
     }
 }
 
+/// Whether the viewport is standing at the tail of the content, given the
+/// vertical scroll offset (gpui reports it as `<= 0`, growing negative as the
+/// reader moves down) and the maximum scrollable height from the last layout.
+///
+/// A list shorter than its viewport has nothing to scroll (`max == 0`) and
+/// counts as at the tail. The slack absorbs sub-pixel layout rounding, which
+/// would otherwise leave a follower permanently one hair short of the bottom
+/// and silently stop following.
+pub(crate) fn at_tail(offset_y: f32, max_offset_height: f32) -> bool {
+    let scrolled = -offset_y;
+    max_offset_height - scrolled <= TAIL_SLACK_PX
+}
+
+/// How far from the bottom still counts as "at the tail", in logical pixels.
+/// Well under one row, so a reader who has genuinely scrolled up is never
+/// mistaken for a follower.
+const TAIL_SLACK_PX: f32 = 2.0;
+
+/// The autoscroll decision, isolated from gpui so it can be tested directly.
+///
+/// `forced` is the reader's own request (window opened, filter changed) and wins
+/// outright. `following` is an arriving frame, and it moves the viewport only
+/// while the reader is `pinned` to the tail — the whole point of the lock: once
+/// they scroll up, incoming frames stop yanking them back down, and returning to
+/// the bottom resumes the follow.
+pub(crate) fn should_scroll_to_tail(forced: bool, following: bool, pinned: bool) -> bool {
+    forced || (following && pinned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this replaces: every arriving frame scrolled the list, so a reader
+    /// looking at history was yanked to the bottom roughly every three seconds.
+    /// A frame must NOT move a reader who has scrolled away from the tail.
+    #[test]
+    fn an_arriving_frame_does_not_move_a_reader_who_left_the_tail() {
+        assert!(
+            !should_scroll_to_tail(false, true, false),
+            "a new frame must not yank a reader who scrolled up"
+        );
+    }
+
+    /// ...and the follow resumes the moment they come back to the tail.
+    #[test]
+    fn an_arriving_frame_follows_a_reader_standing_at_the_tail() {
+        assert!(should_scroll_to_tail(false, true, true));
+    }
+
+    /// A reader's own request (window opened, filter changed) always wins — it is
+    /// not a frame arriving behind their back.
+    #[test]
+    fn an_explicit_request_scrolls_from_anywhere() {
+        assert!(should_scroll_to_tail(true, false, false));
+        assert!(should_scroll_to_tail(true, true, false));
+    }
+
+    /// Nothing happened: no scroll, wherever the viewport is.
+    #[test]
+    fn an_idle_render_never_scrolls() {
+        assert!(!should_scroll_to_tail(false, false, true));
+        assert!(!should_scroll_to_tail(false, false, false));
+    }
+
+    /// gpui reports the offset as `<= 0`, growing negative downward. Standing at
+    /// the bottom means the whole scrollable height has been consumed; anything
+    /// meaningfully short of that is a reader in the history.
+    #[test]
+    fn at_tail_reads_gpui_offsets() {
+        // Nothing to scroll: trivially at the tail.
+        assert!(at_tail(0.0, 0.0));
+        // Fully scrolled down.
+        assert!(at_tail(-500.0, 500.0));
+        // Sub-pixel rounding still counts as the tail.
+        assert!(at_tail(-499.5, 500.0));
+        // Scrolled up by a row and more: not the tail.
+        assert!(!at_tail(-480.0, 500.0));
+        assert!(!at_tail(0.0, 500.0));
+    }
     use net_observer_ipc::{Gap, IncidentSummary, Ready, StreamError, StreamErrorCode};
     use types::{
         DnsSample, DnsVerdict, GwVerdict, HostSample, LinkSample, ObservingEdge, TcpVerdict,
