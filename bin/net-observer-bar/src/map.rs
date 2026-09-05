@@ -42,7 +42,7 @@ use types::{
     TopologyLink,
 };
 
-use crate::ui::{Glance, Theme};
+use crate::ui::{Glance, Theme, separator};
 
 /// Initial size of the network-map window (resizable afterwards), gpui logical px.
 const WIN_W: f32 = 360.0;
@@ -1216,14 +1216,27 @@ fn empty_state(
     .into_any_element()
 }
 
-/// A hairline separator — a 1px full-width rule, matching the event window.
-fn separator(theme: Theme) -> impl IntoElement {
+/// The line that says the picture below is not current.
+///
+/// Worded and coloured like the air map's own `offline: <reason>` line rather
+/// than as a third dialect — the panel says the same thing as a warn glyph with a
+/// tooltip, which a window carrying its own header row has no place for. It
+/// names the transport reason the daemon gave *and* what the reader is
+/// therefore looking at: the last topology, not the current one.
+fn offline_note(reason: &str, theme: Theme) -> impl IntoElement {
     div()
-        // Test handle only — see `crate::ui::separator`.
-        .debug_selector(|| "separator".into())
-        .h(px(1.0))
-        .w_full()
-        .bg(rgb(theme.separator))
+        // Test handle only: a stale map with no marker is exactly the defect
+        // this line exists to prevent, so a headless test must be able to find
+        // it.
+        .debug_selector(|| "map-offline".into())
+        .px_3()
+        .py_1()
+        .flex_none()
+        .text_size(px(11.0))
+        .text_color(rgb(theme.warn))
+        .child(format!(
+            "offline: {reason} \u{00b7} showing the last topology received, not the current one"
+        ))
 }
 
 /// The root view of the **network-map window**. Holds a handle to the shared
@@ -1277,6 +1290,15 @@ impl Render for MapView {
         let glance = self.model.read(cx);
         let snapshot = glance.snapshot.clone();
         let control_msg = glance.control_msg.clone();
+        // The map draws whatever snapshot it last got. When nothing is answering
+        // any more, that picture is a memory, and a memory presented as a live
+        // reading is the silent wrong datum this project refuses to produce.
+        let offline = (!glance.online()).then(|| {
+            glance
+                .error
+                .as_ref()
+                .map_or_else(|| "no answer".to_string(), |e| e.message().to_string())
+        });
         let mode = self.mode;
 
         // The star is fitted to the space this window actually has right now.
@@ -1300,6 +1322,7 @@ impl Render for MapView {
             .font_family(".SystemUIFont")
             .text_size(px(13.0))
             .child(map_toolbar(mode, control_msg, theme, cx))
+            .children(offline.map(|reason| offline_note(&reason, theme)))
             .child(separator(theme))
             .child(body)
     }
@@ -2240,24 +2263,15 @@ mod headless_tests {
         }
     }
 
-    /// **KNOWN DEFECT, pinned rather than fixed.**
+    /// When the daemon is unreachable the map still holds the last topology it
+    /// received — and it must say so. A star from an hour ago presented exactly
+    /// as a star from this second is unbracketed silence: the operator cannot
+    /// tell a live map from a dead one, and "the network looked fine" is
+    /// precisely the claim a forensics tool must not make on stale data.
     ///
-    /// When the daemon is unreachable the map draws the last topology it holds
-    /// with nothing to say that it is stale. `MapView::render` reads only
-    /// `snapshot` and `control_msg` from the shared [`Glance`]; it never reads
-    /// `error` or [`Glance::online`], so a star from an hour ago is presented
-    /// exactly as a star from this second. That is the reading this project
-    /// calls unbracketed silence: the operator cannot tell a live map from a
-    /// dead one, and "the network looked fine" is precisely the claim a
-    /// forensics tool must not make on stale data.
-    ///
-    /// The panel already states this (`offline-warn`); this window does not.
-    /// The fix belongs with whoever owns the map's chrome, so this test stands
-    /// as the record of the gap rather than being quietly deleted.
+    /// [`MapView::render`] therefore reads [`Glance::online`] and draws
+    /// [`offline_note`] — the same `offline: <reason>` line the air map uses.
     #[gpui::test]
-    #[ignore = "known defect: the map draws stale topology with no offline marker \
-                (MapView::render never reads Glance::error / online) — this test \
-                is the record of the gap, not a fix"]
     fn the_map_marks_its_topology_as_stale_when_the_daemon_is_unreachable(cx: &mut TestAppContext) {
         let snapshot = StatusSnapshot {
             neighbors: Some(NeighborsSample {
@@ -2295,9 +2309,10 @@ mod headless_tests {
         );
     }
 
-    /// The same squeeze the panel's separator is held to, over the map's own
-    /// retyped copy. See `crate::ui::headless_tests::SqueezedColumn` for why the
-    /// pressure is supplied by the harness rather than by the real window.
+    /// The same squeeze the panel's separator is held to, over the separator
+    /// this window actually draws. See `crate::ui::headless_tests::SqueezedColumn`
+    /// for why the pressure is supplied by the harness rather than by the real
+    /// window.
     struct SqueezedColumn(Theme);
 
     impl Render for SqueezedColumn {
@@ -2311,25 +2326,16 @@ mod headless_tests {
         }
     }
 
-    /// **KNOWN DEFECT, pinned rather than fixed.**
+    /// The map window draws [`crate::ui::separator`] itself — the retyped copies
+    /// here and in `events.rs` and `air.rs` are gone. They had each dropped the
+    /// original's `.flex_none()`, and with it the reason it is there: "a
+    /// hairline that is allowed to shrink is a hairline that disappears in a
+    /// tight column". Under the squeeze such a copy collapses to 0px and two
+    /// sections silently read as one.
     ///
-    /// The map window's [`separator`] is a retyped copy of
-    /// [`crate::ui::separator`] that dropped its `.flex_none()` — and with it the
-    /// comment saying why the original has one: "a hairline that is allowed to
-    /// shrink is a hairline that disappears in a tight column". The same loss is
-    /// in `events.rs` and `air.rs`; the panel's original is the only copy that
-    /// still holds it, and
-    /// `the_panel_separator_keeps_its_hairline_under_shrink_pressure` guards it.
-    ///
-    /// Under the squeeze this copy collapses to 0px, which is what the panel's
-    /// `flex_none` exists to prevent. The map's live layout does not currently
-    /// apply that pressure, so nothing is broken on screen today — the copy is
-    /// simply carrying no guarantee, and the day a section above it grows, it
-    /// vanishes with no error.
+    /// This check stands beside the panel's own so the guarantee is held at the
+    /// window that consumes it, not only at the one that declares it.
     #[gpui::test]
-    #[ignore = "known defect: map.rs (and events.rs, air.rs) retyped ui::separator \
-                without its .flex_none(), so the hairline collapses to 0px under \
-                shrink pressure — this test is the record of the gap, not a fix"]
     fn the_map_separator_keeps_its_hairline_under_shrink_pressure(cx: &mut TestAppContext) {
         let theme = Theme::for_appearance(gpui::WindowAppearance::Light);
         let window = cx.add_window(|_, _| SqueezedColumn(theme));
@@ -2342,7 +2348,7 @@ mod headless_tests {
             .expect("the separator was not laid out at all");
         assert!(
             rule.size.height >= px(1.0),
-            "the map's separator was squeezed below its hairline ({:?} < 1px)",
+            "the map window's separator was squeezed below its hairline ({:?} < 1px)",
             rule.size.height
         );
     }

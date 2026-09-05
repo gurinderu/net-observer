@@ -71,7 +71,7 @@ use gpui::{
 
 use net_observer_ipc::{Event, EventKind, StreamFrame, SubscriptionHandle};
 
-use crate::ui::{Glance, Theme};
+use crate::ui::{Glance, Theme, separator};
 
 /// Maximum number of events retained in the live list (oldest dropped past this).
 const EVENT_CAP: usize = 1000;
@@ -461,11 +461,6 @@ fn offline_row(reason: SharedString, theme: Theme) -> impl IntoElement {
                 .text_color(rgb(theme.warn))
                 .child(reason),
         )
-}
-
-/// A hairline separator — a 1px full-width rule.
-fn separator(theme: Theme) -> impl IntoElement {
-    div().h(px(1.0)).w_full().bg(rgb(theme.separator))
 }
 
 /// Format one [`StreamFrame`] as its one-line log body: `"<label>  <detail>"`.
