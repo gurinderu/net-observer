@@ -42,7 +42,7 @@ use types::{
     TopologyLink,
 };
 
-use crate::ui::{Glance, Theme, separator};
+use crate::ui::{Dating, Glance, PROVENANCE_TEXT, Theme, dated, moments_diverge, separator};
 
 /// Initial size of the network-map window (resizable afterwards), gpui logical px.
 const WIN_W: f32 = 360.0;
@@ -577,13 +577,17 @@ fn uplink_seen_line(node: &UplinkNode, now_us: i64) -> String {
     } else {
         format!("heard on {}", node.iface)
     };
+    // Both times here answer *how stale is this*, not *which moment was this* —
+    // so both take the relative form of the one dating rule (`ui::parts`).
     let known_since = match node.first_seen_us {
-        Some(us) if us > 0 => format!("first seen {}", crate::ui::age_str(us, now_us)),
+        Some(us) if us > 0 => {
+            format!("first seen {}", dated(Dating::Freshness, us, now_us))
+        }
         _ => String::new(),
     };
     join_parts(&[
         &where_,
-        &crate::ui::age_str(node.ts_us, now_us),
+        &dated(Dating::Freshness, node.ts_us, now_us),
         &known_since,
     ])
 }
@@ -726,7 +730,11 @@ fn uplink_card(node: &UplinkNode, now_us: i64, theme: Theme) -> impl IntoElement
     body = body.child(
         div()
             .overflow_hidden()
-            .text_size(px(9.0))
+            // 9px was off the documented scale entirely, and made the same kind
+            // of fact — when this was true — read smaller here than in the air
+            // map or the log. One provenance size everywhere (`ui::parts`).
+            .debug_selector(|| "map-uplink-seen".into())
+            .text_size(px(PROVENANCE_TEXT))
             .text_color(rgb(theme.muted))
             .child(uplink_seen_line(node, now_us)),
     );
@@ -900,6 +908,17 @@ pub(crate) fn network_map_section(
         section = section.child(uplink_strip(&uplink_nodes_v, uplink_dropped, theme));
     }
     section = section.child(caption(sample, ring.len(), gateway.is_some(), theme));
+    // Named, not implied: a picture assembled from readings that are not one
+    // moment must say so, in the same voice the air map uses.
+    if let Some(skew) = map_skew_line(sample, &uplink_nodes_v) {
+        section = section.child(
+            div()
+                .debug_selector(|| "map-skew".into())
+                .text_size(px(PROVENANCE_TEXT))
+                .text_color(rgb(theme.warn))
+                .child(skew),
+        );
+    }
     section = section.child(area);
     if dropped > 0 {
         section = section.child(
@@ -941,6 +960,44 @@ fn role_legend(theme: Theme) -> impl IntoElement {
 
 /// The one-line caption above the star: the interface and how many devices the
 /// segment showed. States plainly when the gateway itself was not among them.
+/// When the star was read, worded by the shared rule.
+///
+/// The star is a picture being **presented**, so its moment is absolute — the
+/// same dating the air map gives a scan, and the number the operator can quote.
+/// The sighting ages in the uplink cards stay relative, because there the
+/// question is freshness, not which moment this was. (See the vocabulary rule
+/// in `ui::parts`.)
+///
+/// A sample with no usable stamp says so rather than borrowing "now".
+fn read_at_line(sample: &NeighborsSample, now_us: i64) -> String {
+    if sample.ts_us > 0 {
+        format!("read at {}", dated(Dating::Presented, sample.ts_us, now_us))
+    } else {
+        "read at an unreported moment".to_string()
+    }
+}
+
+/// The divergence line: this picture is glued from the neighbour reading and
+/// from LLDP/CDP sightings that arrive on their own cadence, so it is subject to
+/// exactly the fault the air map already names — two readings shown as one
+/// moment. `None` while every uplink sighting is within the same-moment window
+/// of the star, or when there is nothing to compare.
+///
+/// The widest divergence is the one reported: a picture is only as coherent as
+/// its furthest-apart part.
+fn map_skew_line(sample: &NeighborsSample, uplink_nodes: &[UplinkNode]) -> Option<String> {
+    let gap_us = uplink_nodes
+        .iter()
+        .filter(|n| n.ts_us > 0 && sample.ts_us > 0)
+        .filter(|n| moments_diverge(sample.ts_us, n.ts_us).is_some())
+        .map(|n| (sample.ts_us - n.ts_us).abs())
+        .max()?;
+    Some(format!(
+        "the uplinks above were heard {} from this reading, so this picture is glued from moments that are not one moment",
+        crate::ui::gap_label(gap_us)
+    ))
+}
+
 fn caption(
     sample: &NeighborsSample,
     shown: usize,
@@ -953,6 +1010,7 @@ fn caption(
     } else {
         " \u{00b7} gateway not seen"
     };
+    let read_at = read_at_line(sample, crate::ui::now_us());
     div()
         .flex()
         .items_center()
@@ -960,13 +1018,14 @@ fn caption(
         .pb_1()
         .child(
             div()
-                .text_size(px(11.0))
+                .debug_selector(|| "map-provenance".into())
+                .text_size(px(PROVENANCE_TEXT))
                 .text_color(rgb(theme.muted))
-                .child(format!("{iface}{gw}")),
+                .child(format!("{iface}{gw} \u{00b7} {read_at}")),
         )
         .child(
             div()
-                .text_size(px(11.0))
+                .text_size(px(PROVENANCE_TEXT))
                 .text_color(rgb(theme.muted))
                 .child(format!(
                     "{shown} neighbour{}",
@@ -1986,6 +2045,77 @@ mod tests {
         assert!((p[0].0 - 100.0).abs() < 0.001, "x centred");
         assert!((p[0].1 - 50.0).abs() < 0.001, "y above centre");
     }
+
+    /// The star is a picture being presented, so its moment is absolute — the
+    /// air map's dating, in the same words, in this window too.
+    #[test]
+    fn the_star_dates_its_reading_absolutely() {
+        let mut s = sample(None, vec![]);
+        s.ts_us = 1_700_000_000_000_000;
+        let line = read_at_line(&s, s.ts_us);
+        assert_eq!(line, format!("read at {}", crate::ui::clock(s.ts_us)));
+        // Never a relative age: "2m ago" is not a number anyone can quote.
+        assert!(!line.contains("ago"), "got {line}");
+
+        // No usable stamp says so rather than borrowing the present.
+        s.ts_us = 0;
+        assert_eq!(
+            read_at_line(&s, 1_700_000_000_000_000),
+            "read at an unreported moment"
+        );
+    }
+
+    /// This window's picture is glued from the neighbour reading and from
+    /// LLDP/CDP sightings on their own cadence. When those are no longer one
+    /// moment, the map must say so — the fault the air map already names.
+    #[test]
+    fn the_map_names_a_divergence_between_its_readings() {
+        let mut s = sample(None, vec![]);
+        s.ts_us = 1_700_000_000_000_000;
+
+        let mut near = topology_link("sw-1", "Gi0/1", None, LearnedVia::Lldp);
+        near.ts_us = s.ts_us - 30_000_000;
+        let (near_nodes, _) = uplinks(&StatusSnapshot {
+            topology: vec![near],
+            ..Default::default()
+        });
+        assert_eq!(
+            map_skew_line(&s, &near_nodes),
+            None,
+            "readings within one moment are paired silently"
+        );
+
+        let mut far = topology_link("sw-1", "Gi0/1", None, LearnedVia::Lldp);
+        far.ts_us = s.ts_us - 4 * 3600 * 1_000_000;
+        let (far_nodes, _) = uplinks(&StatusSnapshot {
+            topology: vec![far],
+            ..Default::default()
+        });
+        let said = map_skew_line(&s, &far_nodes).expect("a four-hour gap must be named");
+        assert!(
+            said.contains("4h"),
+            "the gap itself must be in words: {said}"
+        );
+        assert!(
+            said.contains("not one moment"),
+            "the divergence must be named, not merely timed: {said}"
+        );
+
+        // The widest divergence wins: a coherent-looking part must not hide an
+        // incoherent one.
+        let (mixed_nodes, _) = uplinks(&StatusSnapshot {
+            topology: {
+                let mut a = topology_link("sw-1", "Gi0/1", None, LearnedVia::Lldp);
+                a.ts_us = s.ts_us - 30_000_000;
+                let mut b = topology_link("sw-2", "Gi0/2", None, LearnedVia::Lldp);
+                b.ts_us = s.ts_us - 4 * 3600 * 1_000_000;
+                vec![a, b]
+            },
+            ..Default::default()
+        });
+        let said = map_skew_line(&s, &mixed_nodes).expect("the far uplink must still be named");
+        assert!(said.contains("4h"), "got {said}");
+    }
 }
 
 /// Headless UI tests for the network map, on gpui's own test platform: layout
@@ -2448,5 +2578,45 @@ mod headless_tests {
         let (bare_nodes, _) = uplinks(&bare);
         assert_eq!(bare_nodes[0].first_seen_us, None);
         assert!(!uplink_seen_line(&bare_nodes[0], 4_000_000).contains("first seen"));
+    }
+
+    /// The divergence line is really drawn when the picture is glued from
+    /// readings that are not one moment — asserted on the laid-out window, not
+    /// on the string alone.
+    #[gpui::test]
+    fn a_divergent_map_draws_its_skew_line(cx: &mut TestAppContext) {
+        let now = 1_700_000_000_000_000i64;
+        let neighbors = vec![obs("gw", 1), obs("alpha", 20)];
+        let gateway_mac = neighbors[0].mac.clone();
+        let mut far = topology_link("sw-1", "Gi0/1", Some("core-sw"), LearnedVia::Lldp);
+        far.ts_us = now - 4 * 3600 * 1_000_000;
+        let snapshot = StatusSnapshot {
+            neighbors: Some(NeighborsSample {
+                ts_us: now,
+                verdict: types::NeighborsVerdict::Ok,
+                reason: None,
+                network_key: Some(gateway_mac),
+                iface: Some("en0".to_string()),
+                neighbors,
+            }),
+            topology: vec![far],
+            ..Default::default()
+        };
+        let model = cx.update(|cx| {
+            cx.new(|_| Glance::new(snapshot, None, "/tmp/net-observer-test.sock".to_string()))
+        });
+        let window = cx.add_window(|_, cx| MapView::new(model, cx));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(size(px(460.0), px(620.0)));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("map-provenance").is_some(),
+            "the map must date its reading at all"
+        );
+        assert!(
+            cx.debug_bounds("map-skew").is_some(),
+            "a picture glued from readings four hours apart must draw the divergence line"
+        );
     }
 }

@@ -47,7 +47,9 @@ pub use control::{
 pub use model::Glance;
 pub use panel::PanelView;
 pub use parts::now_us;
-pub(crate) use parts::{age_str, separator};
+pub(crate) use parts::{
+    Dating, PROVENANCE_TEXT, age_str, clock, dated, gap_label, moments_diverge, separator,
+};
 pub(crate) use theme::{
     MENU_HEADING_H, MENU_HEADING_TEXT, MENU_ROW_H, MENU_ROW_PX, MENU_ROW_RADIUS, MENU_ROW_TEXT,
     MENU_SEPARATOR_H, Theme,

@@ -71,7 +71,7 @@ use gpui::{
 
 use net_observer_ipc::{Event, EventKind, StreamFrame, SubscriptionHandle};
 
-use crate::ui::{Glance, Theme, separator};
+use crate::ui::{Glance, PROVENANCE_TEXT, Theme, clock, separator};
 
 /// Maximum number of events retained in the live list (oldest dropped past this).
 const EVENT_CAP: usize = 1000;
@@ -428,7 +428,9 @@ fn event_row(row: &Row, theme: Theme) -> impl IntoElement + use<> {
             div()
                 .w(px(66.0))
                 .text_color(rgb(theme.muted))
-                .text_size(px(11.0))
+                // An event is a presented moment, dated at the shared
+                // provenance size — see the vocabulary rule in `ui::parts`.
+                .text_size(px(PROVENANCE_TEXT))
                 .child(row.clock.clone()),
         )
         .child(
@@ -469,18 +471,6 @@ fn offline_row(reason: SharedString, theme: Theme) -> impl IntoElement {
 /// unit-tested directly; the row renders the timestamp separately (see [`clock`]).
 pub(crate) fn format_frame(f: &StreamFrame) -> String {
     format!("{}  {}", f.label(), f.detail())
-}
-
-/// Format an epoch-microsecond timestamp as a local `HH:MM:SS` wall clock. Falls
-/// back to `--:--:--` on an out-of-range timestamp (never panics).
-fn clock(ts_us: i64) -> String {
-    match jiff::Timestamp::from_microsecond(ts_us) {
-        Ok(ts) => {
-            let z = ts.to_zoned(jiff::tz::TimeZone::system());
-            format!("{:02}:{:02}:{:02}", z.hour(), z.minute(), z.second())
-        }
-        Err(_) => "--:--:--".to_string(),
-    }
 }
 
 /// Open the event-log window, or bring the already-open one to the front.
