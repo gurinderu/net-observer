@@ -111,7 +111,7 @@ use types::{
     OverlapConfidence, WifiSample, WifiVerdict, overlap_hypothesis,
 };
 
-use crate::ui::{Glance, Theme, separator};
+use crate::ui::{Glance, PROVENANCE_TEXT, Theme, clock, moments_diverge, separator};
 
 /// How often the foreground bridge task drains the channel into the model. The
 /// air scan is a slow period (seconds per scan), so this only has to feel prompt.
@@ -1508,36 +1508,6 @@ impl Render for AirView {
     }
 }
 
-/// How far our own channel reading may lag the scan before the pairing stops
-/// being about the same association: one minute of ordinary roaming.
-const OWN_CHANNEL_STALE_US: i64 = 60_000_000;
-
-/// Wall-clock time of a microsecond stamp, in the system zone.
-fn clock(ts_us: i64) -> String {
-    match jiff::Timestamp::from_microsecond(ts_us) {
-        Ok(ts) => {
-            let z = ts.to_zoned(jiff::tz::TimeZone::system());
-            format!("{:02}:{:02}:{:02}", z.hour(), z.minute(), z.second())
-        }
-        Err(_) => "--:--:--".to_string(),
-    }
-}
-
-/// A microsecond span as a short duration, for saying how far apart two
-/// readings are without making the reader do arithmetic.
-fn gap_label(us: i64) -> String {
-    let secs = us / 1_000_000;
-    if secs < 90 {
-        format!("{secs}s")
-    } else if secs < 5400 {
-        format!("{}m", secs / 60)
-    } else if secs < 172_800 {
-        format!("{}h", secs / 3600)
-    } else {
-        format!("{}d", secs / 86_400)
-    }
-}
-
 /// The two provenance lines under the header: when the slice was taken, and
 /// when the channel it is compared against was read.
 struct ProvenanceLines {
@@ -1566,14 +1536,17 @@ fn provenance_lines(
         (None, true) => "not scanned: this daemon cannot collect the air".to_string(),
         (None, false) => "not scanned yet".to_string(),
     };
+    // The divergence itself is the shared rule (`ui::moments_diverge`); only the
+    // sentence around it is this window's, because only this window knows that
+    // the consequence of a stale pairing here is "we may have roamed".
     let pairing = match (scanned_at, own_read_at) {
-        (Some(scan), Some(own_us)) if (scan - own_us).abs() > OWN_CHANNEL_STALE_US => {
-            Some(format!(
-                "our channel was read at {} — {} apart from the scan, so we may have roamed between them",
+        (Some(scan), Some(own_us)) => Some(match moments_diverge(scan, own_us) {
+            Some(gap) => format!(
+                "our channel was read at {} — {gap} apart from the scan, so we may have roamed between them",
                 clock(own_us),
-                gap_label((scan - own_us).abs())
-            ))
-        }
+            ),
+            None => format!("our channel read at {}", clock(own_us)),
+        }),
         (_, Some(own_us)) => Some(format!("our channel read at {}", clock(own_us))),
         (_, None) => None,
     };
@@ -1720,19 +1693,21 @@ fn header(
         )
         .child(
             div()
-                .text_size(px(11.0))
+                .text_size(px(PROVENANCE_TEXT))
                 .text_color(rgb(theme.muted))
                 .child(own_line),
         )
         .child(
             div()
-                .text_size(px(11.0))
+                .debug_selector(|| "air-provenance".into())
+                .text_size(px(PROVENANCE_TEXT))
                 .text_color(rgb(theme.muted))
                 .child(scanned_line),
         )
         .children(pairing_line.map(|line| {
             div()
-                .text_size(px(11.0))
+                .debug_selector(|| "air-skew".into())
+                .text_size(px(PROVENANCE_TEXT))
                 .text_color(rgb(theme.warn))
                 .child(line)
         }))
