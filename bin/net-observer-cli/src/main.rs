@@ -620,8 +620,9 @@ fn tail_frames(
     TailEnd::DaemonClosed
 }
 
-/// One printed line for a stream frame: `HH:MM:SS  label  detail`, with the clock
-/// in **UTC** (see [`clock`]; the gpui bar renders the same frames in local time).
+/// One printed line for a stream frame: `YYYY-MM-DD HH:MM:SS  label  detail`, with
+/// the clock in **UTC** (see [`clock`]; the gpui bar renders the same frames in
+/// local time).
 /// The label and detail come from `net-observer-ipc` so the CLI tail and the bar spell
 /// every frame identically. Pure over its input (the clock is derived
 /// arithmetically) so it is unit-tested directly.
@@ -629,7 +630,11 @@ fn format_frame_line(f: &StreamFrame) -> String {
     format!("{}  {}  {}", clock(f.ts_us()), f.label(), f.detail())
 }
 
-/// Format an epoch-microsecond timestamp as a `HH:MM:SS` wall clock in **UTC**.
+/// Format an epoch-microsecond timestamp as a `YYYY-MM-DD HH:MM:SS` wall clock in
+/// **UTC**.
+///
+/// The date is carried because a long-running tail is read the next morning, and
+/// a bare time of day cannot say whether a line is yesterday's or today's.
 ///
 /// The tail deliberately stays on pure integer math over `ts_us` — deterministic
 /// and never panicking (Euclidean division handles any `i64`, including
@@ -638,9 +643,28 @@ fn format_frame_line(f: &StreamFrame) -> String {
 /// commands (see [`diagnose`], which resolves `--at` via `jiff`).
 fn clock(ts_us: i64) -> String {
     let secs = ts_us.div_euclid(1_000_000);
+    let days = secs.div_euclid(86_400); // whole UTC days since the epoch
     let tod = secs.rem_euclid(86_400); // seconds within the UTC day
     let (h, m, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
-    format!("{h:02}:{m:02}:{s:02}")
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
+}
+
+/// Days since 1970-01-01 → `(year, month, day)` in the proleptic Gregorian
+/// calendar (Howard Hinnant's `civil_from_days`). Pure integer math, total over
+/// `i64` in the range a `ts_us` can reach, and never panics — the same
+/// properties [`clock`] relies on.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11], March-based
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Ask the daemon to restart the sing-box proxy over the socket
@@ -753,7 +777,10 @@ fn is_lock_error(msg: &str) -> bool {
 /// without a socket.
 fn format_status(snap: &StatusSnapshot) -> String {
     let mut out = String::new();
-    out.push_str(&format!("generated_us   {}\n", snap.generated_us));
+    out.push_str(&format!(
+        "generated_us   {}\n",
+        diagnose::stamp_us(snap.generated_us)
+    ));
 
     // While paused the daemon skips the probes entirely, so the samples below are
     // frozen at whatever they were when collection stopped — say so rather than
@@ -767,7 +794,9 @@ fn format_status(snap: &StatusSnapshot) -> String {
     match &snap.link {
         Some(l) => out.push_str(&format!(
             "link           gw={} direct={} ts_us={}\n",
-            l.gw, l.direct, l.ts_us
+            l.gw,
+            l.direct,
+            diagnose::stamp_us(l.ts_us)
         )),
         None => out.push_str("link           (no data)\n"),
     }
@@ -781,7 +810,7 @@ fn format_status(snap: &StatusSnapshot) -> String {
             let sel = p.selector.as_deref().unwrap_or("-");
             out.push_str(&format!(
                 "proxy          tun={tun} selector={sel} ts_us={}\n",
-                p.ts_us
+                diagnose::stamp_us(p.ts_us)
             ));
         }
         None => out.push_str("proxy          (no data)\n"),
@@ -790,7 +819,10 @@ fn format_status(snap: &StatusSnapshot) -> String {
     match &snap.dns {
         Some(d) => out.push_str(&format!(
             "dns            {} {}/{} ts_us={}\n",
-            d.verdict, d.probe, d.server, d.ts_us
+            d.verdict,
+            d.probe,
+            d.server,
+            diagnose::stamp_us(d.ts_us)
         )),
         None => out.push_str("dns            (no data)\n"),
     }
@@ -798,7 +830,10 @@ fn format_status(snap: &StatusSnapshot) -> String {
     match &snap.host {
         Some(h) => out.push_str(&format!(
             "host           load1={} load5={} load15={} ts_us={}\n",
-            h.load1, h.load5, h.load15, h.ts_us
+            h.load1,
+            h.load5,
+            h.load15,
+            diagnose::stamp_us(h.ts_us)
         )),
         None => out.push_str("host           (no data)\n"),
     }
@@ -818,18 +853,22 @@ fn format_status(snap: &StatusSnapshot) -> String {
 /// Render [`IncidentSummary`] rows as a fixed-width table. An open incident (no
 /// `closed_us`) shows `open`. Pure over its input so it is unit-tested directly.
 fn format_incidents(rows: &[IncidentSummary]) -> String {
+    // The instants are `<raw> (<local ISO>)`, so they no longer fit a right-aligned
+    // numeric column — they are left-aligned like the identifiers beside them.
     let mut out = format!(
-        "{:<20} {:<16} {:>18} {:>18}\n",
-        "ID", "TRIGGER", "OPENED_US", "CLOSED_US"
+        "{:<20} {:<16} {:<40} {}\n",
+        "ID", "TRIGGER", "OPENED", "CLOSED"
     );
     for i in rows {
         let closed = match i.closed_us {
-            Some(c) => c.to_string(),
+            Some(c) => diagnose::stamp_us(c),
             None => "open".to_string(),
         };
         out.push_str(&format!(
-            "{:<20} {:<16} {:>18} {closed:>18}\n",
-            i.id, i.trigger_id, i.opened_us
+            "{:<20} {:<16} {:<40} {closed}\n",
+            i.id,
+            i.trigger_id,
+            diagnose::stamp_us(i.opened_us)
         ));
     }
     out
@@ -887,6 +926,26 @@ mod tests {
         assert!(out.contains("gw-drop") && out.contains("1000") && out.contains("2000"));
     }
 
+    /// Raw microseconds alone are unreadable: both instants must also carry the
+    /// local rendering `diagnose::stamp_us` produces, and the header must name
+    /// the columns for what they now hold.
+    #[test]
+    fn format_incidents_dates_both_instants() {
+        let out = format_incidents(&[incident("i1", "gw-drop", 1000, Some(2000))]);
+        assert!(out.contains(&diagnose::stamp_us(1000)), "opened: {out}");
+        assert!(out.contains(&diagnose::stamp_us(2000)), "closed: {out}");
+        assert!(out.contains("OPENED") && out.contains("CLOSED"));
+    }
+
+    /// An open incident still has no close instant — the word stays, and the
+    /// dating must not invent one.
+    #[test]
+    fn format_incidents_open_row_is_dated_but_not_closed() {
+        let out = format_incidents(&[incident("i2", "wedge", 5000, None)]);
+        assert!(out.contains(&diagnose::stamp_us(5000)), "opened: {out}");
+        assert!(out.contains("open"));
+    }
+
     #[test]
     fn format_incidents_marks_open_incidents() {
         let out = format_incidents(&[incident("i2", "wedge", 5000, None)]);
@@ -938,10 +997,16 @@ mod tests {
     #[test]
     fn format_status_renders_snapshot() {
         let out = format_status(&snapshot(true));
-        assert!(out.contains("generated_us   100"));
+        assert!(out.contains(&format!("generated_us   {}", diagnose::stamp_us(100))));
         assert!(out.contains("observing      on"));
-        assert!(out.contains("link           gw=OK direct=OK ts_us=42"));
-        assert!(out.contains("proxy          tun=204 selector=auto ts_us=43"));
+        assert!(out.contains(&format!(
+            "link           gw=OK direct=OK ts_us={}",
+            diagnose::stamp_us(42)
+        )));
+        assert!(out.contains(&format!(
+            "proxy          tun=204 selector=auto ts_us={}",
+            diagnose::stamp_us(43)
+        )));
         assert!(out.contains("dns            (no data)"));
         assert!(out.contains("host           (no data)"));
         // Two incidents, one still open.
@@ -956,7 +1021,10 @@ mod tests {
         assert!(out.contains("observing      off (paused - samples below are stale)"));
         assert!(!out.contains("observing      on"));
         // The rest of the snapshot still renders.
-        assert!(out.contains("link           gw=OK direct=OK ts_us=42"));
+        assert!(out.contains(&format!(
+            "link           gw=OK direct=OK ts_us={}",
+            diagnose::stamp_us(42)
+        )));
     }
 
     #[test]
@@ -1036,11 +1104,27 @@ mod tests {
 
     #[test]
     fn clock_formats_utc_hh_mm_ss() {
-        // Epoch 0 is 00:00:00 UTC; 1h1m1s later reads 01:01:01.
-        assert_eq!(clock(0), "00:00:00");
-        assert_eq!(clock(3_661_000_000), "01:01:01");
-        // A negative timestamp must not panic (Euclidean wrap into the day).
-        assert_eq!(clock(-1), "23:59:59");
+        // Epoch 0 is 1970-01-01 00:00:00 UTC; 1h1m1s later reads 01:01:01.
+        assert_eq!(clock(0), "1970-01-01 00:00:00");
+        assert_eq!(clock(3_661_000_000), "1970-01-01 01:01:01");
+        // A negative timestamp must not panic (Euclidean wrap into the day) and
+        // must roll the *date* back with the time.
+        assert_eq!(clock(-1), "1969-12-31 23:59:59");
+    }
+
+    /// The morning-after question the date exists to answer: two lines a day
+    /// apart at the same time of day must be distinguishable. Leap-day and
+    /// century boundaries are checked too, because the calendar is hand-rolled.
+    #[test]
+    fn clock_carries_the_date() {
+        let noon = 12 * 3_600 * 1_000_000i64;
+        let day = 86_400 * 1_000_000i64;
+        assert_eq!(clock(noon), "1970-01-01 12:00:00");
+        assert_eq!(clock(noon + day), "1970-01-02 12:00:00");
+        assert_ne!(clock(noon), clock(noon + day));
+        // 2024-02-29T00:00:00Z and 2000-03-01T00:00:00Z (a leap century).
+        assert_eq!(clock(1_709_164_800_000_000), "2024-02-29 00:00:00");
+        assert_eq!(clock(951_868_800_000_000), "2000-03-01 00:00:00");
     }
 
     #[test]
@@ -1059,7 +1143,7 @@ mod tests {
         }));
         assert_eq!(
             format_frame_line(&link),
-            "01:01:01  link  gw=OK direct=FAIL"
+            "1970-01-01 01:01:01  link  gw=OK direct=FAIL"
         );
     }
 
@@ -1074,7 +1158,7 @@ mod tests {
         }));
         assert_eq!(
             format_frame_line(&inc),
-            "00:00:00  incident  wedge tun dead"
+            "1970-01-01 00:00:00  incident  wedge tun dead"
         );
     }
 
@@ -1088,7 +1172,7 @@ mod tests {
         });
         assert_eq!(
             format_frame_line(&gap),
-            "00:00:00  gap  12 events dropped (subscriber lagged)"
+            "1970-01-01 00:00:00  gap  12 events dropped (subscriber lagged)"
         );
     }
 
@@ -1103,7 +1187,7 @@ mod tests {
         });
         assert_eq!(
             format_frame_line(&ready),
-            "00:00:00  subscribed  collection off; kinds: all"
+            "1970-01-01 00:00:00  subscribed  collection off; kinds: all"
         );
     }
 
@@ -1117,7 +1201,7 @@ mod tests {
         });
         assert_eq!(
             format_frame_line(&edge),
-            "00:00:00  observing  collection off"
+            "1970-01-01 00:00:00  observing  collection off"
         );
     }
 
@@ -1178,7 +1262,7 @@ mod tests {
         let end = tail_frames(frames.into_iter(), &mut out);
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "00:00:00  error  too-many-subscribers: subscriber limit reached \
+            "1970-01-01 00:00:00  error  too-many-subscribers: subscriber limit reached \
              (256 concurrent)\n"
         );
         assert_eq!(

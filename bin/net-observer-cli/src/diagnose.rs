@@ -119,10 +119,18 @@ pub(crate) fn fmt_instant(ts_us: i64) -> String {
     }
 }
 
+/// A microsecond instant as `<raw> (<local ISO>)` — the raw number stays
+/// (it is what you paste back into `--at` or a SQL predicate) and the local
+/// rendering is what a human reads. `pub(crate)` because the live `status` and
+/// `incidents` subcommands print their instants in exactly this shape.
+pub(crate) fn stamp_us(ts_us: i64) -> String {
+    format!("{ts_us} ({})", fmt_instant(ts_us))
+}
+
 /// A `ts_us` cell as `<raw> (<local ISO>)`, or [`ABSENT`] when it is `NULL`.
 fn stamp(cell: &str) -> String {
     match cell.parse::<i64>() {
-        Ok(ts) => format!("{ts} ({})", fmt_instant(ts)),
+        Ok(ts) => stamp_us(ts),
         Err(_) => ABSENT.to_string(),
     }
 }
@@ -215,11 +223,7 @@ pub(crate) fn format_verdict_at(table: &QueryTable, asked_ts_us: i64) -> Result<
     let (go, gc) = (c.idx("gap_opened_us")?, c.idx("gap_closed_us")?);
 
     let mut out = String::new();
-    kv(
-        &mut out,
-        "asked_at",
-        &format!("{asked_ts_us} ({})", fmt_instant(asked_ts_us)),
-    );
+    kv(&mut out, "asked_at", &stamp_us(asked_ts_us));
 
     let Some(row) = table.rows.first() else {
         kv(&mut out, "layer", "(no record)");
