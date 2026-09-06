@@ -3,7 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
-use gpui::{Rgba, SharedString, div, px, rgb};
+use gpui::{IntoElement, RenderOnce, Rgba, SharedString, div, px, rgb};
 
 use super::theme::{MENU_SEPARATOR_H, Theme};
 
@@ -27,6 +27,19 @@ pub(crate) fn separator(theme: Theme) -> impl IntoElement {
 /// One label→value list row: a muted label on the left, a colored value on the
 /// right (the Tailscale-style clean list, not a bordered card).
 ///
+/// This is the ONE key-value row of the bar. Windows do not re-derive it: a
+/// difference a window genuinely needs is a knob below, never a second layout.
+/// The knobs exist only where the difference is one of substance:
+///
+/// * [`Row::key_width`] — the label becomes a fixed column and the value takes
+///   the rest. That is what aligns a stack of timestamps on its digits; under
+///   `justify_between` each row's clock sits wherever its own value pushed it.
+/// * [`Row::text_size`] / [`Row::key_text_size`] — a row drawn at a documented
+///   smaller scale (e.g. [`PROVENANCE_TEXT`] for a label that is a dated
+///   moment). The size carries what kind of fact this is, not a taste.
+/// * [`Row::selector`] — a headless test handle; without one no claim about
+///   this row is observable at all.
+///
 /// Both sides take anything convertible into a [`SharedString`], so a `&'static
 /// str` label costs no allocation at all and an owned `String` local is *moved*
 /// in rather than copied — a render runs this once per row, every tick.
@@ -35,16 +48,114 @@ pub(crate) fn row<K: Into<SharedString>, V: Into<SharedString>>(
     value: V,
     value_color: Rgba,
     theme: Theme,
-) -> impl IntoElement {
-    let key: SharedString = key.into();
-    let value: SharedString = value.into();
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .py_1()
-        .child(div().text_color(rgb(theme.muted)).child(key))
-        .child(div().text_color(value_color).child(value))
+) -> Row {
+    Row {
+        key: key.into(),
+        value: value.into(),
+        value_color,
+        theme,
+        key_width: None,
+        text_size: None,
+        key_text_size: None,
+        selector: None,
+    }
+}
+
+/// What a row's label half is named, given the row's own selector.
+pub(crate) const ROW_KEY_SUFFIX: &str = ":key";
+/// What a row's value half is named, given the row's own selector.
+pub(crate) const ROW_VALUE_SUFFIX: &str = ":value";
+
+/// The canonical key-value row. Built by [`row`].
+#[derive(IntoElement)]
+pub(crate) struct Row {
+    key: SharedString,
+    value: SharedString,
+    value_color: Rgba,
+    theme: Theme,
+    key_width: Option<f32>,
+    text_size: Option<f32>,
+    key_text_size: Option<f32>,
+    selector: Option<SharedString>,
+}
+
+impl Row {
+    /// Give the label a fixed column of this width, so a stack of rows aligns
+    /// its values — and its labels' digits — on one edge instead of on whatever
+    /// each row's own text happened to measure. The column never shrinks: a
+    /// column that gives way under pressure is not an alignment.
+    pub(crate) fn key_width(mut self, width: f32) -> Self {
+        self.key_width = Some(width);
+        self
+    }
+
+    /// Draw the whole row at this type size rather than the window's base.
+    pub(crate) fn text_size(mut self, size: f32) -> Self {
+        self.text_size = Some(size);
+        self
+    }
+
+    /// Draw the label at its own type size — for a label whose size says what
+    /// kind of fact it is, such as a dated moment at [`PROVENANCE_TEXT`].
+    pub(crate) fn key_text_size(mut self, size: f32) -> Self {
+        self.key_text_size = Some(size);
+        self
+    }
+
+    /// A handle a headless test can read this row back by.
+    pub(crate) fn selector<S: Into<SharedString>>(mut self, name: S) -> Self {
+        self.selector = Some(name.into());
+        self
+    }
+}
+
+impl RenderOnce for Row {
+    fn render(self, _window: &mut gpui::Window, _cx: &mut gpui::App) -> impl IntoElement {
+        let columned = self.key_width.is_some();
+
+        let mut key = div().text_color(rgb(self.theme.muted));
+        // Each half gets its own handle: the claims worth closing about this row
+        // — where the label column ends, whether the value stayed inside the
+        // panel — are claims about one half, not about the pair.
+        if let Some(sel) = &self.selector {
+            let sel = format!("{sel}{ROW_KEY_SUFFIX}");
+            key = key.debug_selector(move || sel.clone());
+        }
+        if let Some(w) = self.key_width {
+            key = key.w(px(w)).flex_none();
+        }
+        if let Some(s) = self.key_text_size.or(self.text_size) {
+            key = key.text_size(px(s));
+        }
+        let key = key.child(self.key);
+
+        let mut value = div().text_color(self.value_color);
+        if let Some(sel) = &self.selector {
+            let sel = format!("{sel}{ROW_VALUE_SUFFIX}");
+            value = value.debug_selector(move || sel.clone());
+        }
+        // With a label column the value takes the remaining width; without one
+        // the two ends are pushed apart. Either way the value is what gives way
+        // when the row is too narrow — never the label column.
+        if columned {
+            value = value.flex_1().overflow_hidden();
+        }
+        let value = value.child(self.value);
+
+        let mut root = div().flex().items_center().py_1();
+        root = if columned {
+            root.gap_2()
+        } else {
+            root.justify_between()
+        };
+        if let Some(s) = self.text_size {
+            root = root.text_size(px(s));
+        }
+        if let Some(sel) = self.selector {
+            root = root.debug_selector(move || sel.to_string());
+        }
+        root.child(key).child(value)
+    }
 }
 
 /// Current wall-clock time in microseconds since the Unix epoch.
@@ -238,6 +349,120 @@ impl gpui::Render for HintTip {
             .py_1()
             .rounded_md()
             .child(self.0.clone())
+    }
+}
+
+/// Headless proof of what the shared key-value row promises, observed in a
+/// harness that creates the flex pressure a live column absorbs on its own.
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext, size};
+
+    /// The panel's own width — the pressure every row is drawn under.
+    const W: f32 = 320.0;
+    const KEY_W: f32 = 66.0;
+    const SEL: &str = "t-row";
+    /// Long enough that a value allowed to push would carry the row past `W`.
+    const LONG: &str =
+        "dns SERVFAIL from 192.168.1.1 after 5000 ms, resolver unreachable, retrying";
+
+    /// A value a two-ended row really carries: short enough that there IS slack
+    /// to push the two halves apart with. With `LONG` there is none, and the
+    /// question the two-ended layout answers does not arise.
+    const SHORT: &str = "12 ms";
+
+    /// Narrower than the label column itself, so the deficit is pushed onto the
+    /// column rather than onto the value beside it.
+    const TIGHT: f32 = 48.0;
+
+    struct RowHost {
+        columned: bool,
+        width: f32,
+    }
+
+    impl gpui::Render for RowHost {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let theme = Theme::dark();
+            let value = if self.columned { LONG } else { SHORT };
+            let r = row("20:21:34", value, rgb(theme.fg), theme).selector(SEL);
+            let r = if self.columned { r.key_width(KEY_W) } else { r };
+            // A narrow flex column: the row must absorb the deficit itself.
+            div().w(px(self.width)).flex().flex_col().child(r)
+        }
+    }
+
+    fn draw(cx: &mut TestAppContext, columned: bool, width: f32) -> VisualTestContext {
+        let window = cx.add_window(|_, _| RowHost { columned, width });
+        let cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(size(px(width.max(W)), px(200.0)));
+        cx.run_until_parked();
+        cx
+    }
+
+    fn key_sel() -> &'static str {
+        Box::leak(format!("{SEL}{ROW_KEY_SUFFIX}").into_boxed_str())
+    }
+
+    fn value_sel() -> &'static str {
+        Box::leak(format!("{SEL}{ROW_VALUE_SUFFIX}").into_boxed_str())
+    }
+
+    /// The parameter that earns its keep: the label column is EXACTLY the width
+    /// asked for — the whole basis on which a stack of clocks aligns on its
+    /// digits — and stays so with a far-too-long value beside it and a container
+    /// narrower than the column itself.
+    ///
+    /// What this closes is the requested width. `flex_none` on the label is belt
+    /// and braces: at these sizes the value gives way first, so removing it
+    /// changes nothing observable and no check here claims otherwise.
+    #[gpui::test]
+    fn a_key_column_keeps_its_exact_width_under_pressure(cx: &mut TestAppContext) {
+        let mut cx = draw(cx, true, TIGHT);
+        let key = cx.debug_bounds(key_sel()).expect("the label half is drawn");
+        assert_eq!(
+            key.size.width,
+            px(KEY_W),
+            "the label column gave way under pressure, so nothing aligns on it"
+        );
+    }
+
+    /// The value is what gives way, and it gives way *inside* the panel: a row
+    /// that runs past 320pt is a row whose value is unreadable.
+    #[gpui::test]
+    fn the_value_gives_way_and_stays_inside_the_panel(cx: &mut TestAppContext) {
+        let mut cx = draw(cx, true, W);
+        let value = cx
+            .debug_bounds(value_sel())
+            .expect("the value half is drawn");
+        assert!(
+            value.right() <= px(W),
+            "the value ran past the panel's edge: right={:?}",
+            value.right()
+        );
+    }
+
+    /// Without a column the row is the two-ended list row: the label sits at the
+    /// left edge and the value is pushed to the right one.
+    #[gpui::test]
+    fn without_a_column_the_two_halves_are_pushed_apart(cx: &mut TestAppContext) {
+        let mut cx = draw(cx, false, W);
+        let key = cx.debug_bounds(key_sel()).expect("the label half is drawn");
+        let value = cx
+            .debug_bounds(value_sel())
+            .expect("the value half is drawn");
+        assert!(
+            value.left() > key.right(),
+            "the value did not end up to the right of the label"
+        );
+        assert!(
+            value.right() <= px(W),
+            "the value ran past the panel's edge"
+        );
     }
 }
 
