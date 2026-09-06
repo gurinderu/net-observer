@@ -441,28 +441,23 @@ fn chip(
 /// closure cannot return elements tied to the `&mut Context` it was handed.
 fn event_row(row: &Row, theme: Theme) -> impl IntoElement + use<> {
     let value_color = if row.alert { theme.bad } else { theme.fg };
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .py_0p5()
-        .child(
-            div()
-                .w(px(66.0))
-                .text_color(rgb(theme.muted))
-                // An event is a presented moment, dated at the shared
-                // provenance size — see the vocabulary rule in `ui::parts`.
-                .text_size(px(PROVENANCE_TEXT))
-                .child(row.clock.clone()),
-        )
-        .child(
-            div()
-                .flex_1()
-                .text_color(rgb(value_color))
-                .text_size(px(12.0))
-                .child(row.line.clone()),
-        )
+    // The canonical key-value row, with the one difference this list has by
+    // substance: the clock is a fixed column, so a screenful of events aligns on
+    // its digits instead of on whatever each line's own text measured.
+    crate::ui::row(row.clock.clone(), row.line.clone(), rgb(value_color), theme)
+        .key_width(CLOCK_COL_W)
+        // An event is a presented moment, dated at the shared provenance size —
+        // see the vocabulary rule in `ui::parts`.
+        .key_text_size(PROVENANCE_TEXT)
+        .selector(EVENT_ROW_SELECTOR)
 }
+
+/// The clock column of the event list, wide enough for `HH:MM:SS` at
+/// [`PROVENANCE_TEXT`] with air after it.
+const CLOCK_COL_W: f32 = 66.0;
+
+/// How a headless test names an event row.
+pub(crate) const EVENT_ROW_SELECTOR: &str = "row:event";
 
 /// The "offline — reconnecting" banner shown while the subscription is down. The
 /// reason is a [`SharedString`] held by the model, so re-rendering it is free.
@@ -1043,5 +1038,86 @@ mod tests {
     /// The model's offline note as a plain `&str`.
     fn offline_note(log: &EventLog) -> Option<&str> {
         log.offline.as_ref().map(SharedString::as_str)
+    }
+}
+
+/// Headless proof that the event log draws its clock/detail pair through the ONE
+/// shared key-value row (`ui::parts::row`) and not through a layout of its own:
+/// the row is found by the shared component's own selector, and the clock column
+/// it asked for survives the window's width.
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+    use crate::ui::{ROW_KEY_SUFFIX, ROW_VALUE_SUFFIX};
+    use gpui::{TestAppContext, VisualTestContext, size};
+
+    const W: f32 = 320.0;
+
+    struct EventRowHost;
+
+    impl gpui::Render for EventRowHost {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let row = Row {
+                kind: None,
+                clock: "20:21:34".into(),
+                line: "dns  SERVFAIL from 192.168.1.1 after 5000 ms, resolver unreachable".into(),
+                alert: true,
+            };
+            div()
+                .w(px(W))
+                .flex()
+                .flex_col()
+                .child(event_row(&row, Theme::dark()))
+        }
+    }
+
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
+    fn draw(cx: &mut TestAppContext) -> VisualTestContext {
+        let window = cx.add_window(|_, _| EventRowHost);
+        let cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(size(px(W), px(200.0)));
+        cx.run_until_parked();
+        cx
+    }
+
+    /// The load-bearing one: the event row IS the shared row. A hand-rolled pair
+    /// carries no such selector, so this cannot pass by accident.
+    #[gpui::test]
+    fn the_event_row_is_drawn_by_the_shared_key_value_row(cx: &mut TestAppContext) {
+        let mut cx = draw(cx);
+        assert!(
+            cx.debug_bounds(EVENT_ROW_SELECTOR).is_some(),
+            "the event log drew its clock/detail pair with a layout of its own"
+        );
+    }
+
+    /// And it keeps the one difference it has by substance: a fixed clock column,
+    /// so a screenful of events aligns on its digits.
+    #[gpui::test]
+    fn the_clock_keeps_its_column_and_the_detail_stays_inside(cx: &mut TestAppContext) {
+        let mut cx = draw(cx);
+        let key = cx
+            .debug_bounds(leak(format!("{EVENT_ROW_SELECTOR}{ROW_KEY_SUFFIX}")))
+            .expect("the clock half is drawn");
+        assert_eq!(
+            key.size.width,
+            px(CLOCK_COL_W),
+            "the clock column gave way, so the log no longer aligns on its digits"
+        );
+        let value = cx
+            .debug_bounds(leak(format!("{EVENT_ROW_SELECTOR}{ROW_VALUE_SUFFIX}")))
+            .expect("the detail half is drawn");
+        assert!(
+            value.right() <= px(W),
+            "the detail ran past the window's edge: right={:?}",
+            value.right()
+        );
     }
 }

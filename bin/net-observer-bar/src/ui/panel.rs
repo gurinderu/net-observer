@@ -591,6 +591,9 @@ const SPARK_H: f32 = 28.0;
 /// content width without downsampling.
 const SPARK_COL_W: f32 = 1.0;
 const SPARK_GAP: f32 = 1.0;
+/// The type size of a sparkline's caption row — the caption names the series and
+/// its latest reading, and is deliberately smaller than a list row's own text.
+const SPARK_CAPTION_TEXT: f32 = 11.0;
 
 /// The scale a sparkline is drawn against: the largest of the observed values and
 /// the threshold, so the threshold rule is always on-screen and no bar ever
@@ -675,23 +678,12 @@ fn sparkline(
         .flex()
         .flex_col()
         .gap_1()
+        // The caption is the canonical key-value row at the caption scale, not
+        // a second layout that happens to look like one.
         .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(theme.muted))
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(latest_color)
-                        .child(latest_text),
-                ),
+            row(label, latest_text, latest_color, theme)
+                .text_size(SPARK_CAPTION_TEXT)
+                .selector(format!("row:spark:{label}")),
         )
         .child(
             div()

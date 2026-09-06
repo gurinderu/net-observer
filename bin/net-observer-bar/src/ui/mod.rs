@@ -51,8 +51,12 @@ pub use panel::PanelView;
 pub(crate) use parts::HINT_TIP_SELECTOR;
 pub use parts::now_us;
 pub(crate) use parts::{
-    Dating, PROVENANCE_TEXT, age_str, clock, dated, gap_label, hint, moments_diverge, separator,
+    Dating, PROVENANCE_TEXT, age_str, clock, dated, gap_label, hint, moments_diverge, row,
+    separator,
 };
+/// How a headless test names the two halves of a shared key-value row.
+#[cfg(test)]
+pub(crate) use parts::{ROW_KEY_SUFFIX, ROW_VALUE_SUFFIX};
 pub(crate) use theme::{
     MENU_HEADING_H, MENU_HEADING_TEXT, MENU_ROW_H, MENU_ROW_PX, MENU_ROW_RADIUS, MENU_ROW_TEXT,
     MENU_SEPARATOR_H, Theme,
@@ -154,6 +158,47 @@ mod headless_tests {
                 "`{selector}` runs past the panel's bottom edge ({:?} > {:?})",
                 b.origin.y + b.size.height,
                 panel.height
+            );
+        }
+    }
+
+    /// Both sparkline captions are drawn by the ONE shared key-value row, and
+    /// both stay inside the 320pt panel. A caption hand-rolled in the window
+    /// carries no such selector, so this cannot pass by accident.
+    #[gpui::test]
+    fn the_sparkline_captions_are_the_shared_key_value_row(cx: &mut TestAppContext) {
+        let model = cx.update(|cx| {
+            cx.new(|_| {
+                Glance::new(
+                    StatusSnapshot::default(),
+                    None,
+                    "/tmp/net-observer-test.sock".to_string(),
+                )
+            })
+        });
+        let for_view = model.clone();
+        let window = cx.add_window(|_, cx| PanelView::new(for_view, cx));
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(size(px(PANEL_W as f32), px(PANEL_H as f32)));
+        cx.run_until_parked();
+
+        for label in ["gw rtt", "load"] {
+            let sel: &'static str = Box::leak(format!("row:spark:{label}").into_boxed_str());
+            let b = cx.debug_bounds(sel).unwrap_or_else(|| {
+                panic!("the `{label}` caption was not drawn by the shared key-value row")
+            });
+            assert!(
+                b.origin.x + b.size.width <= px(PANEL_W as f32),
+                "the `{label}` caption runs past the panel's right edge: {b:?}"
+            );
+            let value: &'static str =
+                Box::leak(format!("row:spark:{label}{ROW_VALUE_SUFFIX}").into_boxed_str());
+            let v = cx
+                .debug_bounds(value)
+                .unwrap_or_else(|| panic!("the `{label}` caption's value half was not drawn"));
+            assert!(
+                v.right() <= px(PANEL_W as f32),
+                "the `{label}` caption's latest reading runs past the panel's right edge: {v:?}"
             );
         }
     }
