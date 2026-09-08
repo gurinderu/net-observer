@@ -446,7 +446,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         )));
     }
     if cfg.collectors.proxy.enabled {
-        collectors.push(AnyCollector::Proxy(ProxyCollector::new(
+        collectors.push(AnyCollector::Proxy(Box::new(ProxyCollector::new(
             BoundTcpProber::new(),
             ProxySystemFacts::new(
                 SINGBOX_CONFIG_PATH,
@@ -460,7 +460,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             cfg.collectors.proxy.tun_probe_url.clone(),
             phys_iface.clone().unwrap_or_default(),
             cfg.collectors.proxy.interval,
-        )));
+        ))));
     }
     if cfg.collectors.dns.enabled {
         collectors.push(AnyCollector::Dns(DnsCollector::new(
@@ -724,9 +724,16 @@ async fn run_daemon() -> anyhow::Result<()> {
 /// `match` to the concrete collector, and the async ones `await` the underlying
 /// future. Because every arm is a concrete type, the composed `collect` future is
 /// `Send` and can be spawned onto the runtime without `Box::pin`.
+///
+/// The `Proxy` collector is held behind a `Box` (a concrete pointer, not a
+/// `dyn` vtable): its held reference streams carry two long-lived rustls
+/// sessions inline, so an unboxed variant would size every element of the
+/// `Vec<AnyCollector>` to those buffers. Boxing the one heavy variant leaves
+/// the delegating `match` arms unchanged (auto-deref) and the collect future
+/// still concrete and `Send`.
 pub(crate) enum AnyCollector {
     Link(LinkCollector<IcmpPinger, BoundTcpProber, SystemFacts>),
-    Proxy(ProxyCollector<BoundTcpProber, ProxySystemFacts, HeldReferenceStreams>),
+    Proxy(Box<ProxyCollector<BoundTcpProber, ProxySystemFacts, HeldReferenceStreams>>),
     Dns(DnsCollector<DnsResolver>),
     Route(RouteCollector),
     Host(HostCollector<HostLoad>),
@@ -828,7 +835,9 @@ impl AnyCollector {
     pub(crate) fn into_event_source(self) -> Option<Box<dyn EventSource>> {
         match self {
             Self::Link(c) => Box::new(c).into_event_source(),
-            Self::Proxy(c) => Box::new(c).into_event_source(),
+            // Already boxed in the variant (see the enum doc): it IS the
+            // `Box<Self>` the trait method takes, so it is not re-boxed.
+            Self::Proxy(c) => c.into_event_source(),
             Self::Dns(c) => Box::new(c).into_event_source(),
             Self::Route(c) => Box::new(c).into_event_source(),
             Self::Host(c) => Box::new(c).into_event_source(),
