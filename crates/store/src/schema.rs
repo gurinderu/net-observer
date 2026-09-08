@@ -11,6 +11,10 @@ ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS lan_alive USMALLINT;
 -- The egress interface the route table resolves for a fakeip-pool address
 -- (NULL when it could not be determined). Same migration treatment.
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS fakeip_route_if VARCHAR;
+-- The egress interface the route table resolves for the default route (a utun
+-- while sing-box's auto_route owns it — the tunnel-liveness fact). NULL when
+-- there is no default route. Same migration treatment.
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS default_route_if VARCHAR;
 CREATE TABLE IF NOT EXISTS proxy_sample (
   ts_us BIGINT, server_ip VARCHAR, tcp VARCHAR, rtt_ms DOUBLE, tun_code USMALLINT, selector VARCHAR);
 -- Established-flow discriminator: whether the held reference streams (direct

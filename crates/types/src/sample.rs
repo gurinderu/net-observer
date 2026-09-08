@@ -34,6 +34,14 @@ pub struct LinkSample {
     /// still decode.
     #[serde(default)]
     pub fakeip_route_if: Option<String>,
+    /// The egress interface the route table resolves for the DEFAULT route (a
+    /// local lookup, no packet sent). On this host sing-box's `auto_route` owns
+    /// the default while the tunnel is up, so a `utun*` here is the
+    /// tunnel-liveness fact the `fakeip-hijack` signature compares its pool
+    /// egress against — same tick, no cross-sample skew. `None` = no default
+    /// route. `serde(default)` so a pre-field daemon's samples still decode.
+    #[serde(default)]
+    pub default_route_if: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -196,6 +204,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
+            default_route_if: None,
         });
         assert_eq!(l.ts_us(), 42);
 

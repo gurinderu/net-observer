@@ -123,6 +123,16 @@ impl LinkFacts for SystemFacts {
         parse_route_field(&out, "interface")
     }
 
+    async fn default_route_iface(&self) -> Option<String> {
+        // The RAW default-route egress, never the configured phys_iface
+        // override: sing-box's `auto_route` covers 0.0.0.0/1, so the default
+        // resolves to its `utun*` while the tunnel is up (realm net-observer,
+        // node #? — auto_route decomposition, see the oracle's route_snapshot).
+        // Another RTM_GET lookup, no packet on the wire.
+        let out = run("route", &["-n", "get", "default"]).await?;
+        parse_route_field(&out, "interface")
+    }
+
     async fn ssid(&self) -> Option<String> {
         let iface = self.phys_iface().await?;
         wifi::current_ssid(&iface).await

@@ -129,9 +129,12 @@ where
         };
         let ssid = self.facts.ssid().await;
         let wifi_present = self.facts.wifi_capture_present().await;
-        // A local route-table lookup, not a probe: it keeps running under
-        // quiet mode like the other passive facts.
+        // Two local route-table lookups, not probes: the fakeip pool's egress
+        // and the default route's egress (the tunnel-liveness fact). Both keep
+        // running under quiet mode like the other passive facts, and both come
+        // from THIS tick so `fakeip-hijack` compares them without skew.
         let fakeip_route_if = self.facts.fakeip_route_iface().await;
+        let default_route_if = self.facts.default_route_iface().await;
         vec![Sample::Link(build_link_sample(
             ts_us,
             ping,
@@ -142,6 +145,7 @@ where
             arp,
             lan,
             fakeip_route_if,
+            default_route_if,
             ssid,
             wifi_present,
         ))]
@@ -162,6 +166,7 @@ where
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
+            default_route_if: None,
         })]
     }
 }
@@ -243,6 +248,9 @@ mod tests {
             ]
         }
         async fn fakeip_route_iface(&self) -> Option<String> {
+            Some("utun8".into())
+        }
+        async fn default_route_iface(&self) -> Option<String> {
             Some("utun8".into())
         }
         async fn ssid(&self) -> Option<String> {

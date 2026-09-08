@@ -23,6 +23,13 @@ pub trait LinkFacts: Send + Sync {
     /// the sing-box fakeip pool — a local lookup, no packet on the wire.
     /// `None` when it cannot be determined (no config, no range, no route).
     async fn fakeip_route_iface(&self) -> Option<String>;
+    /// The egress interface the route table resolves for the DEFAULT route — a
+    /// local lookup, no packet on the wire. On this host sing-box's `auto_route`
+    /// owns the default while the tunnel is up, so this reads a `utun*` then and
+    /// the physical interface when the tunnel is down: the tunnel-liveness fact
+    /// paired with `fakeip_route_iface` in one tick. `None` when there is no
+    /// default route.
+    async fn default_route_iface(&self) -> Option<String>;
     async fn ssid(&self) -> Option<String>;
     async fn wifi_capture_present(&self) -> bool;
     /// Runtime capability probe: Ready iff the `link` collector can work here/now

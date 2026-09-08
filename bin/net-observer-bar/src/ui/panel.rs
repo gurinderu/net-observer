@@ -836,6 +836,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
+            default_route_if: None,
         });
         s.proxy = Some(types::ProxySample {
             ts_us: 4_000_000,

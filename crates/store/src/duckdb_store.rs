@@ -173,7 +173,7 @@ impl Store for DuckdbStore {
         let c = self.conn.lock().unwrap();
         match s {
             Sample::Link(l) => c.execute(
-                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     l.ts_us,
                     l.gw.to_string(),
@@ -187,7 +187,8 @@ impl Store for DuckdbStore {
                     l.wifi_capture_present,
                     l.lan_probed,
                     l.lan_alive,
-                    l.fakeip_route_if
+                    l.fakeip_route_if,
+                    l.default_route_if
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
@@ -930,6 +931,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
+            default_route_if: None,
         });
         s.write_sample(&sample).unwrap();
         assert_eq!(
@@ -959,6 +961,7 @@ mod tests {
             lan_probed: Some(3),
             lan_alive: Some(1),
             fakeip_route_if: None,
+            default_route_if: None,
         };
         s.write_sample(&Sample::Link(base.clone())).unwrap();
         s.write_sample(&Sample::Link(LinkSample {
@@ -966,6 +969,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
+            default_route_if: None,
             ..base
         }))
         .unwrap();
@@ -1005,11 +1009,15 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: Some("awdl0".into()),
+            default_route_if: Some("utun6".into()),
         }))
         .unwrap();
         assert_eq!(
-            s.query_scalar_i64("SELECT count(*) FROM link_sample WHERE fakeip_route_if = 'awdl0'")
-                .unwrap(),
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample \
+                 WHERE fakeip_route_if = 'awdl0' AND default_route_if = 'utun6'"
+            )
+            .unwrap(),
             1
         );
     }
@@ -1232,6 +1240,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
+            default_route_if: None,
         }))
         .unwrap();
         s.write_sample(&Sample::Proxy(ProxySample {
@@ -1461,6 +1470,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
+            default_route_if: None,
         }))
         .unwrap();
         let t = s.query_table("SELECT ts_us, gw FROM link_sample").unwrap();
