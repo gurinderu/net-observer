@@ -39,7 +39,7 @@ use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
-    FakeIp, GwChange, GwDrop, GwMacChange, NeighborMacCollision, Starvation, Wedge,
+    EndpointBlock, FakeIp, GwChange, GwDrop, GwMacChange, NeighborMacCollision, Starvation, Wedge,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -89,6 +89,12 @@ const EVENT_BUS_CAP: usize = 1024;
 
 /// Wedge signal: tun dead while the direct path is healthy, for this many ticks.
 const WEDGE_CONSECUTIVE: usize = 3;
+
+/// Endpoint-block signal: every upstream endpoint's underlay TCP probe dead
+/// while the direct reference answers, for this many per-tick cohorts. Two
+/// cohorts = 30s at the 15s proxy cadence — a single transition tick must not
+/// fire the fleet-wide signature.
+const ENDPOINT_BLOCK_CONSECUTIVE: usize = 2;
 
 /// Host load above which a dead tun counts as starvation (read from the `host`
 /// collector's newest sample by the `Starvation` condition).
@@ -1354,10 +1360,11 @@ fn build_api_server(
     }
 }
 
-/// Assemble the [`TriggerEngine`] with the starter rules (wedge, gw-drop,
-/// gw-change, fakeip, starvation). Every rule records an incident (durable, in
-/// DuckDB) and mirrors it into the live snapshot's ring for the socket API;
-/// gw-change additionally freezes the pcap ring when one is available.
+/// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
+/// gw-mac-change, neighbor-mac-collision, fakeip, starvation, endpoint-block).
+/// Every rule records an incident (durable, in DuckDB) and mirrors it into the
+/// live snapshot's ring for the socket API; gw-change and gw-mac-change
+/// additionally freeze the pcap ring when one is available.
 fn build_engine(
     store: Arc<DuckdbStore>,
     cfg: &Config,
@@ -1415,6 +1422,15 @@ fn build_engine(
         ),
         Trigger::new(
             Box::new(FakeIp),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        // No pcap freeze: the evidence is the stored per-endpoint verdicts —
+        // packets of connections that never opened add nothing.
+        Trigger::new(
+            Box::new(EndpointBlock {
+                consecutive: ENDPOINT_BLOCK_CONSECUTIVE,
+            }),
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
@@ -1721,6 +1737,20 @@ mod tests {
         })
     }
 
+    /// A per-endpoint proxy row whose underlay TCP probe FAILED while the tun
+    /// is healthy — the endpoint-block shape ([`dead_proxy`] is the opposite:
+    /// tcp OK, tun dead).
+    fn failed_endpoint(ts_us: i64, endpoint: &str) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us,
+            server_ip: endpoint.into(),
+            tcp: TcpVerdict::Fail,
+            rtt_ms: None,
+            tun_code: Some(204),
+            selector: None,
+        })
+    }
+
     fn host(ts_us: i64, load1: f64) -> Sample {
         Sample::Host(HostSample {
             ts_us,
@@ -1956,8 +1986,8 @@ mod tests {
         events_rx: tokio::sync::broadcast::Receiver<EncodedFrame>,
     }
 
-    /// Build the real [`build_engine`] — five rules, production constants — with
-    /// `freezer`.
+    /// Build the real [`build_engine`] — the full production rule set and
+    /// constants — with `freezer`.
     fn engine_under_test(freezer: Arc<PcapRingSlot>) -> EngineFixture {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
@@ -1979,9 +2009,9 @@ mod tests {
 
     /// How many incidents `store` holds for `trigger_id`.
     ///
-    /// ALWAYS filtered: [`build_engine`] installs five rules at once, so an
-    /// unfiltered `count(*)` would let another rule's firing stand in for the one
-    /// under test.
+    /// ALWAYS filtered: [`build_engine`] installs the whole rule set at once, so
+    /// an unfiltered `count(*)` would let another rule's firing stand in for the
+    /// one under test.
     fn incidents_for(store: &DuckdbStore, trigger_id: &str) -> i64 {
         store
             .query_scalar_i64(&format!(
@@ -2102,6 +2132,44 @@ mod tests {
             incidents_for(&fx.store, "starvation"),
             1,
             "a dead tun above STARVATION_LOAD must be recorded as starvation"
+        );
+    }
+
+    /// The `endpoint-block` rule the daemon actually runs counts to
+    /// [`ENDPOINT_BLOCK_CONSECUTIVE`] — two — all-fail cohorts, no fewer.
+    ///
+    /// Dies under `ENDPOINT_BLOCK_CONSECUTIVE = 1` (the single-cohort stream
+    /// fires, so the first assertion reds) and under `= 3` (the two-cohort run
+    /// stays silent, so the second reds). The cohort counts are LITERALS on
+    /// purpose — this test IS the constant's pin, exactly like the wedge pin
+    /// above.
+    ///
+    /// Nothing else in the rule set can fire on this stream: the tun is
+    /// healthy (no wedge/starvation), the gateway verdict is steadily OK with
+    /// no predecessor to differ from (no gw-drop/gw-change), and there is no
+    /// DNS or neighbors sample.
+    #[test]
+    fn build_engine_wires_the_production_endpoint_block_threshold() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(8);
+
+        feed(&mut fx.engine, &mut w, link(1, GwVerdict::Ok));
+        // One all-fail cohort — one short of the production threshold of two.
+        feed(&mut fx.engine, &mut w, failed_endpoint(2, "1.1.1.1:443"));
+        feed(&mut fx.engine, &mut w, failed_endpoint(2, "2.2.2.2:2053"));
+        assert_eq!(
+            incidents_for(&fx.store, "endpoint-block"),
+            0,
+            "one all-fail cohort is one short of ENDPOINT_BLOCK_CONSECUTIVE and must not fire"
+        );
+
+        // The second cohort completes the run.
+        feed(&mut fx.engine, &mut w, failed_endpoint(3, "1.1.1.1:443"));
+        feed(&mut fx.engine, &mut w, failed_endpoint(3, "2.2.2.2:2053"));
+        assert_eq!(
+            incidents_for(&fx.store, "endpoint-block"),
+            1,
+            "the second consecutive all-fail cohort must fire the endpoint-block rule"
         );
     }
 
