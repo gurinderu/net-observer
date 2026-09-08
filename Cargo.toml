@@ -94,6 +94,12 @@ reqwest = { version = "0.12", default-features = false, features = [
 # client is built. Rust plus assembly, no C, x86-64 and aarch64 — one TLS stack
 # on this Mac and on the Linux port. (realm net-observer, node #46)
 rustls-graviola = "0.4"
+# Direct rustls-over-tokio for the held reference streams (the established-flow
+# discriminator). `reqwest` cannot serve there: its pool silently reconnects a
+# dead pooled connection, masking exactly the death being measured.
+# `default-features = false` leaves the crypto to the process-default provider
+# (`rustls-graviola`), like `reqwest` above.
+tokio-rustls = { version = "0.26", default-features = false }
 libc = "0.2"
 tempfile = "3"
 gpui = "0.2.2"

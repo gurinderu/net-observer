@@ -1,12 +1,13 @@
 //! The proxy [`Collector`]: static [`META`] and the [`ProxyCollector`] wiring the
-//! `ProxyFacts`/`TcpProber` ports into the [`build_proxy_samples`] mapping.
+//! `ProxyFacts`/`TcpProber`/`StallProbe` ports into the [`build_proxy_samples`]
+//! mapping.
 
 use std::time::Duration;
 
 use collector_core::{Collector, CollectorMeta, Os, Readiness, Source, TcpProber};
 use types::{ProxySample, Sample, TcpVerdict};
 
-use crate::probes::ProxyFacts;
+use crate::probes::{ProxyFacts, StallProbe};
 use crate::proxy::build_proxy_samples;
 
 /// Static metadata for the proxy collector: macOS-only in v1.
@@ -16,25 +17,36 @@ pub const META: CollectorMeta = CollectorMeta {
 };
 
 /// Interval collector for per-upstream-server TCP reachability, the TUN 204
-/// probe, and the active upstream node selection.
+/// probe, the active upstream node selection, and the established-flow
+/// discriminator (held reference streams checked each tick).
 ///
-/// Static dispatch over the [`TcpProber`] and [`ProxyFacts`] ports: native
-/// `async fn` in traits is not `dyn`-compatible, so the ports are generic
-/// type parameters (the daemon monomorphizes them via `enum AnyCollector`).
-pub struct ProxyCollector<T: TcpProber, F: ProxyFacts> {
+/// Static dispatch over the [`TcpProber`], [`ProxyFacts`] and [`StallProbe`]
+/// ports: native `async fn` in traits is not `dyn`-compatible, so the ports are
+/// generic type parameters (the daemon monomorphizes them via
+/// `enum AnyCollector`).
+pub struct ProxyCollector<T: TcpProber, F: ProxyFacts, S: StallProbe> {
     tcp: T,
     facts: F,
+    stall: S,
     tun_url: String,
     iface: String,
     interval: Duration,
 }
 
-impl<T: TcpProber, F: ProxyFacts> ProxyCollector<T, F> {
+impl<T: TcpProber, F: ProxyFacts, S: StallProbe> ProxyCollector<T, F, S> {
     /// Construct a proxy collector from its ports and cadence.
-    pub fn new(tcp: T, facts: F, tun_url: String, iface: String, interval: Duration) -> Self {
+    pub fn new(
+        tcp: T,
+        facts: F,
+        stall: S,
+        tun_url: String,
+        iface: String,
+        interval: Duration,
+    ) -> Self {
         Self {
             tcp,
             facts,
+            stall,
             tun_url,
             iface,
             interval,
@@ -42,7 +54,7 @@ impl<T: TcpProber, F: ProxyFacts> ProxyCollector<T, F> {
     }
 }
 
-impl<T: TcpProber, F: ProxyFacts> Collector for ProxyCollector<T, F> {
+impl<T: TcpProber, F: ProxyFacts, S: StallProbe> Collector for ProxyCollector<T, F, S> {
     fn meta(&self) -> &'static CollectorMeta {
         &META
     }
@@ -59,6 +71,9 @@ impl<T: TcpProber, F: ProxyFacts> Collector for ProxyCollector<T, F> {
         // Await the probes, then a sync `build_*` composes the samples.
         let tun_code = self.facts.tun_probe(&self.tun_url).await;
         let selector = self.facts.selector().await;
+        // The held-stream check runs in the same tick as the fresh probes, so
+        // "fresh OK while established dead" is one cohort, not a correlation.
+        let stall = self.stall.check().await;
         let endpoints = self.facts.server_endpoints().await;
         let mut probed = Vec::with_capacity(endpoints.len());
         for endpoint in endpoints {
@@ -76,7 +91,7 @@ impl<T: TcpProber, F: ProxyFacts> Collector for ProxyCollector<T, F> {
             // the listener that was probed, matching the oracle's vless[ip:port].
             probed.push((endpoint, o));
         }
-        build_proxy_samples(ts_us, tun_code, selector, probed)
+        build_proxy_samples(ts_us, tun_code, selector, stall, probed)
             .into_iter()
             .map(Sample::Proxy)
             .collect()
@@ -90,6 +105,10 @@ impl<T: TcpProber, F: ProxyFacts> Collector for ProxyCollector<T, F> {
             rtt_ms: None,
             tun_code: None,
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         })]
     }
 }
@@ -97,6 +116,7 @@ impl<T: TcpProber, F: ProxyFacts> Collector for ProxyCollector<T, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probes::{StallReading, StreamCheck};
     use collector_core::PingOutcome;
 
     struct T;
@@ -125,10 +145,28 @@ mod tests {
         }
     }
 
-    fn collector(readiness: Readiness) -> ProxyCollector<T, Facts> {
+    /// A scripted stall probe: both held streams alive and 60s old.
+    struct FakeStall;
+    impl StallProbe for FakeStall {
+        async fn check(&self) -> StallReading {
+            StallReading {
+                direct: Some(StreamCheck {
+                    alive: true,
+                    age_s: 60,
+                }),
+                tun: Some(StreamCheck {
+                    alive: true,
+                    age_s: 60,
+                }),
+            }
+        }
+    }
+
+    fn collector(readiness: Readiness) -> ProxyCollector<T, Facts, FakeStall> {
         ProxyCollector::new(
             T,
             Facts(readiness),
+            FakeStall,
             "http://x/204".into(),
             "en0".into(),
             Duration::from_secs(15),
@@ -149,6 +187,11 @@ mod tests {
         assert!(c.preflight().await.is_ready());
         let samples = c.collect(7).await;
         assert_eq!(samples.len(), 1);
-        assert!(matches!(samples[0], Sample::Proxy(_)));
+        let Sample::Proxy(p) = &samples[0] else {
+            panic!("expected a proxy sample")
+        };
+        // The held-stream reading reaches the row.
+        assert_eq!(p.est_tun_alive, Some(true));
+        assert_eq!(p.est_direct_age_s, Some(60));
     }
 }

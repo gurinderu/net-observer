@@ -115,6 +115,22 @@ impl TcpProber for BoundTcpProber {
 /// `tokio::net::TcpStream`, returning the connect latency in milliseconds on
 /// success.
 async fn connect_bound_inner(host: &str, port: u16, iface: &str) -> Option<f64> {
+    let start = Instant::now();
+    let iface = (!iface.is_empty()).then_some(iface);
+    let _stream = open_bound_stream(host, port, iface).await?;
+    Some(start.elapsed().as_secs_f64() * 1000.0)
+}
+
+/// Open a TCP socket, optionally pin it to `iface` (`IP_BOUND_IF`, IPv4 only),
+/// start a non-blocking connect to `host:port`, and await completion under
+/// [`PROBE_TIMEOUT`] via `tokio::net::TcpStream`, returning the connected
+/// stream. Shared by the one-shot probes above and the held reference streams
+/// (`stall`).
+pub(crate) async fn open_bound_stream(
+    host: &str,
+    port: u16,
+    iface: Option<&str>,
+) -> Option<TcpStream> {
     let addr = (host, port).to_socket_addrs().ok()?.next()?;
     let domain = match addr {
         SocketAddr::V4(_) => Domain::IPV4,
@@ -123,10 +139,12 @@ async fn connect_bound_inner(host: &str, port: u16, iface: &str) -> Option<f64> 
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).ok()?;
     // A non-blocking socket lets tokio drive the connect to completion.
     socket.set_nonblocking(true).ok()?;
-    if !iface.is_empty() && domain == Domain::IPV4 && !bind_to_iface_v4(socket.as_raw_fd(), iface) {
+    if let Some(iface) = iface
+        && domain == Domain::IPV4
+        && !bind_to_iface_v4(socket.as_raw_fd(), iface)
+    {
         tracing::debug!(iface, "IP_BOUND_IF failed; probing on default route");
     }
-    let start = Instant::now();
     // Kick off the non-blocking connect: EINPROGRESS is the expected "started"
     // reply; anything else is an immediate failure.
     match socket.connect(&addr.into()) {
@@ -146,7 +164,7 @@ async fn connect_bound_inner(host: &str, port: u16, iface: &str) -> Option<f64> 
     }
     // Distinguish a completed connect from a failed one via SO_ERROR.
     match stream.take_error() {
-        Ok(None) => Some(start.elapsed().as_secs_f64() * 1000.0),
+        Ok(None) => Some(stream),
         _ => None,
     }
 }

@@ -844,6 +844,10 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(204),
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         });
         // newest is the proxy tick at 4s -> 6s ago at now=10s.
         assert_eq!(freshness_line(&s, 10_000_000), "updated 6s ago");

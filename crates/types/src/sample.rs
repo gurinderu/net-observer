@@ -44,6 +44,25 @@ pub struct ProxySample {
     pub rtt_ms: Option<f64>,
     pub tun_code: Option<u16>,
     pub selector: Option<String>,
+    /// Established-flow discriminator, a per-tick fact replicated across the
+    /// tick's rows like `tun_code`: whether the held reference stream bound to
+    /// the physical interface (the direct underlay path) still round-tripped
+    /// data this tick. `None` = no measurement (the stream was only just
+    /// opened, or could not be opened). `serde(default)` so a pre-field
+    /// daemon's samples still decode.
+    #[serde(default)]
+    pub est_direct_alive: Option<bool>,
+    /// Age of the direct held stream at the check, seconds. `Some` exactly
+    /// when `est_direct_alive` is — on a dead check it is the age at death.
+    #[serde(default)]
+    pub est_direct_age_s: Option<u32>,
+    /// Same discriminator for the held stream on the default route (through
+    /// the TUN while sing-box is up): the established proxied flow.
+    #[serde(default)]
+    pub est_tun_alive: Option<bool>,
+    /// Age of the tunnel held stream at the check, seconds.
+    #[serde(default)]
+    pub est_tun_age_s: Option<u32>,
 }
 
 /// One resolver probe. `probe` is the queried name label (e.g. "nks"), `server`
@@ -187,6 +206,10 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(204),
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         });
         assert_eq!(p.ts_us(), 99);
 

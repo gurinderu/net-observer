@@ -1465,6 +1465,18 @@ mod tests {
         assert_eq!(l.fakeip_route_if, None);
     }
 
+    /// Same guarantee for the proxy sample: a frame from before the
+    /// established-flow discriminator decodes with every `est_*` field `None`.
+    #[test]
+    fn proxy_sample_decodes_frames_from_before_the_established_fields() {
+        let old = r#"{"ts_us":1,"server_ip":"1.1.1.1:443","tcp":"Ok","rtt_ms":null,"tun_code":204,"selector":null}"#;
+        let p: ProxySample = serde_json::from_str(old).unwrap();
+        assert_eq!(p.est_direct_alive, None);
+        assert_eq!(p.est_direct_age_s, None);
+        assert_eq!(p.est_tun_alive, None);
+        assert_eq!(p.est_tun_age_s, None);
+    }
+
     #[test]
     fn frame_round_trip_request() {
         let mut buf = Vec::new();
@@ -1659,6 +1671,10 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(204),
             selector: Some("auto".into()),
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         });
         assert_eq!(proxy.detail(), "tun=204 sel=auto");
 
@@ -1670,6 +1686,10 @@ mod tests {
             rtt_ms: None,
             tun_code: None,
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         });
         assert_eq!(proxy_bare.detail(), "tun=- sel=-");
 

@@ -4,6 +4,33 @@
 
 use collector_core::Readiness;
 
+/// One held reference stream's per-tick check: whether the established stream
+/// still round-tripped data, and how old it was at the check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCheck {
+    pub alive: bool,
+    pub age_s: u32,
+}
+
+/// The established-flow discriminator's per-tick reading. `None` on a side
+/// means no measurement this tick (the stream was only just opened, or could
+/// not be opened at all) — never a verdict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StallReading {
+    /// The stream bound to the physical interface (the direct underlay path).
+    pub direct: Option<StreamCheck>,
+    /// The stream on the default route (through the TUN while sing-box is up).
+    pub tun: Option<StreamCheck>,
+}
+
+/// Established-stream prober: holds one long-lived reference stream per path
+/// across ticks (the adapter owns the sockets as state between calls) and
+/// reports, each tick, whether each still carries data.
+#[allow(async_fn_in_trait)] // internal workspace port, not a published API
+pub trait StallProbe: Send + Sync {
+    async fn check(&self) -> StallReading;
+}
+
 /// Proxy facts: the upstream proxy endpoints, the TUN HTTP 204 probe, and
 /// the active upstream node selection.
 #[allow(async_fn_in_trait)] // internal workspace port, not a published API

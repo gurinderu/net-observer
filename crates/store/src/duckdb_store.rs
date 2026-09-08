@@ -191,14 +191,18 @@ impl Store for DuckdbStore {
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
-                "INSERT INTO proxy_sample VALUES (?,?,?,?,?,?)",
+                "INSERT INTO proxy_sample VALUES (?,?,?,?,?,?,?,?,?,?)",
                 params![
                     p.ts_us,
                     p.server_ip,
                     p.tcp.to_string(),
                     p.rtt_ms,
                     p.tun_code,
-                    p.selector
+                    p.selector,
+                    p.est_direct_alive,
+                    p.est_direct_age_s,
+                    p.est_tun_alive,
+                    p.est_tun_age_s
                 ],
             )?,
             Sample::Dns(d) => c.execute(
@@ -506,7 +510,7 @@ mod tests {
     use crate::Store;
     use types::{
         GwVerdict, LinkSample, NeighborObs, NeighborRole, NeighborSource, NeighborsSample,
-        NeighborsVerdict, Sample, TcpVerdict,
+        NeighborsVerdict, ProxySample, Sample, TcpVerdict,
     };
 
     /// A neighbours tick for one device, so the upsert rules can be driven.
@@ -1010,6 +1014,35 @@ mod tests {
         );
     }
 
+    /// The established-flow discriminator lands in its own proxy columns;
+    /// NULL = no measurement, distinguishable from a stream that died at 0s.
+    #[test]
+    fn proxy_sample_established_columns_round_trip() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Proxy(ProxySample {
+            ts_us: 1000,
+            server_ip: "1.1.1.1:443".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: Some(9.0),
+            tun_code: Some(204),
+            selector: None,
+            est_direct_alive: Some(true),
+            est_direct_age_s: Some(120),
+            est_tun_alive: Some(false),
+            est_tun_age_s: Some(45),
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM proxy_sample \
+                 WHERE est_direct_alive AND est_direct_age_s = 120 \
+                   AND NOT est_tun_alive AND est_tun_age_s = 45"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn write_and_count_host_sample() {
         use types::{HostSample, Sample};
@@ -1208,6 +1241,10 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(0),
             selector: Some("a".into()),
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         }))
         .unwrap();
         s.open_incident(&Incident {

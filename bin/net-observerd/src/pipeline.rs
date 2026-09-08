@@ -2135,6 +2135,10 @@ mod tests {
             rtt_ms: Some(2.0),
             tun_code: Some(204),
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         }))
         .await
         .unwrap();
@@ -2330,6 +2334,10 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(0),
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         })
     }
 

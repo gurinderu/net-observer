@@ -32,8 +32,9 @@ use collector_wifi::WifiCollector;
 use config::Config;
 use macos::LldpCapture;
 use macos::{
-    BoundTcpProber, CoreWlanFacts, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource,
-    ProxySystemFacts, SystemFacts, SystemNeighbors, SystemProfilerAir, TcpdumpLldpCapture,
+    BoundTcpProber, CoreWlanFacts, DnsResolver, HeldReferenceStreams, HostLoad, IcmpPinger,
+    PcapRing, PfRouteSource, ProxySystemFacts, SystemFacts, SystemNeighbors, SystemProfilerAir,
+    TcpdumpLldpCapture,
 };
 use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
@@ -452,6 +453,10 @@ async fn run_daemon() -> anyhow::Result<()> {
                 cfg.collectors.proxy.clash_api.clone(),
                 CLASH_SELECTOR_GROUP,
             ),
+            // The held reference streams: direct bound to the physical
+            // interface, tunnel on the default route. The adapter owns the
+            // sockets across ticks.
+            HeldReferenceStreams::new(phys_iface.clone().unwrap_or_default()),
             cfg.collectors.proxy.tun_probe_url.clone(),
             phys_iface.clone().unwrap_or_default(),
             cfg.collectors.proxy.interval,
@@ -1783,6 +1788,10 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(0),
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         })
     }
 
@@ -1797,6 +1806,10 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(204),
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         })
     }
 

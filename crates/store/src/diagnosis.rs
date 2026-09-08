@@ -955,6 +955,10 @@ mod tests {
             rtt_ms: None,
             tun_code: tun,
             selector: Some("auto".into()),
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         }))
         .unwrap();
     }
