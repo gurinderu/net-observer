@@ -39,7 +39,8 @@ use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
-    EndpointBlock, FakeIp, GwChange, GwDrop, GwMacChange, NeighborMacCollision, Starvation, Wedge,
+    EndpointBlock, FakeIp, GwChange, GwDrop, GwMacChange, NeighborMacCollision, PerClientBlock,
+    Starvation, Wedge,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -1365,10 +1366,11 @@ fn build_api_server(
 }
 
 /// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
-/// gw-mac-change, neighbor-mac-collision, fakeip, starvation, endpoint-block).
-/// Every rule records an incident (durable, in DuckDB) and mirrors it into the
-/// live snapshot's ring for the socket API; gw-change and gw-mac-change
-/// additionally freeze the pcap ring when one is available.
+/// gw-mac-change, neighbor-mac-collision, per-client-block, fakeip,
+/// endpoint-block, starvation). Every rule records an incident (durable, in
+/// DuckDB) and mirrors it into the live snapshot's ring for the socket API;
+/// gw-change and gw-mac-change additionally freeze the pcap ring when one is
+/// available.
 fn build_engine(
     store: Arc<DuckdbStore>,
     cfg: &Config,
@@ -1421,6 +1423,13 @@ fn build_engine(
         // it records and snapshots but does not spend a ring freeze.
         Trigger::new(
             Box::new(NeighborMacCollision),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        // No pcap freeze: the evidence is the recorded counts, and the echoes
+        // the gateway never answered are packets that never arrived.
+        Trigger::new(
+            Box::new(PerClientBlock),
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
@@ -1728,6 +1737,17 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
         })
+    }
+
+    /// A gateway-FAIL link tick carrying probe-on-suspicion counts — the
+    /// per-client-block shape ([`link`] pins both counts to `None`).
+    fn link_gw_fail_with_lan(ts_us: i64, probed: u16, alive: u16) -> Sample {
+        let Sample::Link(mut l) = link(ts_us, GwVerdict::Fail) else {
+            unreachable!("link() builds a link sample")
+        };
+        l.lan_probed = Some(probed);
+        l.lan_alive = Some(alive);
+        Sample::Link(l)
     }
 
     /// A proxy tick with the tun dead (`tun_code` 0) while the TCP path is fine —
@@ -2176,6 +2196,31 @@ mod tests {
             incidents_for(&fx.store, "endpoint-block"),
             1,
             "the second consecutive all-fail cohort must fire the endpoint-block rule"
+        );
+    }
+
+    /// The `per-client-block` rule is installed with the production handlers:
+    /// a gateway-FAIL tick with live probed neighbors records the incident, and
+    /// the same tick without counts (the tick did not probe) records nothing
+    /// under that id. `gw-drop` fires on both streams and is filtered out by
+    /// `incidents_for`, which is exactly why the filter exists.
+    #[test]
+    fn build_engine_registers_the_per_client_block_rule() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(8);
+
+        feed(&mut fx.engine, &mut w, link(1, GwVerdict::Fail));
+        assert_eq!(
+            incidents_for(&fx.store, "per-client-block"),
+            0,
+            "a tick that did not probe carries no measurement and must not fire"
+        );
+
+        feed(&mut fx.engine, &mut w, link_gw_fail_with_lan(2, 3, 2));
+        assert_eq!(
+            incidents_for(&fx.store, "per-client-block"),
+            1,
+            "a silent gateway with live neighbors must be recorded as per-client-block"
         );
     }
 
