@@ -40,8 +40,8 @@ use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
-    EndpointBlock, FakeIp, FakeIpHijack, GwChange, GwDrop, GwMacChange, NeighborMacCollision,
-    PerClientBlock, Starvation, Wedge,
+    EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, GwChange, GwDrop, GwMacChange,
+    NeighborMacCollision, PerClientBlock, Starvation, Wedge,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -1377,10 +1377,10 @@ fn build_api_server(
 
 /// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
 /// gw-mac-change, neighbor-mac-collision, per-client-block, fakeip,
-/// fakeip-hijack, endpoint-block, starvation). Every rule records an incident
-/// (durable, in DuckDB) and mirrors it into the live snapshot's ring for the
-/// socket API; gw-change and gw-mac-change additionally freeze the pcap ring
-/// when one is available.
+/// fakeip-hijack, endpoint-block, established-stall, starvation). Every rule
+/// records an incident (durable, in DuckDB) and mirrors it into the live
+/// snapshot's ring for the socket API; gw-change and gw-mac-change
+/// additionally freeze the pcap ring when one is available.
 fn build_engine(
     store: Arc<DuckdbStore>,
     cfg: &Config,
@@ -1461,6 +1461,13 @@ fn build_engine(
             Box::new(EndpointBlock {
                 consecutive: ENDPOINT_BLOCK_CONSECUTIVE,
             }),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        // No pcap freeze: the evidence is the recorded held-stream reading —
+        // the scoping verdict is already in the detail string.
+        Trigger::new(
+            Box::new(EstablishedStall),
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
@@ -1810,6 +1817,25 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+        })
+    }
+
+    /// A healthy proxy tick carrying held-stream readings — the
+    /// established-stall shape: fresh paths fine, the tunnel stream's fate in
+    /// `tun_alive` ([`dead_proxy`]/[`failed_endpoint`] pin the est fields to
+    /// `None`).
+    fn proxy_with_streams(ts_us: i64, tun_alive: bool) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us,
+            server_ip: "1.1.1.1:443".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: None,
+            tun_code: Some(204),
+            selector: None,
+            est_direct_alive: Some(true),
+            est_direct_age_s: Some(120),
+            est_tun_alive: Some(tun_alive),
+            est_tun_age_s: Some(45),
         })
     }
 
@@ -2283,6 +2309,32 @@ mod tests {
             incidents_for(&fx.store, "fakeip-hijack"),
             1,
             "the pool routing via a real interface must be recorded as fakeip-hijack"
+        );
+    }
+
+    /// The `established-stall` rule is installed with the production handlers:
+    /// a tick whose held tunnel stream still carries records nothing, one
+    /// whose stream died (fresh probes fine) records the incident. Nothing
+    /// else in the rule set can fire on this stream: the tun code is healthy
+    /// (no wedge/starvation), the underlay TCP is Ok (no endpoint-block), and
+    /// there is no link, DNS or neighbors sample.
+    #[test]
+    fn build_engine_registers_the_established_stall_rule() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(8);
+
+        feed(&mut fx.engine, &mut w, proxy_with_streams(1, true));
+        assert_eq!(
+            incidents_for(&fx.store, "established-stall"),
+            0,
+            "a carrying tunnel stream is the healthy state"
+        );
+
+        feed(&mut fx.engine, &mut w, proxy_with_streams(2, false));
+        assert_eq!(
+            incidents_for(&fx.store, "established-stall"),
+            1,
+            "a stalled tunnel stream with fresh probes OK must be recorded as established-stall"
         );
     }
 
