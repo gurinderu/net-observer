@@ -374,6 +374,29 @@ impl Condition for PerClientBlock {
     }
 }
 
+/// Fires when the newest link sample resolved the fakeip-pool probe address to
+/// an egress interface that is not a tunnel (`utun*`) — the AWDL-collision
+/// class: a fakeip answer is only meaningful inside the tunnel, so a pool
+/// address routing via `awdl0`/`en0` sends traffic addressed to a phantom
+/// range out a real interface.
+///
+/// `None` means the route could not be determined (no config, no range, no
+/// route): the absence of a measurement, never a hijack. (realm net-observer,
+/// node: pending — rationale in the PR body until a graph session records it)
+pub struct FakeIpHijack;
+impl Condition for FakeIpHijack {
+    fn id(&self) -> &'static str {
+        "fakeip-hijack"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_link()?;
+        let ifname = last.fakeip_route_if.as_deref()?;
+        (!ifname.starts_with("utun")).then(|| Fire {
+            detail: format!("fakeip pool routes via {ifname}"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1122,6 +1145,60 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
                 "gateway {gw} must not fire per-client-block"
             );
         }
+    }
+
+    /// A link sample pinning what `FakeIpHijack` reads: the egress interface
+    /// the route table resolved for the fakeip-pool probe address (gateway and
+    /// direct healthy, everything else absent).
+    fn link_fakeip(ts: i64, route_if: Option<&str>) -> Sample {
+        Sample::Link(LinkSample {
+            ts_us: ts,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: route_if.map(str::to_string),
+        })
+    }
+
+    /// The AWDL-collision signature: the pool routes out a real interface.
+    #[test]
+    fn fakeip_hijack_fires_on_a_non_tunnel_interface() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_fakeip(1, Some("awdl0")));
+        let fire = FakeIpHijack
+            .eval(&w)
+            .expect("a fakeip pool routing via awdl0 must fire");
+        assert!(
+            fire.detail.contains("awdl0"),
+            "the detail must name the hijacking interface: {}",
+            fire.detail
+        );
+    }
+
+    /// The pool routing into the tunnel is the healthy state, whatever the
+    /// utun's number is.
+    #[test]
+    fn fakeip_hijack_silent_on_a_tunnel_interface() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_fakeip(1, Some("utun8")));
+        assert!(FakeIpHijack.eval(&w).is_none());
+    }
+
+    /// `None` = the route could not be determined (no config, no range, no
+    /// route): the absence of a measurement must not read as a hijack.
+    #[test]
+    fn fakeip_hijack_silent_when_the_route_is_unknown() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_fakeip(1, None));
+        assert!(FakeIpHijack.eval(&w).is_none());
     }
 
     /// Proxy history does not survive a resume (only the link change basis is
