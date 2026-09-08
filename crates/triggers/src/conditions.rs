@@ -397,6 +397,59 @@ impl Condition for FakeIpHijack {
     }
 }
 
+/// Fires when the established reference stream through the tunnel has died
+/// while the fresh tun probe still answers — the long-flow stall signature
+/// measured all day 2026-09-08: an established stream silently stops carrying
+/// while a brand-new connection succeeds instantly. Fresh probes alone cannot
+/// see it, and without the discriminator the incident gets labeled by hand.
+///
+/// The direct underlay stream localizes the fault, spelled out in the detail:
+/// it surviving means the stall is scoped to the proxied path
+/// (endpoint/protocol — the thing loosely called DPI); both dying means the
+/// underlay's treatment of long flows (NAT idle-eviction / radio), not the
+/// proxy. `None` on either side is the absence of a measurement (the stream
+/// was only just opened, or could not be opened): no fire on the tunnel side,
+/// an explicit "unmeasured" in the detail on the direct side. A dead fresh
+/// probe alongside is a plain outage — `wedge`/`gw-drop` territory, not a
+/// stall of established flows. Proxy history does not survive a resume, so
+/// after `clear_for_resume` this waits for a fresh reading. (realm
+/// net-observer, node: pending — rationale in the PR body until a graph
+/// session records it)
+pub struct EstablishedStall;
+impl Condition for EstablishedStall {
+    fn id(&self) -> &'static str {
+        "established-stall"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let p = w.last_proxy()?;
+        if p.est_tun_alive? {
+            return None;
+        }
+        // The fresh path must still answer, or this is a plain outage, not a
+        // long-flow stall (`unwrap_or(0) == 0` is the wedge's dead-tun read).
+        if p.tun_code.unwrap_or(0) == 0 {
+            return None;
+        }
+        let age = p.est_tun_age_s.unwrap_or(0);
+        let detail = match p.est_direct_alive {
+            Some(true) => format!(
+                "established stream through the tunnel stalled after ~{age}s (fresh OK); \
+direct underlay stream survived -> endpoint/protocol-scoped"
+            ),
+            Some(false) => format!(
+                "established streams through the tunnel and the direct underlay both stalled \
+after ~{age}s/~{da}s (fresh OK) -> underlay (NAT/radio), not proxy-scoped",
+                da = p.est_direct_age_s.unwrap_or(0)
+            ),
+            None => format!(
+                "established stream through the tunnel stalled after ~{age}s (fresh OK); \
+direct underlay stream unmeasured"
+            ),
+        };
+        Some(Fire { detail })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1207,6 +1260,113 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         let mut w = RecentWindow::new(8);
         w.push(link_fakeip(1, None));
         assert!(FakeIpHijack.eval(&w).is_none());
+    }
+
+    /// A proxy row pinning what `EstablishedStall` reads: the fresh tun probe
+    /// code and the two held-stream `(alive, age_s)` readings (`None` = no
+    /// measurement). Underlay TCP is Ok, endpoint fixed.
+    fn proxy_est(
+        ts: i64,
+        tun_code: Option<u16>,
+        est_tun: Option<(bool, u32)>,
+        est_direct: Option<(bool, u32)>,
+    ) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us: ts,
+            server_ip: "1.1.1.1:443".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: None,
+            tun_code,
+            selector: None,
+            est_direct_alive: est_direct.map(|(alive, _)| alive),
+            est_direct_age_s: est_direct.map(|(_, age)| age),
+            est_tun_alive: est_tun.map(|(alive, _)| alive),
+            est_tun_age_s: est_tun.map(|(_, age)| age),
+        })
+    }
+
+    /// The 2026-09-08 signature: the established proxied stream stalls while a
+    /// fresh connection succeeds — and the surviving direct stream scopes the
+    /// fault to the proxied path.
+    #[test]
+    fn established_stall_scopes_to_the_endpoint_when_the_direct_stream_survives() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(
+            1,
+            Some(204),
+            Some((false, 45)),
+            Some((true, 120)),
+        ));
+        let fire = EstablishedStall
+            .eval(&w)
+            .expect("a stalled tunnel stream with fresh OK must fire");
+        assert!(
+            fire.detail.contains("endpoint/protocol-scoped"),
+            "a surviving direct stream must scope the verdict: {}",
+            fire.detail
+        );
+        assert!(
+            fire.detail.contains("~45s"),
+            "the detail must carry the age at death: {}",
+            fire.detail
+        );
+    }
+
+    /// Both established streams dying on the same tick is the underlay's
+    /// treatment of long flows, and the detail must say the proxy is not the
+    /// scope. Dies under reading only the tunnel side.
+    #[test]
+    fn established_stall_scopes_to_the_underlay_when_both_streams_die() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(
+            1,
+            Some(204),
+            Some((false, 45)),
+            Some((false, 50)),
+        ));
+        let fire = EstablishedStall
+            .eval(&w)
+            .expect("both dead must still fire");
+        assert!(
+            fire.detail
+                .contains("underlay (NAT/radio), not proxy-scoped"),
+            "both streams dying must scope the verdict to the underlay: {}",
+            fire.detail
+        );
+    }
+
+    /// Healthy held streams are the quiet case, and the None it returns is
+    /// also what re-arms the engine after a real firing.
+    #[test]
+    fn established_stall_silent_while_the_tunnel_stream_carries() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(
+            1,
+            Some(204),
+            Some((true, 300)),
+            Some((true, 300)),
+        ));
+        assert!(EstablishedStall.eval(&w).is_none());
+    }
+
+    /// With the fresh tun probe dead too this is a plain outage (`wedge`
+    /// territory), not a stall of established flows.
+    #[test]
+    fn established_stall_silent_when_the_fresh_probe_is_dead_too() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(1, Some(0), Some((false, 45)), Some((true, 120))));
+        assert!(EstablishedStall.eval(&w).is_none());
+        w.push(proxy_est(2, None, Some((false, 60)), Some((true, 135))));
+        assert!(EstablishedStall.eval(&w).is_none());
+    }
+
+    /// `None` on the tunnel side is the absence of a measurement — the stream
+    /// was only just (re-)opened or could not be opened — never a stall.
+    #[test]
+    fn established_stall_silent_without_a_tunnel_measurement() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(1, Some(204), None, Some((true, 120))));
+        assert!(EstablishedStall.eval(&w).is_none());
     }
 
     /// Proxy history does not survive a resume (only the link change basis is
