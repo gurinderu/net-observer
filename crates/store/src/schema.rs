@@ -8,6 +8,9 @@ CREATE TABLE IF NOT EXISTS link_sample (
 -- until these ALTERs run on open, exactly like `neighbor_port.banner` below.
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS lan_probed USMALLINT;
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS lan_alive USMALLINT;
+-- The egress interface the route table resolves for a fakeip-pool address
+-- (NULL when it could not be determined). Same migration treatment.
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS fakeip_route_if VARCHAR;
 CREATE TABLE IF NOT EXISTS proxy_sample (
   ts_us BIGINT, server_ip VARCHAR, tcp VARCHAR, rtt_ms DOUBLE, tun_code USMALLINT, selector VARCHAR);
 CREATE TABLE IF NOT EXISTS incident (

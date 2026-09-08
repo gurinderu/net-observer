@@ -1382,6 +1382,7 @@ mod tests {
                 wifi_capture_present: false,
                 lan_probed: None,
                 lan_alive: None,
+                fakeip_route_if: None,
             }),
             proxy: None,
             dns: None,
@@ -1451,15 +1452,17 @@ mod tests {
         assert!(snap.observing);
     }
 
-    /// A daemon from before the probe-on-suspicion counts emits link samples
-    /// without `lan_probed`/`lan_alive`. They must decode as `None` — "not
-    /// probed" — never fail the whole frame.
+    /// A daemon from before the probe-on-suspicion counts and the fakeip route
+    /// resolution emits link samples without `lan_probed`/`lan_alive`/
+    /// `fakeip_route_if`. They must decode as `None` — "not measured" — never
+    /// fail the whole frame.
     #[test]
-    fn link_sample_decodes_pre_lan_probe_frame() {
+    fn link_sample_decodes_frames_from_before_the_new_fields() {
         let old = r#"{"ts_us":1,"gw":"Ok","gw_rtt_ms":null,"direct":"Ok","direct_rtt_ms":null,"dhcp_router":null,"dhcp_dns":null,"gw_arp_mac":null,"ssid":null,"wifi_capture_present":false}"#;
         let l: LinkSample = serde_json::from_str(old).unwrap();
         assert_eq!(l.lan_probed, None);
         assert_eq!(l.lan_alive, None);
+        assert_eq!(l.fakeip_route_if, None);
     }
 
     #[test]
@@ -1645,6 +1648,7 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         });
         assert_eq!(link.detail(), "gw=OK direct=FAIL");
 

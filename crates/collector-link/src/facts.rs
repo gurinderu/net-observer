@@ -19,6 +19,10 @@ pub trait LinkFacts: Send + Sync {
     /// interface — candidates for the probe-on-suspicion neighbor pings. The
     /// gateway is NOT filtered out here; the collector, which knows it, does.
     async fn arp_neighbor_ips(&self) -> Vec<String>;
+    /// The egress interface the route table resolves for an address inside
+    /// the sing-box fakeip pool — a local lookup, no packet on the wire.
+    /// `None` when it cannot be determined (no config, no range, no route).
+    async fn fakeip_route_iface(&self) -> Option<String>;
     async fn ssid(&self) -> Option<String>;
     async fn wifi_capture_present(&self) -> bool;
     /// Runtime capability probe: Ready iff the `link` collector can work here/now

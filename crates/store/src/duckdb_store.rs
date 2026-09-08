@@ -173,7 +173,7 @@ impl Store for DuckdbStore {
         let c = self.conn.lock().unwrap();
         match s {
             Sample::Link(l) => c.execute(
-                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     l.ts_us,
                     l.gw.to_string(),
@@ -186,7 +186,8 @@ impl Store for DuckdbStore {
                     l.ssid,
                     l.wifi_capture_present,
                     l.lan_probed,
-                    l.lan_alive
+                    l.lan_alive,
+                    l.fakeip_route_if
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
@@ -924,6 +925,7 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         });
         s.write_sample(&sample).unwrap();
         assert_eq!(
@@ -952,12 +954,14 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: Some(3),
             lan_alive: Some(1),
+            fakeip_route_if: None,
         };
         s.write_sample(&Sample::Link(base.clone())).unwrap();
         s.write_sample(&Sample::Link(LinkSample {
             ts_us: 2000,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
             ..base
         }))
         .unwrap();
@@ -974,6 +978,34 @@ mod tests {
                  WHERE ts_us = 2000 AND lan_probed IS NULL AND lan_alive IS NULL"
             )
             .unwrap(),
+            1
+        );
+    }
+
+    /// The fakeip-pool egress interface lands in its own column; NULL means it
+    /// could not be determined, distinguishable from any real interface name.
+    #[test]
+    fn link_sample_fakeip_route_if_round_trips() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 1000,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: Some("awdl0".into()),
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM link_sample WHERE fakeip_route_if = 'awdl0'")
+                .unwrap(),
             1
         );
     }
@@ -1166,6 +1198,7 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         }))
         .unwrap();
         s.write_sample(&Sample::Proxy(ProxySample {
@@ -1390,6 +1423,7 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         }))
         .unwrap();
         let t = s.query_table("SELECT ts_us, gw FROM link_sample").unwrap();

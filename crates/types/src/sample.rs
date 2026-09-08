@@ -26,6 +26,14 @@ pub struct LinkSample {
     /// exactly when `lan_probed` is.
     #[serde(default)]
     pub lan_alive: Option<u16>,
+    /// The egress interface the route table resolves for an address inside the
+    /// sing-box fakeip pool (a local lookup, no packet sent). A fakeip answer
+    /// is only meaningful inside the tunnel, so anything but a `utun*` here is
+    /// the hijack signature. `None` = could not be determined (no config, no
+    /// range, no route). `serde(default)` so a pre-field daemon's samples
+    /// still decode.
+    #[serde(default)]
+    pub fakeip_route_if: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -168,6 +176,7 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         });
         assert_eq!(l.ts_us(), 42);
 

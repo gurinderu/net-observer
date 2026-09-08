@@ -129,6 +129,9 @@ where
         };
         let ssid = self.facts.ssid().await;
         let wifi_present = self.facts.wifi_capture_present().await;
+        // A local route-table lookup, not a probe: it keeps running under
+        // quiet mode like the other passive facts.
+        let fakeip_route_if = self.facts.fakeip_route_iface().await;
         vec![Sample::Link(build_link_sample(
             ts_us,
             ping,
@@ -138,6 +141,7 @@ where
             dhcp,
             arp,
             lan,
+            fakeip_route_if,
             ssid,
             wifi_present,
         ))]
@@ -157,6 +161,7 @@ where
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         })]
     }
 }
@@ -235,6 +240,9 @@ mod tests {
                 "10.0.0.13".into(),
                 "10.0.0.14".into(),
             ]
+        }
+        async fn fakeip_route_iface(&self) -> Option<String> {
+            Some("utun8".into())
         }
         async fn ssid(&self) -> Option<String> {
             None
@@ -324,6 +332,18 @@ mod tests {
         let samples = c.collect(42).await;
         assert_eq!(samples.len(), 1);
         assert!(matches!(samples[0], Sample::Link(_)));
+    }
+
+    /// The fakeip-pool egress interface flows through to the sample untouched
+    /// — it is a passive fact, present on healthy and failed ticks alike.
+    #[tokio::test]
+    async fn the_fakeip_route_interface_flows_through() {
+        let c = collector(true);
+        let samples = c.collect(42).await;
+        let Sample::Link(l) = &samples[0] else {
+            panic!("expected a link sample")
+        };
+        assert_eq!(l.fakeip_route_if.as_deref(), Some("utun8"));
     }
 
     /// A silent gateway triggers the probe-on-suspicion: at most

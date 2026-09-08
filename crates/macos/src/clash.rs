@@ -185,6 +185,21 @@ fn parse_vless_endpoints(config_json: &str) -> Vec<String> {
     endpoints
 }
 
+/// One probe address from inside the fakeip pool a sing-box config declares
+/// (the first `dns.servers[]` entry carrying `inet4_range`): the range's
+/// network address + 8 — inside any real pool, and never a network or
+/// broadcast address of one.
+pub(crate) fn fakeip_probe_addr(config_json: &str) -> Option<std::net::Ipv4Addr> {
+    let value: serde_json::Value = serde_json::from_str(config_json).ok()?;
+    let servers = value.get("dns")?.get("servers")?.as_array()?;
+    let range = servers
+        .iter()
+        .find_map(|s| s.get("inet4_range").and_then(|r| r.as_str()))?;
+    let (net, _prefix) = range.split_once('/')?;
+    let net: std::net::Ipv4Addr = net.parse().ok()?;
+    Some(std::net::Ipv4Addr::from(u32::from(net) + 8))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +272,32 @@ mod tests {
     fn no_outbounds_is_empty() {
         assert!(parse_vless_endpoints("{}").is_empty());
         assert!(parse_vless_endpoints("garbage").is_empty());
+    }
+
+    #[test]
+    fn fakeip_probe_addr_is_network_plus_eight() {
+        let cfg = r#"{
+            "dns": {
+                "servers": [
+                    {"type": "udp", "server": "1.1.1.1"},
+                    {"type": "fakeip", "inet4_range": "198.18.0.0/15"}
+                ]
+            }
+        }"#;
+        assert_eq!(
+            fakeip_probe_addr(cfg),
+            Some(std::net::Ipv4Addr::new(198, 18, 0, 8))
+        );
+    }
+
+    #[test]
+    fn no_fakeip_range_is_none() {
+        assert_eq!(fakeip_probe_addr("{}"), None);
+        assert_eq!(fakeip_probe_addr(r#"{"dns":{"servers":[]}}"#), None);
+        assert_eq!(
+            fakeip_probe_addr(r#"{"dns":{"servers":[{"inet4_range":"not-a-cidr"}]}}"#),
+            None
+        );
+        assert_eq!(fakeip_probe_addr("garbage"), None);
     }
 }

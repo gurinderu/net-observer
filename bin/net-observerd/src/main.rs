@@ -436,7 +436,10 @@ async fn run_daemon() -> anyhow::Result<()> {
             SystemFacts::new(
                 cfg.collectors.link.gw.clone(),
                 cfg.collectors.link.phys_iface.clone(),
-            ),
+            )
+            // The fakeip-pool route resolution reads the same rendered config
+            // the proxy facts adapter does; absent, the field records None.
+            .with_singbox_config(SINGBOX_CONFIG_PATH),
             cfg.collectors.link.interval,
             quiet.clone(),
         )));
@@ -1100,6 +1103,7 @@ impl Collector for FakeCollector {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         })]
     }
     fn skip(&self, ts_us: i64) -> Vec<Sample> {
@@ -1116,6 +1120,7 @@ impl Collector for FakeCollector {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         })]
     }
 }
@@ -1736,6 +1741,7 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         })
     }
 

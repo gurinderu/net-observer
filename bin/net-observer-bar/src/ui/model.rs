@@ -216,6 +216,7 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         }
     }
 

@@ -970,6 +970,7 @@ mod tests {
                 wifi_capture_present: false,
                 lan_probed: None,
                 lan_alive: None,
+                fakeip_route_if: None,
             }),
             proxy: Some(ProxySample {
                 ts_us: 43,
@@ -1144,6 +1145,7 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         }));
         assert_eq!(
             format_frame_line(&link),

@@ -416,6 +416,7 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         })
     }
 
@@ -435,6 +436,7 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         })
     }
 
@@ -481,6 +483,7 @@ mod tests {
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
+            fakeip_route_if: None,
         })
     }
 
@@ -1066,6 +1069,7 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             wifi_capture_present: false,
             lan_probed: probed,
             lan_alive: alive,
+            fakeip_route_if: None,
         })
     }
 

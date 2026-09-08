@@ -26,6 +26,9 @@ pub struct SystemFacts {
     gw_override: Option<String>,
     iface_override: Option<String>,
     capture_window: Duration,
+    /// Rendered sing-box config to read the fakeip pool from. `None` (the
+    /// default) disables [`LinkFacts::fakeip_route_iface`].
+    singbox_config: Option<std::path::PathBuf>,
 }
 
 impl Default for SystemFacts {
@@ -34,6 +37,7 @@ impl Default for SystemFacts {
             gw_override: None,
             iface_override: None,
             capture_window: DEFAULT_CAPTURE_WINDOW,
+            singbox_config: None,
         }
     }
 }
@@ -46,7 +50,16 @@ impl SystemFacts {
             gw_override,
             iface_override,
             capture_window: DEFAULT_CAPTURE_WINDOW,
+            singbox_config: None,
         }
+    }
+
+    /// Point at the rendered sing-box config, enabling the fakeip-pool route
+    /// resolution ([`LinkFacts::fakeip_route_iface`]).
+    #[must_use]
+    pub fn with_singbox_config(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.singbox_config = Some(path.into());
+        self
     }
 }
 
@@ -96,6 +109,18 @@ impl LinkFacts for SystemFacts {
             .filter(|o| o.ip.parse::<std::net::Ipv4Addr>().is_ok())
             .map(|o| o.ip)
             .collect()
+    }
+
+    async fn fakeip_route_iface(&self) -> Option<String> {
+        let path = self.singbox_config.as_ref()?;
+        // A small local config file: an instant read, kept synchronous inside
+        // the async fn (mirroring the proxy facts adapter).
+        let text = std::fs::read_to_string(path).ok()?;
+        let probe = crate::clash::fakeip_probe_addr(&text)?;
+        // `route -n get` is a local RTM_GET lookup — no packet on the wire, so
+        // this keeps running under quiet mode like every other passive fact.
+        let out = run("route", &["-n", "get", &probe.to_string()]).await?;
+        parse_route_field(&out, "interface")
     }
 
     async fn ssid(&self) -> Option<String> {
