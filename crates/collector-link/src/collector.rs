@@ -170,12 +170,13 @@ where
 mod tests {
     use super::*;
 
-    /// A pinger that counts the echoes actually sent — gateway and neighbor
-    /// separately — so "quiet" can be asserted on the packet, not only on the
-    /// verdict. `gw_alive`/`hosts_alive` script the outcomes.
+    /// A pinger that records the echoes actually sent — the gateway count and
+    /// the exact neighbor addresses — so "quiet" can be asserted on the packet
+    /// (not only on the verdict) and the neighbor selection on the addresses
+    /// (not only on a count). `gw_alive`/`hosts_alive` script the outcomes.
     struct CountingPing {
         sent: Arc<std::sync::atomic::AtomicUsize>,
-        lan_sent: Arc<std::sync::atomic::AtomicUsize>,
+        lan_pinged: Arc<std::sync::Mutex<Vec<String>>>,
         gw_alive: bool,
         hosts_alive: bool,
     }
@@ -183,7 +184,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 sent: Arc::default(),
-                lan_sent: Arc::default(),
+                lan_pinged: Arc::default(),
                 gw_alive: true,
                 hosts_alive: true,
             }
@@ -197,8 +198,8 @@ mod tests {
                 rtt_ms: self.gw_alive.then_some(1.0),
             }
         }
-        async fn ping_host(&self, _: &str) -> PingOutcome {
-            self.lan_sent.fetch_add(1, Ordering::Release);
+        async fn ping_host(&self, addr: &str) -> PingOutcome {
+            self.lan_pinged.lock().unwrap().push(addr.to_string());
             PingOutcome {
                 reachable: self.hosts_alive,
                 rtt_ms: self.hosts_alive.then_some(1.0),
@@ -348,9 +349,11 @@ mod tests {
 
     /// A silent gateway triggers the probe-on-suspicion: at most
     /// [`LAN_PROBE_MAX`] non-gateway ARP entries are pinged and the counts land
-    /// in the sample. The fake ARP cache holds five candidates including the
-    /// gateway itself, so this dies under a missing gateway filter (4 probes)
-    /// and under a missing cap (4 probes) alike.
+    /// in the sample. Asserted on the ADDRESSES pinged, not only a count: the
+    /// fake ARP cache holds five candidates including the gateway itself, so
+    /// dropping the gateway filter would ping `10.0.0.1` and dropping the cap
+    /// would ping `10.0.0.14` — either changes the list, while a bare count of
+    /// three would notice neither.
     #[tokio::test]
     async fn a_failed_gateway_tick_probes_lan_neighbors() {
         let ping = CountingPing {
@@ -358,16 +361,20 @@ mod tests {
             ..CountingPing::default()
         };
         let c = collector_with_ping(ping, Arc::new(AtomicBool::new(false)));
-        let lan_sent = c.ping.lan_sent.clone();
+        let lan_pinged = c.ping.lan_pinged.clone();
 
         let samples = c.collect(42).await;
         let Sample::Link(l) = &samples[0] else {
             panic!("expected a link sample")
         };
         assert_eq!(l.gw, GwVerdict::Fail);
-        assert_eq!(l.lan_probed, Some(3), "3 = 5 ARP entries - gateway, capped");
+        assert_eq!(l.lan_probed, Some(3));
         assert_eq!(l.lan_alive, Some(3));
-        assert_eq!(lan_sent.load(Ordering::Acquire), 3);
+        assert_eq!(
+            *lan_pinged.lock().unwrap(),
+            vec!["10.0.0.11", "10.0.0.12", "10.0.0.13"],
+            "the gateway is filtered out and the cap stops before 10.0.0.14"
+        );
     }
 
     /// A healthy gateway means no suspicion: no neighbor is pinged and the
@@ -376,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn a_healthy_gateway_tick_probes_no_neighbors() {
         let c = collector(true);
-        let lan_sent = c.ping.lan_sent.clone();
+        let lan_pinged = c.ping.lan_pinged.clone();
 
         let samples = c.collect(42).await;
         let Sample::Link(l) = &samples[0] else {
@@ -385,7 +392,7 @@ mod tests {
         assert_eq!(l.gw, GwVerdict::Ok);
         assert_eq!(l.lan_probed, None);
         assert_eq!(l.lan_alive, None);
-        assert_eq!(lan_sent.load(Ordering::Acquire), 0);
+        assert!(lan_pinged.lock().unwrap().is_empty());
     }
 
     /// Quiet must suppress the neighbor pings too: they are addressed packets,
@@ -399,7 +406,7 @@ mod tests {
             ..CountingPing::default()
         };
         let c = collector_with_ping(ping, Arc::new(AtomicBool::new(true)));
-        let lan_sent = c.ping.lan_sent.clone();
+        let lan_pinged = c.ping.lan_pinged.clone();
 
         let samples = c.collect(42).await;
         let Sample::Link(l) = &samples[0] else {
@@ -408,9 +415,8 @@ mod tests {
         assert_eq!(l.gw, GwVerdict::Skip);
         assert_eq!(l.lan_probed, None);
         assert_eq!(l.lan_alive, None);
-        assert_eq!(
-            lan_sent.load(Ordering::Acquire),
-            0,
+        assert!(
+            lan_pinged.lock().unwrap().is_empty(),
             "quiet must address no packet at the segment"
         );
     }
