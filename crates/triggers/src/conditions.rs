@@ -341,6 +341,39 @@ while the reference host answers",
     }
 }
 
+/// Fires when the newest link sample's gateway echo went unanswered while at
+/// least one LAN neighbor probed on that same tick answered — the
+/// per-client-ban signature: the segment is alive, and the gateway is silent
+/// only toward this client.
+///
+/// `lan_probed`/`lan_alive` are `None` on any tick that did not probe (healthy
+/// gateway, quiet mode, no gateway): no measurement, no fire. A probed tick
+/// where nobody answered is the whole segment dead — `gw-drop` territory, not
+/// a selective ban. The gateway match is exhaustive so a future verdict token
+/// cannot join the fault set by accident. (realm net-observer, node: pending —
+/// rationale in the PR body until a graph session records it)
+pub struct PerClientBlock;
+impl Condition for PerClientBlock {
+    fn id(&self) -> &'static str {
+        "per-client-block"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_link()?;
+        match last.gw {
+            GwVerdict::Fail => {}
+            GwVerdict::Ok | GwVerdict::NoGw | GwVerdict::Skip => return None,
+        }
+        let probed = last.lan_probed?;
+        let alive = last.lan_alive?;
+        if probed == 0 || alive == 0 {
+            return None;
+        }
+        Some(Fire {
+            detail: format!("gateway silent while {alive}/{probed} LAN neighbors answer"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1048,76 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         w.push(link(1, TcpVerdict::Ok));
         push_dead_cohort(&mut w, 10);
         assert!(c.eval(&w).is_none());
+    }
+
+    /// A link sample pinning what `PerClientBlock` reads: the gateway verdict
+    /// and the probe-on-suspicion counts (direct Ok, everything else absent).
+    fn link_lan(ts: i64, gw: GwVerdict, probed: Option<u16>, alive: Option<u16>) -> Sample {
+        Sample::Link(LinkSample {
+            ts_us: ts,
+            gw,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+            lan_probed: probed,
+            lan_alive: alive,
+        })
+    }
+
+    /// The measured 2026-09-08 16:44:52 signature: the gateway silent while
+    /// probed neighbors answer.
+    #[test]
+    fn per_client_block_fires_when_neighbors_answer_a_silent_gateway() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_lan(1, GwVerdict::Fail, Some(3), Some(2)));
+        let fire = PerClientBlock
+            .eval(&w)
+            .expect("a silent gateway with live neighbors must fire");
+        assert!(
+            fire.detail.contains("2/3"),
+            "the detail must carry the alive/probed counts: {}",
+            fire.detail
+        );
+    }
+
+    /// Nobody on the segment answering is the whole segment dead — `gw-drop`
+    /// territory, not a selective ban. Dies under `alive >= 0`-style slack.
+    #[test]
+    fn per_client_block_silent_when_no_neighbor_answers() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_lan(1, GwVerdict::Fail, Some(3), Some(0)));
+        assert!(PerClientBlock.eval(&w).is_none());
+    }
+
+    /// `None` counts mean the tick did not probe (a pre-field daemon's replay,
+    /// or a probe that could not run): absence of a measurement must not fire.
+    #[test]
+    fn per_client_block_silent_when_the_tick_did_not_probe() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_lan(1, GwVerdict::Fail, None, None));
+        assert!(PerClientBlock.eval(&w).is_none());
+        // Probed nothing (empty ARP cache) is equally not a ban signature.
+        w.push(link_lan(2, GwVerdict::Fail, Some(0), Some(0)));
+        assert!(PerClientBlock.eval(&w).is_none());
+    }
+
+    /// The signature is anchored to a FAILED gateway echo: a healthy or
+    /// quiet/absent gateway must stay silent even if counts are present.
+    #[test]
+    fn per_client_block_silent_unless_the_gateway_failed() {
+        let mut w = RecentWindow::new(8);
+        for gw in [GwVerdict::Ok, GwVerdict::Skip, GwVerdict::NoGw] {
+            w.push(link_lan(1, gw, Some(3), Some(2)));
+            assert!(
+                PerClientBlock.eval(&w).is_none(),
+                "gateway {gw} must not fire per-client-block"
+            );
+        }
     }
 
     /// Proxy history does not survive a resume (only the link change basis is
