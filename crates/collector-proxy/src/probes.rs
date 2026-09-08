@@ -4,11 +4,11 @@
 
 use collector_core::Readiness;
 
-/// Proxy facts: the upstream proxy server addresses, the TUN HTTP 204 probe, and
+/// Proxy facts: the upstream proxy endpoints, the TUN HTTP 204 probe, and
 /// the active upstream node selection.
 #[allow(async_fn_in_trait)] // internal workspace port, not a published API
 pub trait ProxyFacts: Send + Sync {
-    /// The upstream proxy server addresses to TCP-probe.
+    /// The upstream proxy endpoints to TCP-probe, as `"host:port"` strings.
     async fn server_endpoints(&self) -> Vec<String>;
     async fn tun_probe(&self, url: &str) -> Option<u16>;
     async fn selector(&self) -> Option<String>;

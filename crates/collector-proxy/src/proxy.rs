@@ -1,13 +1,15 @@
 use collector_core::PingOutcome;
 use types::{ProxySample, TcpVerdict};
 
-/// Pure mapping: one [`ProxySample`] per upstream server, with the shared
-/// `tun_code`/`selector` attached to every row. Emits a single `SKIP` row when
-/// no servers are configured (absence of a signal is itself diagnostic).
+/// Pure mapping: one [`ProxySample`] per upstream endpoint (ip:port), with the
+/// shared `tun_code`/`selector` attached to every row. Emits a single `SKIP`
+/// row when no endpoints are configured (absence of a signal is itself
+/// diagnostic).
 ///
 /// This is a SYNC assembly step: the async `collect` awaits the probes, then
-/// hands the fetched values here. `probed` is the per-server `(ip, outcome)`
-/// pairs already gathered from the [`TcpProber`](collector_core::TcpProber).
+/// hands the fetched values here. `probed` is the per-endpoint
+/// `(endpoint, outcome)` pairs already gathered from the
+/// [`TcpProber`](collector_core::TcpProber).
 pub fn build_proxy_samples(
     ts_us: i64,
     tun_code: Option<u16>,

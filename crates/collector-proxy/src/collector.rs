@@ -59,11 +59,22 @@ impl<T: TcpProber, F: ProxyFacts> Collector for ProxyCollector<T, F> {
         // Await the probes, then a sync `build_*` composes the samples.
         let tun_code = self.facts.tun_probe(&self.tun_url).await;
         let selector = self.facts.selector().await;
-        let ips = self.facts.server_endpoints().await;
-        let mut probed = Vec::with_capacity(ips.len());
-        for ip in ips {
-            let o = self.tcp.connect_bound(&ip, 443, &self.iface).await;
-            probed.push((ip, o));
+        let endpoints = self.facts.server_endpoints().await;
+        let mut probed = Vec::with_capacity(endpoints.len());
+        for endpoint in endpoints {
+            // Split at the LAST ':' so the host half keeps any earlier colons;
+            // an endpoint that does not parse as "host:port" is probed on 443.
+            let (host, port) = match endpoint.rsplit_once(':') {
+                Some((host, port)) => match port.parse::<u16>() {
+                    Ok(port) => (host, port),
+                    Err(_) => (endpoint.as_str(), 443),
+                },
+                None => (endpoint.as_str(), 443),
+            };
+            let o = self.tcp.connect_bound(host, port, &self.iface).await;
+            // The sample carries the full "host:port" string: the row must name
+            // the listener that was probed, matching the oracle's vless[ip:port].
+            probed.push((endpoint, o));
         }
         build_proxy_samples(ts_us, tun_code, selector, probed)
             .into_iter()
@@ -101,7 +112,7 @@ mod tests {
     struct Facts(Readiness);
     impl ProxyFacts for Facts {
         async fn server_endpoints(&self) -> Vec<String> {
-            vec!["1.1.1.1".into()]
+            vec!["1.1.1.1:443".into()]
         }
         async fn tun_probe(&self, _: &str) -> Option<u16> {
             Some(204)
