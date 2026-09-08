@@ -374,15 +374,34 @@ impl Condition for PerClientBlock {
     }
 }
 
+/// An interface a fakeip-pool address may legitimately resolve to: a tunnel it
+/// is SUPPOSED to enter (`utun`/`tun`/`ipsec`/`gif`/`stf`), or loopback (`lo`),
+/// where a blackhole/reject or kill-switch route drops the packet — the
+/// opposite of leaking out a real egress. A hijack is anything else.
+fn is_tunnel_or_discard_iface(name: &str) -> bool {
+    const PREFIXES: [&str; 6] = ["utun", "tun", "ipsec", "gif", "stf", "lo"];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
 /// Fires when the newest link sample resolved the fakeip-pool probe address to
-/// an egress interface that is not a tunnel (`utun*`) — the AWDL-collision
-/// class: a fakeip answer is only meaningful inside the tunnel, so a pool
-/// address routing via `awdl0`/`en0` sends traffic addressed to a phantom
-/// range out a real interface.
+/// a real egress interface (not a tunnel, not loopback/discard) WHILE the
+/// tunnel is up — the AWDL-collision class: a fakeip answer is only meaningful
+/// inside the tunnel, so a pool address routing out `awdl0`/`en0` sends traffic
+/// addressed to a phantom range out a real interface.
+///
+/// Two gates keep an ordinary outage from reading as a hijack. First,
+/// loopback/tunnel destinations are not a leak ([`is_tunnel_or_discard_iface`]):
+/// a kill-switch/reject route resolves to `lo0` (packet dropped), the semantic
+/// opposite of the leak. Second, the tunnel must actually be up this tick — when
+/// sing-box is down, `route get` falls through to the default route and returns
+/// the physical interface, which is "the tunnel is simply down"
+/// (`wedge`/`gw-drop` territory), not a hijack; the newest proxy sample's live
+/// `tun_code` distinguishes the two.
 ///
 /// `None` means the route could not be determined (no config, no range, no
-/// route): the absence of a measurement, never a hijack. (realm net-observer,
-/// node: pending — rationale in the PR body until a graph session records it)
+/// route) or the tunnel's state is unknown (no proxy sample): the absence of a
+/// measurement, never a hijack. (realm net-observer, node: pending — rationale
+/// in the PR body until a graph session records it)
 pub struct FakeIpHijack;
 impl Condition for FakeIpHijack {
     fn id(&self) -> &'static str {
@@ -391,8 +410,18 @@ impl Condition for FakeIpHijack {
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let last = w.last_link()?;
         let ifname = last.fakeip_route_if.as_deref()?;
-        (!ifname.starts_with("utun")).then(|| Fire {
-            detail: format!("fakeip pool routes via {ifname}"),
+        if is_tunnel_or_discard_iface(ifname) {
+            return None;
+        }
+        // The tunnel must be up, or a pool address on a real interface is just
+        // "sing-box is down" (route fell through to the default route), not a
+        // hijack. `unwrap_or(0) == 0` is the wedge's dead-tun read.
+        let proxy = w.last_proxy()?;
+        if proxy.tun_code.unwrap_or(0) == 0 {
+            return None;
+        }
+        Some(Fire {
+            detail: format!("fakeip pool routes via {ifname} while the tunnel is up"),
         })
     }
 }
@@ -411,10 +440,17 @@ impl Condition for FakeIpHijack {
 /// was only just opened, or could not be opened): no fire on the tunnel side,
 /// an explicit "unmeasured" in the detail on the direct side. A dead fresh
 /// probe alongside is a plain outage — `wedge`/`gw-drop` territory, not a
-/// stall of established flows. Proxy history does not survive a resume, so
-/// after `clear_for_resume` this waits for a fresh reading. (realm
-/// net-observer, node: pending — rationale in the PR body until a graph
-/// session records it)
+/// stall of established flows.
+///
+/// The "endpoint-scoped" verdict requires the surviving direct stream to be at
+/// least as old as the stalled tunnel stream. The two streams reconnect
+/// independently, so on a real underlay stall the direct stream can have died
+/// and come back young while the tunnel stream reports its long life at death;
+/// a young direct stream is not proof the underlay was healthy across the
+/// window, so it reads "underlay-ambiguous" rather than exonerating the
+/// underlay. Proxy history does not survive a resume, so after
+/// `clear_for_resume` this waits for a fresh reading. (realm net-observer,
+/// node: pending — rationale in the PR body until a graph session records it)
 pub struct EstablishedStall;
 impl Condition for EstablishedStall {
     fn id(&self) -> &'static str {
@@ -430,19 +466,26 @@ impl Condition for EstablishedStall {
         if p.tun_code.unwrap_or(0) == 0 {
             return None;
         }
-        let age = p.est_tun_age_s.unwrap_or(0);
+        let tun_age = p.est_tun_age_s.unwrap_or(0);
+        let direct_age = p.est_direct_age_s.unwrap_or(0);
         let detail = match p.est_direct_alive {
+            // A surviving direct stream exonerates the underlay only if it is at
+            // least as old as the tunnel stream that died — else it may have
+            // reconnected young through the same underlay hiccup.
+            Some(true) if direct_age >= tun_age => format!(
+                "established stream through the tunnel stalled after ~{tun_age}s (fresh OK); \
+direct underlay stream survived ~{direct_age}s -> endpoint/protocol-scoped"
+            ),
             Some(true) => format!(
-                "established stream through the tunnel stalled after ~{age}s (fresh OK); \
-direct underlay stream survived -> endpoint/protocol-scoped"
+                "established stream through the tunnel stalled after ~{tun_age}s (fresh OK); \
+direct underlay stream too young to compare (~{direct_age}s) -> underlay-ambiguous"
             ),
             Some(false) => format!(
                 "established streams through the tunnel and the direct underlay both stalled \
-after ~{age}s/~{da}s (fresh OK) -> underlay (NAT/radio), not proxy-scoped",
-                da = p.est_direct_age_s.unwrap_or(0)
+after ~{tun_age}s/~{direct_age}s (fresh OK) -> underlay (NAT/radio), not proxy-scoped"
             ),
             None => format!(
-                "established stream through the tunnel stalled after ~{age}s (fresh OK); \
+                "established stream through the tunnel stalled after ~{tun_age}s (fresh OK); \
 direct underlay stream unmeasured"
             ),
         };
@@ -1229,14 +1272,17 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         })
     }
 
-    /// The AWDL-collision signature: the pool routes out a real interface.
+    /// The AWDL-collision signature: the pool routes out a real interface while
+    /// the tunnel is up. The healthy proxy sample is what proves the tunnel is
+    /// up — without it the tunnel-up gate cannot fire.
     #[test]
-    fn fakeip_hijack_fires_on_a_non_tunnel_interface() {
+    fn fakeip_hijack_fires_on_a_non_tunnel_interface_while_the_tunnel_is_up() {
         let mut w = RecentWindow::new(8);
-        w.push(link_fakeip(1, Some("awdl0")));
+        w.push(proxy(1, 204)); // tunnel up this tick
+        w.push(link_fakeip(2, Some("awdl0")));
         let fire = FakeIpHijack
             .eval(&w)
-            .expect("a fakeip pool routing via awdl0 must fire");
+            .expect("a fakeip pool routing via awdl0 while the tunnel is up must fire");
         assert!(
             fire.detail.contains("awdl0"),
             "the detail must name the hijacking interface: {}",
@@ -1249,8 +1295,36 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
     #[test]
     fn fakeip_hijack_silent_on_a_tunnel_interface() {
         let mut w = RecentWindow::new(8);
-        w.push(link_fakeip(1, Some("utun8")));
+        w.push(proxy(1, 204));
+        w.push(link_fakeip(2, Some("utun8")));
         assert!(FakeIpHijack.eval(&w).is_none());
+    }
+
+    /// A pool address on loopback is a blackhole/reject or kill-switch drop —
+    /// the packet is discarded, the opposite of leaking out a real egress — so
+    /// it must not fire even with the tunnel up. Dies under the old
+    /// `!starts_with("utun")` test, which flagged `lo0` as a hijack.
+    #[test]
+    fn fakeip_hijack_silent_on_a_loopback_route() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy(1, 204));
+        w.push(link_fakeip(2, Some("lo0")));
+        assert!(FakeIpHijack.eval(&w).is_none());
+    }
+
+    /// When sing-box is down `route get` falls through to the default route and
+    /// returns the physical interface, so a naive check reports a phantom
+    /// hijack next to every wedge. The tunnel-up gate (dead `tun_code`)
+    /// suppresses it. Dies under removing that gate.
+    #[test]
+    fn fakeip_hijack_silent_when_the_tunnel_is_down() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy(1, 0)); // tunnel down: sing-box not carrying
+        w.push(link_fakeip(2, Some("en0")));
+        assert!(
+            FakeIpHijack.eval(&w).is_none(),
+            "a route fall-through while sing-box is down is not a hijack"
+        );
     }
 
     /// `None` = the route could not be determined (no config, no range, no
@@ -1258,7 +1332,17 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
     #[test]
     fn fakeip_hijack_silent_when_the_route_is_unknown() {
         let mut w = RecentWindow::new(8);
-        w.push(link_fakeip(1, None));
+        w.push(proxy(1, 204));
+        w.push(link_fakeip(2, None));
+        assert!(FakeIpHijack.eval(&w).is_none());
+    }
+
+    /// With no proxy sample the tunnel's state is unknown, so a real-interface
+    /// pool route cannot be confirmed a hijack — silence, not a fabricated one.
+    #[test]
+    fn fakeip_hijack_silent_without_a_proxy_sample() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_fakeip(1, Some("en0")));
         assert!(FakeIpHijack.eval(&w).is_none());
     }
 
@@ -1308,6 +1392,35 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         assert!(
             fire.detail.contains("~45s"),
             "the detail must carry the age at death: {}",
+            fire.detail
+        );
+    }
+
+    /// A direct stream that survived but is YOUNGER than the stalled tunnel
+    /// stream may have reconnected through the very same underlay hiccup, so it
+    /// does not exonerate the underlay — the verdict is ambiguous, not
+    /// endpoint-scoped. Dies under the un-gated `Some(true) =>
+    /// endpoint/protocol-scoped` that ignored the ages.
+    #[test]
+    fn established_stall_is_ambiguous_when_the_direct_stream_is_young() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(
+            1,
+            Some(204),
+            Some((false, 300)),
+            Some((true, 20)),
+        ));
+        let fire = EstablishedStall
+            .eval(&w)
+            .expect("a stalled tunnel with fresh OK still fires");
+        assert!(
+            fire.detail.contains("underlay-ambiguous"),
+            "a young direct stream must not be read as exonerating the underlay: {}",
+            fire.detail
+        );
+        assert!(
+            !fire.detail.contains("endpoint/protocol-scoped"),
+            "a young direct stream must not scope the fault to the endpoint: {}",
             fire.detail
         );
     }
