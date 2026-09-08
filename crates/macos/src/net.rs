@@ -117,7 +117,9 @@ impl TcpProber for BoundTcpProber {
 async fn connect_bound_inner(host: &str, port: u16, iface: &str) -> Option<f64> {
     let start = Instant::now();
     let iface = (!iface.is_empty()).then_some(iface);
-    let _stream = open_bound_stream(host, port, iface).await?;
+    // `require_bind = false`: a probe that could not pin the interface still
+    // reports reachability on the default route — the historical behaviour.
+    let _stream = open_bound_stream(host, port, iface, false).await?;
     Some(start.elapsed().as_secs_f64() * 1000.0)
 }
 
@@ -126,10 +128,18 @@ async fn connect_bound_inner(host: &str, port: u16, iface: &str) -> Option<f64> 
 /// [`PROBE_TIMEOUT`] via `tokio::net::TcpStream`, returning the connected
 /// stream. Shared by the one-shot probes above and the held reference streams
 /// (`stall`).
+///
+/// `require_bind` decides what a failed `IP_BOUND_IF` means. With it `false`
+/// the connect falls through to the default route (a probe still measures
+/// *something*). With it `true` a failed bind returns `None` instead: a caller
+/// that needs the *underlay* path (the held direct stream) must never silently
+/// ride the default route — that would have it measuring the TUN and calling
+/// the result "direct".
 pub(crate) async fn open_bound_stream(
     host: &str,
     port: u16,
     iface: Option<&str>,
+    require_bind: bool,
 ) -> Option<TcpStream> {
     let addr = (host, port).to_socket_addrs().ok()?.next()?;
     let domain = match addr {
@@ -143,6 +153,13 @@ pub(crate) async fn open_bound_stream(
         && domain == Domain::IPV4
         && !bind_to_iface_v4(socket.as_raw_fd(), iface)
     {
+        if require_bind {
+            tracing::debug!(
+                iface,
+                "IP_BOUND_IF failed on a required-bind connect; refusing the default route"
+            );
+            return None;
+        }
         tracing::debug!(iface, "IP_BOUND_IF failed; probing on default route");
     }
     // Kick off the non-blocking connect: EINPROGRESS is the expected "started"

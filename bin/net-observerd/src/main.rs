@@ -455,8 +455,12 @@ async fn run_daemon() -> anyhow::Result<()> {
             ),
             // The held reference streams: direct bound to the physical
             // interface, tunnel on the default route. The adapter owns the
-            // sockets across ticks.
-            HeldReferenceStreams::new(phys_iface.clone().unwrap_or_default()),
+            // sockets across ticks; the interval sets its staleness bound, so a
+            // stream idle across an observing pause is discarded unmeasured.
+            HeldReferenceStreams::new(
+                phys_iface.clone().unwrap_or_default(),
+                cfg.collectors.proxy.interval,
+            ),
             cfg.collectors.proxy.tun_probe_url.clone(),
             phys_iface.clone().unwrap_or_default(),
             cfg.collectors.proxy.interval,

@@ -45,10 +45,45 @@ const REFERENCE_PORT: u16 = 443;
 /// looser, so this errs toward reporting the stall early, not late.
 const STALL_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// One held stream: the TLS session and when it was established.
+/// A held stream is discarded, unmeasured, once the gap since it was last
+/// exercised exceeds this many tick intervals. Consecutive ticks are one
+/// interval apart, so three intervals cleanly separates ordinary jitter from an
+/// unmeasured stretch — an operator `SetObserving(false)` pause (minutes) or a
+/// host-starvation stall — across which the far end may have dropped the socket
+/// for reasons that are not a fault.
+const STALE_INTERVAL_MULTIPLE: u32 = 3;
+
+/// The staleness bound (see [`STALE_INTERVAL_MULTIPLE`]) for a tick `interval`.
+/// A pure function so the policy is checkable without a live stream.
+fn stale_after(interval: Duration) -> Duration {
+    interval.saturating_mul(STALE_INTERVAL_MULTIPLE)
+}
+
+/// Whole seconds of `d`, saturated into a `u32` for the wire.
+fn secs_u32(d: Duration) -> u32 {
+    d.as_secs().min(u64::from(u32::MAX)) as u32
+}
+
+/// The outcome of one round-trip attempt on a held stream.
+enum Roundtrip {
+    /// The stream carried the request and a response came back.
+    Alive,
+    /// The far end tore the connection down (a clean keep-alive FIN, or a
+    /// reset): NOT a stall — a healthy path whose server closed an idle
+    /// keep-alive behaves exactly like this. Reconnect and re-measure rather
+    /// than fabricate a stall.
+    TornDown,
+    /// The request or response timed out with the socket still open — silent
+    /// packet loss, which is the established-flow stall this signature hunts.
+    Stalled,
+}
+
+/// One held stream: the TLS session, when it was established, and when it was
+/// last exercised (for the staleness gate).
 struct Held {
     stream: tokio_rustls::client::TlsStream<TcpStream>,
     opened_at: Instant,
+    last_checked: Instant,
 }
 
 /// macOS implementation of [`StallProbe`]: two held reference streams, checked
@@ -56,6 +91,8 @@ struct Held {
 pub struct HeldReferenceStreams {
     /// Physical interface the `direct` stream binds to; empty ⇒ unbound.
     iface: String,
+    /// A held stream idle longer than this is discarded unmeasured.
+    stale_after: Duration,
     direct: Mutex<Option<Held>>,
     tun: Mutex<Option<Held>>,
     connector: TlsConnector,
@@ -64,52 +101,88 @@ pub struct HeldReferenceStreams {
 impl HeldReferenceStreams {
     /// Build the prober. `iface` is the physical interface for the direct
     /// (underlay) stream; the tunnel stream always uses the default route.
+    /// `interval` is the proxy collector's tick cadence, from which the
+    /// staleness bound is derived.
     #[must_use]
-    pub fn new(iface: impl Into<String>) -> Self {
+    pub fn new(iface: impl Into<String>, interval: Duration) -> Self {
         Self {
             iface: iface.into(),
+            stale_after: stale_after(interval),
             direct: Mutex::new(None),
             tun: Mutex::new(None),
             connector: build_connector(),
         }
     }
 
-    /// Check one slot: establish a missing stream (no measurement this tick),
-    /// or round-trip the held one and report alive/dead with its age. A dead
-    /// stream is dropped so the next tick re-establishes it.
+    /// Check one slot against the shared per-tick `now`: discard a stream idle
+    /// across a gap larger than [`Self::stale_after`] (unmeasured), establish a
+    /// missing one (no measurement this tick), or round-trip the held one. Ages
+    /// are measured from `now` so the direct and tun readings of one tick are
+    /// comparable.
     async fn check_slot(
         &self,
         slot: &Mutex<Option<Held>>,
         iface: Option<&str>,
+        now: Instant,
     ) -> Option<StreamCheck> {
         let mut guard = slot.lock().await;
+        // A stream that sat idle across an unmeasured stretch (a pause, a
+        // starvation stall) may have been dropped by the far-end NAT/idle
+        // timeout for a reason that is NOT a fault. Discard it and re-measure
+        // on a fresh one rather than read a stale socket as a stall.
+        if guard
+            .as_ref()
+            .is_some_and(|h| now.saturating_duration_since(h.last_checked) > self.stale_after)
+        {
+            *guard = None;
+        }
         match guard.as_mut() {
             None => {
-                *guard = self.establish(iface).await;
+                *guard = self.establish(iface, now).await;
                 None
             }
             Some(held) => {
-                let age_s = held.opened_at.elapsed().as_secs().min(u64::from(u32::MAX)) as u32;
-                let alive = roundtrip(&mut held.stream).await;
-                if !alive {
-                    *guard = None;
+                let age_s = secs_u32(now.saturating_duration_since(held.opened_at));
+                match roundtrip(&mut held.stream).await {
+                    Roundtrip::Alive => {
+                        held.last_checked = now;
+                        Some(StreamCheck { alive: true, age_s })
+                    }
+                    Roundtrip::Stalled => {
+                        *guard = None;
+                        Some(StreamCheck {
+                            alive: false,
+                            age_s,
+                        })
+                    }
+                    Roundtrip::TornDown => {
+                        // A torn-down keep-alive is not a fault: reconnect so the
+                        // next tick measures a live stream, and report no
+                        // measurement this tick.
+                        *guard = self.establish(iface, now).await;
+                        None
+                    }
                 }
-                Some(StreamCheck { alive, age_s })
             }
         }
     }
 
-    /// Open a TCP connection (optionally interface-bound) to the reference
-    /// host and complete a TLS handshake over it.
-    async fn establish(&self, iface: Option<&str>) -> Option<Held> {
-        let stream = open_bound_stream(REFERENCE_HOST, REFERENCE_PORT, iface).await?;
+    /// Open a TCP connection (interface-bound when `iface` is `Some`, and then
+    /// STRICTLY so — a failed bind is a failed establish, never a silent
+    /// default-route fallback) to the reference host and complete a TLS
+    /// handshake over it. `opened_at`/`last_checked` are stamped from the
+    /// tick's shared `now`.
+    async fn establish(&self, iface: Option<&str>, now: Instant) -> Option<Held> {
+        let stream =
+            open_bound_stream(REFERENCE_HOST, REFERENCE_PORT, iface, iface.is_some()).await?;
         let server_name = rustls::pki_types::ServerName::try_from(REFERENCE_HOST)
             .ok()?
             .to_owned();
         match timeout(STALL_TIMEOUT, self.connector.connect(server_name, stream)).await {
             Ok(Ok(tls)) => Some(Held {
                 stream: tls,
-                opened_at: Instant::now(),
+                opened_at: now,
+                last_checked: now,
             }),
             _ => {
                 tracing::debug!(?iface, "held reference stream failed to establish");
@@ -121,38 +194,43 @@ impl HeldReferenceStreams {
 
 impl StallProbe for HeldReferenceStreams {
     async fn check(&self) -> StallReading {
+        // ONE monotonic reading for the whole tick, so the direct and tun ages
+        // are measured against the same instant and stay comparable.
+        let now = Instant::now();
         let iface = (!self.iface.is_empty()).then_some(self.iface.as_str());
         StallReading {
-            direct: self.check_slot(&self.direct, iface).await,
-            tun: self.check_slot(&self.tun, None).await,
+            direct: self.check_slot(&self.direct, iface, now).await,
+            tun: self.check_slot(&self.tun, None, now).await,
         }
     }
 }
 
-/// One `HEAD` round-trip on the held TLS session: write the request, read
-/// until the response headers end. `false` on any error, EOF, or timeout —
-/// the stream stopped carrying.
-async fn roundtrip(stream: &mut tokio_rustls::client::TlsStream<TcpStream>) -> bool {
+/// One `HEAD` round-trip on the held TLS session, classified into
+/// [`Roundtrip`]. A timeout with the socket still open is a stall; a clean EOF
+/// or a connection error is a teardown, not a stall (see [`Roundtrip`]).
+async fn roundtrip(stream: &mut tokio_rustls::client::TlsStream<TcpStream>) -> Roundtrip {
     let req = b"HEAD / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: keep-alive\r\n\r\n";
     match timeout(STALL_TIMEOUT, stream.write_all(req)).await {
         Ok(Ok(())) => {}
-        _ => return false,
+        Ok(Err(_)) => return Roundtrip::TornDown, // the far end had already gone
+        Err(_) => return Roundtrip::Stalled,      // the write itself hung
     }
-    // Read until the header terminator. `HEAD` carries no body, so nothing is
-    // left on the stream for the next tick; a response longer than the cap
-    // still proved the stream carries and counts as alive.
+    // Read until the header terminator. `HEAD` carries no body, so the response
+    // ends at the blank line and nothing is left on the stream for the next
+    // tick; a response past the cap still proved the stream carries.
     let mut seen: Vec<u8> = Vec::with_capacity(1024);
     let mut buf = [0u8; 1024];
     loop {
         match timeout(STALL_TIMEOUT, stream.read(&mut buf)).await {
-            Ok(Ok(0)) => return false,
+            Ok(Ok(0)) => return Roundtrip::TornDown, // clean FIN before a response
             Ok(Ok(n)) => {
                 seen.extend_from_slice(&buf[..n]);
                 if seen.windows(4).any(|w| w == b"\r\n\r\n") || seen.len() > 16 * 1024 {
-                    return true;
+                    return Roundtrip::Alive;
                 }
             }
-            _ => return false,
+            Ok(Err(_)) => return Roundtrip::TornDown, // reset mid-read
+            Err(_) => return Roundtrip::Stalled,      // silent packet loss: the stall
         }
     }
 }
@@ -211,5 +289,47 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The staleness bound is three tick intervals — strictly greater than one
+    /// interval, so an ordinary tick is never discarded, while a pause (many
+    /// intervals) always is. Dies under a multiple of 1 (every tick would look
+    /// stale, silencing the signature) or 0.
+    #[test]
+    fn stale_after_is_three_intervals_and_exceeds_one() {
+        let interval = Duration::from_secs(15);
+        assert_eq!(stale_after(interval), Duration::from_secs(45));
+        assert!(
+            stale_after(interval) > interval,
+            "the bound must exceed one interval, or every tick discards its own stream"
+        );
+    }
+
+    /// A gap of one interval is fresh; a gap of many intervals (a pause) is
+    /// stale — the exact boundary the pause/resume false-positive turns on.
+    #[test]
+    fn a_paused_gap_is_stale_a_tick_gap_is_not() {
+        let bound = stale_after(Duration::from_secs(15));
+        assert!(Duration::from_secs(15) <= bound, "one tick is fresh");
+        assert!(
+            Duration::from_secs(600) > bound,
+            "a minutes-long pause is stale"
+        );
+    }
+
+    /// Age saturates into `u32` rather than wrapping — a stream held for longer
+    /// than `u32::MAX` seconds reports the ceiling, never a small wrapped value.
+    #[test]
+    fn secs_u32_saturates() {
+        assert_eq!(secs_u32(Duration::from_secs(45)), 45);
+        assert_eq!(
+            secs_u32(Duration::from_secs(u64::from(u32::MAX) + 10)),
+            u32::MAX
+        );
     }
 }
