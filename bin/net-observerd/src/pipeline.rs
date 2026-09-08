@@ -1703,7 +1703,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         })
     }
 
@@ -1737,7 +1737,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         }))
         .await
         .unwrap();

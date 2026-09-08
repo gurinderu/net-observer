@@ -34,14 +34,15 @@ pub struct LinkSample {
     /// still decode.
     #[serde(default)]
     pub fakeip_route_if: Option<String>,
-    /// The egress interface the route table resolves for the DEFAULT route (a
-    /// local lookup, no packet sent). On this host sing-box's `auto_route` owns
-    /// the default while the tunnel is up, so a `utun*` here is the
-    /// tunnel-liveness fact the `fakeip-hijack` signature compares its pool
-    /// egress against — same tick, no cross-sample skew. `None` = no default
-    /// route. `serde(default)` so a pre-field daemon's samples still decode.
+    /// The interface carrying sing-box's OWN TUN address (from the rendered
+    /// config; a local read, no packet sent). That address is assigned only
+    /// while sing-box runs, so `Some(_)` is the sing-box-alive fact the
+    /// `fakeip-hijack` signature compares its pool egress against — same tick,
+    /// no cross-sample skew. NOT "any `utun*`": a foreign VPN's utun would not
+    /// carry this address. `None` = sing-box's TUN is not up. `serde(default)`
+    /// so a pre-field daemon's samples still decode.
     #[serde(default)]
-    pub default_route_if: Option<String>,
+    pub singbox_tun_if: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -204,7 +205,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         });
         assert_eq!(l.ts_us(), 42);
 

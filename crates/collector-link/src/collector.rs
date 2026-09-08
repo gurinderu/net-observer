@@ -129,12 +129,13 @@ where
         };
         let ssid = self.facts.ssid().await;
         let wifi_present = self.facts.wifi_capture_present().await;
-        // Two local route-table lookups, not probes: the fakeip pool's egress
-        // and the default route's egress (the tunnel-liveness fact). Both keep
-        // running under quiet mode like the other passive facts, and both come
-        // from THIS tick so `fakeip-hijack` compares them without skew.
+        // Two local reads, not probes: the fakeip pool's route egress and the
+        // interface carrying sing-box's own TUN address (the sing-box-alive
+        // fact). Both keep running under quiet mode like the other passive
+        // facts, and both come from THIS tick so `fakeip-hijack` compares them
+        // without skew.
         let fakeip_route_if = self.facts.fakeip_route_iface().await;
-        let default_route_if = self.facts.default_route_iface().await;
+        let singbox_tun_if = self.facts.singbox_tun_iface().await;
         vec![Sample::Link(build_link_sample(
             ts_us,
             ping,
@@ -145,7 +146,7 @@ where
             arp,
             lan,
             fakeip_route_if,
-            default_route_if,
+            singbox_tun_if,
             ssid,
             wifi_present,
         ))]
@@ -166,7 +167,7 @@ where
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         })]
     }
 }
@@ -250,7 +251,7 @@ mod tests {
         async fn fakeip_route_iface(&self) -> Option<String> {
             Some("utun8".into())
         }
-        async fn default_route_iface(&self) -> Option<String> {
+        async fn singbox_tun_iface(&self) -> Option<String> {
             Some("utun8".into())
         }
         async fn ssid(&self) -> Option<String> {

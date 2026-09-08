@@ -1122,7 +1122,7 @@ impl Collector for FakeCollector {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         })]
     }
     fn skip(&self, ts_us: i64) -> Vec<Sample> {
@@ -1140,7 +1140,7 @@ impl Collector for FakeCollector {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         })]
     }
 }
@@ -1776,7 +1776,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         })
     }
 
@@ -1792,14 +1792,14 @@ mod tests {
     }
 
     /// A healthy link tick whose fakeip-pool probe resolved to `route_if` while
-    /// the tunnel owns the default route (a utun) — the fakeip-hijack shape
-    /// ([`link`] pins both route fields to `None`).
+    /// sing-box's own TUN is up (on utun6) — the fakeip-hijack shape ([`link`]
+    /// pins both interface fields to `None`).
     fn link_fakeip_via(ts_us: i64, route_if: &str) -> Sample {
         let Sample::Link(mut l) = link(ts_us, GwVerdict::Ok) else {
             unreachable!("link() builds a link sample")
         };
         l.fakeip_route_if = Some(route_if.into());
-        l.default_route_if = Some("utun6".into());
+        l.singbox_tun_if = Some("utun6".into());
         Sample::Link(l)
     }
 

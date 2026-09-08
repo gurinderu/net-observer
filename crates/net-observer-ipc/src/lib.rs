@@ -1383,7 +1383,7 @@ mod tests {
                 lan_probed: None,
                 lan_alive: None,
                 fakeip_route_if: None,
-                default_route_if: None,
+                singbox_tun_if: None,
             }),
             proxy: None,
             dns: None,
@@ -1453,9 +1453,9 @@ mod tests {
         assert!(snap.observing);
     }
 
-    /// A daemon from before the probe-on-suspicion counts and the route-egress
-    /// fields emits link samples without `lan_probed`/`lan_alive`/
-    /// `fakeip_route_if`/`default_route_if`. They must decode as `None` — "not
+    /// A daemon from before the probe-on-suspicion counts and the route/TUN
+    /// interface fields emits link samples without `lan_probed`/`lan_alive`/
+    /// `fakeip_route_if`/`singbox_tun_if`. They must decode as `None` — "not
     /// measured" — never fail the whole frame.
     #[test]
     fn link_sample_decodes_frames_from_before_the_new_fields() {
@@ -1464,7 +1464,7 @@ mod tests {
         assert_eq!(l.lan_probed, None);
         assert_eq!(l.lan_alive, None);
         assert_eq!(l.fakeip_route_if, None);
-        assert_eq!(l.default_route_if, None);
+        assert_eq!(l.singbox_tun_if, None);
     }
 
     /// Same guarantee for the proxy sample: a frame from before the
@@ -1663,7 +1663,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         });
         assert_eq!(link.detail(), "gw=OK direct=FAIL");
 

@@ -19,8 +19,9 @@ use types::{GwVerdict, LinkSample, TcpVerdict};
 /// already gathered by `collect()` on a gateway-FAIL tick and `(None, None)`
 /// otherwise; it flows through untouched like the other fetched facts.
 /// `fakeip_route_if` is the egress interface the route table resolves for a
-/// fakeip-pool address and `default_route_if` the one it resolves for the
-/// default route (both `None` = could not be determined), equally untouched.
+/// fakeip-pool address and `singbox_tun_if` the interface carrying sing-box's
+/// own TUN address (`None` = could not be determined / sing-box not up),
+/// equally untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn build_link_sample(
     ts_us: i64,
@@ -32,7 +33,7 @@ pub fn build_link_sample(
     arp: Option<String>,
     lan: (Option<u16>, Option<u16>),
     fakeip_route_if: Option<String>,
-    default_route_if: Option<String>,
+    singbox_tun_if: Option<String>,
     ssid: Option<String>,
     wifi_present: bool,
 ) -> LinkSample {
@@ -74,7 +75,7 @@ pub fn build_link_sample(
         lan_probed,
         lan_alive,
         fakeip_route_if,
-        default_route_if,
+        singbox_tun_if,
     }
 }
 
@@ -220,7 +221,7 @@ mod tests {
         assert_eq!(s.dhcp_dns.as_deref(), Some("1.1.1.1"));
         assert_eq!(s.gw_arp_mac.as_deref(), Some("aa:bb:cc"));
         assert_eq!(s.fakeip_route_if.as_deref(), Some("awdl0"));
-        assert_eq!(s.default_route_if.as_deref(), Some("utun6"));
+        assert_eq!(s.singbox_tun_if.as_deref(), Some("utun6"));
         assert_eq!(s.ssid.as_deref(), Some("cowork"));
         assert!(s.wifi_capture_present);
     }

@@ -393,18 +393,20 @@ fn is_tunnel_or_discard_iface(name: &str) -> bool {
 /// from the SAME link sample so there is no cross-sample skew. First,
 /// loopback/tunnel destinations are not a leak ([`is_tunnel_or_discard_iface`]):
 /// a kill-switch/reject route resolves to `lo0` (packet dropped), the semantic
-/// opposite of the leak. Second, the tunnel must actually own the default route
-/// this tick — when sing-box is down, `route get` falls through to the physical
-/// default for BOTH the pool and the default, which is "the tunnel is simply
-/// down" (`wedge`/`gw-drop` territory), not a hijack. The discriminator is a
-/// ROUTE-TABLE fact, `default_route_if`: sing-box's `auto_route` owns the
-/// default (a `utun*`) only while the tunnel is up. The public TUN probe's 204
-/// is deliberately NOT used — it travels whatever route reaches gstatic, so it
-/// still succeeds over the physical default when the tunnel is down and would
-/// confirm nothing.
+/// opposite of the leak. Second, sing-box must actually be up this tick — when
+/// sing-box is down, `route get` falls through to the physical route for the
+/// pool, which is "the tunnel is simply down" (`wedge`/`gw-drop` territory),
+/// not a hijack. The discriminator is `singbox_tun_if`: sing-box's OWN TUN
+/// address is assigned to an interface only while sing-box runs, so its
+/// presence proves sing-box specifically is up. It is deliberately NOT "any
+/// `utun*` owns the default" — tailscale/netbird create utuns too, and a
+/// foreign utun owning the default while sing-box is down would fabricate this
+/// incident. Nor the public TUN probe's 204, which travels whatever route
+/// reaches gstatic and still succeeds over the physical default when the tunnel
+/// is down.
 ///
-/// `None` means the pool route or the default route could not be determined
-/// (no config, no range, no route): the absence of a measurement, never a
+/// `None` means the pool route could not be determined (no config, no range, no
+/// route) or sing-box's TUN is not up: the absence of a measurement, never a
 /// hijack. (realm net-observer, node: pending — rationale in the PR body until
 /// a graph session records it)
 pub struct FakeIpHijack;
@@ -418,18 +420,15 @@ impl Condition for FakeIpHijack {
         if is_tunnel_or_discard_iface(ifname) {
             return None;
         }
-        // The tunnel must own the default route this tick, or a pool address on
-        // a real interface is just "sing-box is down" (both the pool and the
-        // default fell through to the physical route). Same tick as the pool
-        // reading, so no skew — and a route-table fact, not a 204 that would
-        // itself travel the leaked physical path.
-        let default_if = last.default_route_if.as_deref()?;
-        if !default_if.starts_with("utun") {
-            return None;
-        }
+        // sing-box must be up, proven by its OWN TUN interface being present
+        // this tick (a foreign VPN's utun does not carry sing-box's address).
+        // `None` = sing-box down, so a pool address on a real interface is just
+        // the outage's route fall-through, not a hijack. Same tick as the pool
+        // reading, so no skew — and not a 204 that would travel the leaked path.
+        let tun_if = last.singbox_tun_if.as_deref()?;
         Some(Fire {
             detail: format!(
-                "fakeip pool routes via {ifname} while the tunnel owns the default ({default_if})"
+                "fakeip pool routes via {ifname} while sing-box's TUN is up on {tun_if}"
             ),
         })
     }
@@ -545,7 +544,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         })
     }
 
@@ -566,7 +565,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         })
     }
 
@@ -622,7 +621,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         })
     }
 
@@ -1209,7 +1208,7 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             lan_probed: probed,
             lan_alive: alive,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         })
     }
 
@@ -1264,13 +1263,12 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         }
     }
 
-    /// A link sample pinning what `FakeIpHijack` reads: the egress interface
-    /// the route table resolved for the fakeip-pool probe address (gateway and
-    /// direct healthy, everything else absent).
-    /// the route table resolved for the fakeip-pool probe address (`route_if`)
-    /// and the DEFAULT route (`default_if`, the tunnel-liveness fact) — both on
-    /// one tick, as the daemon records them.
-    fn link_fakeip(ts: i64, route_if: Option<&str>, default_if: Option<&str>) -> Sample {
+    /// A link sample pinning what `FakeIpHijack` reads: the egress interface the
+    /// route table resolved for the fakeip-pool probe address (`route_if`) and
+    /// the interface carrying sing-box's own TUN address (`tun_if`, `None` =
+    /// sing-box down) — both on one tick, as the daemon records them. Gateway
+    /// and direct are healthy, everything else absent.
+    fn link_fakeip(ts: i64, route_if: Option<&str>, tun_if: Option<&str>) -> Sample {
         Sample::Link(LinkSample {
             ts_us: ts,
             gw: GwVerdict::Ok,
@@ -1285,20 +1283,19 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: route_if.map(str::to_string),
-            default_route_if: default_if.map(str::to_string),
+            singbox_tun_if: tun_if.map(str::to_string),
         })
     }
 
     /// The AWDL-collision signature: the pool routes out a real interface while
-    /// the tunnel owns the default route (a utun) — the tunnel is up, so this is
-    /// a genuine leak, not an outage.
+    /// sing-box's own TUN is up — a genuine leak, not an outage.
     #[test]
-    fn fakeip_hijack_fires_when_the_pool_leaks_while_the_tunnel_owns_the_default() {
+    fn fakeip_hijack_fires_when_the_pool_leaks_while_singbox_is_up() {
         let mut w = RecentWindow::new(8);
         w.push(link_fakeip(1, Some("awdl0"), Some("utun6")));
         let fire = FakeIpHijack
             .eval(&w)
-            .expect("a pool leak while a utun owns the default must fire");
+            .expect("a pool leak while sing-box's TUN is up must fire");
         assert!(
             fire.detail.contains("awdl0"),
             "the detail must name the hijacking interface: {}",
@@ -1317,7 +1314,7 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
 
     /// A pool address on loopback is a blackhole/reject or kill-switch drop —
     /// the packet is discarded, the opposite of leaking out a real egress — so
-    /// it must not fire even with the tunnel up. Dies under the old
+    /// it must not fire even with sing-box up. Dies under the old
     /// `!starts_with("utun")` test, which flagged `lo0` as a hijack.
     #[test]
     fn fakeip_hijack_silent_on_a_loopback_route() {
@@ -1326,21 +1323,34 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         assert!(FakeIpHijack.eval(&w).is_none());
     }
 
-    /// When sing-box is down BOTH the pool and the default route fall through to
-    /// the physical interface, so a phantom hijack sits next to every wedge. The
-    /// default-route-liveness gate suppresses it. This is the specific trap the
-    /// public 204 gate did NOT catch — the 204 travels the physical default and
-    /// still succeeds — so the test pins the route-table discriminator. Dies
-    /// under a `tun_code`-based gate or no gate at all.
+    /// When sing-box is down its TUN interface is absent, so a pool address on a
+    /// real interface is just the outage's route fall-through, not a hijack.
     #[test]
-    fn fakeip_hijack_silent_when_the_tunnel_is_down() {
+    fn fakeip_hijack_silent_when_singbox_is_down() {
         let mut w = RecentWindow::new(8);
-        // sing-box down: the default route is the physical interface, and the
-        // pool falls through to it too.
-        w.push(link_fakeip(1, Some("en0"), Some("en0")));
+        // sing-box down: its TUN address is on no interface; the pool falls
+        // through to the physical route.
+        w.push(link_fakeip(1, Some("en0"), None));
         assert!(
             FakeIpHijack.eval(&w).is_none(),
-            "a route fall-through while the tunnel does not own the default is not a hijack"
+            "a route fall-through while sing-box's TUN is down is not a hijack"
+        );
+    }
+
+    /// THE round-3 trap: sing-box is DOWN but a FOREIGN VPN utun (tailscale /
+    /// netbird) owns the default route, and the pool has a leftover route via
+    /// awdl0. `singbox_tun_if` is `None` because the foreign utun does not carry
+    /// sing-box's own TUN address, so this must stay silent. Dies under any
+    /// "some utun owns the default" gate (which would fire on the foreign utun).
+    #[test]
+    fn fakeip_hijack_silent_when_only_a_foreign_utun_is_up() {
+        let mut w = RecentWindow::new(8);
+        // The foreign utun never surfaces as `singbox_tun_if`; the sample the
+        // daemon would record for this state has it `None`.
+        w.push(link_fakeip(1, Some("awdl0"), None));
+        assert!(
+            FakeIpHijack.eval(&w).is_none(),
+            "a foreign VPN utun owning the default while sing-box is down is not a hijack"
         );
     }
 
@@ -1350,15 +1360,6 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
     fn fakeip_hijack_silent_when_the_pool_route_is_unknown() {
         let mut w = RecentWindow::new(8);
         w.push(link_fakeip(1, None, Some("utun6")));
-        assert!(FakeIpHijack.eval(&w).is_none());
-    }
-
-    /// `None` default route = the tunnel's ownership is unknown, so a
-    /// real-interface pool route cannot be confirmed a hijack — silence.
-    #[test]
-    fn fakeip_hijack_silent_when_the_default_route_is_unknown() {
-        let mut w = RecentWindow::new(8);
-        w.push(link_fakeip(1, Some("en0"), None));
         assert!(FakeIpHijack.eval(&w).is_none());
     }
 

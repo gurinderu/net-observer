@@ -971,7 +971,7 @@ mod tests {
                 lan_probed: None,
                 lan_alive: None,
                 fakeip_route_if: None,
-                default_route_if: None,
+                singbox_tun_if: None,
             }),
             proxy: Some(ProxySample {
                 ts_us: 43,
@@ -1151,7 +1151,7 @@ mod tests {
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
-            default_route_if: None,
+            singbox_tun_if: None,
         }));
         assert_eq!(
             format_frame_line(&link),

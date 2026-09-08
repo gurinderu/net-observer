@@ -200,6 +200,28 @@ pub(crate) fn fakeip_probe_addr(config_json: &str) -> Option<std::net::Ipv4Addr>
     Some(std::net::Ipv4Addr::from(u32::from(net) + 8))
 }
 
+/// The sing-box TUN inbound's own IPv4 address (the first `inbounds[]` of
+/// `type == "tun"`, its first `address` entry, stripped of any `/prefix`):
+/// `172.19.0.1` from `172.19.0.1/30`. This address is assigned to an
+/// interface only while sing-box is running, so its presence is the
+/// sing-box-alive signal the whole stack keys on (dns-fallback.nix). Read from
+/// the rendered config so it stays config-driven, never hardcoded.
+pub(crate) fn singbox_tun_addr(config_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(config_json).ok()?;
+    let inbounds = value.get("inbounds")?.as_array()?;
+    inbounds
+        .iter()
+        .filter(|i| i.get("type").and_then(|t| t.as_str()) == Some("tun"))
+        .find_map(|i| {
+            let addr = i
+                .get("address")?
+                .as_array()?
+                .iter()
+                .find_map(serde_json::Value::as_str)?;
+            Some(addr.split('/').next().unwrap_or(addr).to_string())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +321,24 @@ mod tests {
             None
         );
         assert_eq!(fakeip_probe_addr("garbage"), None);
+    }
+
+    #[test]
+    fn extracts_singbox_tun_addr_stripping_the_prefix() {
+        let cfg = r#"{
+            "inbounds": [
+                {"type": "mixed", "listen": "127.0.0.1"},
+                {"type": "tun", "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"]}
+            ]
+        }"#;
+        assert_eq!(singbox_tun_addr(cfg).as_deref(), Some("172.19.0.1"));
+    }
+
+    #[test]
+    fn no_tun_inbound_is_none() {
+        assert_eq!(singbox_tun_addr("{}"), None);
+        assert_eq!(singbox_tun_addr(r#"{"inbounds":[{"type":"mixed"}]}"#), None);
+        assert_eq!(singbox_tun_addr(r#"{"inbounds":[{"type":"tun"}]}"#), None);
+        assert_eq!(singbox_tun_addr("garbage"), None);
     }
 }
