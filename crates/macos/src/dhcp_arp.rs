@@ -84,6 +84,20 @@ impl LinkFacts for SystemFacts {
         parse_arp_mac(&out, gw)
     }
 
+    async fn arp_neighbor_ips(&self) -> Vec<String> {
+        // The kernel's own cache (`arp -an` via `read_arp`): a passive read, no
+        // packet addressed at anybody. The v4 parse keeps only addresses the
+        // neighbor ping can take.
+        let iface = self.phys_iface().await;
+        let Some(obs) = crate::neighbors::read_arp(iface.as_deref()).await else {
+            return Vec::new();
+        };
+        obs.into_iter()
+            .filter(|o| o.ip.parse::<std::net::Ipv4Addr>().is_ok())
+            .map(|o| o.ip)
+            .collect()
+    }
+
     async fn ssid(&self) -> Option<String> {
         let iface = self.phys_iface().await?;
         wifi::current_ssid(&iface).await

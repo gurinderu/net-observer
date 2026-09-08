@@ -37,8 +37,12 @@ impl IcmpPinger {
 
 impl Pinger for IcmpPinger {
     async fn ping_gw(&self, gw: &str) -> PingOutcome {
-        let Ok(addr) = gw.parse::<IpAddr>() else {
-            tracing::debug!(%gw, "gateway is not a parseable IP address");
+        self.ping_host(gw).await
+    }
+
+    async fn ping_host(&self, addr: &str) -> PingOutcome {
+        let Ok(addr) = addr.parse::<IpAddr>() else {
+            tracing::debug!(%addr, "ping target is not a parseable IP address");
             return PingOutcome {
                 reachable: false,
                 rtt_ms: None,

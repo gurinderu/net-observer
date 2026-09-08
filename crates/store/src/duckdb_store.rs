@@ -173,7 +173,7 @@ impl Store for DuckdbStore {
         let c = self.conn.lock().unwrap();
         match s {
             Sample::Link(l) => c.execute(
-                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     l.ts_us,
                     l.gw.to_string(),
@@ -184,7 +184,9 @@ impl Store for DuckdbStore {
                     l.dhcp_dns,
                     l.gw_arp_mac,
                     l.ssid,
-                    l.wifi_capture_present
+                    l.wifi_capture_present,
+                    l.lan_probed,
+                    l.lan_alive
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
@@ -920,11 +922,58 @@ mod tests {
             gw_arp_mac: Some("incomplete".into()),
             ssid: Some("cowork".into()),
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
         });
         s.write_sample(&sample).unwrap();
         assert_eq!(
             s.query_scalar_i64("SELECT count(*) FROM link_sample WHERE gw='FAIL'")
                 .unwrap(),
+            1
+        );
+    }
+
+    /// The probe-on-suspicion counts land in their own columns, and an unprobed
+    /// tick lands as NULL — "not probed" must stay distinguishable from a
+    /// probed tick where nobody answered.
+    #[test]
+    fn link_sample_lan_counts_round_trip() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let base = LinkSample {
+            ts_us: 1000,
+            gw: GwVerdict::Fail,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+            lan_probed: Some(3),
+            lan_alive: Some(1),
+        };
+        s.write_sample(&Sample::Link(base.clone())).unwrap();
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 2000,
+            lan_probed: None,
+            lan_alive: None,
+            ..base
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample WHERE lan_probed = 3 AND lan_alive = 1"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample \
+                 WHERE ts_us = 2000 AND lan_probed IS NULL AND lan_alive IS NULL"
+            )
+            .unwrap(),
             1
         );
     }
@@ -1115,6 +1164,8 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
         }))
         .unwrap();
         s.write_sample(&Sample::Proxy(ProxySample {
@@ -1337,6 +1388,8 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
         }))
         .unwrap();
         let t = s.query_table("SELECT ts_us, gw FROM link_sample").unwrap();

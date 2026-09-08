@@ -11,10 +11,13 @@ pub struct PingOutcome {
     pub rtt_ms: Option<f64>,
 }
 
-/// ICMP echo to the default gateway.
+/// ICMP echo probes.
 #[allow(async_fn_in_trait)] // internal workspace port, not a published API
 pub trait Pinger: Send + Sync {
+    /// Echo to the default gateway.
     async fn ping_gw(&self, gw: &str) -> PingOutcome;
+    /// Echo to an arbitrary host (a LAN neighbor on a probe-on-suspicion tick).
+    async fn ping_host(&self, addr: &str) -> PingOutcome;
 }
 
 /// TCP connect bound to a specific physical interface (`IP_BOUND_IF`).

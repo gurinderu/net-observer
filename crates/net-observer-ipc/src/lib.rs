@@ -1380,6 +1380,8 @@ mod tests {
                 gw_arp_mac: None,
                 ssid: Some("home".into()),
                 wifi_capture_present: false,
+                lan_probed: None,
+                lan_alive: None,
             }),
             proxy: None,
             dns: None,
@@ -1447,6 +1449,17 @@ mod tests {
         let snap: StatusSnapshot = serde_json::from_str(old).unwrap();
         assert_eq!(snap.generated_us, 1);
         assert!(snap.observing);
+    }
+
+    /// A daemon from before the probe-on-suspicion counts emits link samples
+    /// without `lan_probed`/`lan_alive`. They must decode as `None` — "not
+    /// probed" — never fail the whole frame.
+    #[test]
+    fn link_sample_decodes_pre_lan_probe_frame() {
+        let old = r#"{"ts_us":1,"gw":"Ok","gw_rtt_ms":null,"direct":"Ok","direct_rtt_ms":null,"dhcp_router":null,"dhcp_dns":null,"gw_arp_mac":null,"ssid":null,"wifi_capture_present":false}"#;
+        let l: LinkSample = serde_json::from_str(old).unwrap();
+        assert_eq!(l.lan_probed, None);
+        assert_eq!(l.lan_alive, None);
     }
 
     #[test]
@@ -1630,6 +1643,8 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
         });
         assert_eq!(link.detail(), "gw=OK direct=FAIL");
 

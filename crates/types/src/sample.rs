@@ -16,6 +16,16 @@ pub struct LinkSample {
     pub gw_arp_mac: Option<String>,
     pub ssid: Option<String>,
     pub wifi_capture_present: bool,
+    /// Probe-on-suspicion: how many LAN neighbors were pinged on this tick.
+    /// Measured only when the gateway verdict is `Fail`; `None` = not probed
+    /// (healthy gateway, quiet mode, or no gateway) — never a zero.
+    /// `serde(default)` so a pre-field daemon's samples still decode.
+    #[serde(default)]
+    pub lan_probed: Option<u16>,
+    /// Probe-on-suspicion: how many of the pinged neighbors answered. `None`
+    /// exactly when `lan_probed` is.
+    #[serde(default)]
+    pub lan_alive: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,6 +166,8 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
         });
         assert_eq!(l.ts_us(), 42);
 

@@ -14,6 +14,10 @@ use types::{GwVerdict, LinkSample, TcpVerdict};
 /// The sample is still produced — SKIP, never silence — and every passive fact
 /// (DHCP lease, ARP, SSID) still flows through, because reading them addresses
 /// the gateway with nothing.
+///
+/// `lan` is the probe-on-suspicion `(probed, alive)` neighbor-ping count pair,
+/// already gathered by `collect()` on a gateway-FAIL tick and `(None, None)`
+/// otherwise; it flows through untouched like the other fetched facts.
 #[allow(clippy::too_many_arguments)]
 pub fn build_link_sample(
     ts_us: i64,
@@ -23,6 +27,7 @@ pub fn build_link_sample(
     gw_addr: Option<String>,
     dhcp: (Option<String>, Option<String>),
     arp: Option<String>,
+    lan: (Option<u16>, Option<u16>),
     ssid: Option<String>,
     wifi_present: bool,
 ) -> LinkSample {
@@ -49,6 +54,7 @@ pub fn build_link_sample(
         direct.rtt_ms,
     );
     let (dhcp_router, dhcp_dns) = dhcp;
+    let (lan_probed, lan_alive) = lan;
     LinkSample {
         ts_us,
         gw,
@@ -60,6 +66,8 @@ pub fn build_link_sample(
         gw_arp_mac: arp,
         ssid,
         wifi_capture_present: wifi_present,
+        lan_probed,
+        lan_alive,
     }
 }
 
@@ -85,6 +93,7 @@ mod tests {
             None,
             (Some("10.20.0.1".into()), None),
             None,
+            (None, None),
             Some("cowork".into()),
             false,
         );
@@ -103,10 +112,13 @@ mod tests {
             Some("10.20.0.1".into()),
             (None, None),
             Some("aa:bb".into()),
+            (Some(3), Some(2)),
             None,
             false,
         );
         assert_eq!(s.gw, GwVerdict::Fail);
+        assert_eq!(s.lan_probed, Some(3));
+        assert_eq!(s.lan_alive, Some(2));
     }
 
     #[test]
@@ -119,6 +131,7 @@ mod tests {
             Some("10.20.0.1".into()),
             (None, None),
             Some("aa:bb".into()),
+            (None, None),
             None,
             false,
         );
@@ -138,6 +151,7 @@ mod tests {
             Some("10.20.0.1".into()),
             (Some("10.20.0.1".into()), None),
             Some("aa:bb:cc".into()),
+            (None, None),
             Some("cowork".into()),
             false,
         );
@@ -161,6 +175,7 @@ mod tests {
             None,
             (None, None),
             None,
+            (None, None),
             None,
             false,
         );
@@ -177,6 +192,7 @@ mod tests {
             Some("10.20.0.1".into()),
             (Some("10.20.0.1".into()), Some("1.1.1.1".into())),
             Some("aa:bb:cc".into()),
+            (None, None),
             Some("cowork".into()),
             true,
         );

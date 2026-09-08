@@ -2,6 +2,12 @@ pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS link_sample (
   ts_us BIGINT, gw VARCHAR, gw_rtt_ms DOUBLE, direct VARCHAR, direct_rtt_ms DOUBLE,
   dhcp_router VARCHAR, dhcp_dns VARCHAR, gw_arp_mac VARCHAR, ssid VARCHAR, wifi_capture_present BOOLEAN);
+-- Probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL
+-- tick (NULL on every other tick: not probed, never a zero). Added after the
+-- link table first shipped, so an older database file keeps its column set
+-- until these ALTERs run on open, exactly like `neighbor_port.banner` below.
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS lan_probed USMALLINT;
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS lan_alive USMALLINT;
 CREATE TABLE IF NOT EXISTS proxy_sample (
   ts_us BIGINT, server_ip VARCHAR, tcp VARCHAR, rtt_ms DOUBLE, tun_code USMALLINT, selector VARCHAR);
 CREATE TABLE IF NOT EXISTS incident (
