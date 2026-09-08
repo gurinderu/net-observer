@@ -262,6 +262,85 @@ impl Condition for Starvation {
     }
 }
 
+/// How many recent proxy samples `endpoint-block` scans when grouping rows into
+/// per-tick cohorts. The daemon retains at most 64 samples (its `WINDOW_CAP`),
+/// so this scan ceiling is the window itself.
+const ENDPOINT_BLOCK_SCAN: usize = 64;
+
+/// Fires when, for the newest `consecutive` proxy cohorts (one cohort = the
+/// per-endpoint rows sharing one `ts_us`), every endpoint's underlay TCP
+/// verdict is `Fail` while the newest link sample's `direct` probe is `Ok` —
+/// the selective-block / middlebox signature: the network path to the whole
+/// upstream fleet is dead from the underlay while the reference host answers.
+///
+/// Distinct from `wedge`, which reads the TUN probe (the proxy PROCESS path):
+/// this one reads the per-endpoint underlay TCP verdicts and fires even while
+/// the tun probe still passes. A cohort containing a `Skip` row is the absence
+/// of a measurement (the `-` skip row means no endpoints were parsed) and
+/// breaks the run; a cohort with any `Ok` is not a fleet-wide block. Proxy
+/// history does not survive a resume (only the link change basis is carried),
+/// so after `clear_for_resume` this simply waits for `consecutive` fresh
+/// cohorts. (realm net-observer, node: pending — rationale in the PR body
+/// until a graph session records it)
+pub struct EndpointBlock {
+    pub consecutive: usize,
+}
+impl Condition for EndpointBlock {
+    fn id(&self) -> &'static str {
+        "endpoint-block"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        // The reference host must have answered, or this is a whole-network
+        // outage, not a selective block. Exhaustive over the verdict: `Skip`
+        // is the absence of a measurement, never a healthy reference.
+        let last = w.last_link()?;
+        match last.direct {
+            TcpVerdict::Ok => {}
+            TcpVerdict::Fail | TcpVerdict::Skip => return None,
+        }
+        // Per-tick cohorts, newest first: `(ts_us, rows, all Fail so far)`.
+        // One `collect()` stamps every per-endpoint row with one `ts_us`, so
+        // the shared timestamp is the cohort key.
+        let mut cohorts: Vec<(i64, usize, bool)> = Vec::new();
+        for p in w.recent_proxy(ENDPOINT_BLOCK_SCAN) {
+            // Exhaustive over the verdict: `Skip` carries no measurement, so
+            // it can never count toward "every endpoint failed".
+            let fail = match p.tcp {
+                TcpVerdict::Fail => true,
+                TcpVerdict::Ok | TcpVerdict::Skip => false,
+            };
+            match cohorts.last_mut() {
+                Some((ts, rows, all_fail)) if *ts == p.ts_us => {
+                    *rows += 1;
+                    *all_fail = *all_fail && fail;
+                }
+                _ => {
+                    // A new cohort begins; past `consecutive` of them the
+                    // verdict is already decided.
+                    if cohorts.len() == self.consecutive {
+                        break;
+                    }
+                    cohorts.push((p.ts_us, 1, fail));
+                }
+            }
+        }
+        if cohorts.len() < self.consecutive {
+            return None;
+        }
+        if !cohorts.iter().all(|(_, _, all_fail)| *all_fail) {
+            return None;
+        }
+        let (_, n, _) = *cohorts.first()?;
+        Some(Fire {
+            detail: format!(
+                "all {n} endpoints dead from the underlay across {k} ticks \
+while the reference host answers",
+                k = self.consecutive
+            ),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +408,22 @@ mod tests {
             tcp: TcpVerdict::Ok,
             rtt_ms: None,
             tun_code: Some(tun),
+            selector: None,
+        })
+    }
+
+    /// A per-endpoint proxy row: pins the endpoint string and the underlay TCP
+    /// verdict, with a HEALTHY tun (`endpoint-block` reads the underlay
+    /// verdicts and must fire even while the tun probe still passes). The
+    /// existing [`proxy`] builder pins a single server and varies the tun
+    /// instead.
+    fn proxy_ep(ts: i64, endpoint: &str, tcp: TcpVerdict) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us: ts,
+            server_ip: endpoint.into(),
+            tcp,
+            rtt_ms: None,
+            tun_code: Some(204),
             selector: None,
         })
     }
@@ -828,5 +923,116 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
     fn neighbor_mac_collision_silent_with_no_neighbors_sample_yet() {
         let w = RecentWindow::new(8);
         assert!(NeighborMacCollision.eval(&w).is_none());
+    }
+
+    /// Push one all-`Fail` two-endpoint cohort at `ts` — the fleet-wide-block
+    /// tick shape as `endpoint-block` reads it.
+    fn push_dead_cohort(w: &mut RecentWindow, ts: i64) {
+        w.push(proxy_ep(ts, "1.1.1.1:443", TcpVerdict::Fail));
+        w.push(proxy_ep(ts, "2.2.2.2:2053", TcpVerdict::Fail));
+    }
+
+    /// The measured 2026-09-08 signature: every endpoint dead from the underlay
+    /// for `consecutive` ticks while the reference host answers. The mid-way
+    /// assertion dies under counting ROWS instead of cohorts — one tick's two
+    /// rows would already read as two "ticks".
+    #[test]
+    fn endpoint_block_fires_when_every_endpoint_fails_while_direct_answers() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        assert!(
+            c.eval(&w).is_none(),
+            "one cohort of two rows must not count as two ticks"
+        );
+        push_dead_cohort(&mut w, 20);
+        let fire = c
+            .eval(&w)
+            .expect("two all-fail cohorts with direct OK must fire");
+        assert!(
+            fire.detail.contains("all 2 endpoints"),
+            "the detail must carry the newest cohort size: {}",
+            fire.detail
+        );
+        assert!(
+            fire.detail.contains("2 ticks"),
+            "the detail must carry the run length: {}",
+            fire.detail
+        );
+    }
+
+    /// One endpoint still answering means the fleet is not blocked as a whole.
+    /// Dies under `any(Fail)` in place of `all(Fail)` within a cohort.
+    #[test]
+    fn endpoint_block_silent_when_one_endpoint_still_answers() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        w.push(proxy_ep(20, "1.1.1.1:443", TcpVerdict::Fail));
+        w.push(proxy_ep(20, "2.2.2.2:2053", TcpVerdict::Ok));
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// The `-` skip row means no endpoints were parsed — the absence of a
+    /// measurement, not a dead fleet. Dies under a non-exhaustive
+    /// `tcp != TcpVerdict::Ok` check that lets `Skip` count as a failure.
+    #[test]
+    fn endpoint_block_silent_on_skip_cohorts() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        w.push(proxy_ep(10, "-", TcpVerdict::Skip));
+        w.push(proxy_ep(20, "-", TcpVerdict::Skip));
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// With the reference host dead too there is nothing SELECTIVE about the
+    /// endpoints failing — that is a whole-network outage, `gw-drop` territory.
+    #[test]
+    fn endpoint_block_silent_when_direct_is_down_too() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Fail));
+        push_dead_cohort(&mut w, 10);
+        push_dead_cohort(&mut w, 20);
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// Dies under an off-by-one in the cohort count (`<` -> `<=`, or a scan
+    /// that seeds a phantom empty cohort).
+    #[test]
+    fn endpoint_block_silent_one_cohort_short() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// Proxy history does not survive a resume (only the link change basis is
+    /// carried), so a pre-pause cohort must not combine with a post-resume one
+    /// into a continuity that never existed. The inline control — a second
+    /// fresh cohort fires — proves the silence measures the clear and not a
+    /// fixture that could never fire.
+    #[test]
+    fn endpoint_block_waits_for_fresh_cohorts_after_a_resume() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        w.clear_for_resume();
+        w.push(link(100, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 110);
+        assert!(
+            c.eval(&w).is_none(),
+            "one fresh cohort must not complete a pre-pause run"
+        );
+        push_dead_cohort(&mut w, 120);
+        assert!(
+            c.eval(&w).is_some(),
+            "two fresh cohorts complete the run on their own"
+        );
     }
 }
