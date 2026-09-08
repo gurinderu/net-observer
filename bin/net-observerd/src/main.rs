@@ -39,8 +39,8 @@ use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
-    EndpointBlock, FakeIp, GwChange, GwDrop, GwMacChange, NeighborMacCollision, PerClientBlock,
-    Starvation, Wedge,
+    EndpointBlock, FakeIp, FakeIpHijack, GwChange, GwDrop, GwMacChange, NeighborMacCollision,
+    PerClientBlock, Starvation, Wedge,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -1372,10 +1372,10 @@ fn build_api_server(
 
 /// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
 /// gw-mac-change, neighbor-mac-collision, per-client-block, fakeip,
-/// endpoint-block, starvation). Every rule records an incident (durable, in
-/// DuckDB) and mirrors it into the live snapshot's ring for the socket API;
-/// gw-change and gw-mac-change additionally freeze the pcap ring when one is
-/// available.
+/// fakeip-hijack, endpoint-block, starvation). Every rule records an incident
+/// (durable, in DuckDB) and mirrors it into the live snapshot's ring for the
+/// socket API; gw-change and gw-mac-change additionally freeze the pcap ring
+/// when one is available.
 fn build_engine(
     store: Arc<DuckdbStore>,
     cfg: &Config,
@@ -1440,6 +1440,13 @@ fn build_engine(
         ),
         Trigger::new(
             Box::new(FakeIp),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        // No pcap freeze: the evidence is the recorded egress interface —
+        // provable from the route table alone.
+        Trigger::new(
+            Box::new(FakeIpHijack),
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
@@ -1753,6 +1760,16 @@ mod tests {
         };
         l.lan_probed = Some(probed);
         l.lan_alive = Some(alive);
+        Sample::Link(l)
+    }
+
+    /// A healthy link tick whose fakeip-pool probe resolved to `route_if` —
+    /// the fakeip-hijack shape ([`link`] pins the field to `None`).
+    fn link_fakeip_via(ts_us: i64, route_if: &str) -> Sample {
+        let Sample::Link(mut l) = link(ts_us, GwVerdict::Ok) else {
+            unreachable!("link() builds a link sample")
+        };
+        l.fakeip_route_if = Some(route_if.into());
         Sample::Link(l)
     }
 
@@ -2227,6 +2244,32 @@ mod tests {
             incidents_for(&fx.store, "per-client-block"),
             1,
             "a silent gateway with live neighbors must be recorded as per-client-block"
+        );
+    }
+
+    /// The `fakeip-hijack` rule is installed with the production handlers: a
+    /// tick whose pool routes into the tunnel records nothing, one routing via
+    /// a real interface records the incident. Nothing else in the rule set
+    /// can fire on this stream: the gateway is steadily OK with no
+    /// predecessor to differ from, and there is no proxy, DNS, host or
+    /// neighbors sample.
+    #[test]
+    fn build_engine_registers_the_fakeip_hijack_rule() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(8);
+
+        feed(&mut fx.engine, &mut w, link_fakeip_via(1, "utun8"));
+        assert_eq!(
+            incidents_for(&fx.store, "fakeip-hijack"),
+            0,
+            "the pool routing into the tunnel is the healthy state"
+        );
+
+        feed(&mut fx.engine, &mut w, link_fakeip_via(2, "awdl0"));
+        assert_eq!(
+            incidents_for(&fx.store, "fakeip-hijack"),
+            1,
+            "the pool routing via a real interface must be recorded as fakeip-hijack"
         );
     }
 

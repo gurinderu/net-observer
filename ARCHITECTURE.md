@@ -90,9 +90,10 @@ flowchart LR
   `gw-drop`, `gw-change` (unconditional pcap freeze on any gateway change),
   `gw-mac-change` (pcap freeze too), `neighbor-mac-collision`,
   `per-client-block` (gateway silent while probed LAN neighbors answer),
-  `fakeip`, `starvation`, `endpoint-block` (whole upstream fleet dead from the
-  underlay while the direct reference answers). Each fires at most once per
-  5 min (backoff) and disarms until the signal returns to OK.
+  `fakeip`, `fakeip-hijack` (a fakeip-pool address routes out a non-tunnel
+  interface), `starvation`, `endpoint-block` (whole upstream fleet dead from
+  the underlay while the direct reference answers). Each fires at most once
+  per 5 min (backoff) and disarms until the signal returns to OK.
 - **Live snapshot + local socket API** — the consumer keeps an in-memory
   `StatusSnapshot` (the latest sample per collector + `generated_us`) current on
   every tick, and a passive `SnapshotHandler` mirrors each fired incident into a
