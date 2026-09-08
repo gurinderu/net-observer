@@ -726,7 +726,7 @@ async fn run_daemon() -> anyhow::Result<()> {
 /// `Send` and can be spawned onto the runtime without `Box::pin`.
 pub(crate) enum AnyCollector {
     Link(LinkCollector<IcmpPinger, BoundTcpProber, SystemFacts>),
-    Proxy(ProxyCollector<BoundTcpProber, ProxySystemFacts>),
+    Proxy(ProxyCollector<BoundTcpProber, ProxySystemFacts, HeldReferenceStreams>),
     Dns(DnsCollector<DnsResolver>),
     Route(RouteCollector),
     Host(HostCollector<HostLoad>),
