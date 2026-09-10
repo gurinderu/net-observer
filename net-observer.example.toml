@@ -59,6 +59,11 @@ interval = "15s"
 tun_probe_url = "http://connectivitycheck.gstatic.com/generate_204"
 # Clash/Mihomo RESTful API base URL.
 clash_api = "http://127.0.0.1:9090"
+# Proxy group whose `now` field names the active node. "GLOBAL" is the
+# clash-core convention, but sing-box exposes ONLY the groups its config
+# declares -- against such a config GLOBAL 404s and the selector column reads
+# "-" forever. Point this at the deployment selector/urltest group.
+selector_group = "GLOBAL"
 
 # The `dns` collector probes resolvers (sing-box TUN DNS, DHCP resolver, DoH) for
 # the monitored service domain plus a `.ru` control domain. A fakeip answer on a
@@ -80,6 +85,14 @@ enabled = true
 
 # The `host` collector samples the 1/5/15-minute load averages — the starvation
 # discriminator (high load while the TUN is dead activates the `starvation` trigger).
+# The `air` collector: the radio environment -- which foreign access points
+# are audible, on which channels and how loudly. OFF by default: producing the
+# system wireless report costs seconds of wall time per sample, so it is
+# opted into, on its own slow period (not the daemon tick).
+[collectors.air]
+# enabled = true
+# interval = "5m"
+
 [collectors.host]
 enabled = true
 interval = "15s"

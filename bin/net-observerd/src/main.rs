@@ -106,9 +106,6 @@ const STARVATION_LOAD: f64 = 10.0;
 /// never compiled in). Deployment writes it here; absent ⇒ proxy emits SKIP.
 const SINGBOX_CONFIG_PATH: &str = "/etc/sing-box/config.json";
 
-/// Clash/Mihomo proxy group whose current selection identifies the active node.
-const CLASH_SELECTOR_GROUP: &str = "GLOBAL";
-
 /// Upper bound on the post-signal drain. The `route` collector's PF_ROUTE
 /// `read(2)` runs on a dedicated OS thread that cannot be interrupted, so it
 /// keeps a stream sender alive and the consumer's `rx.recv()` may never observe
@@ -451,7 +448,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             ProxySystemFacts::new(
                 SINGBOX_CONFIG_PATH,
                 cfg.collectors.proxy.clash_api.clone(),
-                CLASH_SELECTOR_GROUP,
+                cfg.collectors.proxy.selector_group.clone(),
             ),
             // The held reference streams: direct bound to the physical
             // interface, tunnel on the default route. The adapter owns the
