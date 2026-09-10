@@ -26,6 +26,7 @@ pub mod neighbors;
 pub mod net;
 pub mod pcap;
 pub mod route;
+pub mod stall;
 pub mod tls;
 pub mod wifi;
 
@@ -40,3 +41,4 @@ pub use neighbors::SystemNeighbors;
 pub use net::{BoundTcpProber, IcmpPinger};
 pub use pcap::PcapRing;
 pub use route::PfRouteSource;
+pub use stall::HeldReferenceStreams;

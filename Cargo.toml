@@ -94,9 +94,24 @@ reqwest = { version = "0.12", default-features = false, features = [
 # client is built. Rust plus assembly, no C, x86-64 and aarch64 — one TLS stack
 # on this Mac and on the Linux port. (realm net-observer, node #46)
 rustls-graviola = "0.4"
+# Direct rustls-over-tokio for the held reference streams (the established-flow
+# discriminator). `reqwest` cannot serve there: its pool silently reconnects a
+# dead pooled connection, masking exactly the death being measured.
+# `default-features = false` leaves the crypto to the process-default provider
+# (`rustls-graviola`), like `reqwest` above.
+tokio-rustls = { version = "0.26", default-features = false }
 libc = "0.2"
 tempfile = "3"
-gpui = "0.2.2"
+# `runtime_shaders` drops gpui's build-time dependency on the Metal Toolchain:
+# without it the build script shells out to `xcrun -sdk macosx metal` to
+# precompile shaders.metallib, which only exists inside a full Xcode — the
+# reason the bar could not be built by nix (or on any CLT-only machine) at
+# all. With the feature the shader SOURCE is stitched into OUT_DIR and
+# compiled once at app launch by the system Metal framework (present on
+# every macOS, no Xcode involved). Same rendering; the cost is a one-time
+# compile at startup. This is the switch that lets the flake ship
+# `net-observer-bar` as a normal nix package instead of a hand-built binary.
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 objc2 = "0.6.4"
 # local crates
 types = { path = "crates/types" }

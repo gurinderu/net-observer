@@ -60,6 +60,18 @@ pub struct ProxyCfg {
     pub interval: Duration,
     pub tun_probe_url: String,
     pub clash_api: String,
+    /// The proxy group whose `now` field names the active node. "GLOBAL" is
+    /// the clash-core convention, but sing-box's Clash API exposes ONLY the
+    /// groups the config actually declares — against such a config the
+    /// default 404s and the selector column reads "-" forever (observed
+    /// live: /proxies/GLOBAL -> 404 while /proxies/vless-auto answered).
+    /// Point it at the deployment's selector/urltest group.
+    #[serde(default = "default_selector_group")]
+    pub selector_group: String,
+}
+
+fn default_selector_group() -> String {
+    "GLOBAL".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +269,7 @@ impl Default for Config {
                     interval: Duration::from_secs(15),
                     tun_probe_url: "http://connectivitycheck.gstatic.com/generate_204".into(),
                     clash_api: "http://127.0.0.1:9090".into(),
+                    selector_group: default_selector_group(),
                 },
                 dns: DnsCfg {
                     enabled: true,

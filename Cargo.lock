@@ -3860,6 +3860,7 @@ dependencies = [
  "surge-ping",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "types",
 ]

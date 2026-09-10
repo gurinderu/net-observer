@@ -1380,6 +1380,10 @@ mod tests {
                 gw_arp_mac: None,
                 ssid: Some("home".into()),
                 wifi_capture_present: false,
+                lan_probed: None,
+                lan_alive: None,
+                fakeip_route_if: None,
+                singbox_tun_if: None,
             }),
             proxy: None,
             dns: None,
@@ -1447,6 +1451,32 @@ mod tests {
         let snap: StatusSnapshot = serde_json::from_str(old).unwrap();
         assert_eq!(snap.generated_us, 1);
         assert!(snap.observing);
+    }
+
+    /// A daemon from before the probe-on-suspicion counts and the route/TUN
+    /// interface fields emits link samples without `lan_probed`/`lan_alive`/
+    /// `fakeip_route_if`/`singbox_tun_if`. They must decode as `None` — "not
+    /// measured" — never fail the whole frame.
+    #[test]
+    fn link_sample_decodes_frames_from_before_the_new_fields() {
+        let old = r#"{"ts_us":1,"gw":"Ok","gw_rtt_ms":null,"direct":"Ok","direct_rtt_ms":null,"dhcp_router":null,"dhcp_dns":null,"gw_arp_mac":null,"ssid":null,"wifi_capture_present":false}"#;
+        let l: LinkSample = serde_json::from_str(old).unwrap();
+        assert_eq!(l.lan_probed, None);
+        assert_eq!(l.lan_alive, None);
+        assert_eq!(l.fakeip_route_if, None);
+        assert_eq!(l.singbox_tun_if, None);
+    }
+
+    /// Same guarantee for the proxy sample: a frame from before the
+    /// established-flow discriminator decodes with every `est_*` field `None`.
+    #[test]
+    fn proxy_sample_decodes_frames_from_before_the_established_fields() {
+        let old = r#"{"ts_us":1,"server_ip":"1.1.1.1:443","tcp":"Ok","rtt_ms":null,"tun_code":204,"selector":null}"#;
+        let p: ProxySample = serde_json::from_str(old).unwrap();
+        assert_eq!(p.est_direct_alive, None);
+        assert_eq!(p.est_direct_age_s, None);
+        assert_eq!(p.est_tun_alive, None);
+        assert_eq!(p.est_tun_age_s, None);
     }
 
     #[test]
@@ -1630,6 +1660,10 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         });
         assert_eq!(link.detail(), "gw=OK direct=FAIL");
 
@@ -1640,6 +1674,10 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(204),
             selector: Some("auto".into()),
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         });
         assert_eq!(proxy.detail(), "tun=204 sel=auto");
 
@@ -1651,6 +1689,10 @@ mod tests {
             rtt_ms: None,
             tun_code: None,
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         });
         assert_eq!(proxy_bare.detail(), "tun=- sel=-");
 

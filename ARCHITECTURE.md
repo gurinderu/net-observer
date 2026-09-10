@@ -86,10 +86,16 @@ flowchart LR
   writes each sample to the store (a write error is *logged as a gap*, never
   silently dropped), mirrors the sample into the live `StatusSnapshot`, pushes
   into the `RecentWindow`, and evaluates the engine.
-- **TriggerEngine** — starter rules ported from the oracle: `wedge`, `gw-drop`,
-  `gw-change` (unconditional pcap freeze on any gateway change), `fakeip`,
-  `starvation`. Each fires at most once per 5 min (backoff) and disarms until the
-  signal returns to OK.
+- **TriggerEngine** — rules ported from the oracle and grown since: `wedge`,
+  `gw-drop`, `gw-change` (unconditional pcap freeze on any gateway change),
+  `gw-mac-change` (pcap freeze too), `neighbor-mac-collision`,
+  `per-client-block` (gateway silent while probed LAN neighbors answer),
+  `fakeip`, `fakeip-hijack` (a fakeip-pool address routes out a non-tunnel
+  interface), `endpoint-block` (whole upstream fleet dead from the underlay
+  while the direct reference answers), `established-stall` (a held long-lived
+  stream through the tunnel stops carrying while fresh probes succeed; the
+  direct underlay stream's fate scopes the verdict), `starvation`. Each fires
+  at most once per 5 min (backoff) and disarms until the signal returns to OK.
 - **Live snapshot + local socket API** — the consumer keeps an in-memory
   `StatusSnapshot` (the latest sample per collector + `generated_us`) current on
   every tick, and a passive `SnapshotHandler` mirrors each fired incident into a
@@ -440,8 +446,8 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 
 | Table | Columns | Notes |
 | --- | --- | --- |
-| `link_sample` | `ts_us, gw, gw_rtt_ms, direct, direct_rtt_ms, dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present` | Local path: gateway ping, direct TCP (bound to phys iface), DHCP/ARP facts, Wi-Fi SSID + CoreCapture presence. |
-| `proxy_sample` | `ts_us, server_ip, tcp, rtt_ms, tun_code, selector` | Per-VLESS TCP reachability, tun HTTP 204 (`tun_code`), Clash selector. |
+| `link_sample` | `ts_us, gw, gw_rtt_ms, direct, direct_rtt_ms, dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present, lan_probed, lan_alive, fakeip_route_if, singbox_tun_if` | Local path: gateway ping, direct TCP (bound to phys iface), DHCP/ARP facts, Wi-Fi SSID + CoreCapture presence. `lan_probed`/`lan_alive` are the probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL tick (NULL = not probed). `fakeip_route_if` is the egress interface the route table resolves for a fakeip-pool address; `singbox_tun_if` is the interface carrying sing-box's own TUN address (present only while sing-box runs — the sing-box-alive fact, not "any utun", so a foreign VPN's utun does not read as sing-box being up). Both NULL = could not be determined. |
+| `proxy_sample` | `ts_us, server_ip, tcp, rtt_ms, tun_code, selector, est_direct_alive, est_direct_age_s, est_tun_alive, est_tun_age_s` | Per-VLESS TCP reachability, tun HTTP 204 (`tun_code`), Clash selector. The `est_*` columns are the established-flow discriminator (held reference streams: direct underlay / through the tunnel), per-tick facts replicated across the tick's rows like `tun_code`; NULL = no measurement. |
 | `dns_sample` | `ts_us, probe, server, verdict, ip, rtt_ms` | One row per resolver probe (name label × resolver path); `verdict` drives the `fakeip` trigger. |
 | `route_event` | `ts_us, kind, iface, detail` | PF_ROUTE event stream (`kind` = `iface` / `addr` / `route`): iface up/down, addr add/loss, default-route change. |
 | `host_sample` | `ts_us, load1, load5, load15` | Host load averages — the `starvation` discriminator. |

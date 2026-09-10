@@ -37,8 +37,12 @@ impl IcmpPinger {
 
 impl Pinger for IcmpPinger {
     async fn ping_gw(&self, gw: &str) -> PingOutcome {
-        let Ok(addr) = gw.parse::<IpAddr>() else {
-            tracing::debug!(%gw, "gateway is not a parseable IP address");
+        self.ping_host(gw).await
+    }
+
+    async fn ping_host(&self, addr: &str) -> PingOutcome {
+        let Ok(addr) = addr.parse::<IpAddr>() else {
+            tracing::debug!(%addr, "ping target is not a parseable IP address");
             return PingOutcome {
                 reachable: false,
                 rtt_ms: None,
@@ -111,6 +115,32 @@ impl TcpProber for BoundTcpProber {
 /// `tokio::net::TcpStream`, returning the connect latency in milliseconds on
 /// success.
 async fn connect_bound_inner(host: &str, port: u16, iface: &str) -> Option<f64> {
+    let start = Instant::now();
+    let iface = (!iface.is_empty()).then_some(iface);
+    // `require_bind = false`: a probe that could not pin the interface still
+    // reports reachability on the default route — the historical behaviour.
+    let _stream = open_bound_stream(host, port, iface, false).await?;
+    Some(start.elapsed().as_secs_f64() * 1000.0)
+}
+
+/// Open a TCP socket, optionally pin it to `iface` (`IP_BOUND_IF`, IPv4 only),
+/// start a non-blocking connect to `host:port`, and await completion under
+/// [`PROBE_TIMEOUT`] via `tokio::net::TcpStream`, returning the connected
+/// stream. Shared by the one-shot probes above and the held reference streams
+/// (`stall`).
+///
+/// `require_bind` decides what a failed `IP_BOUND_IF` means. With it `false`
+/// the connect falls through to the default route (a probe still measures
+/// *something*). With it `true` a failed bind returns `None` instead: a caller
+/// that needs the *underlay* path (the held direct stream) must never silently
+/// ride the default route — that would have it measuring the TUN and calling
+/// the result "direct".
+pub(crate) async fn open_bound_stream(
+    host: &str,
+    port: u16,
+    iface: Option<&str>,
+    require_bind: bool,
+) -> Option<TcpStream> {
     let addr = (host, port).to_socket_addrs().ok()?.next()?;
     let domain = match addr {
         SocketAddr::V4(_) => Domain::IPV4,
@@ -119,10 +149,19 @@ async fn connect_bound_inner(host: &str, port: u16, iface: &str) -> Option<f64> 
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).ok()?;
     // A non-blocking socket lets tokio drive the connect to completion.
     socket.set_nonblocking(true).ok()?;
-    if !iface.is_empty() && domain == Domain::IPV4 && !bind_to_iface_v4(socket.as_raw_fd(), iface) {
+    if let Some(iface) = iface
+        && domain == Domain::IPV4
+        && !bind_to_iface_v4(socket.as_raw_fd(), iface)
+    {
+        if require_bind {
+            tracing::debug!(
+                iface,
+                "IP_BOUND_IF failed on a required-bind connect; refusing the default route"
+            );
+            return None;
+        }
         tracing::debug!(iface, "IP_BOUND_IF failed; probing on default route");
     }
-    let start = Instant::now();
     // Kick off the non-blocking connect: EINPROGRESS is the expected "started"
     // reply; anything else is an immediate failure.
     match socket.connect(&addr.into()) {
@@ -142,7 +181,7 @@ async fn connect_bound_inner(host: &str, port: u16, iface: &str) -> Option<f64> 
     }
     // Distinguish a completed connect from a failed one via SO_ERROR.
     match stream.take_error() {
-        Ok(None) => Some(start.elapsed().as_secs_f64() * 1000.0),
+        Ok(None) => Some(stream),
         _ => None,
     }
 }

@@ -940,6 +940,10 @@ mod tests {
             gw_arp_mac: None,
             ssid: Some("cowork".into()),
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         }))
         .unwrap();
     }
@@ -952,6 +956,10 @@ mod tests {
             rtt_ms: None,
             tun_code: tun,
             selector: Some("auto".into()),
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         }))
         .unwrap();
     }

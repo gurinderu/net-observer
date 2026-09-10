@@ -14,6 +14,14 @@ use types::{GwVerdict, LinkSample, TcpVerdict};
 /// The sample is still produced — SKIP, never silence — and every passive fact
 /// (DHCP lease, ARP, SSID) still flows through, because reading them addresses
 /// the gateway with nothing.
+///
+/// `lan` is the probe-on-suspicion `(probed, alive)` neighbor-ping count pair,
+/// already gathered by `collect()` on a gateway-FAIL tick and `(None, None)`
+/// otherwise; it flows through untouched like the other fetched facts.
+/// `fakeip_route_if` is the egress interface the route table resolves for a
+/// fakeip-pool address and `singbox_tun_if` the interface carrying sing-box's
+/// own TUN address (`None` = could not be determined / sing-box not up),
+/// equally untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn build_link_sample(
     ts_us: i64,
@@ -23,6 +31,9 @@ pub fn build_link_sample(
     gw_addr: Option<String>,
     dhcp: (Option<String>, Option<String>),
     arp: Option<String>,
+    lan: (Option<u16>, Option<u16>),
+    fakeip_route_if: Option<String>,
+    singbox_tun_if: Option<String>,
     ssid: Option<String>,
     wifi_present: bool,
 ) -> LinkSample {
@@ -49,6 +60,7 @@ pub fn build_link_sample(
         direct.rtt_ms,
     );
     let (dhcp_router, dhcp_dns) = dhcp;
+    let (lan_probed, lan_alive) = lan;
     LinkSample {
         ts_us,
         gw,
@@ -60,6 +72,10 @@ pub fn build_link_sample(
         gw_arp_mac: arp,
         ssid,
         wifi_capture_present: wifi_present,
+        lan_probed,
+        lan_alive,
+        fakeip_route_if,
+        singbox_tun_if,
     }
 }
 
@@ -85,6 +101,9 @@ mod tests {
             None,
             (Some("10.20.0.1".into()), None),
             None,
+            (None, None),
+            None,
+            None,
             Some("cowork".into()),
             false,
         );
@@ -103,10 +122,15 @@ mod tests {
             Some("10.20.0.1".into()),
             (None, None),
             Some("aa:bb".into()),
+            (Some(3), Some(2)),
+            None,
+            None,
             None,
             false,
         );
         assert_eq!(s.gw, GwVerdict::Fail);
+        assert_eq!(s.lan_probed, Some(3));
+        assert_eq!(s.lan_alive, Some(2));
     }
 
     #[test]
@@ -119,6 +143,9 @@ mod tests {
             Some("10.20.0.1".into()),
             (None, None),
             Some("aa:bb".into()),
+            (None, None),
+            None,
+            None,
             None,
             false,
         );
@@ -138,6 +165,9 @@ mod tests {
             Some("10.20.0.1".into()),
             (Some("10.20.0.1".into()), None),
             Some("aa:bb:cc".into()),
+            (None, None),
+            None,
+            None,
             Some("cowork".into()),
             false,
         );
@@ -161,6 +191,9 @@ mod tests {
             None,
             (None, None),
             None,
+            (None, None),
+            None,
+            None,
             None,
             false,
         );
@@ -177,6 +210,9 @@ mod tests {
             Some("10.20.0.1".into()),
             (Some("10.20.0.1".into()), Some("1.1.1.1".into())),
             Some("aa:bb:cc".into()),
+            (None, None),
+            Some("awdl0".into()),
+            Some("utun6".into()),
             Some("cowork".into()),
             true,
         );
@@ -184,6 +220,8 @@ mod tests {
         assert_eq!(s.dhcp_router.as_deref(), Some("10.20.0.1"));
         assert_eq!(s.dhcp_dns.as_deref(), Some("1.1.1.1"));
         assert_eq!(s.gw_arp_mac.as_deref(), Some("aa:bb:cc"));
+        assert_eq!(s.fakeip_route_if.as_deref(), Some("awdl0"));
+        assert_eq!(s.singbox_tun_if.as_deref(), Some("utun6"));
         assert_eq!(s.ssid.as_deref(), Some("cowork"));
         assert!(s.wifi_capture_present);
     }

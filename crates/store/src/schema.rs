@@ -2,8 +2,30 @@ pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS link_sample (
   ts_us BIGINT, gw VARCHAR, gw_rtt_ms DOUBLE, direct VARCHAR, direct_rtt_ms DOUBLE,
   dhcp_router VARCHAR, dhcp_dns VARCHAR, gw_arp_mac VARCHAR, ssid VARCHAR, wifi_capture_present BOOLEAN);
+-- Probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL
+-- tick (NULL on every other tick: not probed, never a zero). Added after the
+-- link table first shipped, so an older database file keeps its column set
+-- until these ALTERs run on open, exactly like `neighbor_port.banner` below.
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS lan_probed USMALLINT;
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS lan_alive USMALLINT;
+-- The egress interface the route table resolves for a fakeip-pool address
+-- (NULL when it could not be determined). Same migration treatment.
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS fakeip_route_if VARCHAR;
+-- The interface carrying sing-box's own TUN address (the sing-box-alive fact;
+-- that address is present only while sing-box runs). NULL when sing-box's TUN
+-- is not up. Same migration treatment.
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS singbox_tun_if VARCHAR;
 CREATE TABLE IF NOT EXISTS proxy_sample (
   ts_us BIGINT, server_ip VARCHAR, tcp VARCHAR, rtt_ms DOUBLE, tun_code USMALLINT, selector VARCHAR);
+-- Established-flow discriminator: whether the held reference streams (direct
+-- underlay / through the tunnel) still carried data this tick, and their age at
+-- the check (on a dead check: the age at death). Per-tick facts replicated
+-- across the tick's rows like tun_code; NULL = no measurement. Added after the
+-- proxy table first shipped — same migration treatment as link_sample above.
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_direct_alive BOOLEAN;
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_direct_age_s UINTEGER;
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_tun_alive BOOLEAN;
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_tun_age_s UINTEGER;
 CREATE TABLE IF NOT EXISTS incident (
   id VARCHAR PRIMARY KEY, opened_us BIGINT, closed_us BIGINT, trigger_id VARCHAR, signature VARCHAR);
 CREATE TABLE IF NOT EXISTS blob_ref (

@@ -968,6 +968,10 @@ mod tests {
                 gw_arp_mac: None,
                 ssid: None,
                 wifi_capture_present: false,
+                lan_probed: None,
+                lan_alive: None,
+                fakeip_route_if: None,
+                singbox_tun_if: None,
             }),
             proxy: Some(ProxySample {
                 ts_us: 43,
@@ -976,6 +980,10 @@ mod tests {
                 rtt_ms: None,
                 tun_code: Some(204),
                 selector: Some("auto".into()),
+                est_direct_alive: None,
+                est_direct_age_s: None,
+                est_tun_alive: None,
+                est_tun_age_s: None,
             }),
             dns: None,
             host: None,
@@ -1140,6 +1148,10 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         }));
         assert_eq!(
             format_frame_line(&link),

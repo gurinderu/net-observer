@@ -173,7 +173,7 @@ impl Store for DuckdbStore {
         let c = self.conn.lock().unwrap();
         match s {
             Sample::Link(l) => c.execute(
-                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     l.ts_us,
                     l.gw.to_string(),
@@ -184,18 +184,26 @@ impl Store for DuckdbStore {
                     l.dhcp_dns,
                     l.gw_arp_mac,
                     l.ssid,
-                    l.wifi_capture_present
+                    l.wifi_capture_present,
+                    l.lan_probed,
+                    l.lan_alive,
+                    l.fakeip_route_if,
+                    l.singbox_tun_if
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
-                "INSERT INTO proxy_sample VALUES (?,?,?,?,?,?)",
+                "INSERT INTO proxy_sample VALUES (?,?,?,?,?,?,?,?,?,?)",
                 params![
                     p.ts_us,
                     p.server_ip,
                     p.tcp.to_string(),
                     p.rtt_ms,
                     p.tun_code,
-                    p.selector
+                    p.selector,
+                    p.est_direct_alive,
+                    p.est_direct_age_s,
+                    p.est_tun_alive,
+                    p.est_tun_age_s
                 ],
             )?,
             Sample::Dns(d) => c.execute(
@@ -503,7 +511,7 @@ mod tests {
     use crate::Store;
     use types::{
         GwVerdict, LinkSample, NeighborObs, NeighborRole, NeighborSource, NeighborsSample,
-        NeighborsVerdict, Sample, TcpVerdict,
+        NeighborsVerdict, ProxySample, Sample, TcpVerdict,
     };
 
     /// A neighbours tick for one device, so the upsert rules can be driven.
@@ -920,11 +928,125 @@ mod tests {
             gw_arp_mac: Some("incomplete".into()),
             ssid: Some("cowork".into()),
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         });
         s.write_sample(&sample).unwrap();
         assert_eq!(
             s.query_scalar_i64("SELECT count(*) FROM link_sample WHERE gw='FAIL'")
                 .unwrap(),
+            1
+        );
+    }
+
+    /// The probe-on-suspicion counts land in their own columns, and an unprobed
+    /// tick lands as NULL — "not probed" must stay distinguishable from a
+    /// probed tick where nobody answered.
+    #[test]
+    fn link_sample_lan_counts_round_trip() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let base = LinkSample {
+            ts_us: 1000,
+            gw: GwVerdict::Fail,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+            lan_probed: Some(3),
+            lan_alive: Some(1),
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        };
+        s.write_sample(&Sample::Link(base.clone())).unwrap();
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 2000,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+            ..base
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample WHERE lan_probed = 3 AND lan_alive = 1"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample \
+                 WHERE ts_us = 2000 AND lan_probed IS NULL AND lan_alive IS NULL"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    /// The fakeip-pool egress interface lands in its own column; NULL means it
+    /// could not be determined, distinguishable from any real interface name.
+    #[test]
+    fn link_sample_fakeip_route_if_round_trips() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 1000,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: Some("awdl0".into()),
+            singbox_tun_if: Some("utun6".into()),
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample \
+                 WHERE fakeip_route_if = 'awdl0' AND singbox_tun_if = 'utun6'"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    /// The established-flow discriminator lands in its own proxy columns;
+    /// NULL = no measurement, distinguishable from a stream that died at 0s.
+    #[test]
+    fn proxy_sample_established_columns_round_trip() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Proxy(ProxySample {
+            ts_us: 1000,
+            server_ip: "1.1.1.1:443".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: Some(9.0),
+            tun_code: Some(204),
+            selector: None,
+            est_direct_alive: Some(true),
+            est_direct_age_s: Some(120),
+            est_tun_alive: Some(false),
+            est_tun_age_s: Some(45),
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM proxy_sample \
+                 WHERE est_direct_alive AND est_direct_age_s = 120 \
+                   AND NOT est_tun_alive AND est_tun_age_s = 45"
+            )
+            .unwrap(),
             1
         );
     }
@@ -1115,6 +1237,10 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         }))
         .unwrap();
         s.write_sample(&Sample::Proxy(ProxySample {
@@ -1124,6 +1250,10 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(0),
             selector: Some("a".into()),
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         }))
         .unwrap();
         s.open_incident(&Incident {
@@ -1337,6 +1467,10 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         }))
         .unwrap();
         let t = s.query_table("SELECT ts_us, gw FROM link_sample").unwrap();

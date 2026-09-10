@@ -32,14 +32,16 @@ use collector_wifi::WifiCollector;
 use config::Config;
 use macos::LldpCapture;
 use macos::{
-    BoundTcpProber, CoreWlanFacts, DnsResolver, HostLoad, IcmpPinger, PcapRing, PfRouteSource,
-    ProxySystemFacts, SystemFacts, SystemNeighbors, SystemProfilerAir, TcpdumpLldpCapture,
+    BoundTcpProber, CoreWlanFacts, DnsResolver, HeldReferenceStreams, HostLoad, IcmpPinger,
+    PcapRing, PfRouteSource, ProxySystemFacts, SystemFacts, SystemNeighbors, SystemProfilerAir,
+    TcpdumpLldpCapture,
 };
 use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
-    FakeIp, GwChange, GwDrop, GwMacChange, NeighborMacCollision, Starvation, Wedge,
+    EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, GwChange, GwDrop, GwMacChange,
+    NeighborMacCollision, PerClientBlock, Starvation, Wedge,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -90,6 +92,12 @@ const EVENT_BUS_CAP: usize = 1024;
 /// Wedge signal: tun dead while the direct path is healthy, for this many ticks.
 const WEDGE_CONSECUTIVE: usize = 3;
 
+/// Endpoint-block signal: every upstream endpoint's underlay TCP probe dead
+/// while the direct reference answers, for this many per-tick cohorts. Two
+/// cohorts = 30s at the 15s proxy cadence — a single transition tick must not
+/// fire the fleet-wide signature.
+const ENDPOINT_BLOCK_CONSECUTIVE: usize = 2;
+
 /// Host load above which a dead tun counts as starvation (read from the `host`
 /// collector's newest sample by the `Starvation` condition).
 const STARVATION_LOAD: f64 = 10.0;
@@ -97,9 +105,6 @@ const STARVATION_LOAD: f64 = 10.0;
 /// Path to the rendered sing-box config (read at runtime — server addresses are
 /// never compiled in). Deployment writes it here; absent ⇒ proxy emits SKIP.
 const SINGBOX_CONFIG_PATH: &str = "/etc/sing-box/config.json";
-
-/// Clash/Mihomo proxy group whose current selection identifies the active node.
-const CLASH_SELECTOR_GROUP: &str = "GLOBAL";
 
 /// Upper bound on the post-signal drain. The `route` collector's PF_ROUTE
 /// `read(2)` runs on a dedicated OS thread that cannot be interrupted, so it
@@ -429,23 +434,34 @@ async fn run_daemon() -> anyhow::Result<()> {
             SystemFacts::new(
                 cfg.collectors.link.gw.clone(),
                 cfg.collectors.link.phys_iface.clone(),
-            ),
+            )
+            // The fakeip-pool route resolution reads the same rendered config
+            // the proxy facts adapter does; absent, the field records None.
+            .with_singbox_config(SINGBOX_CONFIG_PATH),
             cfg.collectors.link.interval,
             quiet.clone(),
         )));
     }
     if cfg.collectors.proxy.enabled {
-        collectors.push(AnyCollector::Proxy(ProxyCollector::new(
+        collectors.push(AnyCollector::Proxy(Box::new(ProxyCollector::new(
             BoundTcpProber::new(),
             ProxySystemFacts::new(
                 SINGBOX_CONFIG_PATH,
                 cfg.collectors.proxy.clash_api.clone(),
-                CLASH_SELECTOR_GROUP,
+                cfg.collectors.proxy.selector_group.clone(),
+            ),
+            // The held reference streams: direct bound to the physical
+            // interface, tunnel on the default route. The adapter owns the
+            // sockets across ticks; the interval sets its staleness bound, so a
+            // stream idle across an observing pause is discarded unmeasured.
+            HeldReferenceStreams::new(
+                phys_iface.clone().unwrap_or_default(),
+                cfg.collectors.proxy.interval,
             ),
             cfg.collectors.proxy.tun_probe_url.clone(),
             phys_iface.clone().unwrap_or_default(),
             cfg.collectors.proxy.interval,
-        )));
+        ))));
     }
     if cfg.collectors.dns.enabled {
         collectors.push(AnyCollector::Dns(DnsCollector::new(
@@ -709,9 +725,16 @@ async fn run_daemon() -> anyhow::Result<()> {
 /// `match` to the concrete collector, and the async ones `await` the underlying
 /// future. Because every arm is a concrete type, the composed `collect` future is
 /// `Send` and can be spawned onto the runtime without `Box::pin`.
+///
+/// The `Proxy` collector is held behind a `Box` (a concrete pointer, not a
+/// `dyn` vtable): its held reference streams carry two long-lived rustls
+/// sessions inline, so an unboxed variant would size every element of the
+/// `Vec<AnyCollector>` to those buffers. Boxing the one heavy variant leaves
+/// the delegating `match` arms unchanged (auto-deref) and the collect future
+/// still concrete and `Send`.
 pub(crate) enum AnyCollector {
     Link(LinkCollector<IcmpPinger, BoundTcpProber, SystemFacts>),
-    Proxy(ProxyCollector<BoundTcpProber, ProxySystemFacts>),
+    Proxy(Box<ProxyCollector<BoundTcpProber, ProxySystemFacts, HeldReferenceStreams>>),
     Dns(DnsCollector<DnsResolver>),
     Route(RouteCollector),
     Host(HostCollector<HostLoad>),
@@ -813,7 +836,9 @@ impl AnyCollector {
     pub(crate) fn into_event_source(self) -> Option<Box<dyn EventSource>> {
         match self {
             Self::Link(c) => Box::new(c).into_event_source(),
-            Self::Proxy(c) => Box::new(c).into_event_source(),
+            // Already boxed in the variant (see the enum doc): it IS the
+            // `Box<Self>` the trait method takes, so it is not re-boxed.
+            Self::Proxy(c) => c.into_event_source(),
             Self::Dns(c) => Box::new(c).into_event_source(),
             Self::Route(c) => Box::new(c).into_event_source(),
             Self::Host(c) => Box::new(c).into_event_source(),
@@ -1091,6 +1116,10 @@ impl Collector for FakeCollector {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         })]
     }
     fn skip(&self, ts_us: i64) -> Vec<Sample> {
@@ -1105,6 +1134,10 @@ impl Collector for FakeCollector {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         })]
     }
 }
@@ -1354,10 +1387,12 @@ fn build_api_server(
     }
 }
 
-/// Assemble the [`TriggerEngine`] with the starter rules (wedge, gw-drop,
-/// gw-change, fakeip, starvation). Every rule records an incident (durable, in
-/// DuckDB) and mirrors it into the live snapshot's ring for the socket API;
-/// gw-change additionally freezes the pcap ring when one is available.
+/// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
+/// gw-mac-change, neighbor-mac-collision, per-client-block, fakeip,
+/// fakeip-hijack, endpoint-block, established-stall, starvation). Every rule
+/// records an incident (durable, in DuckDB) and mirrors it into the live
+/// snapshot's ring for the socket API; gw-change and gw-mac-change
+/// additionally freeze the pcap ring when one is available.
 fn build_engine(
     store: Arc<DuckdbStore>,
     cfg: &Config,
@@ -1413,8 +1448,38 @@ fn build_engine(
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
+        // No pcap freeze: the evidence is the recorded counts, and the echoes
+        // the gateway never answered are packets that never arrived.
+        Trigger::new(
+            Box::new(PerClientBlock),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
         Trigger::new(
             Box::new(FakeIp),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        // No pcap freeze: the evidence is the recorded egress interface —
+        // provable from the route table alone.
+        Trigger::new(
+            Box::new(FakeIpHijack),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        // No pcap freeze: the evidence is the stored per-endpoint verdicts —
+        // packets of connections that never opened add nothing.
+        Trigger::new(
+            Box::new(EndpointBlock {
+                consecutive: ENDPOINT_BLOCK_CONSECUTIVE,
+            }),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        // No pcap freeze: the evidence is the recorded held-stream reading —
+        // the scoping verdict is already in the detail string.
+        Trigger::new(
+            Box::new(EstablishedStall),
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
@@ -1705,7 +1770,34 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         })
+    }
+
+    /// A gateway-FAIL link tick carrying probe-on-suspicion counts — the
+    /// per-client-block shape ([`link`] pins both counts to `None`).
+    fn link_gw_fail_with_lan(ts_us: i64, probed: u16, alive: u16) -> Sample {
+        let Sample::Link(mut l) = link(ts_us, GwVerdict::Fail) else {
+            unreachable!("link() builds a link sample")
+        };
+        l.lan_probed = Some(probed);
+        l.lan_alive = Some(alive);
+        Sample::Link(l)
+    }
+
+    /// A healthy link tick whose fakeip-pool probe resolved to `route_if` while
+    /// sing-box's own TUN is up (on utun6) — the fakeip-hijack shape ([`link`]
+    /// pins both interface fields to `None`).
+    fn link_fakeip_via(ts_us: i64, route_if: &str) -> Sample {
+        let Sample::Link(mut l) = link(ts_us, GwVerdict::Ok) else {
+            unreachable!("link() builds a link sample")
+        };
+        l.fakeip_route_if = Some(route_if.into());
+        l.singbox_tun_if = Some("utun6".into());
+        Sample::Link(l)
     }
 
     /// A proxy tick with the tun dead (`tun_code` 0) while the TCP path is fine —
@@ -1718,6 +1810,47 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(0),
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
+        })
+    }
+
+    /// A per-endpoint proxy row whose underlay TCP probe FAILED while the tun
+    /// is healthy — the endpoint-block shape ([`dead_proxy`] is the opposite:
+    /// tcp OK, tun dead).
+    fn failed_endpoint(ts_us: i64, endpoint: &str) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us,
+            server_ip: endpoint.into(),
+            tcp: TcpVerdict::Fail,
+            rtt_ms: None,
+            tun_code: Some(204),
+            selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
+        })
+    }
+
+    /// A healthy proxy tick carrying held-stream readings — the
+    /// established-stall shape: fresh paths fine, the tunnel stream's fate in
+    /// `tun_alive` ([`dead_proxy`]/[`failed_endpoint`] pin the est fields to
+    /// `None`).
+    fn proxy_with_streams(ts_us: i64, tun_alive: bool) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us,
+            server_ip: "1.1.1.1:443".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: None,
+            tun_code: Some(204),
+            selector: None,
+            est_direct_alive: Some(true),
+            est_direct_age_s: Some(120),
+            est_tun_alive: Some(tun_alive),
+            est_tun_age_s: Some(45),
         })
     }
 
@@ -1956,8 +2089,8 @@ mod tests {
         events_rx: tokio::sync::broadcast::Receiver<EncodedFrame>,
     }
 
-    /// Build the real [`build_engine`] — five rules, production constants — with
-    /// `freezer`.
+    /// Build the real [`build_engine`] — the full production rule set and
+    /// constants — with `freezer`.
     fn engine_under_test(freezer: Arc<PcapRingSlot>) -> EngineFixture {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
@@ -1979,9 +2112,9 @@ mod tests {
 
     /// How many incidents `store` holds for `trigger_id`.
     ///
-    /// ALWAYS filtered: [`build_engine`] installs five rules at once, so an
-    /// unfiltered `count(*)` would let another rule's firing stand in for the one
-    /// under test.
+    /// ALWAYS filtered: [`build_engine`] installs the whole rule set at once, so
+    /// an unfiltered `count(*)` would let another rule's firing stand in for the
+    /// one under test.
     fn incidents_for(store: &DuckdbStore, trigger_id: &str) -> i64 {
         store
             .query_scalar_i64(&format!(
@@ -2102,6 +2235,121 @@ mod tests {
             incidents_for(&fx.store, "starvation"),
             1,
             "a dead tun above STARVATION_LOAD must be recorded as starvation"
+        );
+    }
+
+    /// The `endpoint-block` rule the daemon actually runs counts to
+    /// [`ENDPOINT_BLOCK_CONSECUTIVE`] — two — all-fail cohorts, no fewer.
+    ///
+    /// Dies under `ENDPOINT_BLOCK_CONSECUTIVE = 1` (the single-cohort stream
+    /// fires, so the first assertion reds) and under `= 3` (the two-cohort run
+    /// stays silent, so the second reds). The cohort counts are LITERALS on
+    /// purpose — this test IS the constant's pin, exactly like the wedge pin
+    /// above.
+    ///
+    /// Nothing else in the rule set can fire on this stream: the tun is
+    /// healthy (no wedge/starvation), the gateway verdict is steadily OK with
+    /// no predecessor to differ from (no gw-drop/gw-change), and there is no
+    /// DNS or neighbors sample.
+    #[test]
+    fn build_engine_wires_the_production_endpoint_block_threshold() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(8);
+
+        feed(&mut fx.engine, &mut w, link(1, GwVerdict::Ok));
+        // One all-fail cohort — one short of the production threshold of two.
+        feed(&mut fx.engine, &mut w, failed_endpoint(2, "1.1.1.1:443"));
+        feed(&mut fx.engine, &mut w, failed_endpoint(2, "2.2.2.2:2053"));
+        assert_eq!(
+            incidents_for(&fx.store, "endpoint-block"),
+            0,
+            "one all-fail cohort is one short of ENDPOINT_BLOCK_CONSECUTIVE and must not fire"
+        );
+
+        // The second cohort completes the run.
+        feed(&mut fx.engine, &mut w, failed_endpoint(3, "1.1.1.1:443"));
+        feed(&mut fx.engine, &mut w, failed_endpoint(3, "2.2.2.2:2053"));
+        assert_eq!(
+            incidents_for(&fx.store, "endpoint-block"),
+            1,
+            "the second consecutive all-fail cohort must fire the endpoint-block rule"
+        );
+    }
+
+    /// The `per-client-block` rule is installed with the production handlers:
+    /// a gateway-FAIL tick with live probed neighbors records the incident, and
+    /// the same tick without counts (the tick did not probe) records nothing
+    /// under that id. `gw-drop` fires on both streams and is filtered out by
+    /// `incidents_for`, which is exactly why the filter exists.
+    #[test]
+    fn build_engine_registers_the_per_client_block_rule() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(8);
+
+        feed(&mut fx.engine, &mut w, link(1, GwVerdict::Fail));
+        assert_eq!(
+            incidents_for(&fx.store, "per-client-block"),
+            0,
+            "a tick that did not probe carries no measurement and must not fire"
+        );
+
+        feed(&mut fx.engine, &mut w, link_gw_fail_with_lan(2, 3, 2));
+        assert_eq!(
+            incidents_for(&fx.store, "per-client-block"),
+            1,
+            "a silent gateway with live neighbors must be recorded as per-client-block"
+        );
+    }
+
+    /// The `fakeip-hijack` rule is installed with the production handlers: a
+    /// tick whose pool routes into the tunnel records nothing, one routing via
+    /// a real interface records the incident. Nothing else in the rule set
+    /// can fire on this stream: the gateway is steadily OK with no
+    /// predecessor to differ from, and there is no proxy, DNS, host or
+    /// neighbors sample.
+    #[test]
+    fn build_engine_registers_the_fakeip_hijack_rule() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(8);
+
+        feed(&mut fx.engine, &mut w, link_fakeip_via(1, "utun8"));
+        assert_eq!(
+            incidents_for(&fx.store, "fakeip-hijack"),
+            0,
+            "the pool routing into the tunnel is the healthy state"
+        );
+
+        feed(&mut fx.engine, &mut w, link_fakeip_via(2, "awdl0"));
+        assert_eq!(
+            incidents_for(&fx.store, "fakeip-hijack"),
+            1,
+            "the pool routing via a real interface must be recorded as fakeip-hijack"
+        );
+    }
+
+    /// The `established-stall` rule is installed with the production handlers:
+    /// a tick whose held tunnel stream still carries records nothing, one
+    /// whose stream died (fresh probes fine) records the incident. Nothing
+    /// else in the rule set can fire on this stream: the tun code is healthy
+    /// (no wedge/starvation), the underlay TCP is Ok (no endpoint-block), and
+    /// there is no link, DNS or neighbors sample.
+    #[test]
+    fn build_engine_registers_the_established_stall_rule() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(8);
+
+        feed(&mut fx.engine, &mut w, proxy_with_streams(1, true));
+        assert_eq!(
+            incidents_for(&fx.store, "established-stall"),
+            0,
+            "a carrying tunnel stream is the healthy state"
+        );
+
+        feed(&mut fx.engine, &mut w, proxy_with_streams(2, false));
+        assert_eq!(
+            incidents_for(&fx.store, "established-stall"),
+            1,
+            "a stalled tunnel stream with fresh probes OK must be recorded as established-stall"
         );
     }
 

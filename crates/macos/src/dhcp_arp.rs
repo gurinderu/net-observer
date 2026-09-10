@@ -26,6 +26,9 @@ pub struct SystemFacts {
     gw_override: Option<String>,
     iface_override: Option<String>,
     capture_window: Duration,
+    /// Rendered sing-box config to read the fakeip pool from. `None` (the
+    /// default) disables [`LinkFacts::fakeip_route_iface`].
+    singbox_config: Option<std::path::PathBuf>,
 }
 
 impl Default for SystemFacts {
@@ -34,6 +37,7 @@ impl Default for SystemFacts {
             gw_override: None,
             iface_override: None,
             capture_window: DEFAULT_CAPTURE_WINDOW,
+            singbox_config: None,
         }
     }
 }
@@ -46,7 +50,16 @@ impl SystemFacts {
             gw_override,
             iface_override,
             capture_window: DEFAULT_CAPTURE_WINDOW,
+            singbox_config: None,
         }
+    }
+
+    /// Point at the rendered sing-box config, enabling the fakeip-pool route
+    /// resolution ([`LinkFacts::fakeip_route_iface`]).
+    #[must_use]
+    pub fn with_singbox_config(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.singbox_config = Some(path.into());
+        self
     }
 }
 
@@ -82,6 +95,47 @@ impl LinkFacts for SystemFacts {
     async fn gw_arp_mac(&self, gw: &str) -> Option<String> {
         let out = run("arp", &["-n", gw]).await?;
         parse_arp_mac(&out, gw)
+    }
+
+    async fn arp_neighbor_ips(&self) -> Vec<String> {
+        // The kernel's own cache (`arp -an` via `read_arp`): a passive read, no
+        // packet addressed at anybody. The v4 parse keeps only addresses the
+        // neighbor ping can take.
+        let iface = self.phys_iface().await;
+        let Some(obs) = crate::neighbors::read_arp(iface.as_deref()).await else {
+            return Vec::new();
+        };
+        obs.into_iter()
+            .filter(|o| o.ip.parse::<std::net::Ipv4Addr>().is_ok())
+            .map(|o| o.ip)
+            .collect()
+    }
+
+    async fn fakeip_route_iface(&self) -> Option<String> {
+        let path = self.singbox_config.as_ref()?;
+        // A small local config file: an instant read, kept synchronous inside
+        // the async fn (mirroring the proxy facts adapter).
+        let text = std::fs::read_to_string(path).ok()?;
+        let probe = crate::clash::fakeip_probe_addr(&text)?;
+        // `route -n get` is a local RTM_GET lookup — no packet on the wire, so
+        // this keeps running under quiet mode like every other passive fact.
+        let out = run("route", &["-n", "get", &probe.to_string()]).await?;
+        parse_route_field(&out, "interface")
+    }
+
+    async fn singbox_tun_iface(&self) -> Option<String> {
+        // The interface carrying sing-box's OWN TUN address (from the rendered
+        // config), NOT "any utun": tailscale/netbird also create utuns, so a
+        // foreign utun owning the default route must not read as sing-box being
+        // up. That address is assigned to an interface only while sing-box runs,
+        // which is exactly how dns-fallback.nix decides sing-box is alive
+        // (`ifconfig | grep 'inet 172.19.0.1 '`). A local `ifconfig` read, no
+        // packet on the wire, so it keeps running under quiet mode.
+        let path = self.singbox_config.as_ref()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        let addr = crate::clash::singbox_tun_addr(&text)?;
+        let out = run("ifconfig", &[]).await?;
+        iface_with_inet(&out, &addr)
     }
 
     async fn ssid(&self) -> Option<String> {
@@ -143,6 +197,26 @@ fn first_ipv4(s: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The interface whose block in `ifconfig` output carries `inet <addr> `, or
+/// `None`. Header lines (`utun6: flags=...`) start in column 0; address lines
+/// are indented (`\tinet 172.19.0.1 --> ...`). The trailing space in the match
+/// keeps `172.19.0.1` from matching `172.19.0.10`, and a literal substring
+/// search (not a regex) keeps the dots from matching anything else.
+fn iface_with_inet(ifconfig_out: &str, addr: &str) -> Option<String> {
+    let needle = format!("inet {addr} ");
+    let mut current: Option<&str> = None;
+    for line in ifconfig_out.lines() {
+        if line.starts_with(char::is_whitespace) {
+            if line.contains(&needle) {
+                return current.map(str::to_string);
+            }
+        } else {
+            current = line.split_once(':').map(|(name, _)| name);
+        }
+    }
+    None
+}
+
 /// Parse the MAC (or the literal `incomplete`) for `gw` from `arp -n` output.
 fn parse_arp_mac(output: &str, gw: &str) -> Option<String> {
     let line = output.lines().find(|l| l.contains(gw))?;
@@ -180,6 +254,51 @@ mod tests {
     #[test]
     fn missing_route_field_is_none() {
         assert_eq!(parse_route_field(ROUTE_OUT, "nexthop"), None);
+    }
+
+    // A machine running BOTH sing-box (utun6, 172.19.0.1) and a foreign VPN
+    // (tailscale on utun4, 100.x): `ifconfig` lists both.
+    const IFCONFIG_OUT: &str = "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+        \tinet 192.168.1.50 netmask 0xffffff00 broadcast 192.168.1.255\n\
+        lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\
+        \tinet 127.0.0.1 netmask 0xff000000\n\
+        utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280\n\
+        \tinet 100.101.102.103 --> 100.101.102.103 netmask 0xffffffff\n\
+        utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400\n\
+        \tinet 172.19.0.1 --> 172.19.0.1 netmask 0xfffffffc\n";
+
+    #[test]
+    fn iface_with_inet_finds_the_singbox_tun_not_a_foreign_one() {
+        // sing-box's own address resolves to its own utun, never the foreign one.
+        assert_eq!(
+            iface_with_inet(IFCONFIG_OUT, "172.19.0.1").as_deref(),
+            Some("utun6")
+        );
+        // The foreign VPN's address is on utun4 — proving the scan is per-block.
+        assert_eq!(
+            iface_with_inet(IFCONFIG_OUT, "100.101.102.103").as_deref(),
+            Some("utun4")
+        );
+    }
+
+    #[test]
+    fn iface_with_inet_is_none_when_singbox_is_down() {
+        // sing-box down: 172.19.0.1 is assigned to nothing, even though a
+        // foreign utun (utun4) is present and could own the default route. This
+        // is the trap the "any utun" check fell into.
+        let without_singbox = "en0: flags=8863<UP> mtu 1500\n\
+            \tinet 192.168.1.50 netmask 0xffffff00\n\
+            utun4: flags=8051<UP> mtu 1280\n\
+            \tinet 100.101.102.103 --> 100.101.102.103 netmask 0xffffffff\n";
+        assert_eq!(iface_with_inet(without_singbox, "172.19.0.1"), None);
+    }
+
+    #[test]
+    fn iface_with_inet_does_not_match_an_address_prefix() {
+        let out = "utun6: flags=8051<UP> mtu 1400\n\
+            \tinet 172.19.0.10 --> 172.19.0.10 netmask 0xfffffffc\n";
+        // 172.19.0.1 must not match the 172.19.0.10 line (trailing-space guard).
+        assert_eq!(iface_with_inet(out, "172.19.0.1"), None);
     }
 
     #[test]

@@ -833,6 +833,10 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         });
         s.proxy = Some(types::ProxySample {
             ts_us: 4_000_000,
@@ -841,6 +845,10 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(204),
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         });
         // newest is the proxy tick at 4s -> 6s ago at now=10s.
         assert_eq!(freshness_line(&s, 10_000_000), "updated 6s ago");

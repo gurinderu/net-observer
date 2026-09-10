@@ -262,6 +262,245 @@ impl Condition for Starvation {
     }
 }
 
+/// How many recent proxy samples `endpoint-block` scans when grouping rows into
+/// per-tick cohorts. The daemon retains at most 64 samples (its `WINDOW_CAP`),
+/// so this scan ceiling is the window itself.
+const ENDPOINT_BLOCK_SCAN: usize = 64;
+
+/// Fires when, for the newest `consecutive` proxy cohorts (one cohort = the
+/// per-endpoint rows sharing one `ts_us`), every endpoint's underlay TCP
+/// verdict is `Fail` while the newest link sample's `direct` probe is `Ok` —
+/// the selective-block / middlebox signature: the network path to the whole
+/// upstream fleet is dead from the underlay while the reference host answers.
+///
+/// Distinct from `wedge`, which reads the TUN probe (the proxy PROCESS path):
+/// this one reads the per-endpoint underlay TCP verdicts and fires even while
+/// the tun probe still passes. A cohort containing a `Skip` row is the absence
+/// of a measurement (the `-` skip row means no endpoints were parsed) and
+/// breaks the run; a cohort with any `Ok` is not a fleet-wide block. Proxy
+/// history does not survive a resume (only the link change basis is carried),
+/// so after `clear_for_resume` this simply waits for `consecutive` fresh
+/// cohorts. (realm net-observer, node: pending — rationale in the PR body
+/// until a graph session records it)
+pub struct EndpointBlock {
+    pub consecutive: usize,
+}
+impl Condition for EndpointBlock {
+    fn id(&self) -> &'static str {
+        "endpoint-block"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        // The reference host must have answered, or this is a whole-network
+        // outage, not a selective block. Exhaustive over the verdict: `Skip`
+        // is the absence of a measurement, never a healthy reference.
+        let last = w.last_link()?;
+        match last.direct {
+            TcpVerdict::Ok => {}
+            TcpVerdict::Fail | TcpVerdict::Skip => return None,
+        }
+        // Per-tick cohorts, newest first: `(ts_us, rows, all Fail so far)`.
+        // One `collect()` stamps every per-endpoint row with one `ts_us`, so
+        // the shared timestamp is the cohort key.
+        let mut cohorts: Vec<(i64, usize, bool)> = Vec::new();
+        for p in w.recent_proxy(ENDPOINT_BLOCK_SCAN) {
+            // Exhaustive over the verdict: `Skip` carries no measurement, so
+            // it can never count toward "every endpoint failed".
+            let fail = match p.tcp {
+                TcpVerdict::Fail => true,
+                TcpVerdict::Ok | TcpVerdict::Skip => false,
+            };
+            match cohorts.last_mut() {
+                Some((ts, rows, all_fail)) if *ts == p.ts_us => {
+                    *rows += 1;
+                    *all_fail = *all_fail && fail;
+                }
+                _ => {
+                    // A new cohort begins; past `consecutive` of them the
+                    // verdict is already decided.
+                    if cohorts.len() == self.consecutive {
+                        break;
+                    }
+                    cohorts.push((p.ts_us, 1, fail));
+                }
+            }
+        }
+        if cohorts.len() < self.consecutive {
+            return None;
+        }
+        if !cohorts.iter().all(|(_, _, all_fail)| *all_fail) {
+            return None;
+        }
+        let (_, n, _) = *cohorts.first()?;
+        Some(Fire {
+            detail: format!(
+                "all {n} endpoints dead from the underlay across {k} ticks \
+while the reference host answers",
+                k = self.consecutive
+            ),
+        })
+    }
+}
+
+/// Fires when the newest link sample's gateway echo went unanswered while at
+/// least one LAN neighbor probed on that same tick answered — the
+/// per-client-ban signature: the segment is alive, and the gateway is silent
+/// only toward this client.
+///
+/// `lan_probed`/`lan_alive` are `None` on any tick that did not probe (healthy
+/// gateway, quiet mode, no gateway): no measurement, no fire. A probed tick
+/// where nobody answered is the whole segment dead — `gw-drop` territory, not
+/// a selective ban. The gateway match is exhaustive so a future verdict token
+/// cannot join the fault set by accident. (realm net-observer, node: pending —
+/// rationale in the PR body until a graph session records it)
+pub struct PerClientBlock;
+impl Condition for PerClientBlock {
+    fn id(&self) -> &'static str {
+        "per-client-block"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_link()?;
+        match last.gw {
+            GwVerdict::Fail => {}
+            GwVerdict::Ok | GwVerdict::NoGw | GwVerdict::Skip => return None,
+        }
+        let probed = last.lan_probed?;
+        let alive = last.lan_alive?;
+        if probed == 0 || alive == 0 {
+            return None;
+        }
+        Some(Fire {
+            detail: format!("gateway silent while {alive}/{probed} LAN neighbors answer"),
+        })
+    }
+}
+
+/// An interface a fakeip-pool address may legitimately resolve to: a tunnel it
+/// is SUPPOSED to enter (`utun`/`tun`/`ipsec`/`gif`/`stf`), or loopback (`lo`),
+/// where a blackhole/reject or kill-switch route drops the packet — the
+/// opposite of leaking out a real egress. A hijack is anything else.
+fn is_tunnel_or_discard_iface(name: &str) -> bool {
+    const PREFIXES: [&str; 6] = ["utun", "tun", "ipsec", "gif", "stf", "lo"];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Fires when the newest link sample resolved the fakeip-pool probe address to
+/// a real egress interface (not a tunnel, not loopback/discard) WHILE the
+/// tunnel is up — the AWDL-collision class: a fakeip answer is only meaningful
+/// inside the tunnel, so a pool address routing out `awdl0`/`en0` sends traffic
+/// addressed to a phantom range out a real interface.
+///
+/// Two gates keep an ordinary outage from reading as a hijack, and both come
+/// from the SAME link sample so there is no cross-sample skew. First,
+/// loopback/tunnel destinations are not a leak ([`is_tunnel_or_discard_iface`]):
+/// a kill-switch/reject route resolves to `lo0` (packet dropped), the semantic
+/// opposite of the leak. Second, sing-box must actually be up this tick — when
+/// sing-box is down, `route get` falls through to the physical route for the
+/// pool, which is "the tunnel is simply down" (`wedge`/`gw-drop` territory),
+/// not a hijack. The discriminator is `singbox_tun_if`: sing-box's OWN TUN
+/// address is assigned to an interface only while sing-box runs, so its
+/// presence proves sing-box specifically is up. It is deliberately NOT "any
+/// `utun*` owns the default" — tailscale/netbird create utuns too, and a
+/// foreign utun owning the default while sing-box is down would fabricate this
+/// incident. Nor the public TUN probe's 204, which travels whatever route
+/// reaches gstatic and still succeeds over the physical default when the tunnel
+/// is down.
+///
+/// `None` means the pool route could not be determined (no config, no range, no
+/// route) or sing-box's TUN is not up: the absence of a measurement, never a
+/// hijack. (realm net-observer, node: pending — rationale in the PR body until
+/// a graph session records it)
+pub struct FakeIpHijack;
+impl Condition for FakeIpHijack {
+    fn id(&self) -> &'static str {
+        "fakeip-hijack"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_link()?;
+        let ifname = last.fakeip_route_if.as_deref()?;
+        if is_tunnel_or_discard_iface(ifname) {
+            return None;
+        }
+        // sing-box must be up, proven by its OWN TUN interface being present
+        // this tick (a foreign VPN's utun does not carry sing-box's address).
+        // `None` = sing-box down, so a pool address on a real interface is just
+        // the outage's route fall-through, not a hijack. Same tick as the pool
+        // reading, so no skew — and not a 204 that would travel the leaked path.
+        let tun_if = last.singbox_tun_if.as_deref()?;
+        Some(Fire {
+            detail: format!(
+                "fakeip pool routes via {ifname} while sing-box's TUN is up on {tun_if}"
+            ),
+        })
+    }
+}
+
+/// Fires when the established reference stream through the tunnel has died
+/// while the fresh tun probe still answers — the long-flow stall signature
+/// measured all day 2026-09-08: an established stream silently stops carrying
+/// while a brand-new connection succeeds instantly. Fresh probes alone cannot
+/// see it, and without the discriminator the incident gets labeled by hand.
+///
+/// The direct underlay stream localizes the fault, spelled out in the detail:
+/// it surviving means the stall is scoped to the proxied path
+/// (endpoint/protocol — the thing loosely called DPI); both dying means the
+/// underlay's treatment of long flows (NAT idle-eviction / radio), not the
+/// proxy. `None` on either side is the absence of a measurement (the stream
+/// was only just opened, or could not be opened): no fire on the tunnel side,
+/// an explicit "unmeasured" in the detail on the direct side. A dead fresh
+/// probe alongside is a plain outage — `wedge`/`gw-drop` territory, not a
+/// stall of established flows.
+///
+/// The "endpoint-scoped" verdict requires the surviving direct stream to be at
+/// least as old as the stalled tunnel stream. The two streams reconnect
+/// independently, so on a real underlay stall the direct stream can have died
+/// and come back young while the tunnel stream reports its long life at death;
+/// a young direct stream is not proof the underlay was healthy across the
+/// window, so it reads "underlay-ambiguous" rather than exonerating the
+/// underlay. Proxy history does not survive a resume, so after
+/// `clear_for_resume` this waits for a fresh reading. (realm net-observer,
+/// node: pending — rationale in the PR body until a graph session records it)
+pub struct EstablishedStall;
+impl Condition for EstablishedStall {
+    fn id(&self) -> &'static str {
+        "established-stall"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let p = w.last_proxy()?;
+        if p.est_tun_alive? {
+            return None;
+        }
+        // The fresh path must still answer, or this is a plain outage, not a
+        // long-flow stall (`unwrap_or(0) == 0` is the wedge's dead-tun read).
+        if p.tun_code.unwrap_or(0) == 0 {
+            return None;
+        }
+        let tun_age = p.est_tun_age_s.unwrap_or(0);
+        let direct_age = p.est_direct_age_s.unwrap_or(0);
+        let detail = match p.est_direct_alive {
+            // A surviving direct stream exonerates the underlay only if it is at
+            // least as old as the tunnel stream that died — else it may have
+            // reconnected young through the same underlay hiccup.
+            Some(true) if direct_age >= tun_age => format!(
+                "established stream through the tunnel stalled after ~{tun_age}s (fresh OK); \
+direct underlay stream survived ~{direct_age}s -> endpoint/protocol-scoped"
+            ),
+            Some(true) => format!(
+                "established stream through the tunnel stalled after ~{tun_age}s (fresh OK); \
+direct underlay stream too young to compare (~{direct_age}s) -> underlay-ambiguous"
+            ),
+            Some(false) => format!(
+                "established streams through the tunnel and the direct underlay both stalled \
+after ~{tun_age}s/~{direct_age}s (fresh OK) -> underlay (NAT/radio), not proxy-scoped"
+            ),
+            None => format!(
+                "established stream through the tunnel stalled after ~{tun_age}s (fresh OK); \
+direct underlay stream unmeasured"
+            ),
+        };
+        Some(Fire { detail })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +541,10 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         })
     }
 
@@ -319,6 +562,10 @@ mod tests {
             gw_arp_mac: None,
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         })
     }
 
@@ -330,6 +577,30 @@ mod tests {
             rtt_ms: None,
             tun_code: Some(tun),
             selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
+        })
+    }
+
+    /// A per-endpoint proxy row: pins the endpoint string and the underlay TCP
+    /// verdict, with a HEALTHY tun (`endpoint-block` reads the underlay
+    /// verdicts and must fire even while the tun probe still passes). The
+    /// existing [`proxy`] builder pins a single server and varies the tun
+    /// instead.
+    fn proxy_ep(ts: i64, endpoint: &str, tcp: TcpVerdict) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us: ts,
+            server_ip: endpoint.into(),
+            tcp,
+            rtt_ms: None,
+            tun_code: Some(204),
+            selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
         })
     }
 
@@ -347,6 +618,10 @@ mod tests {
             gw_arp_mac: mac.map(str::to_string),
             ssid: None,
             wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
         })
     }
 
@@ -828,5 +1103,424 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
     fn neighbor_mac_collision_silent_with_no_neighbors_sample_yet() {
         let w = RecentWindow::new(8);
         assert!(NeighborMacCollision.eval(&w).is_none());
+    }
+
+    /// Push one all-`Fail` two-endpoint cohort at `ts` — the fleet-wide-block
+    /// tick shape as `endpoint-block` reads it.
+    fn push_dead_cohort(w: &mut RecentWindow, ts: i64) {
+        w.push(proxy_ep(ts, "1.1.1.1:443", TcpVerdict::Fail));
+        w.push(proxy_ep(ts, "2.2.2.2:2053", TcpVerdict::Fail));
+    }
+
+    /// The measured 2026-09-08 signature: every endpoint dead from the underlay
+    /// for `consecutive` ticks while the reference host answers. The mid-way
+    /// assertion dies under counting ROWS instead of cohorts — one tick's two
+    /// rows would already read as two "ticks".
+    #[test]
+    fn endpoint_block_fires_when_every_endpoint_fails_while_direct_answers() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        assert!(
+            c.eval(&w).is_none(),
+            "one cohort of two rows must not count as two ticks"
+        );
+        push_dead_cohort(&mut w, 20);
+        let fire = c
+            .eval(&w)
+            .expect("two all-fail cohorts with direct OK must fire");
+        assert!(
+            fire.detail.contains("all 2 endpoints"),
+            "the detail must carry the newest cohort size: {}",
+            fire.detail
+        );
+        assert!(
+            fire.detail.contains("2 ticks"),
+            "the detail must carry the run length: {}",
+            fire.detail
+        );
+    }
+
+    /// One endpoint still answering means the fleet is not blocked as a whole.
+    /// Dies under `any(Fail)` in place of `all(Fail)` within a cohort.
+    #[test]
+    fn endpoint_block_silent_when_one_endpoint_still_answers() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        w.push(proxy_ep(20, "1.1.1.1:443", TcpVerdict::Fail));
+        w.push(proxy_ep(20, "2.2.2.2:2053", TcpVerdict::Ok));
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// The `-` skip row means no endpoints were parsed — the absence of a
+    /// measurement, not a dead fleet. Dies under a non-exhaustive
+    /// `tcp != TcpVerdict::Ok` check that lets `Skip` count as a failure.
+    #[test]
+    fn endpoint_block_silent_on_skip_cohorts() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        w.push(proxy_ep(10, "-", TcpVerdict::Skip));
+        w.push(proxy_ep(20, "-", TcpVerdict::Skip));
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// With the reference host dead too there is nothing SELECTIVE about the
+    /// endpoints failing — that is a whole-network outage, `gw-drop` territory.
+    #[test]
+    fn endpoint_block_silent_when_direct_is_down_too() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Fail));
+        push_dead_cohort(&mut w, 10);
+        push_dead_cohort(&mut w, 20);
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// Dies under an off-by-one in the cohort count (`<` -> `<=`, or a scan
+    /// that seeds a phantom empty cohort).
+    #[test]
+    fn endpoint_block_silent_one_cohort_short() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// A link sample pinning what `PerClientBlock` reads: the gateway verdict
+    /// and the probe-on-suspicion counts (direct Ok, everything else absent).
+    fn link_lan(ts: i64, gw: GwVerdict, probed: Option<u16>, alive: Option<u16>) -> Sample {
+        Sample::Link(LinkSample {
+            ts_us: ts,
+            gw,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+            lan_probed: probed,
+            lan_alive: alive,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        })
+    }
+
+    /// The measured 2026-09-08 16:44:52 signature: the gateway silent while
+    /// probed neighbors answer.
+    #[test]
+    fn per_client_block_fires_when_neighbors_answer_a_silent_gateway() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_lan(1, GwVerdict::Fail, Some(3), Some(2)));
+        let fire = PerClientBlock
+            .eval(&w)
+            .expect("a silent gateway with live neighbors must fire");
+        assert!(
+            fire.detail.contains("2/3"),
+            "the detail must carry the alive/probed counts: {}",
+            fire.detail
+        );
+    }
+
+    /// Nobody on the segment answering is the whole segment dead — `gw-drop`
+    /// territory, not a selective ban. Dies under `alive >= 0`-style slack.
+    #[test]
+    fn per_client_block_silent_when_no_neighbor_answers() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_lan(1, GwVerdict::Fail, Some(3), Some(0)));
+        assert!(PerClientBlock.eval(&w).is_none());
+    }
+
+    /// `None` counts mean the tick did not probe (a pre-field daemon's replay,
+    /// or a probe that could not run): absence of a measurement must not fire.
+    #[test]
+    fn per_client_block_silent_when_the_tick_did_not_probe() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_lan(1, GwVerdict::Fail, None, None));
+        assert!(PerClientBlock.eval(&w).is_none());
+        // Probed nothing (empty ARP cache) is equally not a ban signature.
+        w.push(link_lan(2, GwVerdict::Fail, Some(0), Some(0)));
+        assert!(PerClientBlock.eval(&w).is_none());
+    }
+
+    /// The signature is anchored to a FAILED gateway echo: a healthy or
+    /// quiet/absent gateway must stay silent even if counts are present.
+    #[test]
+    fn per_client_block_silent_unless_the_gateway_failed() {
+        let mut w = RecentWindow::new(8);
+        for gw in [GwVerdict::Ok, GwVerdict::Skip, GwVerdict::NoGw] {
+            w.push(link_lan(1, gw, Some(3), Some(2)));
+            assert!(
+                PerClientBlock.eval(&w).is_none(),
+                "gateway {gw} must not fire per-client-block"
+            );
+        }
+    }
+
+    /// A link sample pinning what `FakeIpHijack` reads: the egress interface the
+    /// route table resolved for the fakeip-pool probe address (`route_if`) and
+    /// the interface carrying sing-box's own TUN address (`tun_if`, `None` =
+    /// sing-box down) — both on one tick, as the daemon records them. Gateway
+    /// and direct are healthy, everything else absent.
+    fn link_fakeip(ts: i64, route_if: Option<&str>, tun_if: Option<&str>) -> Sample {
+        Sample::Link(LinkSample {
+            ts_us: ts,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: route_if.map(str::to_string),
+            singbox_tun_if: tun_if.map(str::to_string),
+        })
+    }
+
+    /// The AWDL-collision signature: the pool routes out a real interface while
+    /// sing-box's own TUN is up — a genuine leak, not an outage.
+    #[test]
+    fn fakeip_hijack_fires_when_the_pool_leaks_while_singbox_is_up() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_fakeip(1, Some("awdl0"), Some("utun6")));
+        let fire = FakeIpHijack
+            .eval(&w)
+            .expect("a pool leak while sing-box's TUN is up must fire");
+        assert!(
+            fire.detail.contains("awdl0"),
+            "the detail must name the hijacking interface: {}",
+            fire.detail
+        );
+    }
+
+    /// The pool routing into the tunnel is the healthy state, whatever the
+    /// utun's number is.
+    #[test]
+    fn fakeip_hijack_silent_on_a_tunnel_interface() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_fakeip(1, Some("utun8"), Some("utun6")));
+        assert!(FakeIpHijack.eval(&w).is_none());
+    }
+
+    /// A pool address on loopback is a blackhole/reject or kill-switch drop —
+    /// the packet is discarded, the opposite of leaking out a real egress — so
+    /// it must not fire even with sing-box up. Dies under the old
+    /// `!starts_with("utun")` test, which flagged `lo0` as a hijack.
+    #[test]
+    fn fakeip_hijack_silent_on_a_loopback_route() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_fakeip(1, Some("lo0"), Some("utun6")));
+        assert!(FakeIpHijack.eval(&w).is_none());
+    }
+
+    /// When sing-box is down its TUN interface is absent, so a pool address on a
+    /// real interface is just the outage's route fall-through, not a hijack.
+    #[test]
+    fn fakeip_hijack_silent_when_singbox_is_down() {
+        let mut w = RecentWindow::new(8);
+        // sing-box down: its TUN address is on no interface; the pool falls
+        // through to the physical route.
+        w.push(link_fakeip(1, Some("en0"), None));
+        assert!(
+            FakeIpHijack.eval(&w).is_none(),
+            "a route fall-through while sing-box's TUN is down is not a hijack"
+        );
+    }
+
+    /// THE round-3 trap: sing-box is DOWN but a FOREIGN VPN utun (tailscale /
+    /// netbird) owns the default route, and the pool has a leftover route via
+    /// awdl0. `singbox_tun_if` is `None` because the foreign utun does not carry
+    /// sing-box's own TUN address, so this must stay silent. Dies under any
+    /// "some utun owns the default" gate (which would fire on the foreign utun).
+    #[test]
+    fn fakeip_hijack_silent_when_only_a_foreign_utun_is_up() {
+        let mut w = RecentWindow::new(8);
+        // The foreign utun never surfaces as `singbox_tun_if`; the sample the
+        // daemon would record for this state has it `None`.
+        w.push(link_fakeip(1, Some("awdl0"), None));
+        assert!(
+            FakeIpHijack.eval(&w).is_none(),
+            "a foreign VPN utun owning the default while sing-box is down is not a hijack"
+        );
+    }
+
+    /// `None` pool route = it could not be determined (no config, no range, no
+    /// route): the absence of a measurement must not read as a hijack.
+    #[test]
+    fn fakeip_hijack_silent_when_the_pool_route_is_unknown() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_fakeip(1, None, Some("utun6")));
+        assert!(FakeIpHijack.eval(&w).is_none());
+    }
+
+    /// A proxy row pinning what `EstablishedStall` reads: the fresh tun probe
+    /// code and the two held-stream `(alive, age_s)` readings (`None` = no
+    /// measurement). Underlay TCP is Ok, endpoint fixed.
+    fn proxy_est(
+        ts: i64,
+        tun_code: Option<u16>,
+        est_tun: Option<(bool, u32)>,
+        est_direct: Option<(bool, u32)>,
+    ) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us: ts,
+            server_ip: "1.1.1.1:443".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: None,
+            tun_code,
+            selector: None,
+            est_direct_alive: est_direct.map(|(alive, _)| alive),
+            est_direct_age_s: est_direct.map(|(_, age)| age),
+            est_tun_alive: est_tun.map(|(alive, _)| alive),
+            est_tun_age_s: est_tun.map(|(_, age)| age),
+        })
+    }
+
+    /// The 2026-09-08 signature: the established proxied stream stalls while a
+    /// fresh connection succeeds — and the surviving direct stream scopes the
+    /// fault to the proxied path.
+    #[test]
+    fn established_stall_scopes_to_the_endpoint_when_the_direct_stream_survives() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(
+            1,
+            Some(204),
+            Some((false, 45)),
+            Some((true, 120)),
+        ));
+        let fire = EstablishedStall
+            .eval(&w)
+            .expect("a stalled tunnel stream with fresh OK must fire");
+        assert!(
+            fire.detail.contains("endpoint/protocol-scoped"),
+            "a surviving direct stream must scope the verdict: {}",
+            fire.detail
+        );
+        assert!(
+            fire.detail.contains("~45s"),
+            "the detail must carry the age at death: {}",
+            fire.detail
+        );
+    }
+
+    /// A direct stream that survived but is YOUNGER than the stalled tunnel
+    /// stream may have reconnected through the very same underlay hiccup, so it
+    /// does not exonerate the underlay — the verdict is ambiguous, not
+    /// endpoint-scoped. Dies under the un-gated `Some(true) =>
+    /// endpoint/protocol-scoped` that ignored the ages.
+    #[test]
+    fn established_stall_is_ambiguous_when_the_direct_stream_is_young() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(
+            1,
+            Some(204),
+            Some((false, 300)),
+            Some((true, 20)),
+        ));
+        let fire = EstablishedStall
+            .eval(&w)
+            .expect("a stalled tunnel with fresh OK still fires");
+        assert!(
+            fire.detail.contains("underlay-ambiguous"),
+            "a young direct stream must not be read as exonerating the underlay: {}",
+            fire.detail
+        );
+        assert!(
+            !fire.detail.contains("endpoint/protocol-scoped"),
+            "a young direct stream must not scope the fault to the endpoint: {}",
+            fire.detail
+        );
+    }
+
+    /// Both established streams dying on the same tick is the underlay's
+    /// treatment of long flows, and the detail must say the proxy is not the
+    /// scope. Dies under reading only the tunnel side.
+    #[test]
+    fn established_stall_scopes_to_the_underlay_when_both_streams_die() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(
+            1,
+            Some(204),
+            Some((false, 45)),
+            Some((false, 50)),
+        ));
+        let fire = EstablishedStall
+            .eval(&w)
+            .expect("both dead must still fire");
+        assert!(
+            fire.detail
+                .contains("underlay (NAT/radio), not proxy-scoped"),
+            "both streams dying must scope the verdict to the underlay: {}",
+            fire.detail
+        );
+    }
+
+    /// Healthy held streams are the quiet case, and the None it returns is
+    /// also what re-arms the engine after a real firing.
+    #[test]
+    fn established_stall_silent_while_the_tunnel_stream_carries() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(
+            1,
+            Some(204),
+            Some((true, 300)),
+            Some((true, 300)),
+        ));
+        assert!(EstablishedStall.eval(&w).is_none());
+    }
+
+    /// With the fresh tun probe dead too this is a plain outage (`wedge`
+    /// territory), not a stall of established flows.
+    #[test]
+    fn established_stall_silent_when_the_fresh_probe_is_dead_too() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(1, Some(0), Some((false, 45)), Some((true, 120))));
+        assert!(EstablishedStall.eval(&w).is_none());
+        w.push(proxy_est(2, None, Some((false, 60)), Some((true, 135))));
+        assert!(EstablishedStall.eval(&w).is_none());
+    }
+
+    /// `None` on the tunnel side is the absence of a measurement — the stream
+    /// was only just (re-)opened or could not be opened — never a stall.
+    #[test]
+    fn established_stall_silent_without_a_tunnel_measurement() {
+        let mut w = RecentWindow::new(8);
+        w.push(proxy_est(1, Some(204), None, Some((true, 120))));
+        assert!(EstablishedStall.eval(&w).is_none());
+    }
+
+    /// Proxy history does not survive a resume (only the link change basis is
+    /// carried), so a pre-pause cohort must not combine with a post-resume one
+    /// into a continuity that never existed. The inline control — a second
+    /// fresh cohort fires — proves the silence measures the clear and not a
+    /// fixture that could never fire.
+    #[test]
+    fn endpoint_block_waits_for_fresh_cohorts_after_a_resume() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        w.clear_for_resume();
+        w.push(link(100, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 110);
+        assert!(
+            c.eval(&w).is_none(),
+            "one fresh cohort must not complete a pre-pause run"
+        );
+        push_dead_cohort(&mut w, 120);
+        assert!(
+            c.eval(&w).is_some(),
+            "two fresh cohorts complete the run on their own"
+        );
     }
 }

@@ -1709,6 +1709,10 @@ mod tests {
                 gw_arp_mac: None,
                 ssid: Some("home".into()),
                 wifi_capture_present: false,
+                lan_probed: None,
+                lan_alive: None,
+                fakeip_route_if: None,
+                singbox_tun_if: None,
             });
             s.incidents = vec![
                 IncidentSummary {
