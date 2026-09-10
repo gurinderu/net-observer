@@ -27,8 +27,9 @@ pub trait Condition: Send + Sync {
     fn eval(&self, w: &RecentWindow) -> Option<Fire>;
 }
 
-/// Fires when the last `consecutive` link samples all have `direct == Ok` while the
-/// last `consecutive` proxy tun_codes are `0`/`None` (tun dead but direct path healthy).
+/// Fires when the last `consecutive` link samples all have `direct == Ok` while
+/// the last `consecutive` MEASURED proxy ticks all found the tun dead (anything
+/// but a 204 from the probe — mirroring the shell watchdog's `tun != 204`).
 pub struct Wedge {
     pub consecutive: usize,
 }
@@ -38,15 +39,60 @@ impl Condition for Wedge {
     }
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let links = w.recent_link(self.consecutive);
-        let proxies = w.recent_proxy(self.consecutive);
-        if links.len() < self.consecutive || proxies.len() < self.consecutive {
+        if links.len() < self.consecutive {
             return None;
         }
-        let direct_ok = links.iter().all(|l| l.direct == TcpVerdict::Ok);
-        let tun_dead = proxies.iter().all(|p| p.tun_code.unwrap_or(0) == 0);
-        (direct_ok && tun_dead).then(|| Fire {
-            detail: format!("tun dead {} ticks, direct OK", self.consecutive),
-        })
+        if !links.iter().all(|l| l.direct == TcpVerdict::Ok) {
+            return None;
+        }
+        // Proxy rows arrive one per ENDPOINT with the tick's shared `tun_code`
+        // replicated across them, so rows must be folded into ticks (groups
+        // sharing `ts_us`) before counting. The first cut counted ROWS, which
+        // made `consecutive` a fraction of ONE tick — a single transient
+        // transport failure opened an incident (observed live 2026-09-10: two
+        // wedge incidents minutes apart while the shell oracle's TICK log
+        // showed tun=204 on every surrounding probe).
+        //
+        // A tick is MEASURED when its tun probe ran: a `tun_code` is present,
+        // or it is absent on a non-Skip row (the probe ran and failed at the
+        // transport — `tun_probe` returns `None` exactly then). The pipeline's
+        // preflight-skip placeholder (a lone Skip row with no `tun_code`) is
+        // the absence of a measurement and is transparent here — it neither
+        // advances nor resets the dead run (the same rule `GwDrop` documents:
+        // realm net-observer, node #25). A measured tick counts as dead
+        // unless the probe answered exactly 204; a measured healthy tick
+        // breaks the run.
+        let rows = w.recent_proxy(usize::MAX);
+        let mut dead_ticks = 0usize;
+        let mut i = 0;
+        while i < rows.len() {
+            let ts = rows[i].ts_us;
+            let mut measured = false;
+            let mut dead = true;
+            while i < rows.len() && rows[i].ts_us == ts {
+                let r = rows[i];
+                if r.tun_code.is_some() || r.tcp != TcpVerdict::Skip {
+                    measured = true;
+                }
+                if r.tun_code == Some(204) {
+                    dead = false;
+                }
+                i += 1;
+            }
+            if !measured {
+                continue;
+            }
+            if !dead {
+                return None;
+            }
+            dead_ticks += 1;
+            if dead_ticks == self.consecutive {
+                return Some(Fire {
+                    detail: format!("tun dead {} ticks, direct OK", self.consecutive),
+                });
+            }
+        }
+        None
     }
 }
 
@@ -668,6 +714,70 @@ mod tests {
             w.push(proxy(t * 2 + 1, 0));
         }
         assert!(c.eval(&w).is_none()); // whole-network down, not a wedge
+    }
+
+    /// The pipeline's preflight-skip placeholder: a lone Skip row carrying no
+    /// measurement at all (mirrors `ProxyCollector::skip`).
+    fn skip_proxy(ts: i64) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us: ts,
+            server_ip: "-".into(),
+            tcp: TcpVerdict::Skip,
+            rtt_ms: None,
+            tun_code: None,
+            selector: None,
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
+        })
+    }
+
+    #[test]
+    fn wedge_counts_ticks_not_rows() {
+        // One tick emits one row per ENDPOINT, all sharing ts_us. A burst of
+        // dead rows from a single tick must not satisfy `consecutive` — this
+        // is the 2026-09-10 false-positive shape: one transient transport
+        // failure, seven rows, incident.
+        let mut w = RecentWindow::new(16);
+        let c = Wedge { consecutive: 3 };
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(link(2, TcpVerdict::Ok));
+        w.push(link(4, TcpVerdict::Ok));
+        for _ in 0..3 {
+            w.push(proxy(5, 0));
+        }
+        assert!(c.eval(&w).is_none());
+    }
+
+    #[test]
+    fn wedge_skip_placeholder_is_transparent() {
+        // A preflight-skip tick is the absence of a measurement: it neither
+        // advances nor resets the dead run (node #25), so three measured dead
+        // ticks around one still fire.
+        let mut w = RecentWindow::new(16);
+        let c = Wedge { consecutive: 3 };
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(link(2, TcpVerdict::Ok));
+        w.push(link(4, TcpVerdict::Ok));
+        w.push(proxy(1, 0));
+        w.push(skip_proxy(3));
+        w.push(proxy(5, 0));
+        w.push(proxy(7, 0));
+        assert!(c.eval(&w).is_some());
+    }
+
+    #[test]
+    fn wedge_healthy_measured_tick_breaks_the_run() {
+        let mut w = RecentWindow::new(16);
+        let c = Wedge { consecutive: 3 };
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(link(2, TcpVerdict::Ok));
+        w.push(link(4, TcpVerdict::Ok));
+        w.push(proxy(1, 0));
+        w.push(proxy(3, 0));
+        w.push(proxy(5, 204));
+        assert!(c.eval(&w).is_none());
     }
 
     /// Push `n` wedge-shaped tick pairs (direct healthy, tun dead) starting at
