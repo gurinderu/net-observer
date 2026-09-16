@@ -228,19 +228,20 @@ impl ResumeGate {
 /// handled here identically: a passive stretch is bracketed for the triggers
 /// exactly as a pause is (realm net-observer, node #88).
 ///
-/// A RESUME edge RE-OPENS detection; it does not dedup it. The recent-sample
-/// window is cleared and every trigger is re-armed
-/// ([`TriggerEngine::rearm_all`]), so a fault that is still present when
-/// collection resumes is recorded again — as a NEW incident belonging to the new
-/// observation session, not as a duplicate of the pre-pause one. What a resume
-/// does NOT do is reset the firing budget: `last_fire_us` survives it, so each
-/// trigger still fires at most once per `backoff_us` and a toggled switch cannot
-/// storm the incident log. The `observing_edge` rows bound the gap between the
-/// two records. Before either of those two steps, [`TriggerEngine::close_all`]
-/// closes whatever incident the PREVIOUS session left open, at the `ts_us` of
-/// the edge that ended it — the pause's own, or the tier switch's, carried in
-/// `session_end_us` — never at the first post-edge sample's, which would
-/// misattribute the unobserved gap to it (realm net-observer, node #124).
+/// A RESUME edge RE-OPENS detection; it does not dedup it. Before the window
+/// clears and every trigger is re-armed ([`TriggerEngine::rearm_all`]),
+/// [`TriggerEngine::close_all`] closes whatever incident the PREVIOUS session
+/// left open, at the `ts_us` of the edge that ended it — the pause's own, or
+/// the tier switch's, carried in `session_end_us` — never at the first
+/// post-edge sample's, which would misattribute the unobserved gap to it.
+/// Closing there also releases that trigger's firing budget, so a fault still
+/// present when collection resumes is recorded again — as a NEW incident
+/// belonging to the new observation session, AT ONCE, not once whatever
+/// backoff the closed incident had spent happens to expire. A trigger with
+/// NOTHING open at the edge keeps its budget exactly as before, so a toggled
+/// switch on a healthy network still cannot storm the incident log. The
+/// `observing_edge` rows bound the gap between the two records (realm
+/// net-observer, node #124).
 ///
 /// Exactly one thing survives [`RecentWindow::clear_for_resume`]: the newest link
 /// sample, kept as the gateway-CHANGE BASIS and reachable ONLY through
@@ -311,10 +312,12 @@ pub async fn run(
     // `ts_us` of the edge that ENDED the observation session this resume/switch
     // re-opens: a pause's own `ts_us` (published because `resume_at_us` will
     // not move until the LATER resume), or a tier switch's own `ts_us` (the
-    // same instant as its `resume_at_us` bump). Read once per edge, to close
-    // whatever the previous session left open at the instant it actually
-    // ended rather than at this edge's own. `0` = none recorded — the edge's
-    // own `ts_us` is used instead (realm net-observer, node #124).
+    // same instant as its `resume_at_us` bump). The writers publish it with
+    // `compare_exchange(0, ts_us, ..)` so the FIRST unconsumed end wins; this
+    // side CONSUMES it with `swap(0, ..)` — read and reset in one step — so a
+    // value once used at one edge is never read again at a later one. `0` =
+    // none recorded — the edge's own `ts_us` is used instead (realm
+    // net-observer, node #124).
     session_end_us: Arc<AtomicI64>,
 ) {
     let mut window = RecentWindow::new(triggers::WINDOW_CAP);
@@ -400,8 +403,11 @@ pub async fn run(
             // this edge is a resume from a pause (the pause published no edge
             // of its own); falling back to the edge's own `ts_us` covers a
             // tier switch (which stamps both atomics alike) and the case
-            // where nothing was ever recorded (realm net-observer, node #124).
-            let end = session_end_us.load(Ordering::Acquire);
+            // where nothing was ever recorded. `swap`, not `load`: this is the
+            // one place that atomic is ever consumed, and consuming it means
+            // resetting it, or a LATER edge would read a stale end that
+            // belongs to this one (realm net-observer, node #124).
+            let end = session_end_us.swap(0, Ordering::AcqRel);
             let closed_at_us = if end > 0 {
                 end
             } else {
@@ -3125,16 +3131,206 @@ mod tests {
         );
     }
 
-    /// The matched twin of the test above: the identical stream under the daemon's
-    /// PRODUCTION backoff yields exactly ONE incident. A resume re-arms the latch;
-    /// it does not hand the trigger a fresh firing budget, so a spammed switch
-    /// cannot storm the incident log.
-    ///
-    /// The operator scenario, stated plainly: toggling collection off and on again
-    /// inside [`crate::BACKOFF_US`] — the real firing budget the daemon ships with,
-    /// not a synthetic one — writes no second incident. Reading the production
-    /// constant here is what makes this die under `BACKOFF_US = 0`, which nothing
-    /// else in the suite reads.
+    /// Item 1 (realm net-observer, node #124): the coordinator's exact repro. A
+    /// tier switch ACCEPTED WHILE STILL PAUSED publishes no sample of its own
+    /// (the daemon is paused; nothing flows to let the consumer observe and
+    /// consume `session_end_us`), so it must not push the close point forward
+    /// past the pause that actually opened the gap. `SetObserving(false)` and
+    /// `set_probing` both use `compare_exchange(0, ts_us, ..)`: the FIRST
+    /// unconsumed end wins. Simulated here exactly as `api::control_response`
+    /// performs it — the pause's compare_exchange, then (nothing flows) the
+    /// switch's compare_exchange plus its unconditional `resume_at_us` store,
+    /// then the resume's unconditional `resume_at_us` store — so this pins the
+    /// CONTRACT between the two writers and the one consumer, not a
+    /// reimplementation of either.
+    #[tokio::test]
+    async fn run_closes_at_the_pause_ts_even_when_a_switch_lands_inside_the_pause() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 0)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let session_end_us = Arc::new(AtomicI64::new(0));
+        const PAUSE_US: i64 = 10;
+        const SWITCH_US: i64 = 50;
+        const RESUME_US: i64 = 100;
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+            session_end_us.clone(),
+        ));
+
+        tx.send(link(1, GwVerdict::Fail)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 2,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 2).await;
+
+        // `SetObserving(false)` at t=10: the FIRST end, and nothing consumes it.
+        let _ = session_end_us.compare_exchange(0, PAUSE_US, Ordering::AcqRel, Ordering::Acquire);
+        // `set_probing` at t=50, still paused: its compare_exchange loses the
+        // race (session_end_us already holds PAUSE_US, not 0) and is ignored,
+        // but its `resume_at_us` store is unconditional either way — exactly
+        // as `api::set_probing` performs both.
+        let _ = session_end_us.compare_exchange(0, SWITCH_US, Ordering::AcqRel, Ordering::Acquire);
+        resume_at_us.store(SWITCH_US, Ordering::Release);
+        // `SetObserving(true)` at t=100: only `resume_at_us` moves.
+        resume_at_us.store(RESUME_US, Ordering::Release);
+
+        tx.send(link(RESUME_US + 1, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            2,
+            "exactly two incidents: the pre-pause one and the post-resume one"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT closed_us FROM incident WHERE id = 'gw-drop-1'")
+                .unwrap(),
+            PAUSE_US,
+            "the blind switch at t=50 must not move the close point off the pause at t=10"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(&format!(
+                    "SELECT count(*) FROM incident WHERE id = 'gw-drop-{}'",
+                    RESUME_US + 1
+                ))
+                .unwrap(),
+            1,
+            "the persistent fault still opens its new-session incident at the resume"
+        );
+    }
+
+    /// Item 4 (realm net-observer, node #124): two pause/resume cycles with the
+    /// fault persisting throughout produce three incidents — the first two
+    /// closed at their OWN pause's `ts_us`, the third still open. Each pause
+    /// publishes its own `session_end_us` and each resume only moves
+    /// `resume_at_us`, exactly as the single-cycle test above; this is that
+    /// same contract iterated, so a fix that only handles one edge (a
+    /// leftover `armed`/`last_fire_us` from the first cycle bleeding into the
+    /// second) would still be caught.
+    #[tokio::test]
+    async fn run_closes_two_successive_pre_pause_incidents_at_their_own_pause_ts() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 0)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let session_end_us = Arc::new(AtomicI64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+            session_end_us.clone(),
+        ));
+
+        // Cycle 1: fires at t=1 (A), pauses at t=10, resumes at t=20 — the
+        // fault is still present at t=21, so A closes at 10 and B opens at 21.
+        tx.send(link(1, GwVerdict::Fail)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 2,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 2).await;
+        session_end_us.store(10, Ordering::Release);
+        resume_at_us.store(20, Ordering::Release);
+        tx.send(link(21, GwVerdict::Fail)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 22,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 22).await;
+
+        // Cycle 2: pauses at t=30, resumes at t=40 — the fault is STILL
+        // present at t=41, so B closes at 30 and C opens at 41.
+        session_end_us.store(30, Ordering::Release);
+        resume_at_us.store(40, Ordering::Release);
+        tx.send(link(41, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            3,
+            "two persistent-fault cycles open three incidents in total"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT closed_us FROM incident WHERE id = 'gw-drop-1'")
+                .unwrap(),
+            10,
+            "the first incident closes at its OWN pause's ts_us"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT closed_us FROM incident WHERE id = 'gw-drop-21'")
+                .unwrap(),
+            30,
+            "the second incident closes at its OWN pause's ts_us, not the first pause's"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(
+                    "SELECT count(*) FROM incident WHERE id = 'gw-drop-41' AND closed_us IS NULL"
+                )
+                .unwrap(),
+            1,
+            "the third incident is still open"
+        );
+    }
+
+    /// Item 2 (realm net-observer, node #124): closing an incident at the edge
+    /// releases that trigger's firing budget. A fault that persists across an
+    /// ACTUAL PAUSE — a real `session_end_us`, distinct from the resume's own
+    /// `ts_us` — opens a SECOND incident at the resume even though the
+    /// daemon's PRODUCTION `BACKOFF_US` is nowhere near elapsed: the engine's
+    /// documented contract ("a fault still present when collection resumes is
+    /// recorded again, as a NEW incident") must hold without waiting out the
+    /// closed incident's budget. Reading the production constant is what
+    /// makes this die under `BACKOFF_US = 0`, which nothing else in the suite
+    /// reads. The non-vacuity control — nothing open at the edge still
+    /// respects the old budget — is the next test.
     #[tokio::test]
     async fn run_does_not_refire_within_the_backoff_after_a_resume() {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
@@ -3147,6 +3343,7 @@ mod tests {
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let (events_tx, _events_rx) = broadcast::channel(16);
         let resume_at_us = Arc::new(AtomicI64::new(0));
+        let session_end_us = Arc::new(AtomicI64::new(0));
         let (tx, rx) = mpsc::channel(16);
         let h = tokio::spawn(run(
             store.clone(),
@@ -3155,7 +3352,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
-            no_session_end(),
+            session_end_us.clone(),
         ));
 
         tx.send(link(1, GwVerdict::Fail)).await.unwrap();
@@ -3173,8 +3370,85 @@ mod tests {
         .unwrap();
         wait_for_generated(&snapshot, 3).await;
 
-        resume_at_us.store(10, Ordering::Release);
-        tx.send(link(11, GwVerdict::Fail)).await.unwrap();
+        // An ACTUAL pause at t=10, resumed at t=20 — both microseconds after
+        // the firing at t=1, nowhere near the production backoff's own scale.
+        session_end_us.store(10, Ordering::Release);
+        resume_at_us.store(20, Ordering::Release);
+        tx.send(link(21, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            2,
+            "closing at the pause releases the budget; the persistent fault \
+             opens a second incident well inside the production backoff"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT closed_us FROM incident WHERE id = 'gw-drop-1'")
+                .unwrap(),
+            10,
+            "the pre-pause incident closes at the pause's own ts_us"
+        );
+    }
+
+    /// The non-vacuity control for the test above, and the invariant it used
+    /// to state alone: a trigger with NOTHING open AT THE EDGE keeps its
+    /// firing budget untouched, so a toggle across a HEALTHY network still
+    /// cannot storm the incident log. The fault fires once, then RECOVERS
+    /// while still observing (a live `Some -> None` edge, which arms the
+    /// trigger but leaves `last_fire_us` alone — `close_all` never runs for
+    /// it, since nothing is open by the time the pause/resume edge lands).
+    #[tokio::test]
+    async fn run_does_not_refire_a_toggle_storm_on_a_healthy_network() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(
+            Box::new(GwDrop),
+            vec![rec],
+            crate::BACKOFF_US,
+        )]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let session_end_us = Arc::new(AtomicI64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+            session_end_us.clone(),
+        ));
+
+        // Fires at t=1, RECOVERS at t=2 (a live edge, not close_all): armed,
+        // but `last_fire_us` stays at 1.
+        tx.send(link(1, GwVerdict::Fail)).await.unwrap();
+        tx.send(link(2, GwVerdict::Ok)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 3,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 3).await;
+
+        // A pause/resume edge with NOTHING open: `close_all` has nothing to
+        // close, so the budget from the t=1 firing survives untouched.
+        session_end_us.store(10, Ordering::Release);
+        resume_at_us.store(20, Ordering::Release);
+        // Reasserts moments after the resume — well inside the untouched backoff.
+        tx.send(link(21, GwVerdict::Fail)).await.unwrap();
         drop(tx);
         h.await.unwrap();
 
@@ -3183,7 +3457,7 @@ mod tests {
                 .query_scalar_i64("SELECT count(*) FROM incident")
                 .unwrap(),
             1,
-            "a resume re-arms; it does not reset the firing budget"
+            "nothing was open at the edge, so the old backoff still stands"
         );
     }
 

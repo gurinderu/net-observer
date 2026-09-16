@@ -414,15 +414,21 @@ pub struct ApiServer {
     /// edge yet.
     pub resume_at_us: Arc<AtomicI64>,
     /// `ts_us` of the edge that ENDED the observation session the next
-    /// `resume_at_us` move re-opens. `SetObserving(false)` stores the pause's
-    /// own `ts_us` here (the same one it writes into `observing_edge`) — a
-    /// pause moves no `resume_at_us` of its own, so without this the LATER
-    /// resume would close the pre-pause session at the resume's `ts_us`,
-    /// misattributing the unobserved gap to it. `set_probing` stores the
-    /// switch's own `ts_us` here too, before publishing the same value into
-    /// `resume_at_us`. Consumed once per edge by `pipeline::run`
-    /// (`TriggerEngine::close_all`); `0` = none recorded, and the edge's own
-    /// `ts_us` is used instead (realm net-observer, node #124).
+    /// `resume_at_us` move re-opens. `SetObserving(false)` and `set_probing`
+    /// both write here, and BOTH use `compare_exchange(0, ts_us, ..)`, never a
+    /// plain store: the FIRST unconsumed end wins. A tier switch accepted
+    /// WHILE PAUSED publishes no sample of its own to consume this atomic, so
+    /// an unconditional store would let it push the close point forward — a
+    /// pause at `t=10` then a switch at `t=50`, both before the resume at
+    /// `t=100`, would otherwise close at `50`, still inside the unobserved gap
+    /// the pause opened at `10`. Losing the race is the correct outcome for the
+    /// later writer, which is why both call sites ignore the `Result`.
+    /// `pipeline::run` CONSUMES this exactly once per edge with `swap(0, ..)` —
+    /// reading it and resetting it to `0` atomically, so a value once used
+    /// cannot be read again by a later edge — and closes
+    /// (`TriggerEngine::close_all`) at that value if it was `> 0`, or at the
+    /// edge's own `ts_us` otherwise: `0` means no end was ever recorded for
+    /// this edge (realm net-observer, node #124).
     pub session_end_us: Arc<AtomicI64>,
     pub snapshot: Arc<Mutex<StatusSnapshot>>,
     /// Durable sink for pause/resume boundary records.
@@ -1038,9 +1044,22 @@ fn control_response(
                         // what actually triggers the edge. Without this, that
                         // resume would close whatever incident the pre-pause
                         // session left open at the RESUME's `ts_us`, attributing
-                        // the whole unobserved gap to it (realm net-observer,
-                        // node #124).
-                        cx.session_end_us.store(ts_us, Ordering::Release);
+                        // the whole unobserved gap to it.
+                        //
+                        // `compare_exchange`, not a store: the FIRST unconsumed
+                        // end wins. A tier switch accepted while still paused
+                        // publishes no sample to consume this atomic either, so
+                        // an unconditional store here would let THAT switch's
+                        // later `ts_us` overwrite the pause's — closing inside
+                        // the gap the pause itself opened. Losing the race is
+                        // correct, so the `Result` is ignored (realm
+                        // net-observer, node #124).
+                        let _ = cx.session_end_us.compare_exchange(
+                            0,
+                            ts_us,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
                     }
                     cx.observing.store(b, Ordering::Release);
                     snap.observing = b;
@@ -1155,20 +1174,21 @@ fn control_response(
 /// (`RecentWindow::clear_for_resume`, gateway-change basis kept), re-arms every
 /// trigger (`TriggerEngine::rearm_all`) and keeps the bounded pre-edge drain out
 /// of the window; the interval collectors drop a tick that straddled the edge
-/// at the source as well. So the cleared window makes the first post-edge
-/// sample judge afresh, exactly as after a resume: a condition that no longer
-/// holds closes its open incident at that sample's `ts_us`; one that still
-/// holds — a `NoGw` gw-drop, a fakeip hijack, both readable under passive —
-/// keeps it open. The `probing_edge` row at the switch's own `ts_us` is the
-/// bracket that explains either. An incident still open AT the switch closes
-/// at the switch's own `ts_us` (`TriggerEngine::close_all`, realm net-observer,
-/// node #124) — it belongs to the session the switch just ended, not to
-/// whatever the first post-switch sample finds; that first sample may open a
-/// new one. The probe-fed conditions do not read the first passive `SKIP`s as
-/// a recovery, and after a switch back no dead tick from before the stretch
-/// can join the ticks after it. Without this, the switch to passive turned
-/// every probe-fed condition to `None` at once and the engine closed open
-/// incidents as "recovered" at that instant.
+/// at the source as well. Before either of those two steps, whatever incident
+/// was open AT THE SWITCH already closed at the switch's own `ts_us`
+/// (`TriggerEngine::close_all`, realm net-observer, node #124) — never at the
+/// first post-switch sample's — and that trigger's firing budget closed with
+/// it, so the cleared window makes the first post-edge sample judge
+/// completely afresh: a fault still present (a `NoGw` gw-drop, a fakeip
+/// hijack, both readable under passive) opens a NEW incident of the new
+/// session AT ONCE, not once whatever backoff the closed incident had spent
+/// happens to expire. The `probing_edge` row at the switch's own `ts_us` is
+/// the bracket that names the instant. The probe-fed conditions do not read
+/// the first passive `SKIP`s as a recovery, and after a switch back no dead
+/// tick from before the stretch can join the ticks after it. Without
+/// `close_all`, the switch to passive turned every probe-fed condition to
+/// `None` at once and the engine closed open incidents as "recovered" at the
+/// FIRST POST-SWITCH sample instead of at the switch itself.
 fn set_probing(
     tier: ProbingTier,
     authorized: PeerAuthorized,
@@ -1194,10 +1214,18 @@ fn set_probing(
             // consumer-side hole above instead. Accepted as bounded (one tick,
             // one switch) and left as is.
             //
-            // `session_end_us` is stored BEFORE `resume_at_us`, same reasoning:
-            // the consumer that observes the epoch move must already see the
-            // session's end (realm net-observer, node #124).
-            cx.session_end_us.store(ts_us, Ordering::Release);
+            // `session_end_us` is written BEFORE `resume_at_us`, same
+            // reasoning: the consumer that observes the epoch move must
+            // already see the session's end. `compare_exchange`, not a store:
+            // the FIRST unconsumed end wins, so a switch accepted while the
+            // daemon is PAUSED (no sample flows to consume this atomic before
+            // the later resume) cannot push the close point forward past a
+            // pause that already opened the gap. Losing the race is correct
+            // for this later writer, so the `Result` is ignored (realm
+            // net-observer, node #124).
+            let _ =
+                cx.session_end_us
+                    .compare_exchange(0, ts_us, Ordering::AcqRel, Ordering::Acquire);
             cx.resume_at_us.store(ts_us, Ordering::Release);
             cx.probing.set(tier);
             snap.probing = tier;
@@ -2362,10 +2390,15 @@ mod tests {
                 .query_scalar_i64("SELECT ts_us FROM probing_edge WHERE tier = 'active'")
                 .unwrap()
         );
+        // The FIRST unconsumed end wins: nothing ever consumed (swapped) it
+        // between the two switches — exactly the "switch during a pause"
+        // shape, just with the first edge itself standing in for the pause —
+        // so `session_end_us` still holds the FIRST switch's `ts_us`, not this
+        // second one's, even though `resume_at_us` moved again.
         assert_eq!(
             srv.session_end_us.load(Ordering::Acquire),
-            srv.resume_at_us.load(Ordering::Acquire),
-            "the switch back records itself as the session's end too"
+            epoch_after_passive,
+            "an unconsumed session_end_us must not be overwritten by a later switch"
         );
         // A tier switch is not a pause: the observing bracket stays untouched.
         assert_eq!(
