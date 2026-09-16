@@ -1070,13 +1070,25 @@ fn format_status(snap: &StatusSnapshot) -> String {
     }
 
     match &snap.host {
-        Some(h) => out.push_str(&format!(
-            "host           load1={} load5={} load15={} ts_us={}\n",
-            h.load1,
-            h.load5,
-            h.load15,
-            diagnose::stamp_us(h.ts_us)
-        )),
+        Some(h) => {
+            // Disk and swap are optional facts: `-` is "not measured", which a
+            // pre-field daemon always reports, and is never a zero.
+            let dash = || "-".to_string();
+            let disk_pct = h
+                .disk_used_pct
+                .map(|p| format!("{p:.1}"))
+                .unwrap_or_else(dash);
+            let disk_free = h.disk_free_mb.map(|m| m.to_string()).unwrap_or_else(dash);
+            let swap = h.swap_used_mb.map(|m| m.to_string()).unwrap_or_else(dash);
+            out.push_str(&format!(
+                "host           load1={} load5={} load15={} disk_used_pct={disk_pct} \
+                 disk_free_mb={disk_free} swap_used_mb={swap} ts_us={}\n",
+                h.load1,
+                h.load5,
+                h.load15,
+                diagnose::stamp_us(h.ts_us)
+            ));
+        }
         None => out.push_str("host           (no data)\n"),
     }
 
@@ -1263,6 +1275,46 @@ mod tests {
         assert!(out.contains("host           (no data)"));
         // Two incidents, one still open.
         assert!(out.contains("incidents      2 (1 open)"));
+    }
+
+    /// The host line carries the record volume's usage and the swap in use
+    /// next to the load triple, and prints `-` for a value the daemon did not
+    /// measure (a pre-field daemon never does) rather than a zero.
+    #[test]
+    fn format_status_host_line_shows_disk_and_swap_or_a_dash() {
+        use types::HostSample;
+        let host = HostSample {
+            ts_us: 44,
+            load1: 1.5,
+            load5: 1.0,
+            load15: 0.5,
+            disk_used_pct: Some(87.54),
+            disk_free_mb: Some(61_440),
+            swap_used_mb: Some(1235),
+        };
+        let measured = StatusSnapshot {
+            host: Some(host.clone()),
+            ..snapshot(true)
+        };
+        assert!(format_status(&measured).contains(&format!(
+            "host           load1=1.5 load5=1 load15=0.5 disk_used_pct=87.5 \
+             disk_free_mb=61440 swap_used_mb=1235 ts_us={}",
+            diagnose::stamp_us(44)
+        )));
+
+        let unmeasured = StatusSnapshot {
+            host: Some(HostSample {
+                disk_used_pct: None,
+                disk_free_mb: None,
+                swap_used_mb: None,
+                ..host
+            }),
+            ..snapshot(true)
+        };
+        assert!(format_status(&unmeasured).contains(
+            "host           load1=1.5 load5=1 load15=0.5 disk_used_pct=- \
+             disk_free_mb=- swap_used_mb=- ts_us="
+        ));
     }
 
     #[test]

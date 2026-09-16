@@ -894,6 +894,9 @@ mod tests {
                     load1: i as f64,
                     load5: 0.0,
                     load15: 0.0,
+                    disk_used_pct: None,
+                    disk_free_mb: None,
+                    swap_used_mb: None,
                 },
             )))));
         }
@@ -936,6 +939,9 @@ mod tests {
                 load1: 0.0,
                 load5: 0.0,
                 load15: 0.0,
+                disk_used_pct: None,
+                disk_free_mb: None,
+                swap_used_mb: None,
             },
         )))));
         assert!(

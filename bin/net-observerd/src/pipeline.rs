@@ -1814,7 +1814,7 @@ mod tests {
     #[tokio::test]
     async fn interval_collector_forwards_samples_and_exits_on_receiver_drop() {
         let c = AnyCollector::Host(HostCollector::new(
-            Arc::new(HostLoad::new()),
+            Arc::new(HostLoad::new("/")),
             Duration::from_millis(5),
         ));
         let (tx, mut rx) = mpsc::channel(4);
@@ -1843,7 +1843,7 @@ mod tests {
     #[tokio::test]
     async fn interval_collector_skips_probe_while_paused() {
         let c = AnyCollector::Host(HostCollector::new(
-            Arc::new(HostLoad::new()),
+            Arc::new(HostLoad::new("/")),
             Duration::from_millis(5),
         ));
         let (tx, mut rx) = mpsc::channel(4);
@@ -1993,7 +1993,7 @@ mod tests {
     #[tokio::test]
     async fn interval_collector_forwards_nothing_after_a_pause() {
         let c = AnyCollector::Host(HostCollector::new(
-            Arc::new(HostLoad::new()),
+            Arc::new(HostLoad::new("/")),
             Duration::from_millis(100),
         ));
         let (tx, mut rx) = mpsc::channel(4);
@@ -2208,6 +2208,9 @@ mod tests {
             load1: 1.0,
             load5: 2.0,
             load15: 3.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }))
         .await
         .unwrap();
@@ -2290,6 +2293,9 @@ mod tests {
             load1: 1.0,
             load5: 2.0,
             load15: 3.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }))
         .await
         .unwrap();
@@ -2408,6 +2414,9 @@ mod tests {
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }))
         .await
         .unwrap();
@@ -2473,6 +2482,9 @@ mod tests {
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }))
         .await
         .unwrap();
@@ -2731,6 +2743,9 @@ mod tests {
                 load1: 0.0,
                 load5: 0.0,
                 load15: 0.0,
+                disk_used_pct: None,
+                disk_free_mb: None,
+                swap_used_mb: None,
             }))
             .await
             .unwrap();
@@ -2792,6 +2807,9 @@ mod tests {
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }))
         .await
         .unwrap();
@@ -2859,6 +2877,9 @@ mod tests {
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }))
         .await
         .unwrap();
@@ -2922,6 +2943,9 @@ mod tests {
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }))
         .await
         .unwrap();
@@ -2989,6 +3013,9 @@ mod tests {
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }))
         .await
         .unwrap();
@@ -3049,6 +3076,9 @@ mod tests {
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }))
         .await
         .unwrap();
@@ -3124,6 +3154,9 @@ mod tests {
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }))
         .await
         .unwrap();

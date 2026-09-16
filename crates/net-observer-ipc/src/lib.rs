@@ -2018,6 +2018,9 @@ mod tests {
             load1: 1.0,
             load5: 2.0,
             load15: 3.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         });
         assert_eq!(host.detail(), "load 1.00/2.00/3.00");
 
@@ -2161,6 +2164,9 @@ mod tests {
             load1: 1.0,
             load5: 2.0,
             load15: 3.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }));
         assert_eq!(
             EncodedFrame::encode(&event).unwrap().kind(),
@@ -2214,6 +2220,9 @@ mod tests {
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         })))
         .unwrap();
         assert!(!other_kind.passes(kinds));
