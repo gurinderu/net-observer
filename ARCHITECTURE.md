@@ -436,8 +436,30 @@ graph TD
   gpui-drawn pill (green track + knob-right when `snapshot.observing`, grey +
   knob-left when paused); clicking it sends `Control(SetObserving(!observing))`
   over the socket (`send_set_observing`) and refreshes, and the header
-  shows a muted "paused" state (grey dot) while collection is off. gpui's
-  build script runs **bindgen over `dispatch.h`** (libclang plus the SDK
+  shows a muted "paused" state (grey dot) while collection is off.
+  **The map window runs the audit ladder by rung and shows its findings.**
+  The network-map window's control row is four rungs — `Scan · Ports ·
+  Banners · CVE` — each a `Control(ScanNeighbors(ScanOptions))` carrying the
+  ladder up to itself (`Scan` = the base sweep + mDNS; `Ports` adds the port
+  scan; `Banners` = ports + banner grab; `CVE` = ports + banners + the match
+  against the daemon's local CVE snapshot), sent through the same
+  background-executor wiring as every other control button, so the daemon's
+  answer — a refusal, or a rung it dropped for a missing dependency, named —
+  lands verbatim in the line under the rungs. The bar only asks: which rungs
+  actually run is the daemon's decision (see [Control path](#control-path)).
+  While one is in flight all four are inert and `scanning…` stands beside
+  them. A **Findings** reading, beside Graph and List, lists every CVE the
+  record hypothesises for an open port — a read-only
+  `Query(Vulns { network: None })` over the socket on the background executor,
+  fetched when the window opens and again after each rung completes, never on
+  a timer — one line per finding grouped by host (`ip:port  cve_id ·
+  confidence · cvss · KEV`, `KEV` only when the daemon flagged it as
+  known-exploited), `no findings` for an empty table, and the daemon's own
+  words when it could not answer (a query it read but could not run, or a
+  daemon built before `Request::Query` existed). Each finding is a hypothesis
+  carrying its confidence, and the caption says so. (realm net-observer, node
+  #90)
+  gpui's build script runs **bindgen over `dispatch.h`** (libclang plus the SDK
   headers), so the crate is a full workspace member but is excluded from
   `default-members` — a bare `cargo build` needs no GUI toolchain. Build the bar
   with `--all` / `-p net-observer-bar` **from inside `nix develop`**. The

@@ -41,10 +41,11 @@ mod panel;
 mod parts;
 mod theme;
 
-pub(crate) use control::spawn_control_on;
+pub(crate) use control::{ControlRoundTrip, spawn_control_on, spawn_control_then};
 pub use control::{
-    GlanceError, freeze_round_trip, probing_round_trip, quiet_round_trip, read_fresh,
-    scan_round_trip_base,
+    GlanceError, fetch_findings, freeze_round_trip, probing_round_trip, quiet_round_trip,
+    read_fresh, scan_round_trip_banners, scan_round_trip_base, scan_round_trip_cve,
+    scan_round_trip_ports,
 };
 pub use model::Glance;
 pub use panel::PanelView;
