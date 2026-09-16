@@ -413,6 +413,17 @@ pub struct ApiServer {
     /// by `pipeline::run` to drop its pre-edge trigger window. `0` = no such
     /// edge yet.
     pub resume_at_us: Arc<AtomicI64>,
+    /// `ts_us` of the edge that ENDED the observation session the next
+    /// `resume_at_us` move re-opens. `SetObserving(false)` stores the pause's
+    /// own `ts_us` here (the same one it writes into `observing_edge`) — a
+    /// pause moves no `resume_at_us` of its own, so without this the LATER
+    /// resume would close the pre-pause session at the resume's `ts_us`,
+    /// misattributing the unobserved gap to it. `set_probing` stores the
+    /// switch's own `ts_us` here too, before publishing the same value into
+    /// `resume_at_us`. Consumed once per edge by `pipeline::run`
+    /// (`TriggerEngine::close_all`); `0` = none recorded, and the edge's own
+    /// `ts_us` is used instead (realm net-observer, node #124).
+    pub session_end_us: Arc<AtomicI64>,
     pub snapshot: Arc<Mutex<StatusSnapshot>>,
     /// Durable sink for pause/resume boundary records.
     pub store: Arc<dyn Store + Send + Sync>,
@@ -711,6 +722,7 @@ async fn handle_conn(
                 scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
                 blob_dir: &srv.blob_dir,
                 resume_at_us: &srv.resume_at_us,
+                session_end_us: &srv.session_end_us,
                 snapshot: &srv.snapshot,
                 store: srv.store.as_ref(),
                 events_tx: &srv.events_tx,
@@ -937,6 +949,10 @@ pub(crate) struct ControlCtx<'a> {
     pub scan_cve_snapshot: Option<&'a Path>,
     pub blob_dir: &'a Path,
     pub resume_at_us: &'a AtomicI64,
+    /// `ts_us` of the edge that ENDED the observation session the next
+    /// `resume_at_us` move re-opens. See the field of the same name on
+    /// [`ApiServer`] (realm net-observer, node #124).
+    pub session_end_us: &'a AtomicI64,
     pub snapshot: &'a Mutex<StatusSnapshot>,
     pub store: &'a (dyn Store + Send + Sync),
     pub events_tx: &'a broadcast::Sender<EncodedFrame>,
@@ -1015,6 +1031,16 @@ fn control_response(
                     let ts_us = types::now_us();
                     if b {
                         cx.resume_at_us.store(ts_us, Ordering::Release);
+                    } else {
+                        // The session ends HERE, at the pause: a pause moves no
+                        // `resume_at_us` of its own (it produces no sample for
+                        // `pipeline::run` to react to), so the LATER resume is
+                        // what actually triggers the edge. Without this, that
+                        // resume would close whatever incident the pre-pause
+                        // session left open at the RESUME's `ts_us`, attributing
+                        // the whole unobserved gap to it (realm net-observer,
+                        // node #124).
+                        cx.session_end_us.store(ts_us, Ordering::Release);
                     }
                     cx.observing.store(b, Ordering::Release);
                     snap.observing = b;
@@ -1134,11 +1160,15 @@ fn control_response(
 /// holds closes its open incident at that sample's `ts_us`; one that still
 /// holds — a `NoGw` gw-drop, a fakeip hijack, both readable under passive —
 /// keeps it open. The `probing_edge` row at the switch's own `ts_us` is the
-/// bracket that explains either. The probe-fed conditions do not read the
-/// first passive `SKIP`s as a recovery, and after a switch back no dead tick
-/// from before the stretch can join the ticks after it. Without this, the
-/// switch to passive turned every probe-fed condition to `None` at once and
-/// the engine closed open incidents as "recovered" at that instant.
+/// bracket that explains either. An incident still open AT the switch closes
+/// at the switch's own `ts_us` (`TriggerEngine::close_all`, realm net-observer,
+/// node #124) — it belongs to the session the switch just ended, not to
+/// whatever the first post-switch sample finds; that first sample may open a
+/// new one. The probe-fed conditions do not read the first passive `SKIP`s as
+/// a recovery, and after a switch back no dead tick from before the stretch
+/// can join the ticks after it. Without this, the switch to passive turned
+/// every probe-fed condition to `None` at once and the engine closed open
+/// incidents as "recovered" at that instant.
 fn set_probing(
     tier: ProbingTier,
     authorized: PeerAuthorized,
@@ -1163,6 +1193,11 @@ fn set_probing(
             // spawner's re-checks. Swapping the order would open the
             // consumer-side hole above instead. Accepted as bounded (one tick,
             // one switch) and left as is.
+            //
+            // `session_end_us` is stored BEFORE `resume_at_us`, same reasoning:
+            // the consumer that observes the epoch move must already see the
+            // session's end (realm net-observer, node #124).
+            cx.session_end_us.store(ts_us, Ordering::Release);
             cx.resume_at_us.store(ts_us, Ordering::Release);
             cx.probing.set(tier);
             snap.probing = tier;
@@ -1633,6 +1668,7 @@ mod tests {
             scan_cve_snapshot: None,
             blob_dir: std::env::temp_dir().join("net-observerd-test-blobs"),
             resume_at_us: Arc::new(AtomicI64::new(0)),
+            session_end_us: Arc::new(AtomicI64::new(0)),
             snapshot: Arc::new(Mutex::new(StatusSnapshot::default())),
             store: Arc::new(store::DuckdbStore::in_memory().unwrap()),
             query_gate: Arc::new(Semaphore::new(MAX_QUERIES_IN_FLIGHT)),
@@ -1657,6 +1693,7 @@ mod tests {
             scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
             blob_dir: &srv.blob_dir,
             resume_at_us: &srv.resume_at_us,
+            session_end_us: &srv.session_end_us,
             snapshot: &srv.snapshot,
             store: srv.store.as_ref(),
             events_tx: &srv.events_tx,
@@ -2256,6 +2293,13 @@ mod tests {
             epoch_after_passive, row_ts,
             "the epoch is the edge's own instant: the probing_edge row is the bracket"
         );
+        // The switch also records itself as the session's own end, stamped
+        // BEFORE the epoch bump (realm net-observer, node #124).
+        assert_eq!(
+            srv.session_end_us.load(Ordering::Acquire),
+            row_ts,
+            "a tier switch must publish the session's end at its own ts_us"
+        );
         // Sink 2: exactly one frame, describing the same transition.
         let frame = rx.try_recv().expect("a tier switch must publish one frame");
         let decoded: StreamFrame = serde_json::from_slice(frame.bytes()).unwrap();
@@ -2317,6 +2361,11 @@ mod tests {
             srv.store
                 .query_scalar_i64("SELECT ts_us FROM probing_edge WHERE tier = 'active'")
                 .unwrap()
+        );
+        assert_eq!(
+            srv.session_end_us.load(Ordering::Acquire),
+            srv.resume_at_us.load(Ordering::Acquire),
+            "the switch back records itself as the session's end too"
         );
         // A tier switch is not a pause: the observing bracket stays untouched.
         assert_eq!(
@@ -2869,6 +2918,14 @@ mod tests {
             .store
             .query_scalar_i64("SELECT ts_us FROM observing_edge")
             .unwrap();
+        // The pause also records the session's own end — for the LATER resume
+        // to close the incident this pause interrupted at, not at the
+        // resume's own `ts_us` (realm net-observer, node #124).
+        assert_eq!(
+            srv.session_end_us.load(Ordering::Acquire),
+            row_ts,
+            "a pause must publish the session's end for the pipeline to close against"
+        );
         assert_eq!(
             srv.store
                 .query_scalar_i64("SELECT peer_uid FROM observing_edge")
@@ -2945,12 +3002,22 @@ mod tests {
             0,
             "a pause is not a resume and must not move the resume epoch"
         );
+        let session_end_at_pause = srv.session_end_us.load(Ordering::Acquire);
+        assert!(
+            session_end_at_pause > 0,
+            "a pause must record the session's end for the eventual resume to close against"
+        );
 
         let on = control_request(ControlCmd::SetObserving(true), Some(TEST_DAEMON_UID), &cx);
         assert!(on.ok);
         assert!(
             srv.resume_at_us.load(Ordering::Acquire) > 0,
             "a resume must publish its epoch for the pipeline to observe"
+        );
+        assert_eq!(
+            srv.session_end_us.load(Ordering::Acquire),
+            session_end_at_pause,
+            "a resume does not itself end a session; it must not move session_end_us"
         );
     }
 

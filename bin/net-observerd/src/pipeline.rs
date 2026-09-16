@@ -236,7 +236,11 @@ impl ResumeGate {
 /// does NOT do is reset the firing budget: `last_fire_us` survives it, so each
 /// trigger still fires at most once per `backoff_us` and a toggled switch cannot
 /// storm the incident log. The `observing_edge` rows bound the gap between the
-/// two records.
+/// two records. Before either of those two steps, [`TriggerEngine::close_all`]
+/// closes whatever incident the PREVIOUS session left open, at the `ts_us` of
+/// the edge that ended it — the pause's own, or the tier switch's, carried in
+/// `session_end_us` — never at the first post-edge sample's, which would
+/// misattribute the unobserved gap to it (realm net-observer, node #124).
 ///
 /// Exactly one thing survives [`RecentWindow::clear_for_resume`]: the newest link
 /// sample, kept as the gateway-CHANGE BASIS and reachable ONLY through
@@ -304,6 +308,14 @@ pub async fn run(
     // clears and re-arms by exactly this path (realm net-observer, node #88).
     // `0` = no such edge yet.
     resume_at_us: Arc<AtomicI64>,
+    // `ts_us` of the edge that ENDED the observation session this resume/switch
+    // re-opens: a pause's own `ts_us` (published because `resume_at_us` will
+    // not move until the LATER resume), or a tier switch's own `ts_us` (the
+    // same instant as its `resume_at_us` bump). Read once per edge, to close
+    // whatever the previous session left open at the instant it actually
+    // ended rather than at this edge's own. `0` = none recorded — the edge's
+    // own `ts_us` is used instead (realm net-observer, node #124).
+    session_end_us: Arc<AtomicI64>,
 ) {
     let mut window = RecentWindow::new(triggers::WINDOW_CAP);
     // The bounded post-resume drain filter, replacing the raw
@@ -381,12 +393,28 @@ pub async fn run(
         // so a sample is never timed against two different instants.
         let now = Instant::now();
         if gate.observe_edge(resume_at_us.load(Ordering::Acquire), now) {
+            // Close whatever the PREVIOUS observation session left open before
+            // clearing the window and re-arming: that incident belongs to the
+            // session that just ended, not to whatever this edge's first
+            // sample finds. `session_end_us` is the pause's own `ts_us` when
+            // this edge is a resume from a pause (the pause published no edge
+            // of its own); falling back to the edge's own `ts_us` covers a
+            // tier switch (which stamps both atomics alike) and the case
+            // where nothing was ever recorded (realm net-observer, node #124).
+            let end = session_end_us.load(Ordering::Acquire);
+            let closed_at_us = if end > 0 {
+                end
+            } else {
+                gate.applied_resume_us()
+            };
+            engine.close_all(closed_at_us);
             // Forget the samples, KEEP the gateway-change basis (see
             // `RecentWindow::clear_for_resume`), and re-open detection.
             window.clear_for_resume();
             engine.rearm_all();
             tracing::info!(
                 edge_us = gate.applied_resume_us(),
+                closed_at_us,
                 "resume or probing-tier switch; window cleared (gateway-change basis kept), \
                  triggers re-armed"
             );
@@ -1716,6 +1744,16 @@ mod tests {
         Arc::new(AtomicI64::new(0))
     }
 
+    /// No session-end recorded: `run` then closes an edge's open incidents at
+    /// the edge's OWN `ts_us` ([`ResumeGate::applied_resume_us`]) instead of a
+    /// separately-published pause instant. Correct for every test here that
+    /// drives a bare `resume_at_us` edge with no matching pause — a real tier
+    /// switch stamps this atomic to that same edge instant rather than leaving
+    /// it at `0`, but the fallback lands on the identical value either way.
+    fn no_session_end() -> Arc<AtomicI64> {
+        Arc::new(AtomicI64::new(0))
+    }
+
     fn link(ts_us: i64, gw: GwVerdict) -> Sample {
         Sample::Link(LinkSample {
             ts_us,
@@ -1753,6 +1791,7 @@ mod tests {
             snapshot,
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
         tx.send(Sample::Link(LinkSample {
             ts_us: 1,
@@ -1814,6 +1853,7 @@ mod tests {
             snapshot,
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
         // Ok -> Fail is a gateway-verdict change: gw-change must fire.
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -2286,6 +2326,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
 
         // A link sample then a proxy sample: each populates its own snapshot field,
@@ -2357,6 +2398,7 @@ mod tests {
             snapshot,
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
 
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -2403,6 +2445,7 @@ mod tests {
             snapshot,
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
 
         tx.send(link(11, GwVerdict::Ok)).await.unwrap();
@@ -2443,6 +2486,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
         tx.send(link(7, GwVerdict::Ok)).await.unwrap();
         tx.send(Sample::Host(HostSample {
@@ -2557,6 +2601,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         // Two wedge-shaped tick pairs before the pause.
@@ -2628,6 +2673,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
 
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -2703,6 +2749,7 @@ mod tests {
             snapshot,
             events_tx,
             resume_at_us,
+            no_session_end(),
         ));
 
         // The straggler: the probe that spanned both edges.
@@ -2890,6 +2937,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         // Enough stale-looking samples to exhaust the drop cap on their own.
@@ -2952,6 +3000,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         // Fires once, then stays latched while the fault persists.
@@ -2995,6 +3044,87 @@ mod tests {
         );
     }
 
+    /// Item 3 (realm net-observer, node #124): the incident a pre-pause firing
+    /// left open closes at the PAUSE's own `ts_us` — the edge that actually
+    /// ended its observation session — never at the resume's, which would
+    /// misattribute the whole unobserved gap to it. A pause moves no
+    /// `resume_at_us` of its own (it produces no sample for the consumer to
+    /// react to), so `session_end_us` is what carries the pause's `ts_us`
+    /// forward to the edge the consumer actually processes: the later resume.
+    #[tokio::test]
+    async fn run_closes_the_pre_pause_incident_at_the_pause_ts_not_the_resumes() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 0)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        // The pause's own ts_us, published the way `SetObserving(false)` does in
+        // `api::control_response` — BEFORE the later resume moves `resume_at_us`.
+        const PAUSE_US: i64 = 10;
+        const RESUME_US: i64 = 100;
+        let session_end_us = Arc::new(AtomicI64::new(PAUSE_US));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+            session_end_us,
+        ));
+
+        // Fires once; stays latched while the fault persists across the
+        // (unmodelled) pause.
+        tx.send(link(1, GwVerdict::Fail)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 2,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 2).await;
+
+        // The edge the consumer actually observes: `resume_at_us` moving to
+        // `RESUME_US`, well past the pause that really ended the session.
+        resume_at_us.store(RESUME_US, Ordering::Release);
+        tx.send(link(RESUME_US + 1, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            2,
+            "the persistent fault opens a second incident at the resume"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT closed_us FROM incident WHERE id = 'gw-drop-1'")
+                .unwrap(),
+            PAUSE_US,
+            "the pre-pause incident closes at the pause's own ts_us, not the resume's"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(&format!(
+                    "SELECT count(*) FROM incident \
+                     WHERE id = 'gw-drop-{}' AND closed_us IS NULL",
+                    RESUME_US + 1
+                ))
+                .unwrap(),
+            1,
+            "the post-resume incident is freshly opened and still asserting"
+        );
+    }
+
     /// The matched twin of the test above: the identical stream under the daemon's
     /// PRODUCTION backoff yields exactly ONE incident. A resume re-arms the latch;
     /// it does not hand the trigger a fresh firing budget, so a spammed switch
@@ -3025,6 +3155,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         tx.send(link(1, GwVerdict::Fail)).await.unwrap();
@@ -3090,6 +3221,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         // Fires once at ts 1, then stays latched while the fault persists.
@@ -3161,6 +3293,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         // The last gateway state observed before the pause.
@@ -3225,6 +3358,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -3296,6 +3430,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         // No predecessor yet, so `GwChange::eval` returns `None` and the trigger
