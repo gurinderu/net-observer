@@ -4589,6 +4589,10 @@ rec {
             packageId = "serde";
             features = [ "derive" ];
           }
+          {
+            name = "types";
+            packageId = "types";
+          }
         ];
         devDependencies = [
           {
