@@ -651,7 +651,7 @@ the durable record; the socket is the live, low-latency read path.
   attacker opens fds faster than the timeout reaps them. Then either
   answer a **one-shot** request (`Status` / `Incidents` / `Control`) from the
   shared `Arc<Mutex<StatusSnapshot>>` the pipeline keeps current (or, for a
-  `Control`, pass the peer-credential gate and then run the class-gated command),
+  `Control`, pass the peer-credential gate and then run the command),
   write one `Response`, and close; or, for a `Subscribe`, **hold the connection
   open** and stream `StreamFrame`s until the client disconnects (see [Event bus
   and live subscriptions](#event-bus-and-live-subscriptions)). The lock is held
@@ -837,9 +837,10 @@ still refuse, with a reason, is a contradiction of the daemon's own state (a
 scan while paused or quiet) or a missing dependency (no ring, no scanner, no
 CVE snapshot).
 
-**Gate 1 — who may command the daemon at all.** Before any dispatch on the
-`ControlCmd`, the connection's peer credentials are read from the `UnixStream`
-(`peer_cred()`, `getpeereid(2)` on macOS — the peer at `connect(2)` time) and put
+**The peer-credential gate — who may command the daemon at all.** Before any
+dispatch on the `ControlCmd`, the connection's peer credentials are read from the
+`UnixStream` (`peer_cred()`, `getpeereid(2)` on macOS — the peer at `connect(2)`
+time) and put
 through the pure predicate `api::control_authorized`. It admits:
 
 - **root** (uid 0) — it can already stop and reconfigure the daemon, so refusing
@@ -914,10 +915,10 @@ already-authorised command:
    still reads the old epoch (see the window clear under
    [Async collectors](#async-collectors)). It touches neither sing-box nor the
    network — a purely benign, reversible pause of the daemon's own probing. Like
-   every control request it must first pass gate 1. The daemon stays alive and
-   the socket keeps serving throughout, so the same switch can turn collection
-   back on. Clients: the bar's toggle switch and the CLI `observe on|off`
-   subcommand.
+   every control request it must first pass the peer-credential gate. The daemon
+   stays alive and the socket keeps serving throughout, so the same switch can
+   turn collection back on. Clients: the bar's toggle switch and the CLI
+   `observe on|off` subcommand.
 
    A **real transition** then goes to two sinks, from one `types::ObservingEdge`
    built once and stamped with one `ts_us`, so the offline record and the wire
@@ -954,7 +955,7 @@ contradict (paused; for the sweep also quiet) or a missing dependency.
 ```
 Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
                               │
-                              ├─ GATE 1: control_authorized(policy, peer_uid, console_uid())
+                              ├─ PEER-CREDENTIAL GATE: control_authorized(policy, peer_uid, console_uid())
                               │     ├─ refused / peer unknown
                               │     │     └─► ControlResult { ok: false, "control refused: …" }
                               │     │         (fails closed; nothing is dispatched)
@@ -993,8 +994,8 @@ Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
 from an **authorised peer**. Acting is never triggered by the pipeline or a
 passive handler — only by an explicit operator request, and that request is its
 own sanction: `config::ActingCfg` holds the service name and gates nothing.
-`SetObserving` is a `Control` request over the same socket, so gate 1 and the
-socket hardening below apply to it unchanged.
+`SetObserving` is a `Control` request over the same socket, so the
+peer-credential gate and the socket hardening below apply to it unchanged.
 
 **Pause semantics: process-scoped, never persisted.** The `observing` state lives
 only in the running process — it is deliberately **not** written to the store or
@@ -1013,8 +1014,9 @@ it applies whatever the file permissions are. Still, an operator who uses the
 control path should narrow who can even connect: set `socket_mode = 0o600` and
 `socket_owner_uid = <logged-in uid>` so only that owner reaches the endpoint at
 all. With the default `socket_mode = 0o666` the socket is world-connectable (fine
-for read-only status; a stranger's `Control` is refused by gate 1, but tightening
-the mode removes the attempt as well as the effect), and `socket_owner_uid` is
+for read-only status; a stranger's `Control` is refused by the peer-credential
+gate, but tightening the mode removes the attempt as well as the effect), and
+`socket_owner_uid` is
 `None` (the socket keeps the daemon's root ownership — and then authorises no one
 through that clause). On a host with no console session, `control_uids` is the
 way to authorise an administrator, since the console-user rule admits nobody

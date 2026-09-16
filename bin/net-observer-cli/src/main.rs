@@ -110,9 +110,10 @@ enum Command {
     /// Unlike the passive `neighbors` collector, this **speaks on the network**
     /// — it addresses every host of the subnet. Nothing in the daemon's config
     /// has to permit it: the command is the sanction, and every run leaves a
-    /// `neighbor_scan` row saying what was probed. The daemon refuses it only
-    /// while paused or quiet. Exits non-zero if the scan was refused/failed or
-    /// the daemon is unreachable.
+    /// `neighbor_scan` row saying what was probed. The daemon refuses it with a
+    /// reason when it cannot run (paused, quiet, no IPv4 subnet, no scanner on
+    /// this host) or when the peer is not authorised. Exits non-zero if the
+    /// scan was refused/failed or the daemon is unreachable.
     ScanNeighbors {
         /// Also TCP-connect-scan discovered neighbours' common ports. Off unless
         /// given.

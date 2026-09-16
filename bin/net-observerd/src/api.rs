@@ -1385,7 +1385,10 @@ mod tests {
 
     fn test_acting() -> ActingConfig {
         ActingConfig {
-            singbox_service: "system/sing-box".into(),
+            // A sentinel no launchd holds: with no config gate, an authorised
+            // `KickstartProxy` in a test would otherwise `launchctl kickstart -k`
+            // the REAL sing-box on a developer's Mac.
+            singbox_service: "system/net-observer-test-sentinel".into(),
         }
     }
 
