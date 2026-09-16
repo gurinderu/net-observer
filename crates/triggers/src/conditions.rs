@@ -538,21 +538,44 @@ impl Condition for PerClientBlock {
 /// window itself.
 const BAN_CYCLE_SCAN: usize = 64;
 
+/// The fewest measured dead readings (`Fail`/`NoGw`) a run needs to be a ban:
+/// Wi-Fi jitter loses single echoes, and one lost echo is not a ban. Tunable
+/// by the owner.
+const BAN_MIN_RUN_TICKS: usize = 2;
+
+/// The shortest mean interval between ban starts that reads as the cycle: a
+/// cycle shorter than a minute is not the field pattern (2–4 minutes per
+/// round). Tunable by the owner.
+const BAN_MIN_PERIOD_S: i64 = 60;
+
 /// Fires when the window holds at least `min_bans` gateway bans — a ban being
-/// a maximal run of `Fail` gateway readings with an `Ok` reading on either
-/// side, the newest run possibly still open — the coworking ban-cycle
+/// a maximal run of dead gateway readings (`Fail` or `NoGw`: one run class,
+/// the same fold the CLI's `gw_drops()` uses) of at least
+/// [`BAN_MIN_RUN_TICKS`] measured ticks with an `Ok` reading on either side,
+/// the newest run possibly still open — and the mean interval between ban
+/// starts is at least [`BAN_MIN_PERIOD_S`]. The coworking ban-cycle
 /// signature: the client is admitted, blocked, admitted again, and each round
 /// otherwise lands as its own `gw-drop`/`gw-change`/`per-client-block`
 /// incident with the cycle itself readable nowhere. This one names the cycle
 /// and its period, and stays asserted while the pattern is in the window so
 /// the engine's clear edge closes the one incident when it ages out.
 ///
-/// `Skip` is the absence of a measurement and is transparent: it neither
-/// splits a run nor starts one (node #25). `NoGw` is a different state — no
-/// gateway at all, not a ban — and ends the scan: nothing older than it is
-/// read. A run the window cut off (no `Ok` older than it) has no known start
-/// and is not counted. The match is exhaustive over the verdict so a future
-/// token cannot join a set by accident. (realm net-observer, node #60)
+/// The detail is written when the incident opens, so the count and span it
+/// carries are those of the first firing — `min_bans` bans; the full count
+/// and span of the episode live in the recorded link samples, not in this
+/// detail. `Skip` is the absence of a measurement and is transparent: it
+/// neither splits a run nor starts one (node #25). `NoGw` at the roam (the
+/// default gateway momentarily absent before the echoes start failing) is the
+/// start of that ban, not a wall that hides it. A run the window cut off (no
+/// `Ok` older than it) has no known start and is not counted. The match is
+/// exhaustive over the verdict so a future token cannot join a set by
+/// accident. A cycle has a period only from two bans on, so `min_bans` below
+/// 2 reads as 2.
+///
+/// The daemon registers this behind the settle gate on purpose: a different
+/// router IP is a different segment, not one gateway's ban, so a roam that
+/// re-leases a new router does not feed this count. (realm net-observer,
+/// node #60)
 pub struct BanCycle {
     pub min_bans: usize,
 }
@@ -561,27 +584,40 @@ impl Condition for BanCycle {
         "ban-cycle"
     }
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
-        // Ban starts, newest first: the `ts_us` of the oldest `Fail` in each
-        // run, recorded once the `Ok` before that run is reached.
+        // Ban starts, newest first: the `ts_us` of the oldest dead reading in
+        // each run, recorded once the `Ok` before that run is reached — if
+        // the run measured enough dead ticks to be a ban.
         let mut starts: Vec<i64> = Vec::new();
-        let mut run_start: Option<i64> = None;
+        // The run being walked: its oldest dead reading so far and how many
+        // measured dead readings it holds.
+        let mut run: Option<(i64, usize)> = None;
         for l in w.recent_link(BAN_CYCLE_SCAN) {
             match l.gw {
-                GwVerdict::Fail => run_start = Some(l.ts_us),
-                GwVerdict::Ok => starts.extend(run_start.take()),
+                GwVerdict::Fail | GwVerdict::NoGw => {
+                    run = Some((l.ts_us, run.map_or(1, |(_, ticks)| ticks + 1)));
+                }
+                GwVerdict::Ok => {
+                    if let Some((start, ticks)) = run.take()
+                        && ticks >= BAN_MIN_RUN_TICKS
+                    {
+                        starts.push(start);
+                    }
+                }
                 GwVerdict::Skip => {}
-                GwVerdict::NoGw => break,
             }
         }
         let n = starts.len();
-        if n < self.min_bans {
+        if n < self.min_bans.max(2) {
             return None;
         }
         let intervals: Vec<i64> = starts.windows(2).map(|pair| pair[0] - pair[1]).collect();
         let span_us = starts.first()? - starts.last()?;
         // Mean interval between consecutive ban starts; the sum of the
-        // intervals is the span. Guarded so `min_bans: 1` cannot divide by zero.
-        let period_us = span_us / i64::try_from(intervals.len().max(1)).ok()?;
+        // intervals is the span, and `n >= 2` makes the divisor at least 1.
+        let period_us = span_us / i64::try_from(intervals.len()).ok()?;
+        if period_us < BAN_MIN_PERIOD_S * 1_000_000 {
+            return None;
+        }
         let min_us = intervals.iter().copied().min().unwrap_or(0);
         let max_us = intervals.iter().copied().max().unwrap_or(0);
         let secs = |us: i64| us / 1_000_000;
@@ -2018,7 +2054,8 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
     }
 
     /// The newest ban may still be in progress (the client is blocked right
-    /// now): with at least one `Fail` and an `Ok` before it, it is a ban start.
+    /// now): with `BAN_MIN_RUN_TICKS` dead readings and an `Ok` before it, it
+    /// is a ban start.
     #[test]
     fn ban_cycle_counts_the_open_newest_ban() {
         let mut w = RecentWindow::new(64);
@@ -2030,7 +2067,12 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         push_gw_ticks(
             &mut w,
             next,
-            &[GwVerdict::Ok, GwVerdict::Ok, GwVerdict::Fail],
+            &[
+                GwVerdict::Ok,
+                GwVerdict::Ok,
+                GwVerdict::Fail,
+                GwVerdict::Fail,
+            ],
         );
         let fire = c
             .eval(&w)
@@ -2056,10 +2098,10 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
     }
 
     /// Quiet-mode `Skip` ticks are the absence of a measurement (node #25):
-    /// one inside a run does not split the ban, one between two `Ok`s does
-    /// not start one. Dies under `Skip` read as `Ok` (six bans) and under
-    /// `Skip` read as `Fail` (six bans too — the between-`Ok` skips become
-    /// bans).
+    /// one inside a run does not split the ban, two between `Ok`s do not
+    /// start one. Dies under `Skip` read as `Ok` (each `Fail` is then a lone
+    /// tick below the run bound: no ban at all) and under `Skip` read as
+    /// `Fail` (the between-`Ok` pair becomes a second ban per round: six).
     #[test]
     fn ban_cycle_skip_neither_splits_nor_starts_a_ban() {
         let mut w = RecentWindow::new(64);
@@ -2070,10 +2112,10 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             GwVerdict::Fail,
             GwVerdict::Skip,
             GwVerdict::Fail,
-            GwVerdict::Fail,
-            GwVerdict::Skip,
             GwVerdict::Ok,
             GwVerdict::Skip,
+            GwVerdict::Skip,
+            GwVerdict::Ok,
             GwVerdict::Ok,
         ];
         let mut next = 0;
@@ -2087,28 +2129,93 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         );
     }
 
-    /// `NoGw` is a different state — no gateway at all, not a ban — and ends
-    /// the scan: a ban older than it is not read. The inline control (the
-    /// same stream with `Ok` in that slot fires) proves the silence measures
-    /// the `NoGw` and not a fixture that could never fire.
+    /// One ban round shaped like the field episode: at the roam the default
+    /// gateway is momentarily absent (`NoGw`) before the echoes start failing,
+    /// and quiet mode drops one reading inside the run. Same period and ban
+    /// start as [`BAN_ROUND`].
+    const FIELD_ROUND: [GwVerdict; 10] = [
+        GwVerdict::Ok,
+        GwVerdict::Ok,
+        GwVerdict::NoGw,
+        GwVerdict::Fail,
+        GwVerdict::Skip,
+        GwVerdict::Fail,
+        GwVerdict::Ok,
+        GwVerdict::Ok,
+        GwVerdict::Ok,
+        GwVerdict::Ok,
+    ];
+
+    /// `NoGw` is a dead reading like `Fail` — one run class, the fold the
+    /// CLI's `gw_drops()` uses — so a `NoGw` tick at the roam is the start of
+    /// the ban, not a wall that hides it. Dies under `NoGw => break`, which
+    /// read every field round as no ban at all.
     #[test]
-    fn ban_cycle_stops_at_a_no_gateway_reading() {
+    fn ban_cycle_counts_a_no_gateway_tick_as_dead() {
         let c = BanCycle { min_bans: 3 };
-        let stream = |middle: GwVerdict| {
+        let mut w = RecentWindow::new(64);
+        let mut next = 0;
+        for _ in 0..3 {
+            next = push_gw_ticks(&mut w, next, &FIELD_ROUND);
+        }
+        let fire = c
+            .eval(&w)
+            .expect("three field-shaped rounds with NoGw at the roam must fire");
+        assert_eq!(
+            fire.detail,
+            "gateway ban cycle: 3 bans in ~300s, period ~150s (min 150s, max 150s)"
+        );
+    }
+
+    /// Wi-Fi jitter loses single echoes: a one-tick `Fail` or `NoGw` between
+    /// two `Ok`s is not a ban, however many of them the window holds. Dies
+    /// under no lower bound on the run length ("3 bans in ~60s").
+    #[test]
+    fn ban_cycle_ignores_single_tick_echo_losses() {
+        let c = BanCycle { min_bans: 3 };
+        let mut w = RecentWindow::new(64);
+        let mut next = 0;
+        for lost in [GwVerdict::Fail, GwVerdict::NoGw, GwVerdict::Fail] {
+            next = push_gw_ticks(
+                &mut w,
+                next,
+                &[GwVerdict::Ok, GwVerdict::Ok, lost, GwVerdict::Ok],
+            );
+        }
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// A cycle shorter than a minute is not the field pattern: three two-tick
+    /// bans 45 s apart stay silent, and the same bans 60 s apart fire — the
+    /// bound is on the mean period, inclusive.
+    #[test]
+    fn ban_cycle_silent_below_the_minimum_period() {
+        let c = BanCycle { min_bans: 3 };
+        let stream = |round: &[GwVerdict]| {
             let mut w = RecentWindow::new(64);
-            let next = push_gw_ticks(&mut w, 0, &BAN_ROUND);
-            let next = push_gw_ticks(&mut w, next, &[middle]);
-            let next = push_gw_ticks(&mut w, next, &BAN_ROUND);
-            push_gw_ticks(&mut w, next, &BAN_ROUND);
+            let mut next = 0;
+            for _ in 0..3 {
+                next = push_gw_ticks(&mut w, next, round);
+            }
             w
         };
         assert!(
-            c.eval(&stream(GwVerdict::NoGw)).is_none(),
-            "a ban behind a NoGw reading must not be counted"
+            c.eval(&stream(&[GwVerdict::Ok, GwVerdict::Fail, GwVerdict::Fail]))
+                .is_none(),
+            "a 45 s period is below BAN_MIN_PERIOD_S"
         );
+        let fire = c
+            .eval(&stream(&[
+                GwVerdict::Ok,
+                GwVerdict::Fail,
+                GwVerdict::Fail,
+                GwVerdict::Ok,
+            ]))
+            .expect("a 60 s period is the bound itself and fires");
         assert!(
-            c.eval(&stream(GwVerdict::Ok)).is_some(),
-            "control: the same stream without the NoGw fires"
+            fire.detail.contains("period ~60s"),
+            "the detail must carry the period: {}",
+            fire.detail
         );
     }
 
