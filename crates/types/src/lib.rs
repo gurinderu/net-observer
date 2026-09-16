@@ -2,6 +2,7 @@ pub mod air;
 pub mod incident;
 pub mod neighbor;
 pub mod observing;
+pub mod probing;
 pub mod sample;
 pub mod topology;
 pub mod verdict;
@@ -15,6 +16,7 @@ pub use neighbor::{
     HistoryWindow, NeighborLifetime, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence,
 };
 pub use observing::{ObservingCause, ObservingEdge};
+pub use probing::{EmissionClass, ProbingEdge, ProbingTier};
 pub use sample::{
     DnsSample, HostSample, LinkSample, ProxySample, RouteEvent, Sample, WifiSample, now_us,
 };
