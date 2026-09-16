@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::window::{LinkProvenance, RecentWindow};
 use types::{
     DnsVerdict, GwVerdict, LinkMedium, LinkSample, NeighborsVerdict, ProxySample, TcpVerdict,
+    normalize_mac,
 };
 
 /// How many recent DNS samples the `fakeip` condition scans (one polling tick
@@ -325,13 +326,17 @@ impl Condition for GwChange {
 /// newest comparable predecessor's, while the DHCP-leased router IP is unchanged
 /// — the same address answered by a different MAC.
 ///
-/// A predecessor is comparable only if it carries both the router IP and the
-/// MAC: an empty ARP cache is common for a tick or two right after a link flap,
-/// which is exactly when the MAC changes, so the scan reaches back past those
-/// ticks rather than comparing against the immediate neighbour and losing the
-/// change for good. A comparison made across an operator pause or across
-/// unreadable ticks is labelled as such, so the incident never reads as two
-/// consecutive measurements. (realm net-observer, node #32)
+/// A predecessor is comparable only if it carries both the router IP and a MAC
+/// that normalises: an empty ARP cache is common for a tick or two right after
+/// a link flap, which is exactly when the MAC changes, so the scan reaches
+/// back past those ticks rather than comparing against the immediate
+/// neighbour and losing the change for good. Both sides of the comparison —
+/// and the MACs named in the fire detail — go through [`normalize_mac`], so a
+/// row stored before the source-side fix landed (raw, unpadded octets) does
+/// not read as a change against a normalised successor at the same gateway
+/// (realm net-observer, node #94). A comparison made across an operator pause
+/// or across unreadable ticks is labelled as such, so the incident never
+/// reads as two consecutive measurements. (realm net-observer, node #32)
 pub struct GwMacChange;
 impl Condition for GwMacChange {
     fn id(&self) -> &'static str {
@@ -340,13 +345,23 @@ impl Condition for GwMacChange {
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let last = w.last_link()?;
         let last_router = last.dhcp_router.as_deref()?;
-        let last_mac = last.gw_arp_mac.as_deref()?;
-        let comparable = |l: &LinkSample| l.dhcp_router.is_some() && l.gw_arp_mac.is_some();
+        let last_mac = normalize_mac(last.gw_arp_mac.as_deref()?)?;
+        // Both sides through the same fold as `bssid`/`if_mac`: a row written
+        // before the source-side normalisation still carries `arp -n`'s raw,
+        // unpadded form, and comparing it unfolded against a normalised
+        // successor would read as a MAC change on the very first tick after
+        // the upgrade at an unchanged gateway (realm net-observer, node #94).
+        let comparable = |l: &LinkSample| {
+            l.dhcp_router.is_some()
+                && l.gw_arp_mac
+                    .as_deref()
+                    .is_some_and(|m| normalize_mac(m).is_some())
+        };
         let recent = w.recent_link(GW_CHANGE_SCAN);
         let unreadable = recent.iter().skip(1).take_while(|l| !comparable(l)).count();
         let (prev, provenance) = measured_predecessor(w, &recent, comparable)?;
         let prev_router = prev.dhcp_router.as_deref()?;
-        let prev_mac = prev.gw_arp_mac.as_deref()?;
+        let prev_mac = normalize_mac(prev.gw_arp_mac.as_deref()?)?;
         if last_router != prev_router {
             return None;
         }
@@ -1810,14 +1825,59 @@ mod tests {
         w.push(link_router_mac(
             2,
             Some("192.168.1.1"),
-            Some("bb:bb:bb:bb:bb:bb"),
+            Some("cc:cc:cc:cc:cc:cc"),
         ));
         let fire = GwMacChange
             .eval(&w)
             .expect("same gateway IP with a different MAC must fire");
         assert!(fire.detail.contains("192.168.1.1"));
         assert!(fire.detail.contains("aa:aa:aa:aa:aa:aa"));
-        assert!(fire.detail.contains("bb:bb:bb:bb:bb:bb"));
+        assert!(fire.detail.contains("cc:cc:cc:cc:cc:cc"));
+    }
+
+    /// The upgrade boundary itself: a predecessor stored before the
+    /// source-side normalisation landed carries `arp -n`'s raw, unpadded
+    /// form, and the successor carries the same gateway's now-normalised
+    /// form. Comparing unfolded would read this as a MAC change on the very
+    /// first tick after the upgrade — one false incident per machine — so it
+    /// must stay silent (realm net-observer, node #94).
+    #[test]
+    fn gw_mac_change_silent_across_the_normalisation_upgrade() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_router_mac(
+            1,
+            Some("192.168.1.1"),
+            Some("0:1e:6:ab:cd:ef"),
+        ));
+        w.push(link_router_mac(
+            2,
+            Some("192.168.1.1"),
+            Some("00:1e:06:ab:cd:ef"),
+        ));
+        assert!(GwMacChange.eval(&w).is_none());
+    }
+
+    /// A genuine change is still caught even when the predecessor is in the
+    /// pre-upgrade raw form: the fold must not paper over a real difference,
+    /// only the padding one.
+    #[test]
+    fn gw_mac_change_fires_when_a_real_change_crosses_the_upgrade_boundary() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_router_mac(
+            1,
+            Some("192.168.1.1"),
+            Some("0:1e:6:ab:cd:ef"),
+        ));
+        w.push(link_router_mac(
+            2,
+            Some("192.168.1.1"),
+            Some("cc:cc:cc:cc:cc:cc"),
+        ));
+        let fire = GwMacChange
+            .eval(&w)
+            .expect("a real change must still fire across the upgrade boundary");
+        assert!(fire.detail.contains("00:1e:06:ab:cd:ef"));
+        assert!(fire.detail.contains("cc:cc:cc:cc:cc:cc"));
     }
 
     #[test]
@@ -1850,7 +1910,7 @@ mod tests {
         w.push(link_router_mac(
             2,
             Some("10.0.0.1"),
-            Some("bb:bb:bb:bb:bb:bb"),
+            Some("cc:cc:cc:cc:cc:cc"),
         ));
         assert!(GwMacChange.eval(&w).is_none());
     }
@@ -1884,7 +1944,7 @@ mod tests {
         w.push(link_router_mac(
             10,
             Some("192.168.1.1"),
-            Some("bb:bb:bb:bb:bb:bb"),
+            Some("cc:cc:cc:cc:cc:cc"),
         ));
         assert!(GwMacChange.eval(&w).is_some());
     }
@@ -1905,13 +1965,13 @@ mod tests {
         w.push(link_router_mac(
             3,
             Some("192.168.1.1"),
-            Some("bb:bb:bb:bb:bb:bb"),
+            Some("cc:cc:cc:cc:cc:cc"),
         ));
         let fire = GwMacChange
             .eval(&w)
             .expect("a MAC change straddling an unreadable tick must still fire");
         assert!(fire.detail.contains("aa:aa:aa:aa:aa:aa"));
-        assert!(fire.detail.contains("bb:bb:bb:bb:bb:bb"));
+        assert!(fire.detail.contains("cc:cc:cc:cc:cc:cc"));
         assert!(
             fire.detail.contains("without an ARP entry"),
             "the comparison is not two consecutive measurements and must say so: {}",
@@ -1935,7 +1995,7 @@ mod tests {
         w.push(link_router_mac(
             10,
             Some("192.168.1.1"),
-            Some("bb:bb:bb:bb:bb:bb"),
+            Some("cc:cc:cc:cc:cc:cc"),
         ));
         let fire = GwMacChange.eval(&w).expect("must fire across a resume");
         assert!(
