@@ -40,8 +40,8 @@ use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
-    EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, Gated, GwChange, GwDrop, GwMacChange,
-    NeighborMacCollision, PerClientBlock, Starvation, Wedge,
+    BanCycle, EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, Gated, GwChange, GwDrop,
+    GwMacChange, NeighborMacCollision, PerClientBlock, Starvation, Wedge,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -97,6 +97,11 @@ const WEDGE_CONSECUTIVE: usize = 3;
 /// cohorts = 30s at the 15s proxy cadence — a single transition tick must not
 /// fire the fleet-wide signature.
 const ENDPOINT_BLOCK_CONSECUTIVE: usize = 2;
+
+/// Ban-cycle signal: this many gateway bans (`Fail` runs bounded by `Ok`) in
+/// the recent window read as one cycling incident with a period. Two bans are
+/// two outages; the third is the pattern.
+const BAN_CYCLE_MIN_BANS: usize = 3;
 
 /// Host load above which a dead tun counts as starvation (read from the `host`
 /// collector's newest sample by the `Starvation` condition), and above which
@@ -1408,7 +1413,7 @@ fn build_api_server(
 }
 
 /// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
-/// gw-mac-change, neighbor-mac-collision, per-client-block, fakeip,
+/// gw-mac-change, neighbor-mac-collision, per-client-block, ban-cycle, fakeip,
 /// fakeip-hijack, endpoint-block, established-stall, starvation). Every rule
 /// records an incident (durable, in DuckDB) and mirrors it into the live
 /// snapshot's ring for the socket API; gw-change and gw-mac-change
@@ -1485,6 +1490,22 @@ fn build_engine(
         Trigger::new(
             Box::new(Gated {
                 inner: PerClientBlock,
+                require_direct: false,
+                load_below: Some(STARVATION_LOAD),
+                settle_us: Some(SETTLE_US),
+            }),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        // No pcap freeze: the evidence is the recorded verdict sequence
+        // itself. No direct-path gate either — the pattern is measured
+        // THROUGH the dead gateways, so requiring a live uplink would
+        // suppress exactly what it looks for.
+        Trigger::new(
+            Box::new(Gated {
+                inner: BanCycle {
+                    min_bans: BAN_CYCLE_MIN_BANS,
+                },
                 require_direct: false,
                 load_below: Some(STARVATION_LOAD),
                 settle_us: Some(SETTLE_US),
@@ -2345,6 +2366,53 @@ mod tests {
             incidents_for(&fx.store, "per-client-block"),
             1,
             "a silent gateway with live neighbors must be recorded as per-client-block"
+        );
+    }
+
+    /// The `ban-cycle` rule the daemon actually runs counts to
+    /// [`BAN_CYCLE_MIN_BANS`] — three — gateway bans, no fewer. `gw-drop` and
+    /// `gw-change` fire on the same stream and are filtered out by
+    /// `incidents_for`. Dies under `BAN_CYCLE_MIN_BANS = 2` (the two-ban
+    /// stream fires, so the first assertion reds) and under a condition that
+    /// is written but never registered (the second never goes green).
+    #[test]
+    fn build_engine_registers_the_ban_cycle_rule() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(64);
+        // One ban round at the 15 s link cadence: admitted for two ticks,
+        // blocked for three, admitted for five.
+        let round = [
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Fail,
+            GwVerdict::Fail,
+            GwVerdict::Fail,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+        ];
+        for (tick, gw) in round.iter().chain(&round).copied().enumerate() {
+            feed(&mut fx.engine, &mut w, link(tick as i64 * 15_000_000, gw));
+        }
+        assert_eq!(
+            incidents_for(&fx.store, "ban-cycle"),
+            0,
+            "two bans are one short of BAN_CYCLE_MIN_BANS and must not fire"
+        );
+
+        for (tick, gw) in round.iter().copied().enumerate() {
+            feed(
+                &mut fx.engine,
+                &mut w,
+                link((20 + tick as i64) * 15_000_000, gw),
+            );
+        }
+        assert_eq!(
+            incidents_for(&fx.store, "ban-cycle"),
+            1,
+            "the third ban must be recorded as ban-cycle, once"
         );
     }
 
