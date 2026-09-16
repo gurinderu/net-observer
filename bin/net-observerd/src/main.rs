@@ -42,7 +42,7 @@ use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
     BanCycle, EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, Gated, GwChange, GwDrop,
-    GwMacChange, NeighborMacCollision, PerClientBlock, Starvation, Wedge,
+    GwMacChange, NeighborMacCollision, PerClientBlock, Roam, Starvation, Wedge,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -1475,6 +1475,16 @@ fn build_engine(
             BACKOFF_US,
         ),
         Trigger::new(Box::new(GwChange), gw_change_handlers, BACKOFF_US),
+        // A roam — a new BSSID at the same SSID, or a new interface MAC — is
+        // its own incident, not the `gw-drop`/`per-client-block` it used to
+        // masquerade as. Not gated: the settle window would suppress exactly
+        // this event. No pcap freeze: the evidence is the two identities in
+        // the record. (realm net-observer, node #59)
+        Trigger::new(
+            Box::new(Roam),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
         // The same gateway address answered by a new MAC freezes the ring like
         // any other gateway change: the frames around the swap are the evidence
         // that separates an ARP spoof from a silent move to another network.

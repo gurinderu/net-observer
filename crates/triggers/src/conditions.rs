@@ -170,7 +170,9 @@ impl<C: Condition> Condition for Gated<C> {
 }
 
 /// How far back `gw-change` looks for a comparable (non-`SKIP`) predecessor when
-/// the operator's quiet mode has suppressed the echo for a run of ticks.
+/// the operator's quiet mode has suppressed the echo for a run of ticks; the
+/// other change signatures (`gw-mac-change`, `roam`) reach back the same way
+/// past ticks that could not read their field.
 const GW_CHANGE_SCAN: usize = 64;
 
 /// Fires when the newest link sample's gateway verdict is `Fail` or `NoGw`.
@@ -297,6 +299,95 @@ impl Condition for GwMacChange {
         };
         Some(Fire {
             detail: format!("gateway {last_router} mac {prev_mac} -> {last_mac}{across}"),
+        })
+    }
+}
+
+/// The newest link sample older than the newest one in which `measured`
+/// holds, with the provenance of the answer: found inside `recent` (newest
+/// first, the newest itself at index 0) as a contiguous predecessor, else the
+/// basis carried across a pause — which must itself be measured. `None` when
+/// nothing measured precedes the newest sample. The predecessor scan
+/// `gw-change` and `gw-mac-change` each spell out inline, for a signature
+/// that needs it twice.
+fn measured_predecessor<'w>(
+    w: &'w RecentWindow,
+    recent: &[&'w LinkSample],
+    measured: impl Fn(&LinkSample) -> bool,
+) -> Option<(&'w LinkSample, LinkProvenance)> {
+    match recent.iter().skip(1).find(|l| measured(l)) {
+        Some(prev) => Some((prev, LinkProvenance::Contiguous)),
+        None => match w.prev_link_with_provenance()? {
+            (prev, _) if !measured(prev) => None,
+            (prev, provenance) => Some((prev, provenance)),
+        },
+    }
+}
+
+/// Fires when the link's own Wi-Fi identity moved between the newest link
+/// sample and its newest measured predecessor: the associated access point
+/// (`bssid`) changed while the SSID stayed the same — band steering, twin
+/// access points — or the interface's own MAC (`if_mac`) changed, which under
+/// Private Wi-Fi Address is a new DHCP identity toward the network. Either
+/// is a roam, and both on one tick are one roam whose detail names both. The
+/// masquerade this unmasks: a roam otherwise lands as `gw-drop` or
+/// `per-client-block` with the move itself readable nowhere. (realm
+/// net-observer, node #59)
+///
+/// Each field is compared against the newest OLDER sample in which that
+/// field is measured, so a tick that could not read the identity is
+/// transparent; `None` on either side is the absence of a measurement and
+/// never one half of a change. A BSSID change under a different SSID is a
+/// move to another network — `gw-change` territory — not a roam, and the
+/// SSID must be measured on both sides for "the same SSID" to be a fact. The
+/// ARP-resolved gateway MAC is never read here: it is stored raw and is not
+/// comparable to a normalised BSSID (node #94). Like `gw-change`, this
+/// asserts only on the tick where the newest sample differs from its
+/// predecessor, so the engine's clear edge closes the incident on the next
+/// unchanged tick; a comparison against the basis carried across a pause is
+/// labelled, so the incident never reads as two consecutive ticks.
+pub struct Roam;
+impl Condition for Roam {
+    fn id(&self) -> &'static str {
+        "roam"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_link()?;
+        let recent = w.recent_link(GW_CHANGE_SCAN);
+        let mut moves: Vec<String> = Vec::new();
+        let mut across_gap = false;
+        if let Some(new_ap) = last.bssid.as_deref()
+            && let Some(ssid) = last.ssid.as_deref()
+            && let Some((prev, provenance)) =
+                measured_predecessor(w, &recent, |l| l.bssid.is_some())
+            && let Some(old_ap) = prev.bssid.as_deref()
+            && old_ap != new_ap
+            && prev.ssid.as_deref() == Some(ssid)
+        {
+            moves.push(format!("BSSID {old_ap} -> {new_ap} at SSID {ssid}"));
+            across_gap |= provenance == LinkProvenance::AcrossGap;
+        }
+        if let Some(new_mac) = last.if_mac.as_deref()
+            && let Some((prev, provenance)) =
+                measured_predecessor(w, &recent, |l| l.if_mac.is_some())
+            && let Some(old_mac) = prev.if_mac.as_deref()
+            && old_mac != new_mac
+        {
+            moves.push(format!(
+                "interface MAC {old_mac} -> {new_mac} (new DHCP identity)"
+            ));
+            across_gap |= provenance == LinkProvenance::AcrossGap;
+        }
+        if moves.is_empty() {
+            return None;
+        }
+        let across = if across_gap {
+            " (across an observation gap)"
+        } else {
+            ""
+        };
+        Some(Fire {
+            detail: format!("roam: {}{across}", moves.join("; ")),
         })
     }
 }
@@ -1417,6 +1508,165 @@ mod tests {
             Some("bb:bb:bb:bb:bb:bb"),
         ));
         let fire = GwMacChange.eval(&w).expect("must fire across a resume");
+        assert!(
+            fire.detail.contains("across an observation gap"),
+            "a comparison across a pause must be attributable: {}",
+            fire.detail
+        );
+    }
+
+    /// A link sample carrying only what `Roam` reads: the Wi-Fi network name,
+    /// the associated access point and the interface's own MAC, each possibly
+    /// unmeasured. Gateway and direct are healthy, everything else absent.
+    fn link_identity(
+        ts: i64,
+        ssid: Option<&str>,
+        bssid: Option<&str>,
+        if_mac: Option<&str>,
+    ) -> Sample {
+        Sample::Link(LinkSample {
+            ts_us: ts,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: ssid.map(str::to_string),
+            bssid: bssid.map(str::to_string),
+            if_mac: if_mac.map(str::to_string),
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        })
+    }
+
+    const AP_A: &str = "aa:aa:aa:aa:aa:01";
+    const AP_B: &str = "aa:aa:aa:aa:aa:02";
+    const MAC_A: &str = "cc:cc:cc:cc:cc:01";
+    const MAC_B: &str = "cc:cc:cc:cc:cc:02";
+
+    /// Band steering / twin access points: the same SSID answered by a new
+    /// BSSID is a roam, and the detail names both access points and the SSID.
+    #[test]
+    fn roam_fires_when_the_bssid_moves_at_the_same_ssid() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        assert!(Roam.eval(&w).is_none(), "no predecessor yet");
+        w.push(link_identity(2, Some("Office"), Some(AP_B), Some(MAC_A)));
+        let fire = Roam
+            .eval(&w)
+            .expect("a new BSSID at the same SSID must fire");
+        assert_eq!(
+            fire.detail,
+            format!("roam: BSSID {AP_A} -> {AP_B} at SSID Office")
+        );
+    }
+
+    /// Private Wi-Fi Address rotating the interface's own MAC is a new DHCP
+    /// identity toward the network: a roam even with the access point unchanged.
+    #[test]
+    fn roam_fires_when_the_interface_mac_moves() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), Some(AP_A), Some(MAC_B)));
+        let fire = Roam.eval(&w).expect("a new interface MAC must fire");
+        assert_eq!(
+            fire.detail,
+            format!("roam: interface MAC {MAC_A} -> {MAC_B} (new DHCP identity)")
+        );
+    }
+
+    /// Both identities moving on one tick is one roam, and the one detail
+    /// names both moves.
+    #[test]
+    fn roam_names_both_moves_in_one_detail() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), Some(AP_B), Some(MAC_B)));
+        let fire = Roam.eval(&w).expect("both moves must fire once");
+        assert_eq!(
+            fire.detail,
+            format!(
+                "roam: BSSID {AP_A} -> {AP_B} at SSID Office; \
+interface MAC {MAC_A} -> {MAC_B} (new DHCP identity)"
+            )
+        );
+    }
+
+    /// A new BSSID under a new SSID is a move to another network — `gw-change`
+    /// territory — not a roam within one. Dies under a BSSID comparison that
+    /// ignores the SSID.
+    #[test]
+    fn roam_silent_when_the_ssid_changed_too() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Home"), Some(AP_B), Some(MAC_A)));
+        assert!(Roam.eval(&w).is_none());
+    }
+
+    /// `None` on either side is the absence of a measurement (not associated,
+    /// or not determinable this tick), never one half of a change.
+    #[test]
+    fn roam_silent_when_either_side_is_unmeasured() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), None, None));
+        w.push(link_identity(2, Some("Office"), Some(AP_A), Some(MAC_A)));
+        assert!(
+            Roam.eval(&w).is_none(),
+            "an unmeasured predecessor is no basis"
+        );
+        w.push(link_identity(3, Some("Office"), None, None));
+        assert!(
+            Roam.eval(&w).is_none(),
+            "an unmeasured newest tick is nothing to compare"
+        );
+    }
+
+    /// A tick that could not read the identity sits between the two readings
+    /// and is transparent: the comparison reaches back past it to the newest
+    /// measured predecessor, so the roam is not lost.
+    #[test]
+    fn roam_reaches_back_past_an_unmeasured_tick() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), None, None));
+        w.push(link_identity(3, Some("Office"), Some(AP_B), Some(MAC_A)));
+        let fire = Roam
+            .eval(&w)
+            .expect("a roam straddling an unmeasured tick must still fire");
+        assert!(fire.detail.contains(AP_A), "{}", fire.detail);
+        assert!(fire.detail.contains(AP_B), "{}", fire.detail);
+    }
+
+    /// The condition asserts only on the tick where the identity moved: the
+    /// next tick agrees with its predecessor, so the engine's clear edge can
+    /// close the incident.
+    #[test]
+    fn roam_clears_on_the_next_unchanged_tick() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), Some(AP_B), Some(MAC_B)));
+        assert!(Roam.eval(&w).is_some());
+        w.push(link_identity(3, Some("Office"), Some(AP_B), Some(MAC_B)));
+        assert!(Roam.eval(&w).is_none());
+    }
+
+    /// A roam during an operator pause is still a roam at resume: like
+    /// `gw-change`, the comparison falls back to the basis carried across the
+    /// clear, and the detail says the two readings are not consecutive ticks.
+    #[test]
+    fn roam_fires_across_a_resume_and_is_labelled() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.clear_for_resume();
+        w.push(link_identity(10, Some("Office"), Some(AP_B), Some(MAC_A)));
+        let fire = Roam
+            .eval(&w)
+            .expect("a roam during a pause must fire at resume");
         assert!(
             fire.detail.contains("across an observation gap"),
             "a comparison across a pause must be attributable: {}",
