@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::window::{LinkProvenance, RecentWindow};
-use types::{DnsVerdict, GwVerdict, LinkSample, NeighborsVerdict, TcpVerdict};
+use types::{DnsVerdict, GwVerdict, LinkMedium, LinkSample, NeighborsVerdict, TcpVerdict};
 
 /// How many recent DNS samples the `fakeip` condition scans (one polling tick
 /// emits several probe rows, so a small window covers the latest tick).
@@ -333,19 +333,27 @@ fn measured_predecessor<'w>(
     }
 }
 
-/// Whether a link sample was read on a Wi-Fi link: it carries a Wi-Fi
-/// identity, the associated BSSID or the SSID. The invariant the identity
-/// rules rest on: `LinkSample` has no interface name (a future field), and
-/// `if_mac` is the DEFAULT-ROUTE interface's MAC, so a dock or undock moves
-/// it between the wired and the Wi-Fi adapter. A tick with neither BSSID nor
-/// SSID is a wired or unknown medium and is transparent to `roam` and
-/// `wifi-churn`: its address is neither compared nor a comparison basis.
+/// Whether a link sample was read on a link whose medium was MEASURED as
+/// Wi-Fi (`LinkSample::medium`, from the hardware-port table). The invariant
+/// the identity rules rest on: `LinkSample` has no interface name (a future
+/// field), and `if_mac` is the DEFAULT-ROUTE interface's MAC, so a dock or
+/// undock moves it between the wired and the Wi-Fi adapter — the medium is
+/// what tells a roam from a dock. It is never inferred from a readable SSID
+/// or BSSID: the deployed daemon reads as root, where the SSID is
+/// `<redacted>` (realm net-observer, node #93) and the BSSID line is
+/// unproven (node #108), so readable names would make every Wi-Fi tick look
+/// wired and leave `roam` and `wifi-churn` inert. `None` — the medium not
+/// determinable — is the absence of a measurement on the medium itself
+/// (#25's second obligation: the field's absence is not the medium's
+/// absence), and such a tick is transparent to the address comparison like a
+/// wired one: neither compared nor a comparison basis.
 fn on_wifi(l: &LinkSample) -> bool {
-    l.bssid.is_some() || l.ssid.is_some()
+    l.medium == Some(LinkMedium::Wifi)
 }
 
-/// The link address of a Wi-Fi tick; `None` on a wired or unknown medium,
-/// where the address belongs to another adapter ([`on_wifi`]).
+/// The link address of a tick measured as Wi-Fi; `None` on a wired or
+/// undetermined medium, where the address may belong to another adapter
+/// ([`on_wifi`]).
 fn wifi_if_mac(l: &LinkSample) -> Option<&str> {
     if on_wifi(l) {
         l.if_mac.as_deref()
@@ -379,9 +387,10 @@ fn wifi_if_mac(l: &LinkSample) -> Option<&str> {
 /// Each field is compared against the newest OLDER sample in which that
 /// field is measured, so a tick that could not read the identity is
 /// transparent; `None` on either side is the absence of a measurement and
-/// never one half of a change. A tick with no Wi-Fi identity at all is a
-/// wired or unknown medium and is transparent to the address comparison
-/// ([`on_wifi`]): a dock or undock is not a roam. The ARP-resolved gateway
+/// never one half of a change. The address is compared only between ticks
+/// whose medium was MEASURED as Wi-Fi — a wired or undetermined medium is
+/// transparent to it ([`on_wifi`]): a dock or undock is not a roam, and an
+/// unmeasured medium is no basis. The ARP-resolved gateway
 /// MAC is never read here: it is stored raw and is not comparable to a
 /// normalised BSSID (node #94). Like `gw-change`, this asserts only on the
 /// tick where the newest sample differs from its predecessor, so the
@@ -526,9 +535,10 @@ fn identity_changes(
 /// (realm net-observer, node #109)
 ///
 /// A tick with a field unmeasured (`None`) is skipped in that field's
-/// comparison and never counted as a change (node #25); a tick with no Wi-Fi
-/// identity at all is a wired or unknown medium, and its address is neither
-/// counted nor a comparison basis ([`on_wifi`]). A tick where both fields
+/// comparison and never counted as a change (node #25); the address is
+/// counted only between ticks whose medium was MEASURED as Wi-Fi, so a
+/// wired or undetermined tick is neither counted nor a comparison basis
+/// ([`on_wifi`]). A tick where both fields
 /// moved is one change; the per-field counts in the detail say which moved.
 /// The detail is written when the incident opens, so its counts and span are
 /// those of the first firing.
@@ -1022,8 +1032,9 @@ mod tests {
     use super::*;
     use crate::window::{RecentWindow, WINDOW_CAP};
     use types::{
-        DnsSample, DnsVerdict, GwVerdict, HostSample, LinkSample, NeighborObs, NeighborRole,
-        NeighborSource, NeighborsSample, NeighborsVerdict, ProxySample, Sample, TcpVerdict,
+        DnsSample, DnsVerdict, GwVerdict, HostSample, LinkMedium, LinkSample, NeighborObs,
+        NeighborRole, NeighborSource, NeighborsSample, NeighborsVerdict, ProxySample, Sample,
+        TcpVerdict,
     };
 
     fn dns(ts: i64, probe: &str, verdict: DnsVerdict, ip: Option<&str>) -> Sample {
@@ -1760,11 +1771,13 @@ mod tests {
         );
     }
 
-    /// A link sample carrying only what `Roam` reads: the Wi-Fi network name,
-    /// the associated access point and the interface's own MAC, each possibly
-    /// unmeasured. Gateway and direct are healthy, everything else absent.
-    fn link_identity(
+    /// A link sample carrying only what `Roam` reads: the measured medium of
+    /// the default-route interface, the Wi-Fi network name, the associated
+    /// access point and the interface's own MAC, each possibly unmeasured.
+    /// Gateway and direct are healthy, everything else absent.
+    fn link_on(
         ts: i64,
+        medium: Option<LinkMedium>,
         ssid: Option<&str>,
         bssid: Option<&str>,
         if_mac: Option<&str>,
@@ -1781,13 +1794,30 @@ mod tests {
             ssid: ssid.map(str::to_string),
             bssid: bssid.map(str::to_string),
             if_mac: if_mac.map(str::to_string),
-            medium: None,
+            medium,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
             fakeip_route_if: None,
             singbox_tun_if: None,
         })
+    }
+
+    /// [`link_on`] a link whose medium was measured as Wi-Fi — what every
+    /// identity reading in these tests is unless it says otherwise.
+    fn link_identity(
+        ts: i64,
+        ssid: Option<&str>,
+        bssid: Option<&str>,
+        if_mac: Option<&str>,
+    ) -> Sample {
+        link_on(ts, Some(LinkMedium::Wifi), ssid, bssid, if_mac)
+    }
+
+    /// [`link_on`] a link whose medium was measured as wired: no Wi-Fi
+    /// identity, the wired adapter's own address as `if_mac`.
+    fn link_wired(ts: i64, if_mac: &str) -> Sample {
+        link_on(ts, Some(LinkMedium::Wired), None, None, Some(if_mac))
     }
 
     const AP_A: &str = "aa:aa:aa:aa:aa:01";
@@ -1937,15 +1967,15 @@ link address {MAC_A} -> {MAC_B} (new DHCP identity)"
 
     /// `if_mac` is the default-route interface's MAC and the sample carries
     /// no interface name, so a dock or undock moves it between the wired and
-    /// the Wi-Fi adapter. A tick with neither BSSID nor SSID is a wired or
-    /// unknown medium and is transparent: a wired hop is no roam, and the
-    /// Wi-Fi identity on either side of it compares against itself. Dies
-    /// under an `if_mac` comparison that ignores the medium.
+    /// the Wi-Fi adapter. A tick whose medium was measured as wired is
+    /// transparent: a wired hop is no roam, and the Wi-Fi identity on either
+    /// side of it compares against itself. Dies under an `if_mac` comparison
+    /// that ignores the medium.
     #[test]
     fn roam_ignores_a_wired_hop() {
         let mut w = RecentWindow::new(8);
-        w.push(link_identity(1, None, None, Some(MAC_A)));
-        w.push(link_identity(2, None, None, Some(MAC_B)));
+        w.push(link_wired(1, MAC_A));
+        w.push(link_wired(2, MAC_B));
         assert!(
             Roam.eval(&w).is_none(),
             "a new address on a wired link is not a roam"
@@ -1957,12 +1987,61 @@ link address {MAC_A} -> {MAC_B} (new DHCP identity)"
             Roam.eval(&w).is_none(),
             "the first Wi-Fi tick has no Wi-Fi predecessor and is no roam"
         );
-        w.push(link_identity(4, None, None, Some(MAC_B)));
+        w.push(link_wired(4, MAC_B));
         assert!(Roam.eval(&w).is_none(), "docking is not a roam");
         w.push(link_identity(5, Some("Office"), Some(AP_A), Some(MAC_A)));
         assert!(
             Roam.eval(&w).is_none(),
             "undocking onto the same Wi-Fi identity is not a roam"
+        );
+    }
+
+    /// The medium is judged from the measurement, never from whether a Wi-Fi
+    /// name was readable: a Wi-Fi tick whose SSID and BSSID are both
+    /// unreadable — the root reader's view (nodes #93, #108) — still
+    /// compares its address, so a per-SSID address rotation fires as a roam
+    /// with nothing else observable. Dies under a medium inferred from
+    /// `bssid`/`ssid`, which made the rule inert on the deployed daemon.
+    #[test]
+    fn roam_fires_on_a_root_shaped_address_hop() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, None, None, Some(MAC_A)));
+        w.push(link_identity(2, None, None, Some(MAC_B)));
+        let fire = Roam
+            .eval(&w)
+            .expect("an address hop on a measured Wi-Fi link fires without names");
+        assert_eq!(
+            fire.detail,
+            format!("roam: link address {MAC_A} -> {MAC_B} (new DHCP identity)")
+        );
+    }
+
+    /// `medium = None` is the absence of a measurement on the medium itself
+    /// — #25's second obligation: the field's absence is not the medium's
+    /// absence, and an address whose medium is unknown on either side is
+    /// neither compared nor a comparison basis. The BSSID branch, which
+    /// carries its medium in the reading itself, is unaffected.
+    #[test]
+    fn roam_does_not_compare_the_address_across_an_unmeasured_medium() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_on(1, None, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), Some(AP_A), Some(MAC_B)));
+        assert!(
+            Roam.eval(&w).is_none(),
+            "a predecessor of unknown medium is no basis for the address"
+        );
+        w.push(link_on(3, None, Some("Office"), Some(AP_A), Some(MAC_A)));
+        assert!(
+            Roam.eval(&w).is_none(),
+            "a newest tick of unknown medium does not compare its address"
+        );
+        w.push(link_on(4, None, Some("Office"), Some(AP_B), Some(MAC_A)));
+        let fire = Roam
+            .eval(&w)
+            .expect("the BSSID branch does not need the medium");
+        assert_eq!(
+            fire.detail,
+            format!("roam: BSSID {AP_A} -> {AP_B}; link address unmeasured")
         );
     }
 
@@ -2108,10 +2187,10 @@ link address {MAC_A} -> {MAC_B} (new DHCP identity)"
         );
     }
 
-    /// A tick with neither BSSID nor SSID is a wired or unknown medium: its
-    /// `if_mac` is the wired adapter's, and docking and undocking must not
-    /// count as identity changes. Six dock/undock cycles in a quarter hour
-    /// are no churn. Dies under an `if_mac` count that ignores the medium.
+    /// A tick whose medium was measured as wired carries the wired adapter's
+    /// `if_mac`, and docking and undocking must not count as identity changes.
+    /// Six dock/undock cycles in a quarter hour are no churn. Dies under an
+    /// `if_mac` count that ignores the medium.
     #[test]
     fn wifi_churn_ignores_wired_ticks() {
         let mut w = RecentWindow::new(WINDOW_CAP);
@@ -2125,10 +2204,10 @@ link address {MAC_A} -> {MAC_B} (new DHCP identity)"
         assert!(WifiChurn.eval(&w).is_none());
     }
 
-    /// One wired reading at 15 s tick `tick`: no Wi-Fi identity, the wired
-    /// adapter's own address as `if_mac`.
+    /// One reading at 15 s tick `tick` on a link measured as wired: no Wi-Fi
+    /// identity, the wired adapter's own address as `if_mac`.
     fn push_identity_wired(w: &mut RecentWindow, tick: i64, if_mac: &str) {
-        w.push(link_identity(tick * TICK_US, None, None, Some(if_mac)));
+        w.push(link_wired(tick * TICK_US, if_mac));
     }
 
     /// Four changes spread over 20 min are not the pattern: only the changes
@@ -2213,6 +2292,66 @@ link address {MAC_A} -> {MAC_B} (new DHCP identity)"
             assert_eq!(
                 fire.detail,
                 format!("roam: BSSID {old_ap} -> {ap}, SSID {old_ssid} -> {ssid}; {address}"),
+                "tick {tick}"
+            );
+        }
+    }
+
+    /// The same episode as the deployed root daemon sees it (nodes #93,
+    /// #108): the SSID reads `<redacted>` and is recorded as `None`, the
+    /// BSSID line is unproven and `None`, and only the measured medium says
+    /// the link is Wi-Fi. Regime A's per-SSID address rotation is then the
+    /// whole observable signal: every hop fires `roam` in the harmful class
+    /// and `wifi-churn` counts the four address changes; regime B's aligned
+    /// address leaves nothing observable, and the churn ages out. Dies under
+    /// a medium inferred from readable names, which made both rules inert
+    /// exactly here.
+    #[test]
+    fn twin_ssid_episode_as_root_replays_the_address_hops() {
+        const HOP_TICKS: i64 = 12;
+        const REGIME_B_FROM: i64 = 60;
+        let mac_at = |tick: i64| {
+            let on_6g = (tick / HOP_TICKS) % 2 == 1;
+            if tick < REGIME_B_FROM && on_6g {
+                MAC_B
+            } else {
+                MAC_A
+            }
+        };
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        for tick in 0..=96 {
+            let mac = mac_at(tick);
+            w.push(link_identity(tick * TICK_US, None, None, Some(mac)));
+            let churn = WifiChurn.eval(&w);
+            match tick {
+                47 => assert!(churn.is_none(), "three address hops are not churn"),
+                48 => assert_eq!(
+                    churn
+                        .expect("the fourth address hop completes the churn")
+                        .detail,
+                    "wifi identity churn: 4 changes in ~540s (bssid: 0, link address: 4)"
+                ),
+                96 => assert!(
+                    churn.is_none(),
+                    "with the address aligned, the changes age out of the horizon"
+                ),
+                _ => {}
+            }
+            let roam = Roam.eval(&w);
+            if tick == 0 || tick % HOP_TICKS != 0 || tick >= REGIME_B_FROM {
+                assert!(
+                    roam.is_none(),
+                    "tick {tick}: nothing observable moved for a root reader"
+                );
+                continue;
+            }
+            let fire = roam.unwrap_or_else(|| panic!("tick {tick}: an address hop must fire"));
+            assert_eq!(
+                fire.detail,
+                format!(
+                    "roam: link address {} -> {mac} (new DHCP identity)",
+                    mac_at(tick - 1)
+                ),
                 "tick {tick}"
             );
         }
