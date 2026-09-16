@@ -87,14 +87,14 @@ enum Command {
     },
     /// Ask the running daemon to restart the sing-box proxy service
     /// (`launchctl kickstart`), sent as a `Control(KickstartProxy)` request over
-    /// the socket. The daemon runs it as root **only** when `acting.enabled` is
-    /// set in its config; otherwise it refuses the request without acting. Exits
-    /// non-zero if the action was refused/failed or the daemon is unreachable.
+    /// the socket. The daemon runs it as root for any authorised peer; nothing
+    /// in its config has to be switched on. Exits non-zero if the action was
+    /// refused/failed or the daemon is unreachable.
     Kickstart,
     /// Turn the observer's own collection on or off (pause/resume), sent as a
     /// `Control(SetObserving)` request over the socket. This controls the
     /// daemon's OWN observation only — it does **not** touch sing-box or the
-    /// network, and is **not** gated by `acting.enabled` (benign self-control).
+    /// network (benign self-control).
     /// The daemon stays alive and the socket keeps serving while paused, so the
     /// switch can be turned back on. Exits non-zero if the request failed or the
     /// daemon is unreachable.
@@ -108,28 +108,27 @@ enum Command {
     /// `Control(ScanNeighbors)` request over the socket.
     ///
     /// Unlike the passive `neighbors` collector, this **speaks on the network**
-    /// — it addresses every host of the subnet — so it is acting-class and the
-    /// daemon refuses it unless `acting.enabled` is set. Every run that does
-    /// happen leaves a `neighbor_scan` row saying what was probed. Exits
-    /// non-zero if the scan was refused/failed or the daemon is unreachable.
+    /// — it addresses every host of the subnet. Nothing in the daemon's config
+    /// has to permit it: the command is the sanction, and every run leaves a
+    /// `neighbor_scan` row saying what was probed. The daemon refuses it only
+    /// while paused or quiet. Exits non-zero if the scan was refused/failed or
+    /// the daemon is unreachable.
     ScanNeighbors {
-        /// Also TCP-connect-scan discovered neighbours' common ports. Only runs
-        /// if `collectors.neighbors.scan.ports` permits it in the daemon config;
-        /// otherwise the daemon drops it and says so. Off unless given.
+        /// Also TCP-connect-scan discovered neighbours' common ports. Off unless
+        /// given.
         #[arg(long)]
         ports: bool,
         /// Also grab the banner each open port volunteers. Needs `--ports` (a
-        /// banner grab reads from an open port) and the daemon's
-        /// `collectors.neighbors.scan.banners` permission; without an effective
-        /// port scan the daemon drops it and says so. Off unless given.
+        /// banner grab reads from an open port); without an effective port scan
+        /// the daemon drops it and says so. Off unless given.
         #[arg(long)]
         banners: bool,
         /// Also match the grabbed banners against the daemon's local CVE
-        /// snapshot. Needs `--banners` (a match parses a banner), the daemon's
-        /// `collectors.neighbors.scan.cve` permission, and a provisioned
-        /// `collectors.neighbors.cve_snapshot_dir`; without all three the daemon
-        /// drops it and says so. Each stored match is a hypothesis, not a fact.
-        /// Off unless given. Read the findings back offline with `vulns`.
+        /// snapshot. Needs `--banners` (a match parses a banner) and a
+        /// provisioned `collectors.neighbors.cve_snapshot_dir` in the daemon's
+        /// config; without both the daemon drops it and says so. Each stored
+        /// match is a hypothesis, not a fact. Off unless given. Read the
+        /// findings back offline with `vulns`.
         #[arg(long)]
         cve: bool,
     },
@@ -338,8 +337,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             let cfg = load_config(cli)?;
             let result = fetch_kickstart(&cfg.socket_path)?;
             print!("{}", format_control(&result));
-            // A refusal (acting disabled) or a failed action is a non-zero exit,
-            // even though the request itself round-tripped fine.
+            // A refusal (unauthorised peer) or a failed action is a non-zero
+            // exit, even though the request itself round-tripped fine.
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
@@ -670,8 +669,8 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// Ask the daemon to restart the sing-box proxy over the socket
 /// (`Control(KickstartProxy)`) and return its [`ControlResult`]. A daemon-down /
 /// absent socket becomes a clear `Err` (handled by [`daemon_query`]); the daemon
-/// itself decides whether to act (gated by `acting.enabled`) and reports the
-/// outcome in the result. Never panics.
+/// itself authorises the peer, runs the action and reports the outcome in the
+/// result. Never panics.
 fn fetch_kickstart(socket_path: &str) -> Result<ControlResult> {
     match daemon_query(socket_path, &Request::Control(ControlCmd::KickstartProxy))? {
         Response::Control(result) => Ok(result),
@@ -683,9 +682,8 @@ fn fetch_kickstart(socket_path: &str) -> Result<ControlResult> {
 /// Ask the daemon to turn its own observation on/off over the socket
 /// (`Control(SetObserving)`) and return its [`ControlResult`]. This is benign
 /// self-control (pause/resume the daemon's OWN collection) — it does not touch
-/// sing-box or the network and is not gated by `acting.enabled`. A daemon-down /
-/// absent socket becomes a clear `Err` (handled by [`daemon_query`]). Never
-/// panics.
+/// sing-box or the network. A daemon-down / absent socket becomes a clear `Err`
+/// (handled by [`daemon_query`]). Never panics.
 fn fetch_set_observing(socket_path: &str, observing: bool) -> Result<ControlResult> {
     match daemon_query(
         socket_path,
@@ -710,8 +708,9 @@ fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlR
 }
 
 /// Render a [`ControlResult`] as a single status line: `ok: <message>` when the
-/// action ran, `failed: <message>` when it was refused (acting disabled) or the
-/// action itself failed. Pure over its input so it is unit-tested directly.
+/// action ran, `failed: <message>` when it was refused (unauthorised peer, a
+/// state it contradicts, a missing dependency) or the action itself failed.
+/// Pure over its input so it is unit-tested directly.
 fn format_control(result: &ControlResult) -> String {
     let tag = if result.ok { "ok" } else { "failed" };
     format!("{tag}: {}\n", result.message)
@@ -1065,12 +1064,15 @@ mod tests {
 
     #[test]
     fn format_control_refused_reports_failure() {
-        // The daemon refuses when acting is disabled (the safe default).
+        // The daemon refuses a peer it does not authorise.
         let out = format_control(&ControlResult {
             ok: false,
-            message: "acting disabled".into(),
+            message: "control refused: peer credentials unavailable".into(),
         });
-        assert_eq!(out, "failed: acting disabled\n");
+        assert_eq!(
+            out,
+            "failed: control refused: peer credentials unavailable\n"
+        );
     }
 
     #[test]

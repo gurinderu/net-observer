@@ -309,65 +309,13 @@ fn authorize_control(
     }
 }
 
-/// The authority class a [`ControlCmd`] requires — the ONE place a command's
-/// gating class is decided.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ControlAuthority {
-    /// Benign self-control: an authorised peer, and nothing else. No external
-    /// effect, so `acting.enabled` does not apply.
-    SelfControl,
-    /// Runs an external actuator as root: an authorised peer AND
-    /// `acting.enabled`.
-    Acting,
-}
-
-impl ControlAuthority {
-    /// The class of `cmd`.
-    ///
-    /// **Exhaustive on purpose.** `ControlCmd` is deliberately not
-    /// `#[non_exhaustive]`, so adding a third command fails to compile here
-    /// until someone decides its class — no command can inherit the weaker gate
-    /// by omission. Orthogonal to peer authorisation, which every control
-    /// request passes before this function is ever reached.
-    pub(crate) fn of(cmd: &ControlCmd) -> Self {
-        match cmd {
-            ControlCmd::SetObserving(_) => Self::SelfControl,
-            // Copying the daemon's OWN pcap ring into the daemon's OWN blob
-            // directory sends nothing and starts nothing: same class as a pause.
-            ControlCmd::FreezePcap => Self::SelfControl,
-            // Quiet only suppresses a probe this daemon would otherwise emit.
-            ControlCmd::SetQuiet(_) => Self::SelfControl,
-            ControlCmd::KickstartProxy => Self::Acting,
-            // A sweep addresses every host on the segment and an mDNS browse
-            // speaks to a multicast group: this is the daemon talking to
-            // machines that are not its own, so it takes the stronger gate even
-            // though it changes nothing.
-            ControlCmd::ScanNeighbors(_) => Self::Acting,
-            // Reading the operating system's report about the daemon's OWN radio
-            // originates nothing on the air — no probe request of this daemon's
-            // making, no host addressed. Same class as a pause or a freeze, and
-            // deliberately NOT the class `ScanNeighbors` takes: what separates
-            // them is whether the daemon speaks to machines that are not this
-            // one (realm net-observer, node #47).
-            ControlCmd::ScanAir => Self::SelfControl,
-        }
-    }
-}
-
-/// The acting (write/control) configuration handed to the socket server.
-///
-/// Safety invariant: `enabled` is off by default; with `enabled = false` every
-/// *acting-class* control request (`ControlCmd::KickstartProxy`) is refused
-/// *without running anything*. Benign self-control (`ControlCmd::SetObserving`)
-/// is deliberately not gated by this switch — but it, like every control
-/// request, must still pass the peer-credential gate ([`ControlPolicy`]). The
-/// two are orthogonal: peer credentials answer "may this uid command the daemon
-/// at all", `acting.enabled` answers "may the daemon touch the outside world".
+/// Parameters of the manual actions handed to the socket server. Gates nothing:
+/// config may switch off what the daemon does by itself, never a command the
+/// operator sends by hand — the invocation is the sanction (realm net-observer,
+/// node #91). The one gate on the control path is the peer-credential check
+/// ([`ControlPolicy`]), applied to every `Request::Control` before dispatch.
 #[derive(Debug, Clone)]
 pub struct ActingConfig {
-    /// Master switch for the acting class of the control path
-    /// (`config.acting.enabled`).
-    pub enabled: bool,
     /// The `launchctl` service target for `ControlCmd::KickstartProxy`.
     pub singbox_service: String,
 }
@@ -411,9 +359,6 @@ pub struct ApiServer {
     /// The on-demand air scanner, when the platform has one. `None` makes
     /// `ScanAir` a refusal with a message, never a silent success.
     pub air_scanner: Option<Arc<dyn AirScanner>>,
-    /// What the active scan is PERMITTED to do, from config. A run's requested
-    /// options are intersected with this ceiling; every field is off by default.
-    pub scan_permission: ScanOptions,
     /// The configured CVE snapshot directory, when one is set. The `cve` rung is
     /// UNAVAILABLE unless this is `Some` AND the directory exists — checked at
     /// scan time so a snapshot removed after boot is honestly reported as
@@ -448,10 +393,10 @@ impl ApiServer {
     /// optionally `chown` it to `socket_owner_uid`, and serve [`Request`]s from
     /// the shared snapshot until the task is aborted.
     ///
-    /// `acting` gates the *acting class* of the control path (e.g.
-    /// `KickstartProxy`); the peer-credential [`ControlPolicy`] gates the whole
-    /// of it. Only this daemon runs the actuator, and only on an explicit
-    /// request — never automatically.
+    /// The peer-credential [`ControlPolicy`] gates the whole of the control
+    /// path; `acting` only names the service `KickstartProxy` targets. Only this
+    /// daemon runs the actuator, and only on an explicit request — never
+    /// automatically.
     ///
     /// A one-shot request (`Status`, `Incidents`, `Control`) is answered with a
     /// single [`Response`] then the connection closes; a [`Request::Subscribe`]
@@ -475,8 +420,8 @@ impl ApiServer {
             std::fs::Permissions::from_mode(self.socket_mode),
         )?;
         // Socket hardening for the control path: when an owner uid is configured,
-        // chown the socket to it (operators pair this with mode 0600 when enabling
-        // acting so only the owner can send privileged commands). Best-effort: a
+        // chown the socket to it (operators pair this with mode 0600 so only the
+        // owner can even connect to the control endpoint). Best-effort: a
         // chown failure is logged but never takes the daemon down. Note this is
         // belt-and-braces only — authorisation itself is the peer-credential
         // check in `control_request`, not the socket mode.
@@ -491,7 +436,6 @@ impl ApiServer {
         tracing::info!(
             path = %self.socket_path,
             mode = format!("{:o}", self.socket_mode),
-            acting = self.acting.enabled,
             max_subscribers = self.max_subscribers,
             "status socket listening"
         );
@@ -677,7 +621,6 @@ async fn handle_conn(
                 freezer: &srv.freezer,
                 scanner: srv.scanner.as_deref(),
                 air_scanner: srv.air_scanner.as_deref(),
-                scan_permission: &srv.scan_permission,
                 scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
                 blob_dir: &srv.blob_dir,
                 resume_at_us: &srv.resume_at_us,
@@ -894,8 +837,6 @@ pub(crate) struct ControlCtx<'a> {
     pub scanner: Option<&'a dyn NeighborScanner>,
     /// The on-demand air scanner, when the platform has one.
     pub air_scanner: Option<&'a dyn AirScanner>,
-    /// The config permission ceiling for the active scan.
-    pub scan_permission: &'a ScanOptions,
     /// The configured CVE snapshot directory, when one is set (see the field of
     /// the same name on the server). Checked for existence at scan time.
     pub scan_cve_snapshot: Option<&'a Path>,
@@ -940,33 +881,17 @@ pub(crate) fn control_request(
 /// Dispatch an ALREADY-AUTHORISED command. Private, and requires a
 /// [`PeerAuthorized`], so "dispatch without a peer check" is unrepresentable.
 ///
-/// Two classes of command with different gating, decided once by
-/// [`ControlAuthority::of`]:
-///
-/// - **`SetObserving(b)` — benign self-control, NOT gated by `acting.enabled`.**
-///   It flips the observer's OWN collection on/off and, on a real edge, records
-///   the boundary in both sinks (durable row + realtime frame). It never touches
-///   sing-box or the network, so the acting gate does not apply — a client can
-///   pause/resume collection even with acting disabled.
-///
-/// - **Acting-class commands (e.g. `KickstartProxy`) — gated by
-///   `acting.enabled`.** Safety invariant: when acting is disabled the command is
-///   refused *without running anything* — no `launchctl` (or any other actuator)
-///   is ever invoked.
+/// No config gate sits here: the peer check in [`control_request`] is the one
+/// gate on the control path, because config may switch off what the daemon does
+/// by itself, never a command the operator sends by hand — the invocation is the
+/// sanction (realm net-observer, node #91). What an arm can still refuse is a
+/// contradiction of the daemon's own state (a scan while paused or quiet) or a
+/// missing dependency (no ring, no scanner, no snapshot) — each with a reason.
 fn control_response(
     cmd: ControlCmd,
     authorized: PeerAuthorized,
     cx: &ControlCtx<'_>,
 ) -> ControlResult {
-    // The acting gate is derived from ONE exhaustive classification of the
-    // command set, not from a per-arm decision, so a third command cannot pick a
-    // weaker gate. Peer authorisation already happened in `control_request`.
-    if ControlAuthority::of(&cmd) == ControlAuthority::Acting && !cx.acting.enabled {
-        return ControlResult {
-            ok: false,
-            message: "acting disabled".into(),
-        };
-    }
     match cmd {
         ControlCmd::SetObserving(b) => {
             // Flag + snapshot mirror under one lock: the snapshot mutex is the
@@ -1125,46 +1050,36 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
             message: "neighbour scanning not available".to_string(),
         };
     };
-    // A run does a rung only when it is BOTH requested and permitted. A
-    // requested-but-unpermitted rung is dropped, and the operator is told —
-    // never silently, never by running it anyway.
-    let ports = requested.ports && cx.scan_permission.ports;
+    // Every requested rung runs — no config permission sits between the
+    // operator's request and the scanner (realm net-observer, node #91). What
+    // can still drop a rung is a DEPENDENCY it cannot do without, and then the
+    // operator is told — never silently, never by running it anyway.
+    let ports = requested.ports;
     // A banner grab needs an open port to read from, so it is effective only
-    // when it is requested, permitted, AND the `ports` rung itself is effective.
-    let banners = requested.banners && cx.scan_permission.banners && ports;
+    // when the `ports` rung itself is effective.
+    let banners = requested.banners && ports;
     // The snapshot is available only when a directory is configured AND present:
     // a path removed after boot is honestly reported as dropped, never faked.
     let snapshot_available = cx.scan_cve_snapshot.is_some_and(|p| p.is_dir());
     // The `cve` rung matches banners against the snapshot: effective only when
-    // requested, permitted, the `banners` rung is itself effective (a match
-    // parses a banner), AND a snapshot is present to match against.
-    let cve = requested.cve && cx.scan_permission.cve && banners && snapshot_available;
+    // the `banners` rung is itself effective (a match parses a banner) AND a
+    // snapshot is present to match against.
+    let cve = requested.cve && banners && snapshot_available;
     let effective = ScanOptions {
         ports,
         banners,
         cve,
     };
     let mut dropped = Vec::new();
-    if requested.ports && !cx.scan_permission.ports {
-        dropped.push("ports (not permitted; enable collectors.neighbors.scan.ports)".to_string());
-    }
     if requested.banners && !banners {
-        // Say WHY it was dropped: no permission, or no effective port scan to
-        // grab from. Both are honest refusals the operator should see.
-        let why = if !cx.scan_permission.banners {
-            "not permitted; enable collectors.neighbors.scan.banners"
-        } else {
-            "needs the ports rung, which is not effective this run"
-        };
-        dropped.push(format!("banners ({why})"));
+        // Say WHY it was dropped: no effective port scan to grab from.
+        dropped.push("banners (needs the ports rung, which is not effective this run)".to_string());
     }
     if requested.cve && !cve {
-        // Say WHY, in the order the rung depends on things: permission, then an
-        // effective banner grab to parse, then a provisioned snapshot to match
-        // against. Each is an honest refusal, never a silent skip.
-        let why = if !cx.scan_permission.cve {
-            "not permitted; enable collectors.neighbors.scan.cve"
-        } else if !banners {
+        // Say WHY, in the order the rung depends on things: an effective banner
+        // grab to parse, then a provisioned snapshot to match against. Each is
+        // an honest refusal, never a silent skip.
+        let why = if !banners {
             "needs the banners rung, which is not effective this run"
         } else {
             "no CVE snapshot; set collectors.neighbors.cve_snapshot_dir to a provisioned directory"
@@ -1260,11 +1175,10 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
 
 /// Read the radio environment once on operator demand.
 ///
-/// Self-control, not acting: the daemon asks the OS for its own radio's report
-/// and puts nothing on the air (realm net-observer, node #47). So there is no
-/// `acting.enabled` gate here and — unlike [`scan_now`] — no `quiet` refusal
-/// either: quiet means this daemon addresses no packet at the gateway, and a
-/// reading that transmits nothing does not contradict it.
+/// The daemon asks the OS for its own radio's report and puts nothing on the
+/// air (realm net-observer, node #47). So — unlike [`scan_now`] — there is no
+/// `quiet` refusal here: quiet means this daemon addresses no packet at the
+/// gateway, and a reading that transmits nothing does not contradict it.
 ///
 /// A PAUSE still refuses, for the reason it refuses a neighbour scan: the pause
 /// is bracketed silence, and a sample stamped inside that bracket would make the
@@ -1469,9 +1383,8 @@ mod tests {
         }
     }
 
-    fn test_acting(enabled: bool) -> ActingConfig {
+    fn test_acting() -> ActingConfig {
         ActingConfig {
-            enabled,
             singbox_service: "system/sing-box".into(),
         }
     }
@@ -1507,7 +1420,6 @@ mod tests {
             freezer: Arc::new(PcapRingSlot::empty()),
             scanner: None,
             air_scanner: None,
-            scan_permission: ScanOptions::default(),
             scan_cve_snapshot: None,
             blob_dir: std::env::temp_dir().join("net-observerd-test-blobs"),
             resume_at_us: Arc::new(AtomicI64::new(0)),
@@ -1530,7 +1442,6 @@ mod tests {
             freezer: &srv.freezer,
             scanner: srv.scanner.as_deref(),
             air_scanner: srv.air_scanner.as_deref(),
-            scan_permission: &srv.scan_permission,
             scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
             blob_dir: &srv.blob_dir,
             resume_at_us: &srv.resume_at_us,
@@ -1563,34 +1474,11 @@ mod tests {
         asked
     }
 
-    /// The classification decision, asserted as a decision.
-    ///
-    /// Reading the OS's report about this daemon's OWN radio originates nothing
-    /// on the air, so it takes the same class as a pause or a pcap freeze — NOT
-    /// the class the neighbour sweep takes, which addresses machines that are not
-    /// this one. If this ever flips, the button silently stops working on every
-    /// default config, which is the failure this test exists to catch.
+    /// An authorised press reaches the scanner on a default server: nothing in
+    /// config sits between the operator's command and the radio read.
     #[test]
-    fn scanning_the_air_is_self_control_not_acting() {
-        assert_eq!(
-            ControlAuthority::of(&ControlCmd::ScanAir),
-            ControlAuthority::SelfControl
-        );
-        assert_eq!(
-            ControlAuthority::of(&ControlCmd::ScanNeighbors(ScanOptions::default())),
-            ControlAuthority::Acting
-        );
-    }
-
-    /// ...and the classification has teeth: with acting DISABLED (the default),
-    /// the command still reaches the scanner.
-    #[test]
-    fn an_air_scan_runs_with_acting_disabled() {
-        let mut srv = test_server(
-            "/tmp/unused-air-1.sock",
-            test_acting(false),
-            TEST_DAEMON_UID,
-        );
+    fn an_air_scan_reaches_the_scanner() {
+        let mut srv = test_server("/tmp/unused-air-1.sock", test_acting(), TEST_DAEMON_UID);
         let asked = with_air(&mut srv, AirScanRequest::Started);
         let cx = test_ctx(&srv);
         let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
@@ -1603,7 +1491,7 @@ mod tests {
     /// neighbour sweep, which quiet must refuse.
     #[test]
     fn quiet_does_not_refuse_an_air_scan() {
-        let mut srv = test_server("/tmp/unused-air-2.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut srv = test_server("/tmp/unused-air-2.sock", test_acting(), TEST_DAEMON_UID);
         let asked = with_air(&mut srv, AirScanRequest::Started);
         srv.quiet.store(true, Ordering::Release);
         let cx = test_ctx(&srv);
@@ -1617,7 +1505,7 @@ mod tests {
     /// disagree about the same seconds. Nothing is asked of the radio.
     #[test]
     fn a_paused_daemon_refuses_an_air_scan_without_touching_the_radio() {
-        let mut srv = test_server("/tmp/unused-air-3.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut srv = test_server("/tmp/unused-air-3.sock", test_acting(), TEST_DAEMON_UID);
         let asked = with_air(&mut srv, AirScanRequest::Started);
         srv.observing.store(false, Ordering::Release);
         let cx = test_ctx(&srv);
@@ -1635,7 +1523,7 @@ mod tests {
             (AirScanRequest::AlreadyRunning, "already running"),
             (AirScanRequest::TooSoon { retry_in_s: 9 }, "9s"),
         ] {
-            let mut srv = test_server("/tmp/unused-air-4.sock", test_acting(true), TEST_DAEMON_UID);
+            let mut srv = test_server("/tmp/unused-air-4.sock", test_acting(), TEST_DAEMON_UID);
             with_air(&mut srv, answer.clone());
             let cx = test_ctx(&srv);
             let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
@@ -1648,7 +1536,7 @@ mod tests {
     /// success — the same rule `FreezePcap` follows for an absent ring.
     #[test]
     fn an_air_scan_without_a_scanner_is_a_refusal_with_a_reason() {
-        let srv = test_server("/tmp/unused-air-5.sock", test_acting(true), TEST_DAEMON_UID);
+        let srv = test_server("/tmp/unused-air-5.sock", test_acting(), TEST_DAEMON_UID);
         let cx = test_ctx(&srv);
         let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
         assert!(!r.ok);
@@ -1659,7 +1547,7 @@ mod tests {
     /// and the radio is not read for it.
     #[test]
     fn an_unauthorised_peer_cannot_scan_the_air() {
-        let mut srv = test_server("/tmp/unused-air-6.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut srv = test_server("/tmp/unused-air-6.sock", test_acting(), TEST_DAEMON_UID);
         let asked = with_air(&mut srv, AirScanRequest::Started);
         let cx = test_ctx(&srv);
         let r = control_request(ControlCmd::ScanAir, None, &cx);
@@ -1693,7 +1581,7 @@ mod tests {
         let sock = dir.join("observer.sock");
         let sock_str = sock.to_str().unwrap().to_string();
 
-        let srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        let srv = test_server(&sock_str, test_acting(), TEST_DAEMON_UID);
         let snapshot = Arc::clone(&srv.snapshot);
         {
             let mut s = snapshot.lock().unwrap();
@@ -1824,7 +1712,7 @@ mod tests {
     /// read (`getpeereid` failed) is refused, and nothing is mutated.
     #[test]
     fn control_refused_when_peer_credentials_unavailable() {
-        let srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let cx = test_ctx(&srv);
         let result = control_request(ControlCmd::SetObserving(false), None, &cx);
         assert!(!result.ok, "an unidentifiable peer must be refused");
@@ -1839,9 +1727,9 @@ mod tests {
         );
     }
 
-    /// D2: EVERY control command is peer-gated, not just the acting-class one —
-    /// the self-control commands (`SetObserving`, `SetQuiet`, `FreezePcap`) are
-    /// exempt from `acting.enabled`, never from the peer gate.
+    /// D2: EVERY control command is peer-gated. The peer check is the one gate
+    /// on the control path — no command is exempt from it, and no config switch
+    /// stands in for it (realm net-observer, node #91).
     /// The `match` inside the loop is exhaustive on purpose — a further
     /// `ControlCmd` variant fails to compile until it is added here and thus
     /// asserted.
@@ -1868,9 +1756,9 @@ mod tests {
                 | ControlCmd::ScanNeighbors(_)
                 | ControlCmd::ScanAir => {}
             }
-            // Acting is ENABLED, so a refusal here can only come from the peer
-            // gate, never from the acting switch.
-            let srv = test_server("/nonexistent.sock", test_acting(true), 1);
+            // A refusal here can only come from the peer gate: there is no
+            // other gate on the control path.
+            let srv = test_server("/nonexistent.sock", test_acting(), 1);
             let cx = test_ctx(&srv);
             let result = control_request(cmd.clone(), stranger, &cx);
             assert!(
@@ -1896,33 +1784,16 @@ mod tests {
         }
     }
 
-    /// Safety invariant: with acting disabled, an acting-class control request is
-    /// refused without running anything — exercised through the real entry point
-    /// with an AUTHORISED peer, so the acting dimension is tested in isolation
-    /// from the peer gate. The actuator itself is intentionally never invoked.
+    /// `SetObserving` flips the shared flag and mirrors the new state into the
+    /// live snapshot so the switch shows reality.
     #[test]
-    fn control_refused_when_acting_disabled() {
-        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
-        let cx = test_ctx(&srv);
-        let result = control_request(ControlCmd::KickstartProxy, Some(TEST_DAEMON_UID), &cx);
-        assert!(
-            !result.ok,
-            "control must be refused when acting is disabled"
-        );
-        assert_eq!(result.message, "acting disabled");
-    }
-
-    /// `SetObserving` is benign self-control: it must succeed even with acting
-    /// disabled (it is NOT gated by `acting.enabled`), flip the shared flag, and
-    /// mirror the new state into the live snapshot so the switch shows reality.
-    #[test]
-    fn set_observing_not_gated_by_acting_and_updates_snapshot() {
-        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+    fn set_observing_flips_the_flag_and_updates_snapshot() {
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let cx = test_ctx(&srv);
 
-        // Pause: succeeds despite acting being disabled; flag + snapshot go false.
+        // Pause: flag + snapshot go false.
         let off = control_request(ControlCmd::SetObserving(false), Some(TEST_DAEMON_UID), &cx);
-        assert!(off.ok, "SetObserving must not be gated by acting");
+        assert!(off.ok, "{}", off.message);
         assert_eq!(off.message, "observing off");
         assert!(!srv.observing.load(Ordering::Acquire));
         assert!(!srv.snapshot.lock().unwrap().observing);
@@ -1933,36 +1804,6 @@ mod tests {
         assert_eq!(on.message, "observing on");
         assert!(srv.observing.load(Ordering::Acquire));
         assert!(srv.snapshot.lock().unwrap().observing);
-    }
-
-    /// Every [`ControlCmd`] variant must declare its gating class explicitly, so a
-    /// future third variant cannot silently default to ungated: the `match` in
-    /// [`ControlAuthority::of`] is exhaustive, so adding a variant fails to
-    /// compile until someone decides its class.
-    #[test]
-    fn every_control_cmd_variant_declares_its_gating_class() {
-        for cmd in [
-            ControlCmd::SetObserving(false),
-            ControlCmd::KickstartProxy,
-            ControlCmd::ScanNeighbors(ScanOptions::default()),
-            ControlCmd::ScanAir,
-        ] {
-            // Exhaustive on purpose — a new variant breaks this arm list.
-            let expected = match cmd {
-                ControlCmd::SetObserving(_) => ControlAuthority::SelfControl,
-                ControlCmd::SetQuiet(_) => ControlAuthority::SelfControl,
-                ControlCmd::FreezePcap => ControlAuthority::SelfControl,
-                ControlCmd::KickstartProxy => ControlAuthority::Acting,
-                ControlCmd::ScanNeighbors(_) => ControlAuthority::Acting,
-                // Reading this daemon's OWN radio report addresses nobody.
-                ControlCmd::ScanAir => ControlAuthority::SelfControl,
-            };
-            assert_eq!(
-                ControlAuthority::of(&cmd),
-                expected,
-                "{cmd:?} declares the wrong authority class"
-            );
-        }
     }
 
     /// A fake scanner, so the control path is exercised without putting a single
@@ -2013,33 +1854,12 @@ mod tests {
         }
     }
 
-    /// A scan speaks to machines that are not this one, so with acting disabled
-    /// it must be refused BEFORE the scanner is ever asked to run.
-    #[test]
-    fn scan_neighbours_is_refused_while_acting_is_disabled() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
-        srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
-        let cx = test_ctx(&srv);
-        let res = control_request(
-            ControlCmd::ScanNeighbors(ScanOptions::default()),
-            Some(TEST_DAEMON_UID),
-            &cx,
-        );
-        assert!(!res.ok, "an acting-class command must be refused");
-        assert_eq!(
-            srv.store
-                .query_scalar_i64("SELECT count(*) FROM neighbor")
-                .unwrap(),
-            0,
-            "a refused scan must leave no trace of having run"
-        );
-    }
-
     /// A scan that runs records both halves: the entities it found AND the row
-    /// saying the daemon went looking.
+    /// saying the daemon went looking. The server is a default one: nothing in
+    /// config has to be switched on for an authorised operator's scan to run.
     #[test]
     fn a_scan_records_its_findings_and_the_fact_that_it_ran() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
         let cx = test_ctx(&srv);
         let res = control_request(
@@ -2070,7 +1890,7 @@ mod tests {
     /// reports it via `cve_note`; `scan_now` must surface it in the message.
     #[test]
     fn an_unusable_cve_snapshot_is_surfaced_not_silent() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let mut report = fake_report();
         report.cve_note = Some("snapshot at /tmp/x is empty or wrong layout".to_string());
         srv.scanner = Some(Arc::new(FakeScanner(Some(report))));
@@ -2092,7 +1912,7 @@ mod tests {
     /// timestamp inside it and make the bracket a false account of the silence.
     #[test]
     fn a_scan_is_refused_while_observation_is_paused() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
         srv.observing.store(false, Ordering::Release);
         let cx = test_ctx(&srv);
@@ -2117,7 +1937,7 @@ mod tests {
     /// making quiet untrue.
     #[test]
     fn a_scan_is_refused_while_quiet_is_on() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
         srv.quiet.store(true, Ordering::Release);
         let cx = test_ctx(&srv);
@@ -2139,7 +1959,7 @@ mod tests {
     /// Nothing to scan is a refusal with a reason, never a silent success.
     #[test]
     fn a_scanner_with_nothing_to_scan_refuses() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         srv.scanner = Some(Arc::new(FakeScanner(None)));
         let cx = test_ctx(&srv);
         let res = control_request(
@@ -2151,84 +1971,15 @@ mod tests {
         assert!(res.message.contains("no interface"), "{}", res.message);
     }
 
-    /// A requested-but-unpermitted `banners` rung is dropped with a note, exactly
-    /// like `ports`, and the scanner is never handed an effective banner rung.
+    /// Every requested rung runs on a default server with a snapshot present:
+    /// no config permission stands between the operator's request and the
+    /// scanner, and nothing is reported dropped (realm net-observer, node #91).
     #[test]
-    fn a_requested_but_unpermitted_banner_rung_is_dropped_with_a_note() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+    fn every_requested_rung_runs_without_a_config_permission() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let seen = Arc::new(Mutex::new(None));
         srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
-        // ports permitted, banners NOT permitted.
-        srv.scan_permission = ScanOptions {
-            ports: true,
-            banners: false,
-            cve: false,
-        };
-        let cx = test_ctx(&srv);
-        let res = control_request(
-            ControlCmd::ScanNeighbors(ScanOptions {
-                ports: true,
-                banners: true,
-                cve: false,
-            }),
-            Some(TEST_DAEMON_UID),
-            &cx,
-        );
-        assert!(res.ok, "{}", res.message);
-        assert!(res.message.contains("dropped"), "{}", res.message);
-        assert!(res.message.contains("banners"), "{}", res.message);
-        let eff = seen.lock().unwrap().clone().expect("scanner ran");
-        assert!(eff.ports, "ports was permitted and requested");
-        assert!(!eff.banners, "an unpermitted banner rung must not run");
-    }
-
-    /// `banners` requested and permitted but with no effective `ports` rung does
-    /// nothing: a banner grab has no open port to read from.
-    #[test]
-    fn a_banner_rung_without_an_effective_port_rung_does_nothing() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
-        let seen = Arc::new(Mutex::new(None));
-        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
-        // banners permitted, ports NOT permitted.
-        srv.scan_permission = ScanOptions {
-            ports: false,
-            banners: true,
-            cve: false,
-        };
-        let cx = test_ctx(&srv);
-        let res = control_request(
-            ControlCmd::ScanNeighbors(ScanOptions {
-                ports: true,
-                banners: true,
-                cve: false,
-            }),
-            Some(TEST_DAEMON_UID),
-            &cx,
-        );
-        assert!(res.ok, "{}", res.message);
-        let eff = seen.lock().unwrap().clone().expect("scanner ran");
-        assert!(!eff.ports, "ports was not permitted");
-        assert!(
-            !eff.banners,
-            "banners needs an effective ports rung to do anything"
-        );
-        assert!(res.message.contains("banners"), "{}", res.message);
-    }
-
-    /// A requested `cve` rung that is not permitted is dropped with a note, and
-    /// the scanner is never handed an effective cve rung.
-    #[test]
-    fn a_requested_but_unpermitted_cve_rung_is_dropped_with_a_note() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
-        let seen = Arc::new(Mutex::new(None));
-        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
-        // ports+banners permitted with a snapshot present, but cve NOT permitted.
         let snap = tempfile::tempdir().unwrap();
-        srv.scan_permission = ScanOptions {
-            ports: true,
-            banners: true,
-            cve: false,
-        };
         srv.scan_cve_snapshot = Some(snap.path().to_path_buf());
         let cx = test_ctx(&srv);
         let res = control_request(
@@ -2241,32 +1992,65 @@ mod tests {
             &cx,
         );
         assert!(res.ok, "{}", res.message);
-        assert!(res.message.contains("cve"), "{}", res.message);
-        assert!(res.message.contains("not permitted"), "{}", res.message);
+        assert!(
+            !res.message.contains("dropped"),
+            "a rung with its dependencies met must not be dropped: {}",
+            res.message
+        );
         let eff = seen.lock().unwrap().clone().expect("scanner ran");
-        assert!(!eff.cve, "an unpermitted cve rung must not run");
+        assert!(eff.ports, "ports was requested");
+        assert!(eff.banners, "banners was requested and ports is effective");
+        assert!(
+            eff.cve,
+            "cve was requested, banners is effective and a snapshot is present"
+        );
     }
 
-    /// `cve` permitted and requested but with no effective `banners` rung does
-    /// nothing: a match needs a banner to parse.
+    /// `banners` requested with no effective `ports` rung does nothing: a banner
+    /// grab has no open port to read from. A dependency, not a permission — and
+    /// the operator is told which.
     #[test]
-    fn a_cve_rung_without_an_effective_banner_rung_does_nothing() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+    fn a_banner_rung_without_an_effective_port_rung_does_nothing() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let seen = Arc::new(Mutex::new(None));
         srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
-        // cve permitted and a snapshot present, but banners NOT permitted.
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                ports: false,
+                banners: true,
+                cve: false,
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        let eff = seen.lock().unwrap().clone().expect("scanner ran");
+        assert!(!eff.ports, "ports was not requested");
+        assert!(
+            !eff.banners,
+            "banners needs an effective ports rung to do anything"
+        );
+        assert!(res.message.contains("dropped"), "{}", res.message);
+        assert!(res.message.contains("banners"), "{}", res.message);
+        assert!(res.message.contains("ports rung"), "{}", res.message);
+    }
+
+    /// `cve` requested with no effective `banners` rung does nothing: a match
+    /// needs a banner to parse. A dependency, not a permission.
+    #[test]
+    fn a_cve_rung_without_an_effective_banner_rung_does_nothing() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        // A snapshot is present, so the only thing missing is the banner rung.
         let snap = tempfile::tempdir().unwrap();
-        srv.scan_permission = ScanOptions {
-            ports: true,
-            banners: false,
-            cve: true,
-        };
         srv.scan_cve_snapshot = Some(snap.path().to_path_buf());
         let cx = test_ctx(&srv);
         let res = control_request(
             ControlCmd::ScanNeighbors(ScanOptions {
                 ports: true,
-                banners: true,
+                banners: false,
                 cve: true,
             }),
             Some(TEST_DAEMON_UID),
@@ -2282,19 +2066,14 @@ mod tests {
         );
     }
 
-    /// `cve` permitted, requested, and with an effective banner grab, but no CVE
-    /// snapshot configured, is dropped honestly rather than pretended present.
+    /// `cve` requested with an effective banner grab, but no CVE snapshot
+    /// configured, is dropped honestly rather than pretended present.
     #[test]
     fn a_cve_rung_without_a_snapshot_is_dropped_with_a_note() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let seen = Arc::new(Mutex::new(None));
         srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
-        // Everything permitted, but no snapshot directory at all.
-        srv.scan_permission = ScanOptions {
-            ports: true,
-            banners: true,
-            cve: true,
-        };
+        // No snapshot directory at all.
         srv.scan_cve_snapshot = None;
         let cx = test_ctx(&srv);
         let res = control_request(
@@ -2317,14 +2096,9 @@ mod tests {
     /// path that does not exist is not a snapshot, and the rung is dropped.
     #[test]
     fn a_cve_snapshot_path_that_does_not_exist_is_unavailable() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let seen = Arc::new(Mutex::new(None));
         srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
-        srv.scan_permission = ScanOptions {
-            ports: true,
-            banners: true,
-            cve: true,
-        };
         srv.scan_cve_snapshot = Some(std::path::PathBuf::from("/no/such/snapshot/dir"));
         let cx = test_ctx(&srv);
         let res = control_request(
@@ -2345,17 +2119,16 @@ mod tests {
         );
     }
 
-    /// `SetQuiet` is benign self-control like `SetObserving`: ungated by
-    /// `acting.enabled`, it flips the flag the link collector reads and mirrors
-    /// the state into the live snapshot so the bar renders it. Unlike a pause it
-    /// writes NO boundary row — quiet produces no gap to bracket.
+    /// `SetQuiet` flips the flag the link collector reads and mirrors the state
+    /// into the live snapshot so the bar renders it. Unlike a pause it writes NO
+    /// boundary row — quiet produces no gap to bracket.
     #[test]
-    fn set_quiet_not_gated_by_acting_and_writes_no_boundary_row() {
-        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+    fn set_quiet_flips_the_flag_and_writes_no_boundary_row() {
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let cx = test_ctx(&srv);
 
         let on = control_request(ControlCmd::SetQuiet(true), Some(TEST_DAEMON_UID), &cx);
-        assert!(on.ok, "SetQuiet must not be gated by acting");
+        assert!(on.ok, "{}", on.message);
         assert_eq!(on.message, "quiet on");
         assert!(srv.quiet.load(Ordering::Acquire));
         assert!(srv.snapshot.lock().unwrap().quiet);
@@ -2382,7 +2155,7 @@ mod tests {
     /// silent success that would leave the operator believing an artifact exists.
     #[test]
     fn freeze_pcap_refuses_when_the_ring_is_not_running() {
-        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         assert!(srv.freezer.get().is_none());
         let cx = test_ctx(&srv);
         let res = control_request(ControlCmd::FreezePcap, Some(TEST_DAEMON_UID), &cx);
@@ -2390,9 +2163,8 @@ mod tests {
         assert_eq!(res.message, "pcap ring not running");
     }
 
-    /// With a ring running, `FreezePcap` copies it — even with acting disabled,
-    /// because it is self-control — and the message names the destination and the
-    /// file count so the operator can find the artifact.
+    /// With a ring running, `FreezePcap` copies it, and the message names the
+    /// destination and the file count so the operator can find the artifact.
     #[test]
     fn freeze_pcap_copies_the_ring_and_names_the_destination() {
         /// A freezer that records where it was asked to write and reports two files.
@@ -2404,7 +2176,7 @@ mod tests {
             }
         }
 
-        let mut srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let freezer = Arc::new(RecordingFreezer(Mutex::new(None)));
         srv.freezer = Arc::new(PcapRingSlot::with_ring(
             freezer.clone() as Arc<dyn crate::pipeline::PcapFreezer>
@@ -2414,10 +2186,7 @@ mod tests {
         let cx = test_ctx(&srv);
 
         let res = control_request(ControlCmd::FreezePcap, Some(TEST_DAEMON_UID), &cx);
-        assert!(
-            res.ok,
-            "a self-control freeze must run with acting disabled"
-        );
+        assert!(res.ok, "{}", res.message);
         let dest = freezer.0.lock().unwrap().clone().expect("ring was frozen");
         assert!(
             dest.starts_with(&blob_dir),
@@ -2449,7 +2218,7 @@ mod tests {
             }
         }
 
-        let mut srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         srv.blob_dir = temp_dir("freeze-late-ring");
         let slot = srv.freezer.clone();
 
@@ -2486,7 +2255,7 @@ mod tests {
     /// the peer gate runs before the class check, for every variant.
     #[test]
     fn new_self_control_commands_still_need_an_authorised_peer() {
-        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let cx = test_ctx(&srv);
         for cmd in [ControlCmd::SetQuiet(true), ControlCmd::FreezePcap] {
             let res = control_request(cmd.clone(), None, &cx);
@@ -2501,7 +2270,7 @@ mod tests {
     /// transition (same `ts_us`, same state, same peer).
     #[test]
     fn set_observing_edge_writes_one_row_and_publishes_one_frame() {
-        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let mut rx = srv.events_tx.subscribe();
         let cx = test_ctx(&srv);
 
@@ -2558,7 +2327,7 @@ mod tests {
     /// reports success, because the requested state does hold.
     #[test]
     fn repeat_set_observing_writes_nothing_and_publishes_nothing() {
-        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let mut rx = srv.events_tx.subscribe();
         let cx = test_ctx(&srv);
 
@@ -2586,7 +2355,7 @@ mod tests {
     /// its window clear off this value moving, so a pause must not move it.
     #[test]
     fn resume_edge_publishes_the_resume_epoch() {
-        let srv = test_server("/nonexistent.sock", test_acting(false), TEST_DAEMON_UID);
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let cx = test_ctx(&srv);
 
         let off = control_request(ControlCmd::SetObserving(false), Some(TEST_DAEMON_UID), &cx);
@@ -2781,7 +2550,7 @@ mod tests {
         let sock = dir.join("observer.sock");
         let sock_str = sock.to_str().unwrap().to_string();
 
-        let srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        let srv = test_server(&sock_str, test_acting(), TEST_DAEMON_UID);
         let events_tx = srv.events_tx.clone();
         let handle = tokio::spawn(srv.serve());
         wait_for_socket(&sock).await;
@@ -2851,7 +2620,7 @@ mod tests {
         let sock = dir.join("observer.sock");
         let sock_str = sock.to_str().unwrap().to_string();
 
-        let srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        let srv = test_server(&sock_str, test_acting(), TEST_DAEMON_UID);
         let events_tx = srv.events_tx.clone();
         let handle = tokio::spawn(srv.serve());
         wait_for_socket(&sock).await;
@@ -2931,7 +2700,7 @@ mod tests {
     /// this read would be `Some(..)`.
     #[test]
     fn a_refused_control_request_consumes_the_log_budget() {
-        let srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let cx = test_ctx(&srv);
         let result = control_request(ControlCmd::SetObserving(false), Some(NOT_A_REAL_UID), &cx);
         assert!(!result.ok, "an unlisted uid must be refused");
@@ -2952,7 +2721,7 @@ mod tests {
         let sock = dir.join("observer.sock");
         let sock_str = sock.to_str().unwrap().to_string();
 
-        let mut srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        let mut srv = test_server(&sock_str, test_acting(), TEST_DAEMON_UID);
         srv.max_connections = 1;
         let handle = tokio::spawn(srv.serve());
         wait_for_socket(&sock).await;
@@ -3014,7 +2783,7 @@ mod tests {
         let sock = dir.join("observer.sock");
         let sock_str = sock.to_str().unwrap().to_string();
 
-        let mut srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        let mut srv = test_server(&sock_str, test_acting(), TEST_DAEMON_UID);
         srv.request_timeout = Duration::from_millis(50);
         let handle = tokio::spawn(srv.serve());
         wait_for_socket(&sock).await;
@@ -3036,10 +2805,10 @@ mod tests {
     /// Item 5, refusal arm: the daemon acts on the REAL peer uid read from the
     /// socket, not a hardcoded one.
     ///
-    /// Acting is ENABLED and `console` is pinned to "no console session", so the
-    /// only clauses left are root, `daemon_uid` (deliberately set to a uid no
-    /// account holds) and `control_uids` (empty) — a refusal can therefore come
-    /// from the peer gate and nowhere else.
+    /// `console` is pinned to "no console session", so the only clauses left are
+    /// root, `daemon_uid` (deliberately set to a uid no account holds) and
+    /// `control_uids` (empty) — a refusal can therefore come from the peer gate
+    /// and nowhere else.
     ///
     /// Honest limit: server and client share this process, so `Some(geteuid())`
     /// hardcoded at the lookup site would be indistinguishable from the real
@@ -3076,7 +2845,7 @@ mod tests {
         let sock = dir.join("observer.sock");
         let sock_str = sock.to_str().unwrap().to_string();
 
-        let srv = test_server(&sock_str, test_acting(true), NOT_A_REAL_UID);
+        let srv = test_server(&sock_str, test_acting(), NOT_A_REAL_UID);
         let observing = Arc::clone(&srv.observing);
         let store = Arc::clone(&srv.store);
         let handle = tokio::spawn(srv.serve());
@@ -3144,7 +2913,7 @@ mod tests {
         let sock = dir.join("observer.sock");
         let sock_str = sock.to_str().unwrap().to_string();
 
-        let mut srv = test_server(&sock_str, test_acting(true), NOT_A_REAL_UID);
+        let mut srv = test_server(&sock_str, test_acting(), NOT_A_REAL_UID);
         // The ONLY difference from the refusal arm.
         srv.policy.control_uids = vec![own_uid()];
         let observing = Arc::clone(&srv.observing);
@@ -3205,11 +2974,10 @@ mod tests {
         );
 
         let (mut client, server) = UnixStream::pair().unwrap();
-        // Acting is ENABLED, `console` is pinned to "no session",
-        // `socket_owner_uid` is None, `control_uids` is empty and `daemon_uid` is
-        // a uid no account holds — so a refusal can come from the peer gate and
-        // from nowhere else.
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), NOT_A_REAL_UID);
+        // `console` is pinned to "no session", `socket_owner_uid` is None,
+        // `control_uids` is empty and `daemon_uid` is a uid no account holds — so
+        // a refusal can come from the peer gate and from nowhere else.
+        let mut srv = test_server("/nonexistent.sock", test_acting(), NOT_A_REAL_UID);
         // The seam: a second local account, which one process cannot otherwise
         // have.
         srv.policy.peer_uid = foreign_peer;
@@ -3269,7 +3037,7 @@ mod tests {
         );
 
         let (mut client, server) = UnixStream::pair().unwrap();
-        let mut srv = test_server("/nonexistent.sock", test_acting(true), NOT_A_REAL_UID);
+        let mut srv = test_server("/nonexistent.sock", test_acting(), NOT_A_REAL_UID);
         srv.policy.peer_uid = foreign_peer;
         // The ONLY difference from the refusal arm.
         srv.policy.control_uids = vec![FOREIGN_UID];
@@ -3346,7 +3114,7 @@ mod tests {
     #[test]
     fn a_burst_of_refused_controls_logs_exactly_one_line() {
         let log = EventLog::default();
-        let srv = test_server("/nonexistent.sock", test_acting(true), TEST_DAEMON_UID);
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let cx = test_ctx(&srv);
         tracing::subscriber::with_default(CountingSubscriber(log.clone()), || {
             for _ in 0..REFUSAL_BURST {
@@ -3462,7 +3230,7 @@ mod tests {
         let sock = dir.join("observer.sock");
         let sock_str = sock.to_str().unwrap().to_string();
 
-        let mut srv = test_server(&sock_str, test_acting(false), TEST_DAEMON_UID);
+        let mut srv = test_server(&sock_str, test_acting(), TEST_DAEMON_UID);
         srv.max_connections = 1;
         let handle = tokio::spawn(srv.serve());
         wait_for_socket(&sock).await;

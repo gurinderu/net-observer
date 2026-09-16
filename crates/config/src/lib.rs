@@ -15,9 +15,9 @@ pub struct Config {
     /// can connect while the daemon runs as root.
     pub socket_mode: u32,
     /// When `Some(uid)`, the daemon `chown`s the socket to this uid (control-path
-    /// hardening: pair with a restrictive `socket_mode` such as `0o600` when
-    /// enabling acting so only the owner can send privileged commands). Default
-    /// `None` — the socket keeps the daemon's ownership.
+    /// hardening: pair with a restrictive `socket_mode` such as `0o600` so only
+    /// the owner can even connect to the control endpoint). Default `None` — the
+    /// socket keeps the daemon's ownership.
     pub socket_owner_uid: Option<u32>,
     /// Extra uids allowed to send a `Request::Control`, on top of root, the
     /// daemon's own uid, `socket_owner_uid`, and the logged-in console user.
@@ -26,7 +26,7 @@ pub struct Config {
     /// nobody. See `net-observerd::api::ControlPolicy`.
     pub control_uids: Vec<u32>,
     pub collectors: Collectors,
-    /// The write/control ("acting") path. Disabled by default.
+    /// Parameters of the manual actions the control path can run. Gates nothing.
     pub acting: ActingCfg,
 }
 
@@ -148,8 +148,12 @@ fn default_true() -> bool {
 /// interval is minutes, not seconds, because a neighbour table changes on the
 /// timescale of devices joining a network, not of packets.
 ///
-/// The *active* discovery (subnet sweep, mDNS) is deliberately NOT configurable
-/// here: it never runs on a timer, only on an explicit `ControlCmd::ScanNeighbors`.
+/// The *active* discovery (subnet sweep, mDNS, and the ports/banners/cve rungs)
+/// is deliberately NOT configurable here: it never runs on a timer, only on an
+/// explicit `ControlCmd::ScanNeighbors`, and config gates only what the daemon
+/// does by itself — an operator's command is its own sanction (realm
+/// net-observer, node #91). What a rung needs to work with (a snapshot, an
+/// effective earlier rung) is a dependency the daemon reports, not a permission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeighborsCfg {
     pub enabled: bool,
@@ -164,14 +168,6 @@ pub struct NeighborsCfg {
     /// that and records no links, never a pretence of a clean topology.
     #[serde(default = "default_true")]
     pub topology: bool,
-    /// What an operator-pressed scan is PERMITTED to do. The ceiling, not the
-    /// switch: every capability is off by default, and the bar's checkboxes pick
-    /// which permitted capabilities a given manual run includes. A run never
-    /// exceeds this — a requested-but-unpermitted capability is dropped and the
-    /// scan says so. The passive collector above needs none of this; it only
-    /// ever reads caches the OS filled.
-    #[serde(default)]
-    pub scan: ScanCfg,
     /// Directory holding the local CVE snapshot the `cve` rung matches banners
     /// against (a cvelistV5 tree under `cves/` plus an optional `kev.json`).
     /// `None` by default, and the operator provisions the data out-of-band. The
@@ -189,31 +185,6 @@ pub struct NeighborsCfg {
     pub oui_snapshot_dir: Option<String>,
 }
 
-/// Per-capability permission for the active neighbour scan, each off by default.
-/// The rungs escalate in how loud they are on the wire; a host turns on exactly
-/// what it is willing to emit into the networks it visits. Reading order matches
-/// the ladder: sweep/mDNS are the base (always run when scanning); the rungs
-/// below are the additions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ScanCfg {
-    /// TCP-connect probes to discovered neighbours' ports — the daemon opening
-    /// connections to other machines, so off by default and gated by acting.
-    #[serde(default)]
-    pub ports: bool,
-    /// Banner grabs on the open ports the port scan found — reading what each
-    /// service volunteers about itself. Louder than a bare connect (it exchanges
-    /// bytes) and needs `ports` to have anything to grab from, so off by default.
-    #[serde(default)]
-    pub banners: bool,
-    /// Match grabbed banners against the local CVE snapshot, the loudest rung in
-    /// diagnostic terms though it emits nothing new on the wire: it needs the
-    /// `banners` rung to have parsed a service and a provisioned snapshot to
-    /// match against. Off by default; every match it stores is a hypothesis,
-    /// never an asserted fact.
-    #[serde(default)]
-    pub cve: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PcapCfg {
     pub enabled: bool,
@@ -221,28 +192,23 @@ pub struct PcapCfg {
     pub filter: String,
 }
 
-/// The write/control ("acting") path — manual recovery actions the daemon runs
-/// as root. Disabled by default: with `enabled = false`, every *acting-class*
-/// control request (`ControlCmd::KickstartProxy`) is refused without running
-/// anything. Benign self-control (`ControlCmd::SetObserving`, which only
-/// pauses/resumes this daemon's own collection) is not gated by *this* switch.
+/// Parameters of the manual actions the daemon runs as root on an explicit
+/// `Request::Control` (today: `ControlCmd::KickstartProxy`). This section holds
+/// parameters only and gates nothing: config may switch off what the daemon
+/// does by itself, never a command the operator sends by hand — the invocation
+/// is the sanction (realm net-observer, node #91).
 ///
-/// This switch is NOT the whole story for the control path, and never was for
-/// authorisation: **every** `Request::Control`, of either class, must first pass
-/// the daemon's peer-credential check (`net-observerd::api::ControlPolicy`) — root,
-/// the daemon's own uid, `socket_owner_uid`, the logged-in console user, or a
-/// uid listed in `control_uids`. `SetObserving` is exempt from the *acting*
-/// gate, not from authorisation. Both gates are applied in exactly one place,
-/// `net-observerd::api::control_request`. Acting NEVER happens automatically — only
-/// on an explicit `Request::Control`.
+/// What does gate the control path is authorisation: **every** `Request::Control`
+/// must first pass the daemon's peer-credential check
+/// (`net-observerd::api::ControlPolicy`) — root, the daemon's own uid,
+/// `socket_owner_uid`, the logged-in console user, or a uid listed in
+/// `control_uids`. Acting NEVER happens automatically — only on an explicit
+/// `Request::Control`.
+///
+/// A legacy `enabled` key under `[acting]` is ignored on load, so a deployed
+/// config that still carries it keeps parsing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActingCfg {
-    /// Master switch for the ACTING CLASS of the control path only. `false`
-    /// (default) ⇒ refuse every acting-class control request
-    /// (`ControlCmd::KickstartProxy`) without executing anything. Benign
-    /// self-control (`ControlCmd::SetObserving`) is not gated by this switch —
-    /// but, like every control request, it still requires an authorised peer.
-    pub enabled: bool,
     /// The `launchctl` service target restarted by `ControlCmd::KickstartProxy`
     /// (`launchctl kickstart -k <service>`).
     pub singbox_service: String,
@@ -292,7 +258,6 @@ impl Default for Config {
                     enabled: true,
                     interval: Duration::from_secs(120),
                     topology: true,
-                    scan: ScanCfg::default(),
                     cve_snapshot_dir: None,
                     oui_snapshot_dir: None,
                 },
@@ -303,7 +268,6 @@ impl Default for Config {
                 },
             },
             acting: ActingCfg {
-                enabled: false,
                 singbox_service: "system/sing-box".into(),
             },
         }
@@ -402,36 +366,42 @@ mod tests {
         assert!(!c.collectors.wifi.enabled);
         assert_eq!(c.collectors.wifi.interval.as_secs(), 30);
     }
+    /// The gates this section used to carry (`acting.enabled`, the
+    /// `collectors.neighbors.scan.*` rung permissions) are gone, but the owner's
+    /// deployed config still names them. Figment ignores keys no field claims,
+    /// so such a file must keep loading — and the keys around the legacy ones
+    /// must still land (realm net-observer, node #91).
     #[test]
-    fn scan_capabilities_are_all_off_by_default_and_toggle_from_toml() {
-        let c = Config::load(None).unwrap();
-        assert!(
-            !c.collectors.neighbors.scan.ports,
-            "an active scan capability must be off until explicitly permitted"
-        );
+    fn legacy_gate_keys_are_ignored_on_load() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("o.toml");
-        std::fs::write(&p, "[collectors.neighbors.scan]\nports = true\n").unwrap();
-        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
-        assert!(c.collectors.neighbors.scan.ports);
-        // A rung not named in the toml stays off.
-        assert!(!c.collectors.neighbors.scan.banners);
+        let p = dir.path().join("legacy.toml");
+        std::fs::write(
+            &p,
+            "[acting]\n\
+             enabled = true\n\
+             singbox_service = \"system/mihomo\"\n\
+             [collectors.neighbors]\n\
+             cve_snapshot_dir = \"/var/lib/observer/cve\"\n\
+             [collectors.neighbors.scan]\n\
+             ports = true\n\
+             banners = true\n\
+             cve = true\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap()))
+            .expect("a config carrying the retired gate keys must still load");
+        assert_eq!(c.acting.singbox_service, "system/mihomo");
+        assert_eq!(
+            c.collectors.neighbors.cve_snapshot_dir.as_deref(),
+            Some("/var/lib/observer/cve")
+        );
         // The rest of the neighbors config keeps its defaults.
         assert!(c.collectors.neighbors.enabled);
-
-        let p = dir.path().join("b.toml");
-        std::fs::write(&p, "[collectors.neighbors.scan]\nbanners = true\n").unwrap();
-        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
-        assert!(c.collectors.neighbors.scan.banners);
     }
 
     #[test]
-    fn cve_rung_is_off_and_snapshot_dir_absent_by_default() {
+    fn cve_snapshot_dir_absent_by_default() {
         let c = Config::load(None).unwrap();
-        assert!(
-            !c.collectors.neighbors.scan.cve,
-            "the cve rung must be off until explicitly permitted"
-        );
         assert!(
             c.collectors.neighbors.cve_snapshot_dir.is_none(),
             "no snapshot directory until the operator provisions one"
@@ -462,17 +432,15 @@ mod tests {
     }
 
     #[test]
-    fn cve_rung_and_snapshot_dir_come_from_toml() {
+    fn cve_snapshot_dir_comes_from_toml() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("o.toml");
         std::fs::write(
             &p,
-            "[collectors.neighbors]\ncve_snapshot_dir = \"/var/lib/observer/cve\"\n\
-             [collectors.neighbors.scan]\ncve = true\n",
+            "[collectors.neighbors]\ncve_snapshot_dir = \"/var/lib/observer/cve\"\n",
         )
         .unwrap();
         let c = Config::load(Some(p.to_str().unwrap())).unwrap();
-        assert!(c.collectors.neighbors.scan.cve);
         assert_eq!(
             c.collectors.neighbors.cve_snapshot_dir.as_deref(),
             Some("/var/lib/observer/cve")
@@ -504,28 +472,25 @@ mod tests {
         assert_eq!(c.collectors.link.interval.as_secs(), 5);
     }
     #[test]
-    fn acting_disabled_by_default() {
-        // Asserts the default value only: `acting.enabled` ships off. What that
-        // switch gates lives in `net-observerd::api::control_response`.
+    fn acting_parameters_default() {
+        // `[acting]` holds parameters of manual actions, not a switch: the only
+        // default to assert is the service `KickstartProxy` targets.
         let c = Config::load(None).unwrap();
-        assert!(!c.acting.enabled);
         assert_eq!(c.acting.singbox_service, "system/sing-box");
         assert!(c.socket_owner_uid.is_none());
     }
     #[test]
-    fn acting_can_be_enabled_via_toml() {
+    fn acting_parameters_come_from_toml() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("o.toml");
         std::fs::write(
             &p,
             "socket_owner_uid = 501\n\
              [acting]\n\
-             enabled = true\n\
              singbox_service = \"system/mihomo\"\n",
         )
         .unwrap();
         let c = Config::load(Some(p.to_str().unwrap())).unwrap();
-        assert!(c.acting.enabled);
         assert_eq!(c.acting.singbox_service, "system/mihomo");
         assert_eq!(c.socket_owner_uid, Some(501));
     }
