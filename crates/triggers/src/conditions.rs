@@ -27,6 +27,15 @@ pub trait Condition: Send + Sync {
     fn eval(&self, w: &RecentWindow) -> Option<Fire>;
 }
 
+/// How many recent proxy rows `wedge` scans for its dead-tick run: one tick
+/// emits one row per endpoint, ~7 rows with the daemon's defaults, so 64 rows
+/// ≈ 9 ticks ≈ 2 min at the 15 s cadence. The run it counts is the daemon's
+/// `WEDGE_CONSECUTIVE = 3`, so the scan needs only a few ticks beyond that;
+/// an unbounded scan reached across the whole 2048-sample window and fired
+/// on a dead run any number of unmeasured ticks old (#96). Tunable by the
+/// owner.
+const WEDGE_SCAN: usize = 64;
+
 /// Fires when the last `consecutive` link samples all have `direct == Ok` while
 /// the last `consecutive` MEASURED proxy ticks all found the tun dead (anything
 /// but a 204 from the probe — mirroring the shell watchdog's `tun != 204`).
@@ -61,8 +70,9 @@ impl Condition for Wedge {
         // advances nor resets the dead run (the same rule `GwDrop` documents:
         // realm net-observer, node #25). A measured tick counts as dead
         // unless the probe answered exactly 204; a measured healthy tick
-        // breaks the run.
-        let rows = w.recent_proxy(usize::MAX);
+        // breaks the run. The scan is bounded by `WEDGE_SCAN`: a dead run
+        // further back than that is history, not the present.
+        let rows = w.recent_proxy(WEDGE_SCAN);
         let mut dead_ticks = 0usize;
         let mut i = 0;
         while i < rows.len() {
@@ -112,10 +122,12 @@ impl Condition for Wedge {
 /// Each gate is optional so every signature keeps exactly the guards its
 /// semantics allow (`per-client-block` measures a DEAD gateway, so it must
 /// not require a working direct path):
-///   - `require_direct`: the newest MEASURED link sample must say the direct
-///     path works. A destination-fault verdict is meaningless while the
-///     uplink itself is down. `Skip` rows are the absence of a measurement
-///     and satisfy nothing (node #25).
+///   - `require_direct`: the newest MEASURED link sample within the last
+///     [`GATE_DIRECT_SCAN`] must say the direct path works. A
+///     destination-fault verdict is meaningless while the uplink itself is
+///     down. `Skip` rows are the absence of a measurement and satisfy
+///     nothing (node #25), and a `direct` reading older than the scan is not
+///     evidence the uplink works now.
 ///   - `load_below`: the newest host sample's `load1` must be below this —
 ///     above it, probe failures measure the run queue, not the network
 ///     (measured 2026-07-30: at load1 ≥ 64 half of all probes fail). No host
@@ -130,6 +142,13 @@ pub struct Gated<C> {
     pub settle_us: Option<i64>,
 }
 
+/// How many recent link samples the direct-path gate scans for a measured
+/// `direct`: 8 at the 15 s link cadence is ≈ 2 min. Only that lookup uses it
+/// — `gw-change`'s own predecessor scan keeps [`GW_CHANGE_SCAN`], because a
+/// change straddling a long quiet run is still a change, while a `direct`
+/// reading that old is not evidence the uplink works now (#96).
+const GATE_DIRECT_SCAN: usize = 8;
+
 impl<C: Condition> Condition for Gated<C> {
     fn id(&self) -> &'static str {
         self.inner.id()
@@ -137,7 +156,7 @@ impl<C: Condition> Condition for Gated<C> {
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         if self.require_direct {
             let direct_ok = w
-                .recent_link(GW_CHANGE_SCAN)
+                .recent_link(GATE_DIRECT_SCAN)
                 .into_iter()
                 .find(|l| l.direct != TcpVerdict::Skip)
                 .is_some_and(|l| l.direct == TcpVerdict::Ok);
@@ -1082,6 +1101,33 @@ mod tests {
         assert!(c.eval(&w).is_none());
     }
 
+    /// The dead-tick scan is bounded by `WEDGE_SCAN` proxy rows: a dead run
+    /// that far behind the present is history, not a wedge now. Three dead
+    /// ticks followed by exactly enough skip placeholders to be the oldest
+    /// rows of the scan still fire; one placeholder more pushes the run out
+    /// of reach. Dies under the unbounded `usize::MAX` scan (#96), which
+    /// fired on a run any number of unmeasured ticks old.
+    #[test]
+    fn wedge_does_not_reach_past_the_scan_bound() {
+        let c = Wedge { consecutive: 3 };
+        let stream = |placeholders: usize| {
+            let mut w = RecentWindow::new(WINDOW_CAP);
+            push_wedge_ticks(&mut w, 0, 3);
+            for i in 0..placeholders {
+                w.push(skip_proxy(100 + i as i64));
+            }
+            w
+        };
+        assert!(
+            c.eval(&stream(WEDGE_SCAN - 3)).is_some(),
+            "the dead run as the oldest rows of the scan still fires"
+        );
+        assert!(
+            c.eval(&stream(WEDGE_SCAN - 2)).is_none(),
+            "a dead run beyond WEDGE_SCAN rows is not the present"
+        );
+    }
+
     /// A link sample whose only interesting field is the network identity
     /// (`dhcp_router`) — the settle gate's input.
     fn link_router(ts: i64, router: Option<&str>) -> Sample {
@@ -1124,6 +1170,38 @@ mod tests {
         assert!(c.eval(&w).is_none(), "uplink down voids the verdict");
         w.push(link(2, TcpVerdict::Ok));
         assert!(c.eval(&w).is_some());
+    }
+
+    /// A `direct` reading is evidence the uplink works NOW only within the
+    /// last `GATE_DIRECT_SCAN` link samples: an `Ok` that many quiet ticks
+    /// ago is the oldest reading the gate still accepts, one tick older and
+    /// the gate refuses. Dies under the `GW_CHANGE_SCAN` reach the gate used
+    /// to share with `gw-change` (#96), which accepted a `direct` from 64
+    /// ticks back as the present.
+    #[test]
+    fn gate_refuses_a_direct_reading_older_than_its_scan() {
+        let c = Gated {
+            inner: AlwaysFire,
+            require_direct: true,
+            load_below: None,
+            settle_us: None,
+        };
+        let stream = |quiet: usize| {
+            let mut w = RecentWindow::new(WINDOW_CAP);
+            w.push(link(0, TcpVerdict::Ok));
+            for i in 0..quiet {
+                w.push(link(1 + i as i64, TcpVerdict::Skip));
+            }
+            w
+        };
+        assert!(
+            c.eval(&stream(GATE_DIRECT_SCAN - 1)).is_some(),
+            "an Ok as the oldest sample of the scan still passes"
+        );
+        assert!(
+            c.eval(&stream(GATE_DIRECT_SCAN)).is_none(),
+            "an Ok older than GATE_DIRECT_SCAN samples is not evidence now"
+        );
     }
 
     #[test]
