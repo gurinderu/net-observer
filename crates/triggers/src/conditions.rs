@@ -1596,6 +1596,32 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         );
     }
 
+    /// The other half of fleet growth: the fleet grows from two to three
+    /// endpoints and STAYS fully blocked. Once the three-row cohorts are ended
+    /// the run fires, and the detail names the grown fleet — three endpoints,
+    /// read from the newest judged cohort, not the older two-row ones.
+    #[test]
+    fn endpoint_block_fires_on_a_grown_fleet_that_stays_blocked() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        push_dead_cohort(&mut w, 20);
+        for ts in [30, 40] {
+            push_dead_cohort(&mut w, ts);
+            w.push(proxy_ep(ts, "3.3.3.3:443", TcpVerdict::Fail));
+        }
+        push_end_marker(&mut w, 50);
+        let fire = c
+            .eval(&w)
+            .expect("two ended all-fail three-row cohorts must fire");
+        assert!(
+            fire.detail.contains("all 3 endpoints"),
+            "the detail must name the grown fleet: {}",
+            fire.detail
+        );
+    }
+
     /// One endpoint still answering means the fleet is not blocked as a whole.
     /// Dies under `any(Fail)` in place of `all(Fail)` within a cohort.
     #[test]
@@ -2171,7 +2197,7 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
 
     /// Wi-Fi jitter loses single echoes: a one-tick `Fail` or `NoGw` between
     /// two `Ok`s is not a ban, however many of them the window holds. Dies
-    /// under no lower bound on the run length ("3 bans in ~60s").
+    /// under no lower bound on the run length ("3 bans in ~120s, period ~60s").
     #[test]
     fn ban_cycle_ignores_single_tick_echo_losses() {
         let c = BanCycle { min_bans: 3 };
