@@ -71,6 +71,17 @@
 //!   Only when nothing at all follows the pause does the gap stay open-ended,
 //!   which is the truth: the record ends there.
 //!
+//! ## Passive stretches
+//!
+//! The second bracket, and a different one: while the probing tier is
+//! `passive` the daemon puts nothing on the wire but keeps writing a row per
+//! tick, every probe verdict `SKIP` (realm net-observer, node #88). The
+//! per-moment queries need no special case for it — a `SKIP` already reads as
+//! `unknown` — but a reader of a long run of `SKIP`s must be able to tell
+//! "withheld" from "could not run", so `gaps` lists each stretch from the
+//! `probing_edge` rows next to the pauses, marked `kind = 'passive'`. Samples
+//! never close a stretch (they land throughout); only an `active` edge does.
+//!
 //! ## Correlation
 //!
 //! Streams have their own cadences, so correlation is by DuckDB `ASOF JOIN`:
@@ -206,16 +217,90 @@ gap_at AS (
   LIMIT 1
 )";
 
+/// One row per stretch in which the daemon withheld every probe — the second
+/// kind of bracket, read from `probing_edge` (realm net-observer, node #88).
+///
+/// NOT an observation gap, and deliberately not folded into
+/// [`OBSERVATION_GAP_CTE`]: a passive daemon keeps writing a row per tick, so
+/// the per-moment queries already answer `unknown` from the `SKIP`s they find
+/// there, and a moment inside a passive stretch must not read as `gap` — the
+/// record does exist, it just carries no measurement. This CTE only names the
+/// stretches so a reader knows the `SKIP`s were withheld, not failed.
+///
+/// A stretch opens at a `passive` edge whose predecessor is not `passive` (a
+/// startup edge re-declaring passive after a crash continues the stretch
+/// rather than opening a second one) and is half-open
+/// `[gap_opened_us, gap_closed_us)`. It closes at the first later `active`
+/// edge, and `gap_closed_by` says which kind:
+///
+/// | `gap_closed_by` | what closed the stretch |
+/// | --- | --- |
+/// | `active` | an operator `SetProbing(active)` (a peer asked) |
+/// | `startup` | a startup edge whose configured default is `active` |
+///
+/// Samples never close it — they keep landing throughout — so `gap_closed_us`
+/// is `NULL` exactly when the record ends still passive.
+const PROBING_STRETCH_CTE: &str = "\
+probing_stretch AS (
+  SELECT gap_opened_us, gap_closed_us, gap_closed_by
+  FROM (
+    SELECT p.ts_us AS gap_opened_us,
+           e.ts_us AS gap_closed_us,
+           e.closed_by AS gap_closed_by,
+           row_number() OVER (PARTITION BY p.ts_us ORDER BY e.ts_us) AS rn
+    FROM (
+      SELECT ts_us
+      FROM (SELECT ts_us, tier, lag(tier) OVER (ORDER BY ts_us) AS prev_tier
+            FROM probing_edge)
+      WHERE tier = 'passive' AND (prev_tier IS NULL OR prev_tier <> 'passive')
+    ) p
+    LEFT JOIN (
+      SELECT ts_us,
+             CASE WHEN peer_uid IS NULL THEN 'startup' ELSE 'active' END AS closed_by
+      FROM probing_edge WHERE tier = 'active'
+    ) e ON e.ts_us > p.ts_us
+  )
+  WHERE rn = 1
+)";
+
 /// **Observation gaps** — every interval the operator paused collection for.
 ///
 /// The read side of the bracketed silence: one row per gap, open-ended
 /// (`gap_closed_us` `NULL`) only when the record ends inside the pause.
+///
+/// Pauses ONLY, in the shape it has had since it shipped: this is what a
+/// reader built before the probing tier asks for as `DiagnosticQuery::Gaps`,
+/// and a passive stretch listed here would be printed by that reader as a
+/// pause. The passive stretches ride alongside in [`silences_sql`], under a
+/// query id that reader has never heard of.
 pub fn observation_gaps_sql() -> String {
     format!(
         "WITH {SAMPLE_TS_CTE},
 {OBSERVATION_GAP_CTE}
 SELECT gap_opened_us, gap_closed_us, gap_closed_by
 FROM observation_gap ORDER BY gap_opened_us"
+    )
+}
+
+/// **Silences** — every bracketed silence the record contains: each interval
+/// the operator paused collection for, and each stretch the daemon spent
+/// withholding its probes.
+///
+/// The read side of both brackets, told apart by `kind`: `pause` rows are the
+/// silence of [`OBSERVATION_GAP_CTE`] (no samples at all — exactly the rows of
+/// [`observation_gaps_sql`]), `passive` rows the withheld probes of
+/// [`PROBING_STRETCH_CTE`] (samples every tick, verdicts `SKIP`). Each is
+/// open-ended (`gap_closed_us` `NULL`) only when the record ends inside it.
+/// (realm net-observer, node #88)
+pub fn silences_sql() -> String {
+    format!(
+        "WITH {SAMPLE_TS_CTE},
+{OBSERVATION_GAP_CTE},
+{PROBING_STRETCH_CTE}
+SELECT 'pause' AS kind, gap_opened_us, gap_closed_us, gap_closed_by FROM observation_gap
+UNION ALL
+SELECT 'passive' AS kind, gap_opened_us, gap_closed_us, gap_closed_by FROM probing_stretch
+ORDER BY gap_opened_us, kind"
     )
 }
 
@@ -811,6 +896,11 @@ impl DuckdbStore {
         self.query_table(&observation_gaps_sql())
     }
 
+    /// Run [`silences_sql`].
+    pub fn silences(&self) -> Result<QueryTable, StoreError> {
+        self.query_table(&silences_sql())
+    }
+
     /// Run [`segments_sql`].
     pub fn segments(&self) -> Result<QueryTable, StoreError> {
         self.query_table(&segments_sql())
@@ -925,7 +1015,7 @@ mod tests {
     use types::{
         DnsSample, DnsVerdict, GwVerdict, HostSample, Incident, LinkSample, NeighborObs,
         NeighborRole, NeighborSource, NeighborsSample, NeighborsVerdict, ObservingEdge,
-        ProxySample, Sample, TcpVerdict,
+        ProbingEdge, ProbingTier, ProxySample, Sample, TcpVerdict,
     };
 
     const SEC: i64 = 1_000_000;
@@ -1023,6 +1113,25 @@ mod tests {
             cause: types::ObservingCause::Startup,
         })
         .unwrap();
+    }
+
+    /// One switch of the probing tier. `peer` is `None` for the startup edge
+    /// that applies the configured default, `Some(uid)` for an operator's.
+    fn probing_edge(s: &DuckdbStore, ts_us: i64, tier: ProbingTier, peer: Option<u32>) {
+        s.write_probing_edge(&ProbingEdge {
+            ts_us,
+            tier,
+            peer_uid: peer,
+        })
+        .unwrap();
+    }
+
+    /// A tick every stream writes while the tier is passive: the probes are
+    /// withheld, so their verdicts are `SKIP`, and the row still lands.
+    fn passive_tick(s: &DuckdbStore, ts_us: i64) {
+        link(s, ts_us, GwVerdict::Skip, None, TcpVerdict::Skip);
+        proxy(s, ts_us, TcpVerdict::Skip, None);
+        host(s, ts_us, 1.5);
     }
 
     fn cell(t: &QueryTable, row: usize, column: &str) -> String {
@@ -1761,6 +1870,141 @@ mod tests {
         assert_eq!(cell(&g, 0, "gap_closed_us"), (30 * SEC).to_string());
         assert_eq!(cell(&g, 1, "gap_opened_us"), (40 * SEC).to_string());
         assert_eq!(cell(&g, 1, "gap_closed_us"), (55 * SEC).to_string());
+        // The same rows, as `silences` lists them: every one a pause.
+        let all = s.silences().unwrap();
+        assert_eq!(all.rows.len(), 2);
+        assert!(
+            all.rows.iter().all(|r| r[0] == "pause"),
+            "with no probing edge, every silence is a pause: {:?}",
+            all.rows
+        );
+    }
+
+    // ---- 6b. passive stretches: the second bracket ---------------------------
+
+    /// A daemon that boots passive (the configured default, written as a
+    /// peerless edge) and is switched to active by an operator: one `passive`
+    /// row, closed by `active`, listed by `silences` next to the pauses. The
+    /// `SKIP` ticks in between do NOT close it — samples keep landing under
+    /// passive — and a moment inside it reads `unknown` from those `SKIP`s,
+    /// never `gap`.
+    ///
+    /// `observation_gaps` (the `Gaps` query a pre-tier reader still asks for)
+    /// keeps its pauses-only shape: no `kind` column, and the stretch is NOT
+    /// among its rows — that reader would print it as a pause.
+    #[test]
+    fn a_passive_stretch_is_a_silence_of_its_own_kind_and_is_not_a_gap() {
+        let s = DuckdbStore::in_memory().unwrap();
+        probing_edge(&s, 5 * SEC, ProbingTier::Passive, None);
+        passive_tick(&s, 10 * SEC);
+        passive_tick(&s, 25 * SEC);
+        probing_edge(&s, 30 * SEC, ProbingTier::Active, Some(501));
+        healthy_tick(&s, 40 * SEC);
+
+        let g = s.silences().unwrap();
+        assert_eq!(g.rows.len(), 1, "{:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "passive");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (5 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (30 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "active");
+
+        let gaps = s.observation_gaps().unwrap();
+        assert_eq!(
+            gaps.columns,
+            vec!["gap_opened_us", "gap_closed_us", "gap_closed_by"],
+            "`Gaps` keeps the shape it shipped with"
+        );
+        assert!(
+            gaps.rows.is_empty(),
+            "a passive stretch is not a pause and must not reach a pre-tier reader as one: {:?}",
+            gaps.rows
+        );
+
+        // Not a gap: the record exists and says "no measurement".
+        let t = s.verdict_at(25 * SEC).unwrap();
+        assert_eq!(cell(&t, 0, "layer"), "unknown");
+        assert_eq!(cell(&t, 0, "gw"), "SKIP");
+        assert_eq!(
+            cell(&s.verdict_at(40 * SEC).unwrap(), 0, "layer"),
+            "healthy"
+        );
+    }
+
+    /// The record ends passive: the stretch is open-ended, and the ticks after
+    /// the edge are exactly what must not be read as closing it.
+    #[test]
+    fn a_stretch_the_record_ends_inside_stays_open_ended() {
+        let s = DuckdbStore::in_memory().unwrap();
+        probing_edge(&s, 5 * SEC, ProbingTier::Passive, None);
+        passive_tick(&s, 10 * SEC);
+        passive_tick(&s, 25 * SEC);
+
+        let g = s.silences().unwrap();
+        assert_eq!(g.rows.len(), 1);
+        assert_eq!(cell(&g, 0, "kind"), "passive");
+        assert_eq!(cell(&g, 0, "gap_closed_us"), "");
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "");
+    }
+
+    /// A crash while passive: the next boot writes its passive default as a
+    /// second `passive` edge, which CONTINUES the stretch rather than opening
+    /// another — until a boot whose default is active (a peerless `active`
+    /// edge) closes it, named as `startup`.
+    #[test]
+    fn a_restart_that_stays_passive_continues_the_stretch_and_an_active_boot_closes_it() {
+        let s = DuckdbStore::in_memory().unwrap();
+        probing_edge(&s, 5 * SEC, ProbingTier::Passive, None);
+        passive_tick(&s, 10 * SEC);
+        // Died, came back with the same default.
+        probing_edge(&s, 30 * SEC, ProbingTier::Passive, None);
+        passive_tick(&s, 35 * SEC);
+        // Reconfigured to active, restarted.
+        probing_edge(&s, 60 * SEC, ProbingTier::Active, None);
+        healthy_tick(&s, 65 * SEC);
+
+        let g = s.silences().unwrap();
+        assert_eq!(g.rows.len(), 1, "one stretch, not two: {:?}", g.rows);
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (5 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (60 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "startup");
+    }
+
+    /// Both brackets in one record, interleaved: a pause inside a passive
+    /// stretch is listed as its own `pause` row, the stretch as `passive`, in
+    /// time order. Neither swallows the other.
+    #[test]
+    fn a_pause_inside_a_passive_stretch_is_listed_as_both() {
+        let s = DuckdbStore::in_memory().unwrap();
+        probing_edge(&s, 5 * SEC, ProbingTier::Passive, None);
+        passive_tick(&s, 10 * SEC);
+        edge(&s, 20 * SEC, false);
+        edge(&s, 30 * SEC, true);
+        passive_tick(&s, 30 * SEC);
+        probing_edge(&s, 45 * SEC, ProbingTier::Active, Some(501));
+        healthy_tick(&s, 50 * SEC);
+
+        let g = s.silences().unwrap();
+        assert_eq!(g.rows.len(), 2, "{:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "passive");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (5 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (45 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "kind"), "pause");
+        assert_eq!(cell(&g, 1, "gap_opened_us"), (20 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "gap_closed_us"), (30 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "gap_closed_by"), "resume");
+        // The pause is still a gap for the per-moment reader.
+        assert_eq!(cell(&s.verdict_at(25 * SEC).unwrap(), 0, "layer"), "gap");
+    }
+
+    /// An active daemon opens no stretch: only a `passive` edge does, and a
+    /// record that begins with an active startup edge lists nothing.
+    #[test]
+    fn an_active_default_opens_no_stretch() {
+        let s = DuckdbStore::in_memory().unwrap();
+        probing_edge(&s, 5 * SEC, ProbingTier::Active, None);
+        healthy_tick(&s, 10 * SEC);
+        assert!(s.silences().unwrap().rows.is_empty());
+        assert!(s.observation_gaps().unwrap().rows.is_empty());
     }
 
     // ---- 7. segments (where have I been) and one segment's history ----------

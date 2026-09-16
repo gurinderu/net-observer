@@ -5,8 +5,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use types::{
-    BlobRef, Incident, NeighborLifetime, ObservingEdge, Sample, TopologyLifetime, TopologyLink,
-    TriggerFired,
+    BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, TopologyLifetime,
+    TopologyLink, TriggerFired,
 };
 
 /// `network_key` for a segment whose gateway MAC could not be read. Neighbours
@@ -607,6 +607,13 @@ impl Store for DuckdbStore {
                 e.peer_uid.map(i64::from),
                 e.cause.as_str()
             ],
+        )?;
+        Ok(())
+    }
+    fn write_probing_edge(&self, e: &ProbingEdge) -> Result<(), StoreError> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO probing_edge (ts_us, tier, peer_uid) VALUES (?,?,?)",
+            params![e.ts_us, e.tier.as_str(), e.peer_uid.map(i64::from)],
         )?;
         Ok(())
     }
@@ -1787,6 +1794,45 @@ mod tests {
             s.query_scalar_i64("SELECT count(*) FROM observing_edge WHERE peer_uid IS NULL")
                 .unwrap(),
             1
+        );
+    }
+
+    /// A tier switch lands as one row carrying the tier's token and the peer;
+    /// the startup edge (no peer) stores a NULL, so the two are told apart in
+    /// SQL exactly like `observing_edge`.
+    #[test]
+    fn write_probing_edge_round_trips_in_ts_order() {
+        use types::{ProbingEdge, ProbingTier};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_probing_edge(&ProbingEdge {
+            ts_us: 100,
+            tier: ProbingTier::Passive,
+            peer_uid: None,
+        })
+        .unwrap();
+        s.write_probing_edge(&ProbingEdge {
+            ts_us: 200,
+            tier: ProbingTier::Active,
+            peer_uid: Some(501),
+        })
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM probing_edge WHERE tier = 'passive' AND peer_uid IS NULL"
+            )
+            .unwrap(),
+            1,
+            "the startup default is a peerless edge"
+        );
+        let t = s
+            .query_table("SELECT ts_us, tier, peer_uid FROM probing_edge ORDER BY ts_us")
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec!["100".to_string(), "passive".to_string(), String::new()],
+                vec!["200".to_string(), "active".to_string(), "501".to_string()],
+            ]
         );
     }
 

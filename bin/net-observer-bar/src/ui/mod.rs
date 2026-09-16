@@ -43,7 +43,8 @@ mod theme;
 
 pub(crate) use control::spawn_control_on;
 pub use control::{
-    GlanceError, freeze_round_trip, quiet_round_trip, read_fresh, scan_round_trip_base,
+    GlanceError, freeze_round_trip, probing_round_trip, quiet_round_trip, read_fresh,
+    scan_round_trip_base,
 };
 pub use model::Glance;
 pub use panel::PanelView;

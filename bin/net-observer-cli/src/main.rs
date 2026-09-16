@@ -33,6 +33,7 @@ use net_observer_ipc::{
 use std::io::Write;
 use std::process::ExitCode;
 use store::{DuckdbStore, QueryTable, Store as _, diagnosis};
+use types::ProbingTier;
 
 /// The `load1` above which a dead tun reads as host starvation rather than a
 /// proxy wedge. The CLI reads the record with the same threshold the daemon
@@ -142,6 +143,19 @@ enum Command {
         /// `on` resumes collection; `off` pauses it.
         #[arg(value_enum)]
         state: ObserveState,
+    },
+    /// Set the daemon's probing tier, sent as a `Control(SetProbing)` request
+    /// over the socket. `passive` (the daemon's default) puts nothing on the
+    /// wire: every link, proxy and dns probe is withheld and lands as `SKIP`,
+    /// and the held reference streams are closed. `active` runs every probe.
+    /// Benign self-control like `observe`, process-scoped, and every real
+    /// switch is recorded as a `probing_edge` row (see `gaps`). Exits non-zero
+    /// if the request failed, the daemon refused it, or the daemon is
+    /// unreachable.
+    Probe {
+        /// `passive` withholds every probe; `active` sends them.
+        #[arg(value_enum)]
+        tier: ProbeTier,
     },
     /// Ask the running daemon to go and find out who is on this segment NOW:
     /// sweep the local IPv4 subnet and browse mDNS for names, sent as a
@@ -318,6 +332,27 @@ impl ObserveState {
     }
 }
 
+/// The tier accepted by the `probe` subcommand. A thin CLI mirror of
+/// [`ProbingTier`] so `clap` renders `<passive|active>` in the help without
+/// leaking the wire type into the argument surface.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProbeTier {
+    /// Nothing on the wire; every probe lands as `SKIP`.
+    Passive,
+    /// Every probe runs.
+    Active,
+}
+
+impl ProbeTier {
+    /// The tier carried in `ControlCmd::SetProbing`.
+    fn to_tier(self) -> ProbingTier {
+        match self {
+            ProbeTier::Passive => ProbingTier::Passive,
+            ProbeTier::Active => ProbingTier::Active,
+        }
+    }
+}
+
 /// The event kind accepted by `events --kind`. A thin CLI mirror of
 /// [`EventKind`] so `clap` renders
 /// `<link|proxy|dns|route|host|wifi|neighbors|air|incident>` in the help without
@@ -401,6 +436,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             print!("{}", format_control(&result));
             // The request round-trips fine; a non-`ok` result means the daemon
             // declined or failed, which is a non-zero exit.
+            if !result.ok {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Probe { tier } => {
+            let cfg = load_config(cli)?;
+            let result = fetch_set_probing(&cfg.socket_path, tier.to_tier())?;
+            print!("{}", format_control(&result));
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
@@ -521,9 +564,24 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             );
         }
         Command::Gaps => {
-            let table = diagnose_table(cli, DiagnosticQuery::Gaps, |off| {
-                run_query(off, &diagnosis::observation_gaps_sql())
-            })?;
+            // Every bracketed silence — pauses AND passive stretches — is
+            // `Silences`. A daemon built before it cannot read that request;
+            // it is then asked `Gaps`, the pauses-only shape it has, and the
+            // reader is told what THAT answer lacks — only when it is the
+            // answer: the offline record is read with the full query and
+            // lists the stretches, so the file path prints its usual source
+            // line alone. (realm net-observer, node #88)
+            let table = diagnose_table_by(
+                cli,
+                |socket| {
+                    let (outcome, note) = ask_silences_or_gaps(socket, net_observer_ipc::diagnose)?;
+                    if let Some(note) = note {
+                        eprintln!("{note}");
+                    }
+                    Ok(outcome)
+                },
+                |off| run_query(off, &diagnosis::silences_sql()),
+            )?;
             print!("{}", diagnose::format_observation_gaps(&table)?);
         }
         Command::Segments => {
@@ -662,10 +720,48 @@ fn diagnose_table(
     q: DiagnosticQuery,
     offline: impl FnOnce(&Offline) -> Result<QueryTable>,
 ) -> Result<Table> {
+    diagnose_table_by(cli, |s| net_observer_ipc::diagnose(s, q), offline)
+}
+
+/// Ask `Silences` and, on a daemon that cannot read it, `Gaps` instead.
+///
+/// The second value is the one-line note for stderr, and it is `Some` ONLY
+/// when a daemon actually answered `Gaps`: that answer lists the pauses only,
+/// and a reader must not take "no passive stretch listed" for "there was
+/// none". A daemon too old for `Query` at all answers `Unsupported` twice;
+/// [`route`] then reads the file with the full `silences_sql`, which DOES list
+/// the stretches — so no note, or it would contradict the table under it.
+/// `ask` is the socket round-trip, injected so the rule is testable without a
+/// daemon; a daemon that reads `Silences` and fails it is NOT retried (the
+/// file would only meet the lock).
+fn ask_silences_or_gaps(
+    socket: &str,
+    ask: impl Fn(&str, DiagnosticQuery) -> std::io::Result<QueryOutcome>,
+) -> std::io::Result<(QueryOutcome, Option<String>)> {
+    match ask(socket, DiagnosticQuery::Silences)? {
+        QueryOutcome::Unsupported(m) => {
+            let fallback = ask(socket, DiagnosticQuery::Gaps)?;
+            let note = matches!(fallback, QueryOutcome::Table(_)).then(|| {
+                format!(
+                    "net-observerd at {socket} predates the `Silences` diagnosis ({m}); \
+                     it answered `Gaps` instead — pauses only, passive stretches not listed"
+                )
+            });
+            Ok((fallback, note))
+        }
+        answered => Ok((answered, None)),
+    }
+}
+
+/// [`diagnose_table`] with the socket round-trip itself injected, for a
+/// command whose live question is not one fixed [`DiagnosticQuery`].
+fn diagnose_table_by(
+    cli: &Cli,
+    ask: impl FnOnce(&str) -> std::io::Result<QueryOutcome>,
+    offline: impl FnOnce(&Offline) -> Result<QueryTable>,
+) -> Result<Table> {
     let record = Record::resolve(cli)?;
-    match route(record.socket.as_deref(), |s| {
-        net_observer_ipc::diagnose(s, q)
-    })? {
+    match route(record.socket.as_deref(), ask)? {
         Route::Live { table, via } => {
             eprintln!("source: net-observerd via {via}");
             Ok(table)
@@ -915,6 +1011,29 @@ fn fetch_set_observing(socket_path: &str, observing: bool) -> Result<ControlResu
     }
 }
 
+/// Ask the daemon to switch its probing tier over the socket
+/// (`Control(SetProbing)`) and return its [`ControlResult`]. Benign
+/// self-control, like [`fetch_set_observing`]: it changes what the daemon's
+/// own collectors put on the wire and nothing else. A daemon built before the
+/// tier existed cannot decode the request; that is reported as "cannot", not
+/// as a refusal, through [`net_observer_ipc::control`]. Never panics.
+fn fetch_set_probing(socket_path: &str, tier: ProbingTier) -> Result<ControlResult> {
+    let outcome =
+        net_observer_ipc::control(socket_path, ControlCmd::SetProbing(tier)).map_err(|e| {
+            if daemon_not_running(&e) {
+                anyhow!("net-observerd not running (socket {socket_path} unavailable)")
+            } else {
+                anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
+            }
+        })?;
+    match outcome {
+        net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
+        net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
+            "net-observerd cannot set a probing tier (built before it existed): {e}"
+        )),
+    }
+}
+
 /// Send `Control(ScanNeighbors)` and return the daemon's verdict.
 fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
     match daemon_query(
@@ -1032,6 +1151,16 @@ fn format_status(snap: &StatusSnapshot) -> String {
     } else {
         "observing      off (paused - samples below are stale)\n"
     });
+
+    // The tier says what the SKIPs below mean: passive = withheld on purpose,
+    // nothing on the wire; active = every probe was sent.
+    out.push_str(&format!(
+        "probing        {}\n",
+        match snap.probing {
+            ProbingTier::Passive => "passive (nothing on the wire - probe verdicts read SKIP)",
+            ProbingTier::Active => "active",
+        }
+    ));
 
     match &snap.link {
         Some(l) => out.push_str(&format!(
@@ -1255,6 +1384,7 @@ mod tests {
             ],
             observing,
             quiet: false,
+            probing: ProbingTier::Active,
             capabilities: None,
         }
     }
@@ -1264,6 +1394,7 @@ mod tests {
         let out = format_status(&snapshot(true));
         assert!(out.contains(&format!("generated_us   {}", diagnose::stamp_us(100))));
         assert!(out.contains("observing      on"));
+        assert!(out.contains("probing        active"));
         assert!(out.contains(&format!(
             "link           gw=OK direct=OK ts_us={}",
             diagnose::stamp_us(42)
@@ -1330,6 +1461,23 @@ mod tests {
             "link           gw=OK direct=OK ts_us={}",
             diagnose::stamp_us(42)
         )));
+    }
+
+    /// A passive daemon says so on its own line, and says what it means for
+    /// the verdicts below — a reader must not take their SKIPs for failed
+    /// probes.
+    #[test]
+    fn format_status_names_the_passive_tier() {
+        let snap = StatusSnapshot {
+            probing: ProbingTier::Passive,
+            ..snapshot(true)
+        };
+        let out = format_status(&snap);
+        assert!(
+            out.contains("probing        passive (nothing on the wire - probe verdicts read SKIP)"),
+            "{out}"
+        );
+        assert!(!out.contains("probing        active"));
     }
 
     #[test]
@@ -1434,6 +1582,78 @@ mod tests {
             }
             other => panic!("expected Offline with a reason, got {other:?}"),
         }
+    }
+
+    /// `gaps` asks `Silences`; a daemon that cannot read it is asked `Gaps`
+    /// instead, and only then. A daemon that answers `Silences` — with a
+    /// table, or with a failure — is never asked twice.
+    #[test]
+    fn gaps_asks_silences_first_and_gaps_only_on_an_old_daemon() {
+        use std::cell::RefCell;
+        let asked: RefCell<Vec<DiagnosticQuery>> = RefCell::new(Vec::new());
+
+        // An old daemon: `Silences` is undecodable, `Gaps` answers — and the
+        // note says what that answer lacks.
+        let (out, note) = ask_silences_or_gaps("/run/observer.sock", |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(match q {
+                DiagnosticQuery::Silences => {
+                    QueryOutcome::Unsupported("bad request: unknown variant `Silences`".into())
+                }
+                _ => QueryOutcome::Table(Table::default()),
+            })
+        })
+        .unwrap();
+        assert_eq!(out, QueryOutcome::Table(Table::default()));
+        assert_eq!(
+            *asked.borrow(),
+            vec![DiagnosticQuery::Silences, DiagnosticQuery::Gaps]
+        );
+        let note = note.expect("a daemon that answered `Gaps` earns the note");
+        assert!(note.contains("passive stretches not listed"), "{note}");
+
+        // A daemon too old for `Query` at all: `Unsupported` twice, NO note —
+        // `route` then reads the file with the full query, which does list
+        // the stretches, and a note here would contradict the table under it.
+        asked.borrow_mut().clear();
+        let (out, note) = ask_silences_or_gaps("/run/observer.sock", |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(QueryOutcome::Unsupported(
+                "bad request: unknown variant `Query`".into(),
+            ))
+        })
+        .unwrap();
+        assert!(matches!(out, QueryOutcome::Unsupported(_)));
+        assert_eq!(
+            *asked.borrow(),
+            vec![DiagnosticQuery::Silences, DiagnosticQuery::Gaps]
+        );
+        assert_eq!(
+            note, None,
+            "no daemon answered `Gaps`, so nothing to warn about"
+        );
+
+        // A current daemon: one question, no note.
+        asked.borrow_mut().clear();
+        let (out, note) = ask_silences_or_gaps("/run/observer.sock", |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(QueryOutcome::Table(Table::default()))
+        })
+        .unwrap();
+        assert_eq!(out, QueryOutcome::Table(Table::default()));
+        assert_eq!(*asked.borrow(), vec![DiagnosticQuery::Silences]);
+        assert_eq!(note, None);
+
+        // A daemon that read `Silences` and failed it: reported, not retried.
+        asked.borrow_mut().clear();
+        let (out, note) = ask_silences_or_gaps("/run/observer.sock", |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(QueryOutcome::Failed("boom".into()))
+        })
+        .unwrap();
+        assert_eq!(out, QueryOutcome::Failed("boom".into()));
+        assert_eq!(*asked.borrow(), vec![DiagnosticQuery::Silences]);
+        assert_eq!(note, None);
     }
 
     /// A daemon that read the request and could not run it, and a socket that
@@ -1649,10 +1869,11 @@ mod tests {
             ts_us: 0,
             kinds: None,
             observing: false,
+            probing: ProbingTier::Active,
         });
         assert_eq!(
             format_frame_line(&ready),
-            "1970-01-01 00:00:00  subscribed  collection off; kinds: all"
+            "1970-01-01 00:00:00  subscribed  collection off; probing active; kinds: all"
         );
     }
 

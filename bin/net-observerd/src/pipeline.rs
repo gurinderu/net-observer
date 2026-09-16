@@ -223,7 +223,10 @@ impl ResumeGate {
 /// window is dropped before the next sample is pushed
 /// ([`RecentWindow::clear_for_resume`]), so the count-based conditions (`Wedge`)
 /// can never span an observation gap: two bad pre-pause ticks plus one
-/// post-resume tick must not read as "tun dead 3 ticks".
+/// post-resume tick must not read as "tun dead 3 ticks". A probing-tier switch
+/// (`api::set_probing`, either direction) publishes the same epoch and is
+/// handled here identically: a passive stretch is bracketed for the triggers
+/// exactly as a pause is (realm net-observer, node #88).
 ///
 /// A RESUME edge RE-OPENS detection; it does not dedup it. The recent-sample
 /// window is cleared and every trigger is re-armed
@@ -296,8 +299,10 @@ pub async fn run(
     mut rx: mpsc::Receiver<Sample>,
     snapshot: Arc<Mutex<StatusSnapshot>>,
     events_tx: broadcast::Sender<EncodedFrame>,
-    // `ts_us` of the most recent RESUME edge, published by the control socket.
-    // `0` = the daemon has never resumed.
+    // `ts_us` of the most recent window-clearing edge published by the control
+    // socket: a RESUME, or a probing-tier switch in either direction, which
+    // clears and re-arms by exactly this path (realm net-observer, node #88).
+    // `0` = no such edge yet.
     resume_at_us: Arc<AtomicI64>,
 ) {
     let mut window = RecentWindow::new(triggers::WINDOW_CAP);
@@ -381,8 +386,9 @@ pub async fn run(
             window.clear_for_resume();
             engine.rearm_all();
             tracing::info!(
-                resume_us = gate.applied_resume_us(),
-                "collection resumed; window cleared (gateway-change basis kept), triggers re-armed"
+                edge_us = gate.applied_resume_us(),
+                "resume or probing-tier switch; window cleared (gateway-change basis kept), \
+                 triggers re-armed"
             );
         }
         // A sample produced before the resume is on the far side of the
@@ -428,10 +434,20 @@ pub async fn run(
 /// instead of letting it advance `generated_us` after the control socket has
 /// already acked `observing: false`. The daemon and its socket stay alive
 /// throughout, so `SetObserving(true)` resumes probing on the next tick.
+///
+/// The same source-side drop guards a probing-tier switch: `resume_at_us` is
+/// the window-clearing epoch the control socket publishes on a resume and on
+/// every real `SetProbing`, read before `collect()` and again after it, and a
+/// tick that straddled an edge is dropped here rather than forwarded. Without
+/// it a proxy tick in flight across active→passive, whose probes all time out,
+/// lands after the consumer's bounded drain has closed and stays the newest
+/// MEASURED tick for the whole passive stretch — a dead tun the record would
+/// keep blaming the load for (realm net-observer, node #88).
 pub(crate) fn spawn_interval_collector(
     c: AnyCollector,
     tx: mpsc::Sender<Sample>,
     observing: Arc<AtomicBool>,
+    resume_at_us: Arc<AtomicI64>,
 ) -> JoinHandle<()> {
     let Source::Interval(interval) = c.source() else {
         unreachable!("interval spawner")
@@ -450,6 +466,8 @@ pub(crate) fn spawn_interval_collector(
             if !observing.load(Ordering::Acquire) {
                 continue;
             }
+            // The epoch this tick starts under; compared again after the probe.
+            let epoch = resume_at_us.load(Ordering::Acquire);
             let ts_us = types::now_us();
             // Preflight is a per-tick CONDITION, not a startup gate. A missing
             // prerequisite (no interface up yet at boot, a config file not
@@ -493,6 +511,16 @@ pub(crate) fn spawn_interval_collector(
             // Re-check after the probe: a pause that landed while `collect()` was
             // in flight is already acked, so this result must not be forwarded.
             if !observing.load(Ordering::Acquire) {
+                continue;
+            }
+            // Same for a window-clearing edge (a resume, or a tier switch in
+            // either direction): a tick that straddled it was taken under the
+            // old tier and is dropped at the source, like the paused one above.
+            if resume_at_us.load(Ordering::Acquire) != epoch {
+                tracing::info!(
+                    collector = name,
+                    "tick straddled a resume or tier switch; in-flight sample dropped"
+                );
                 continue;
             }
             for s in samples {
@@ -1821,7 +1849,7 @@ mod tests {
         ));
         let (tx, mut rx) = mpsc::channel(4);
         let observing = Arc::new(AtomicBool::new(true));
-        let handle = spawn_interval_collector(c, tx, observing);
+        let handle = spawn_interval_collector(c, tx, observing, no_resume());
 
         // First tick forwards a Host sample (bounded so a stuck loop fails fast).
         let first = time::timeout(Duration::from_secs(5), rx.recv())
@@ -1850,7 +1878,7 @@ mod tests {
         ));
         let (tx, mut rx) = mpsc::channel(4);
         let observing = Arc::new(AtomicBool::new(false));
-        let handle = spawn_interval_collector(c, tx, observing.clone());
+        let handle = spawn_interval_collector(c, tx, observing.clone(), no_resume());
 
         // Paused: several tick intervals must elapse with no sample forwarded.
         let paused = time::timeout(Duration::from_millis(100), rx.recv()).await;
@@ -1890,8 +1918,42 @@ mod tests {
             interval: Duration::from_millis(5),
             ready: ready.clone(),
             collects: collects.clone(),
+            gate: None,
         });
         (c, ready, collects)
+    }
+
+    /// A ready test collector whose every `collect()` parks on a gate until the
+    /// test adds a permit — the tick held open in flight — plus handles on the
+    /// gate and on the entry counter that says a tick is being held.
+    fn gated_fake_collector() -> (
+        AnyCollector,
+        Arc<tokio::sync::Semaphore>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let collects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = AnyCollector::Fake(crate::FakeCollector {
+            meta: &collector_link::META,
+            interval: Duration::from_millis(5),
+            ready: Arc::new(AtomicBool::new(true)),
+            collects: collects.clone(),
+            gate: Some(gate.clone()),
+        });
+        (c, gate, collects)
+    }
+
+    /// Wait until `collects` reaches `n` — the n-th tick has entered
+    /// `collect()` and is parked on its gate — bounded so a loop that never gets
+    /// there fails the test instead of hanging it.
+    async fn held_open(collects: &std::sync::atomic::AtomicUsize, n: usize) {
+        time::timeout(Duration::from_secs(5), async {
+            while collects.load(Ordering::Acquire) < n {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("tick {n} never entered collect()"));
     }
 
     /// A collector whose prerequisite is missing is NOT disabled: it stays
@@ -1906,7 +1968,7 @@ mod tests {
     async fn interval_collector_emits_skip_while_preflight_is_unavailable() {
         let (c, _ready, collects) = fake_collector(false);
         let (tx, mut rx) = mpsc::channel(8);
-        let handle = spawn_interval_collector(c, tx, Arc::new(AtomicBool::new(true)));
+        let handle = spawn_interval_collector(c, tx, Arc::new(AtomicBool::new(true)), no_resume());
 
         for _ in 0..3 {
             let s = time::timeout(Duration::from_secs(5), rx.recv())
@@ -1942,7 +2004,7 @@ mod tests {
     async fn interval_collector_recovers_when_preflight_becomes_ready() {
         let (c, ready, collects) = fake_collector(false);
         let (tx, mut rx) = mpsc::channel(8);
-        let handle = spawn_interval_collector(c, tx, Arc::new(AtomicBool::new(true)));
+        let handle = spawn_interval_collector(c, tx, Arc::new(AtomicBool::new(true)), no_resume());
 
         // N ticks with the prerequisite missing: SKIP, every one of them.
         for _ in 0..3 {
@@ -1982,16 +2044,10 @@ mod tests {
     /// goes silent and stays silent, so nothing advances `generated_us` after the
     /// control socket has already acked `observing: false`.
     ///
-    /// What this does NOT cover, despite the pause landing "mid-tick" in wall-clock
-    /// terms: the post-probe re-check at the top of this file (the second
-    /// `observing` load, between `collect()` and the forward). `HostCollector::collect`
-    /// is a single instant `getloadavg`, so the loop is parked in `ticker.tick()`
-    /// when the flag flips and the pre-probe check catches it every time — deleting
-    /// the re-check leaves this test green. Nothing else covers it either; making it
-    /// genuinely testable needs a `#[cfg(test)]` collector whose `collect()` can be
-    /// held open, which is a production change out of proportion to the line. Named
-    /// here so the next auditor does not re-trip on the name (this test used to be
-    /// called `interval_collector_drops_in_flight_probe_on_pause`).
+    /// This one reaches only the pre-probe check: `HostCollector::collect` is an
+    /// instant `getloadavg`, so the loop is parked in `ticker.tick()` when the
+    /// flag flips. The post-probe re-checks — a pause or a tier switch landing
+    /// while `collect()` is in flight — are pinned by the two gated tests below.
     #[tokio::test]
     async fn interval_collector_forwards_nothing_after_a_pause() {
         let c = AnyCollector::Host(HostCollector::new(
@@ -2000,7 +2056,7 @@ mod tests {
         ));
         let (tx, mut rx) = mpsc::channel(4);
         let observing = Arc::new(AtomicBool::new(true));
-        let handle = spawn_interval_collector(c, tx, observing.clone());
+        let handle = spawn_interval_collector(c, tx, observing.clone(), no_resume());
 
         // Observing: the first tick forwards a sample.
         let first = time::timeout(Duration::from_secs(5), rx.recv())
@@ -2020,6 +2076,105 @@ mod tests {
 
         drop(rx);
         observing.store(true, Ordering::Release);
+        time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("collector task should exit after the receiver is dropped")
+            .expect("collector task should not panic");
+    }
+
+    /// A pause landing while `collect()` is IN FLIGHT: the probe was started
+    /// under `observing == true`, the flag flips while it runs, and its result
+    /// must not be forwarded — the control socket has already acked
+    /// `observing: false`, and a sample arriving after that ack would advance
+    /// `generated_us` past the pause. The post-probe `observing` re-check is
+    /// what drops it; deleting that re-check forwards the held tick and fails
+    /// this test.
+    #[tokio::test]
+    async fn interval_collector_drops_the_tick_in_flight_across_a_pause() {
+        let (c, gate, collects) = gated_fake_collector();
+        let (tx, mut rx) = mpsc::channel(8);
+        let observing = Arc::new(AtomicBool::new(true));
+        let handle = spawn_interval_collector(c, tx, observing.clone(), no_resume());
+
+        // Tick 1 has entered collect() and is parked on the gate; the pause
+        // lands now, then the probe "returns".
+        held_open(&collects, 1).await;
+        observing.store(false, Ordering::Release);
+        gate.add_permits(1);
+        let paused = time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            paused.is_err(),
+            "the tick in flight across the pause must not be forwarded"
+        );
+        assert_eq!(
+            collects.load(Ordering::Acquire),
+            1,
+            "while paused, no further tick enters collect()"
+        );
+
+        // Resume: the next tick is held, then released, and IS forwarded — the
+        // loop went on after the drop.
+        observing.store(true, Ordering::Release);
+        held_open(&collects, 2).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing forwarded before tick 2 returns"
+        );
+        gate.add_permits(1);
+        let forwarded = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the post-resume tick must be forwarded")
+            .expect("channel should stay open while the collector runs");
+        assert!(matches!(forwarded, Sample::Link(_)));
+
+        drop(rx);
+        gate.add_permits(8);
+        time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("collector task should exit after the receiver is dropped")
+            .expect("collector task should not panic");
+    }
+
+    /// A probing-tier switch landing while `collect()` is IN FLIGHT — the
+    /// control socket bumps `resume_at_us`, exactly as `api::set_probing` does
+    /// — and the tick that started under the old tier must not be forwarded:
+    /// dropped whole at the source, bracketed by the `probing_edge` row the
+    /// switch wrote, so a proxy tick whose probes all timed out across
+    /// active→passive cannot land after the consumer's drain closed and stay
+    /// the newest measured tick for the whole stretch. The epoch re-check is
+    /// what drops it; deleting that re-check forwards the held tick and fails
+    /// this test. The next tick, started under the new epoch, IS forwarded.
+    #[tokio::test]
+    async fn interval_collector_drops_the_tick_in_flight_across_a_tier_switch() {
+        let (c, gate, collects) = gated_fake_collector();
+        let (tx, mut rx) = mpsc::channel(8);
+        let resume_at_us = no_resume();
+        let handle =
+            spawn_interval_collector(c, tx, Arc::new(AtomicBool::new(true)), resume_at_us.clone());
+
+        // Tick 1 is held; the switch publishes its epoch; the probe "returns".
+        held_open(&collects, 1).await;
+        resume_at_us.store(7_000_000, Ordering::Release);
+        gate.add_permits(1);
+
+        // The loop goes on to tick 2 (held) with nothing forwarded in between:
+        // tick 1 was dropped at the source, not queued behind the switch.
+        held_open(&collects, 2).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the tick in flight across the tier switch must not be forwarded"
+        );
+
+        // Tick 2 started under the new epoch: released, it is forwarded.
+        gate.add_permits(1);
+        let forwarded = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the first tick under the new tier must be forwarded")
+            .expect("channel should stay open while the collector runs");
+        assert!(matches!(forwarded, Sample::Link(_)));
+
+        drop(rx);
+        gate.add_permits(8);
         time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("collector task should exit after the receiver is dropped")

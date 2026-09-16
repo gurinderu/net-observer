@@ -8,6 +8,7 @@ use gpui::{
 };
 
 use net_observer_ipc::{IncidentSummary, StatusSnapshot};
+use types::ProbingTier;
 
 use crate::status::{Health, health};
 
@@ -148,18 +149,9 @@ fn header_row(
                 .font_weight(gpui::FontWeight::BOLD)
                 .child("net-observer"),
         );
-    // Only a muted "paused" label when the daemon is up but collection is off.
-    // Offline is conveyed by a warning glyph next to the (disabled) toggle — no text.
-    // Paused and quiet are DIFFERENT states and must never be rendered as one: a
-    // paused daemon collects nothing, a quiet daemon is still collecting and still
-    // recording — it just sends nothing at the gateway. Paused wins the label when
-    // both hold, because it is the stronger claim about what is being recorded.
-    let sub = match (online, snapshot.observing, snapshot.quiet) {
-        (true, false, _) => Some("paused"),
-        (true, true, true) => Some("quiet"),
-        _ => None,
-    };
-    if let Some(label) = sub {
+    // A muted state label after the name, only while the daemon is up. Offline
+    // is conveyed by a warning glyph next to the (disabled) toggle — no text.
+    if let Some(label) = header_sub_label(online, snapshot) {
         left = left.child(
             div()
                 .text_size(px(11.0))
@@ -184,6 +176,31 @@ fn header_row(
             theme,
             cx,
         ))
+}
+
+/// The header's muted state label, or `None` while offline.
+///
+/// Paused, passive and quiet are DIFFERENT states and must never be rendered
+/// as one: a paused daemon collects nothing; a passive daemon collects and
+/// records but puts nothing on the wire, every probe reading `SKIP`; a quiet
+/// daemon probes and withholds only the gateway echo. The stronger claim about
+/// what is being recorded wins the label — paused over the tier — and the
+/// tier is always named, because "passive" is the daemon's default and an
+/// operator reading the panel must see whether the wire is silent. Quiet is
+/// shown only inside the active tier, the one place it changes anything.
+/// Pure over its inputs, so the wording is a testable fact.
+fn header_sub_label(online: bool, snapshot: &StatusSnapshot) -> Option<&'static str> {
+    if !online {
+        return None;
+    }
+    if !snapshot.observing {
+        return Some("paused");
+    }
+    Some(match (snapshot.probing, snapshot.quiet) {
+        (ProbingTier::Passive, _) => "passive",
+        (ProbingTier::Active, true) => "probing, quiet",
+        (ProbingTier::Active, false) => "probing",
+    })
 }
 
 /// A warning glyph shown in the header when the daemon is unreachable. Hovering it
@@ -763,6 +780,44 @@ fn freshness_line(snapshot: &StatusSnapshot, now_us: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four states the header can name, kept apart: offline says nothing,
+    /// paused outranks the tier, and the tier is named in both directions —
+    /// with quiet shown only where it changes anything (inside active).
+    #[test]
+    fn header_sub_label_keeps_paused_passive_and_quiet_apart() {
+        let snap = |observing: bool, probing: ProbingTier, quiet: bool| StatusSnapshot {
+            observing,
+            probing,
+            quiet,
+            ..StatusSnapshot::default()
+        };
+        assert_eq!(
+            header_sub_label(false, &snap(true, ProbingTier::Passive, false)),
+            None
+        );
+        assert_eq!(
+            header_sub_label(true, &snap(false, ProbingTier::Active, true)),
+            Some("paused")
+        );
+        assert_eq!(
+            header_sub_label(true, &snap(true, ProbingTier::Passive, false)),
+            Some("passive")
+        );
+        assert_eq!(
+            header_sub_label(true, &snap(true, ProbingTier::Passive, true)),
+            Some("passive"),
+            "quiet changes nothing under passive and must not be shown there"
+        );
+        assert_eq!(
+            header_sub_label(true, &snap(true, ProbingTier::Active, false)),
+            Some("probing")
+        );
+        assert_eq!(
+            header_sub_label(true, &snap(true, ProbingTier::Active, true)),
+            Some("probing, quiet")
+        );
+    }
 
     /// The panel is a fixed 320 logical pixels wide: an over-long signature must
     /// be shortened to fit, never allowed to push the row past the window edge.
