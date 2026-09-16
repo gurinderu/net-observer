@@ -50,10 +50,10 @@ struct Cli {
     /// socket path for every command that talks to the running daemon.
     #[arg(long)]
     config: Option<String>,
-    /// Path to the observer DuckDB file [default: /var/lib/observer/observer.duckdb].
+    /// Path to the observer DuckDB file [default: the `db_path` of the daemon config].
     /// Giving it means "read this file": the diagnoses then never ask the
     /// daemon's socket. Without it they ask the running daemon first and read
-    /// the default file only when nothing answers on the socket. `query <SQL>`
+    /// the config's file only when nothing answers on the socket. `query <SQL>`
     /// and `air` always read the file. Every diagnosis prints which record
     /// answered as a `source:` line on stderr.
     #[arg(long)]
@@ -62,16 +62,33 @@ struct Cli {
     command: Command,
 }
 
-/// Where the daemon writes the record unless told otherwise — the file the
-/// diagnoses fall back to, and `query`/`air` read, when `--db` is not given.
-const DEFAULT_DB: &str = "/var/lib/observer/observer.duckdb";
+/// The record a command reads, and the socket to ask first when the operator
+/// did not name the record — both from the same place.
+///
+/// `--db` names the file outright and leaves `socket` empty: nothing is asked.
+/// Without it the daemon config is loaded and supplies both the socket and
+/// the file (`db_path`), so the fallback is the file the daemon writes, not a
+/// literal of this binary's own that could drift from it.
+struct Record {
+    socket: Option<String>,
+    db_path: String,
+}
 
-impl Cli {
-    /// The record file: `--db` when given, else [`DEFAULT_DB`]. Whether it was
-    /// GIVEN is a separate fact (`self.db.is_some()`) that [`diagnose_table`]
-    /// routes on.
-    fn db_path(&self) -> &str {
-        self.db.as_deref().unwrap_or(DEFAULT_DB)
+impl Record {
+    fn resolve(cli: &Cli) -> Result<Self> {
+        match &cli.db {
+            Some(db) => Ok(Self {
+                socket: None,
+                db_path: db.clone(),
+            }),
+            None => {
+                let cfg = load_config(cli)?;
+                Ok(Self {
+                    socket: Some(cfg.socket_path),
+                    db_path: cfg.db_path,
+                })
+            }
+        }
     }
 }
 
@@ -448,14 +465,16 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             // Three reads, one moment: the scan itself (so a SKIP is rendered as
             // a refusal), what it heard, and our own channel to compare against.
             let scan =
-                table_from_query(run_query(&file_only(cli), diagnosis::AIR_LATEST_SCAN_SQL)?);
-            let aps = table_from_query(run_query(&file_only(cli), diagnosis::AIR_LATEST_APS_SQL)?);
-            let own =
-                table_from_query(run_query(&file_only(cli), diagnosis::AIR_SELF_CHANNEL_SQL)?);
+                table_from_query(run_query(&file_only(cli)?, diagnosis::AIR_LATEST_SCAN_SQL)?);
+            let aps = table_from_query(run_query(&file_only(cli)?, diagnosis::AIR_LATEST_APS_SQL)?);
+            let own = table_from_query(run_query(
+                &file_only(cli)?,
+                diagnosis::AIR_SELF_CHANNEL_SQL,
+            )?);
             print!("{}", diagnose::format_air(&scan, &aps, &own)?);
         }
         Command::Query { sql } => {
-            let table = table_from_query(run_query(&file_only(cli), sql)?);
+            let table = table_from_query(run_query(&file_only(cli)?, sql)?);
             print!("{}", format_table(&table));
         }
         Command::Why { at } => {
@@ -643,14 +662,10 @@ fn diagnose_table(
     q: DiagnosticQuery,
     offline: impl FnOnce(&Offline) -> Result<QueryTable>,
 ) -> Result<Table> {
-    // The config (for the socket path) is loaded only when the socket is going
-    // to be asked; an explicit `--db` needs none of it.
-    let cfg = match cli.db {
-        Some(_) => None,
-        None => Some(load_config(cli)?),
-    };
-    let socket = cfg.as_ref().map(|c| c.socket_path.as_str());
-    match route(socket, |s| net_observer_ipc::diagnose(s, q))? {
+    let record = Record::resolve(cli)?;
+    match route(record.socket.as_deref(), |s| {
+        net_observer_ipc::diagnose(s, q)
+    })? {
         Route::Live { table, via } => {
             eprintln!("source: net-observerd via {via}");
             Ok(table)
@@ -659,9 +674,12 @@ fn diagnose_table(
             if let Some(why) = why {
                 eprintln!("{why}; reading the file instead");
             }
-            let db_path = cli.db_path();
-            eprintln!("source: file {db_path}");
-            offline(&Offline { db_path, locked }).map(table_from_query)
+            eprintln!("source: file {}", record.db_path);
+            offline(&Offline {
+                db_path: record.db_path,
+                locked,
+            })
+            .map(table_from_query)
         }
     }
 }
@@ -669,8 +687,8 @@ fn diagnose_table(
 /// The offline record and the sentence to print if a daemon holds its lock —
 /// the reason the reader is at the file, so the lock message never
 /// contradicts what just happened.
-struct Offline<'a> {
-    db_path: &'a str,
+struct Offline {
+    db_path: String,
     locked: String,
 }
 
@@ -939,10 +957,10 @@ fn run_prepared(offline: &Offline, p: &diagnosis::PreparedSql) -> Result<QueryTa
 }
 
 fn open_store(offline: &Offline) -> Result<DuckdbStore> {
-    DuckdbStore::open(offline.db_path).map_err(|e| {
+    DuckdbStore::open(&offline.db_path).map_err(|e| {
         let msg = e.to_string();
         if is_lock_error(&msg) {
-            anyhow!("{}", lock_message(offline.db_path, &offline.locked))
+            anyhow!("{}", lock_message(&offline.db_path, &offline.locked))
         } else {
             anyhow!("failed to open DuckDB at {}: {msg}", offline.db_path)
         }
@@ -958,11 +976,11 @@ fn lock_message(db_path: &str, locked: &str) -> String {
 
 /// The offline context of `query <SQL>` and `air`, which read the file by
 /// ruling and never ask the socket.
-fn file_only(cli: &Cli) -> Offline<'_> {
-    Offline {
-        db_path: cli.db_path(),
+fn file_only(cli: &Cli) -> Result<Offline> {
+    Ok(Offline {
+        db_path: Record::resolve(cli)?.db_path,
         locked: "`query` and `air` read the file only; stop the daemon for them".to_string(),
-    }
+    })
 }
 
 /// The `ts_us` of the newest gateway drop in the record, used when

@@ -232,16 +232,20 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// A deadline on one statement: a thread that interrupts the connection if it
 /// is not stood down within `budget`.
 ///
-/// Armed and disarmed INSIDE the connection lock, and `disarm` joins the
-/// thread — so once the statement's caller holds its result, no interrupt can
-/// still be on its way to hit whatever the writer runs next. The remaining
-/// case, an interrupt that lands after the statement finished but before the
-/// join, leaves a flag with nothing running; DuckDB clears it at the start of
-/// the next statement (`ClientContext::InitialCleanup`, checked against the
-/// bundled sources), so that statement is unaffected.
+/// Armed and disarmed INSIDE the connection lock, and standing down JOINS the
+/// thread — on the explicit `disarm` and, through `Drop`, on the panic path
+/// `with_conn` catches — so once the guard is gone, no interrupt can still be
+/// on its way to hit whatever the writer runs next. The remaining case, an
+/// interrupt that lands after the statement finished but before the join,
+/// leaves a flag with nothing running; DuckDB clears it at the start of the
+/// next statement (`ClientContext::InitialCleanup`, checked against the
+/// bundled sources), so that statement is unaffected. Likewise an interrupt
+/// landing during `prepare` — unreachable at a 30 s budget — is cleared by
+/// the execute step's own reset, and the statement then runs unbounded rather
+/// than misfiring on the writer.
 struct Watchdog {
-    stand_down: mpsc::Sender<()>,
-    thread: std::thread::JoinHandle<bool>,
+    stand_down: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<bool>>,
 }
 
 impl Watchdog {
@@ -256,13 +260,31 @@ impl Watchdog {
             // Stood down: the sender was dropped before the deadline.
             Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
         });
-        Self { stand_down, thread }
+        Self {
+            stand_down: Some(stand_down),
+            thread: Some(thread),
+        }
     }
 
-    /// Stand the thread down and wait for it; `true` iff it fired.
-    fn disarm(self) -> bool {
-        drop(self.stand_down);
-        self.thread.join().unwrap_or(false)
+    /// Stand the thread down and wait for it; `true` iff it fired. Idempotent
+    /// with [`Drop`]: whichever runs first does the work, the other finds
+    /// nothing left to do.
+    fn disarm(mut self) -> bool {
+        self.stand_down_and_join()
+    }
+
+    fn stand_down_and_join(&mut self) -> bool {
+        drop(self.stand_down.take());
+        self.thread
+            .take()
+            .map(|t| t.join().unwrap_or(false))
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.stand_down_and_join();
     }
 }
 

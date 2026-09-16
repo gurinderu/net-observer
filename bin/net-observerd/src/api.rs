@@ -408,8 +408,10 @@ pub struct ApiServer {
     /// Durable sink for pause/resume boundary records.
     pub store: Arc<dyn Store + Send + Sync>,
     /// The one-in-flight gate on `Request::Query` — [`MAX_QUERIES_IN_FLIGHT`]
-    /// permits, claimed with `try_acquire` and never awaited. Shared (`Arc`) so
-    /// a test can hold the permit and observe the refusal without a sleep.
+    /// permits, claimed with `try_acquire` and never awaited. An `Arc` like
+    /// the other shared state here (`observing`, `quiet`, `store`): one gate
+    /// for the server and every connection task it spawns, whichever of them
+    /// is holding the permit.
     pub query_gate: Arc<Semaphore>,
     /// The realtime bus, carrying frames already serialised once.
     pub events_tx: broadcast::Sender<EncodedFrame>,
