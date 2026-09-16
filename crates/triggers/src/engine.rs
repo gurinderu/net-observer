@@ -61,14 +61,16 @@ impl TriggerEngine {
     /// window is cleared and every trigger is re-armed
     /// ([`TriggerEngine::rearm_all`]), so a fault that is still present when
     /// collection resumes is recorded again — as a NEW incident belonging to the
-    /// new observation session, not as a duplicate of the pre-pause one. What a
-    /// resume does NOT do is reset the firing budget: `last_fire_us` survives it,
-    /// so each trigger still fires at most once per `backoff_us` and a toggled
-    /// switch cannot storm the incident log. The `observing_edge` rows bound the
-    /// gap between the two records. The incident the PREVIOUS session had open
-    /// closes at the edge that ends it ([`TriggerEngine::close_all`]), called
-    /// before the re-arm, so no row is left open across the bracket (realm
-    /// net-observer, node #124).
+    /// new observation session, not as a duplicate of the pre-pause one. The
+    /// incident the PREVIOUS session had open closes at the edge that ends it
+    /// ([`TriggerEngine::close_all`]), called before the re-arm, so no row is
+    /// left open across the bracket — and closing it releases that trigger's
+    /// firing budget too: `last_fire_us` resets, so a fault still present opens
+    /// its new-session incident AT ONCE rather than waiting out whatever backoff
+    /// the closed incident had spent. A trigger with NOTHING open at the edge
+    /// keeps its budget untouched, so a toggle storm on a healthy network still
+    /// cannot fire (realm net-observer, node #124). The `observing_edge` rows
+    /// bound the gap between the two records.
     pub fn on_sample(&mut self, w: &RecentWindow, now_us: i64) {
         for trig in &mut self.triggers {
             match trig.condition.eval(w) {
@@ -143,8 +145,19 @@ impl TriggerEngine {
     /// For every trigger with an open incident: every handler's `on_clear` runs
     /// at `ts_us`, the id is taken (so a later `close_all` or the next `None`
     /// edge finds nothing to close twice), and the trigger is armed — the same
-    /// effect the `None` arm has. `last_fire_us` is left untouched, so the
-    /// backoff still bounds how soon a re-open may fire.
+    /// effect the `None` arm has.
+    ///
+    /// `last_fire_us` is reset to [`i64::MIN`] — the same sentinel
+    /// [`Trigger::new`] starts a never-fired trigger at — but ONLY for a
+    /// trigger whose incident this call actually closed. Closing an incident at
+    /// the edge releases that trigger's firing budget: the engine's documented
+    /// contract is that a fault still present when collection resumes is
+    /// recorded again "as a NEW incident", and a new incident that then sits
+    /// silently unrecorded until the OLD session's backoff happens to expire is
+    /// a missed incident, which this project ranks above a noisy log. A trigger
+    /// with NOTHING open here is untouched: its budget survives exactly as
+    /// before, so a toggle storm on a healthy network still cannot fire (realm
+    /// net-observer, node #124).
     pub fn close_all(&mut self, ts_us: i64) {
         for trig in &mut self.triggers {
             if let Some(id) = trig.open_incident.take() {
@@ -152,6 +165,7 @@ impl TriggerEngine {
                     h.on_clear(&id, ts_us);
                 }
                 trig.armed = true;
+                trig.last_fire_us = i64::MIN;
             }
         }
     }
@@ -344,11 +358,15 @@ mod tests {
 
     /// (b) The pin for the hole itself, stated positively: fire (A) -> `close_all`
     /// at the edge -> `rearm_all` (the exact pair `pipeline::run` calls at a
-    /// resume/tier-switch edge) -> a sample past the backoff still asserting ->
-    /// a NEW incident (B) fires, and EXACTLY ONE clear exists — A, at the edge.
-    /// Without `close_all` this sequence would produce two fires and ZERO
-    /// clears: A silently overwritten, its `incident` row never closed (realm
-    /// net-observer, node #124).
+    /// resume/tier-switch edge) -> a sample STILL WELL INSIDE A's old backoff,
+    /// still asserting -> a NEW incident (B) fires anyway, and EXACTLY ONE clear
+    /// exists — A, at the edge. The backoff is 1_000 and the post-edge sample
+    /// lands at `ts 15` — only 15us after A's own firing — so this dies unless
+    /// `close_all` actually releases the budget, not merely if a mutation
+    /// happened to leave enough real elapsed time for the old backoff to expire
+    /// on its own. Without `close_all` this sequence would produce ONE fire and
+    /// ZERO clears: A silently latched forever, its `incident` row never closed
+    /// (realm net-observer, node #124).
     #[test]
     fn close_all_then_rearm_all_lets_a_persistent_fault_open_a_new_incident_with_one_clear() {
         let h = Arc::new(EdgeHandler::new());
@@ -364,15 +382,18 @@ mod tests {
         w.clear_for_resume();
         eng.rearm_all();
 
-        // Still asserting, past the (untouched) backoff: a NEW incident.
-        w.push(link(1_001, GwVerdict::Fail));
-        eng.on_sample(&w, 1_001);
+        // Still asserting, well INSIDE the old backoff (0 -> 1_000): only the
+        // budget release lets this fire.
+        w.push(link(15, GwVerdict::Fail));
+        eng.on_sample(&w, 15);
 
         let opened = h.opened.lock().unwrap().clone();
         assert_eq!(
             opened.len(),
             2,
-            "the persistent fault opens a second incident"
+            "closing at the edge must release the budget so the persistent \
+             fault opens a second incident immediately, not once the old \
+             backoff happens to expire"
         );
         assert_ne!(
             opened[0], opened[1],
