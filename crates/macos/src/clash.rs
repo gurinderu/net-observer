@@ -185,19 +185,39 @@ fn parse_vless_endpoints(config_json: &str) -> Vec<String> {
     endpoints
 }
 
-/// One probe address from inside the fakeip pool a sing-box config declares
-/// (the first `dns.servers[]` entry carrying `inet4_range`): the range's
-/// network address + 8 — inside any real pool, and never a network or
-/// broadcast address of one.
-pub(crate) fn fakeip_probe_addr(config_json: &str) -> Option<std::net::Ipv4Addr> {
+/// The fakeip pool a sing-box config declares (the first `dns.servers[]`
+/// entry carrying `inet4_range`), as a `(network, mask)` pair ready for a
+/// bitwise membership test. `None` — no config, no range, no parse — means
+/// the caller CANNOT JUDGE pool membership; it must never be read as "not a
+/// fakeip". Config-driven on purpose: the pool moved four times in one
+/// month, and anything hardcoding it gets left behind (the dns collector's
+/// 198.18.0.0/15 literal silently judged a pool sing-box no longer served).
+pub(crate) fn fakeip_range(config_json: &str) -> Option<(u32, u32)> {
     let value: serde_json::Value = serde_json::from_str(config_json).ok()?;
     let servers = value.get("dns")?.get("servers")?.as_array()?;
     let range = servers
         .iter()
         .find_map(|s| s.get("inet4_range").and_then(|r| r.as_str()))?;
-    let (net, _prefix) = range.split_once('/')?;
+    let (net, prefix) = range.split_once('/')?;
     let net: std::net::Ipv4Addr = net.parse().ok()?;
-    Some(std::net::Ipv4Addr::from(u32::from(net) + 8))
+    let prefix: u32 = prefix.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Some((u32::from(net) & mask, mask))
+}
+
+/// One probe address from inside the fakeip pool a sing-box config declares:
+/// the range's network address + 8 — inside any real pool, and never a
+/// network or broadcast address of one.
+pub(crate) fn fakeip_probe_addr(config_json: &str) -> Option<std::net::Ipv4Addr> {
+    let (net, _mask) = fakeip_range(config_json)?;
+    Some(std::net::Ipv4Addr::from(net + 8))
 }
 
 /// The sing-box TUN inbound's own IPv4 address (the first `inbounds[]` of

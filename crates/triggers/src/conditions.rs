@@ -96,6 +96,79 @@ impl Condition for Wedge {
     }
 }
 
+/// Measurement-context gate around a fault condition.
+///
+/// The first live-trial days produced a stream of incidents whose only cause
+/// was an invalid measurement context: `endpoint-block` fired while the
+/// machine had no uplink at all (every raw probe fails when there is no
+/// interface to probe from), `per-client-block` fired a minute into a freshly
+/// joined network and during host starvation, `established-stall` fired
+/// seconds after a network move (the old flows legally died with the NAT).
+/// The shell watchdog has carried the equivalent guards for months — its
+/// load1 gate and its direct-path requirement; this wrapper gives the fault
+/// conditions the same discipline without teaching each one about hosts and
+/// links.
+///
+/// Each gate is optional so every signature keeps exactly the guards its
+/// semantics allow (`per-client-block` measures a DEAD gateway, so it must
+/// not require a working direct path):
+///   - `require_direct`: the newest MEASURED link sample must say the direct
+///     path works. A destination-fault verdict is meaningless while the
+///     uplink itself is down. `Skip` rows are the absence of a measurement
+///     and satisfy nothing (node #25).
+///   - `load_below`: the newest host sample's `load1` must be below this —
+///     above it, probe failures measure the run queue, not the network
+///     (measured 2026-07-30: at load1 ≥ 64 half of all probes fail). No host
+///     sample yet = no starvation evidence = the gate stays open.
+///   - `settle_us`: the network identity (`dhcp_router`) must not have
+///     changed within this window — right after a move every layer is
+///     legitimately in flux.
+pub struct Gated<C> {
+    pub inner: C,
+    pub require_direct: bool,
+    pub load_below: Option<f64>,
+    pub settle_us: Option<i64>,
+}
+
+impl<C: Condition> Condition for Gated<C> {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        if self.require_direct {
+            let direct_ok = w
+                .recent_link(GW_CHANGE_SCAN)
+                .into_iter()
+                .find(|l| l.direct != TcpVerdict::Skip)
+                .is_some_and(|l| l.direct == TcpVerdict::Ok);
+            if !direct_ok {
+                return None;
+            }
+        }
+        if let Some(threshold) = self.load_below {
+            if w.last_host().is_some_and(|h| h.load1 >= threshold) {
+                return None;
+            }
+        }
+        if let Some(settle_us) = self.settle_us {
+            let links = w.recent_link(GW_CHANGE_SCAN);
+            if let Some(newest) = links.first() {
+                let horizon = newest.ts_us.saturating_sub(settle_us);
+                let mut identities = links
+                    .iter()
+                    .take_while(|l| l.ts_us >= horizon)
+                    .filter_map(|l| l.dhcp_router.as_deref());
+                if let Some(first) = identities.next() {
+                    if identities.any(|r| r != first) {
+                        return None;
+                    }
+                }
+            }
+        }
+        self.inner.eval(w)
+    }
+}
+
 /// How far back `gw-change` looks for a comparable (non-`SKIP`) predecessor when
 /// the operator's quiet mode has suppressed the echo for a run of ticks.
 const GW_CHANGE_SCAN: usize = 64;
@@ -778,6 +851,91 @@ mod tests {
         w.push(proxy(3, 0));
         w.push(proxy(5, 204));
         assert!(c.eval(&w).is_none());
+    }
+
+    /// A link sample whose only interesting field is the network identity
+    /// (`dhcp_router`) — the settle gate's input.
+    fn link_router(ts: i64, router: Option<&str>) -> Sample {
+        match link(ts, TcpVerdict::Ok) {
+            Sample::Link(mut l) => {
+                l.dhcp_router = router.map(str::to_string);
+                Sample::Link(l)
+            }
+            other => other,
+        }
+    }
+
+    /// A condition that always asserts — the gate around it is what's under test.
+    struct AlwaysFire;
+    impl Condition for AlwaysFire {
+        fn id(&self) -> &'static str {
+            "always"
+        }
+        fn eval(&self, _: &RecentWindow) -> Option<Fire> {
+            Some(Fire {
+                detail: "always".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn gate_requires_a_measured_direct_ok() {
+        let mut w = RecentWindow::new(16);
+        let c = Gated {
+            inner: AlwaysFire,
+            require_direct: true,
+            load_below: None,
+            settle_us: None,
+        };
+        assert!(
+            c.eval(&w).is_none(),
+            "no link sample at all is no measurement, not a pass"
+        );
+        w.push(link(1, TcpVerdict::Fail));
+        assert!(c.eval(&w).is_none(), "uplink down voids the verdict");
+        w.push(link(2, TcpVerdict::Ok));
+        assert!(c.eval(&w).is_some());
+    }
+
+    #[test]
+    fn gate_suppresses_under_host_starvation() {
+        let mut w = RecentWindow::new(16);
+        let c = Gated {
+            inner: AlwaysFire,
+            require_direct: false,
+            load_below: Some(10.0),
+            settle_us: None,
+        };
+        assert!(
+            c.eval(&w).is_some(),
+            "no host sample = no starvation evidence, the gate stays open"
+        );
+        w.push(host(1, 42.0));
+        assert!(c.eval(&w).is_none(), "probes under load measure the run queue");
+        w.push(host(2, 3.0));
+        assert!(c.eval(&w).is_some());
+    }
+
+    #[test]
+    fn gate_holds_through_a_network_move_settle_window() {
+        let mut w = RecentWindow::new(16);
+        let c = Gated {
+            inner: AlwaysFire,
+            require_direct: false,
+            load_below: None,
+            settle_us: Some(100),
+        };
+        w.push(link_router(1, Some("10.0.0.1")));
+        w.push(link_router(50, Some("192.168.0.1")));
+        assert!(
+            c.eval(&w).is_none(),
+            "identity changed inside the settle window"
+        );
+        w.push(link_router(200, Some("192.168.0.1")));
+        assert!(
+            c.eval(&w).is_some(),
+            "the old identity aged out of the settle horizon"
+        );
     }
 
     /// Push `n` wedge-shaped tick pairs (direct healthy, tun dead) starting at

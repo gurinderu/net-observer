@@ -13,6 +13,12 @@ pub trait Handler: Send + Sync {
     /// Called once per firing with the generated `incident_id`, firing timestamp
     /// (epoch microseconds) and a human-readable `detail`.
     fn on_fire(&self, incident_id: &str, ts_us: i64, detail: &str);
+
+    /// Called once when the condition that opened `incident_id` stops
+    /// asserting — the engine's Some→None edge. Default: nothing, so handlers
+    /// whose side effect has no closing half (a pcap freeze, a snapshot) keep
+    /// their one-shot semantics untouched.
+    fn on_clear(&self, _incident_id: &str, _ts_us: i64) {}
 }
 
 /// A [`Handler`] that persists a firing: opens an [`Incident`] and records a
@@ -56,6 +62,12 @@ impl<S: Store + Send + Sync> Handler for RecordHandler<S> {
         };
         if let Err(e) = self.store.write_trigger_fired(&fired) {
             tracing::warn!(incident_id, error = %e, "failed to record trigger_fired");
+        }
+    }
+
+    fn on_clear(&self, incident_id: &str, ts_us: i64) {
+        if let Err(e) = self.store.close_incident(incident_id, ts_us) {
+            tracing::warn!(incident_id, error = %e, "failed to close incident");
         }
     }
 }

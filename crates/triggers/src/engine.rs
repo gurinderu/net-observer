@@ -15,6 +15,11 @@ pub struct Trigger {
     backoff_us: i64,
     armed: bool,
     last_fire_us: i64,
+    /// The incident the last firing opened, held until the condition's
+    /// Some→None edge closes it. Lives here because this is the only place
+    /// that edge is observable. A firing suppressed by the backoff does NOT
+    /// replace it: a continuing assertion belongs to the same episode.
+    open_incident: Option<String>,
 }
 
 impl Trigger {
@@ -30,6 +35,7 @@ impl Trigger {
             backoff_us,
             armed: true,
             last_fire_us: i64::MIN,
+            open_incident: None,
         }
     }
 }
@@ -69,11 +75,24 @@ impl TriggerEngine {
                         for h in &trig.handlers {
                             h.on_fire(&incident_id, now_us, &fire.detail);
                         }
+                        trig.open_incident = Some(incident_id);
                         trig.armed = false;
                         trig.last_fire_us = now_us;
                     }
                 }
                 None => {
+                    // The condition stopped asserting: close what it opened.
+                    // `None` covers both "measured healthy" and "cannot tell"
+                    // (an emptied window after a resume) — either way the
+                    // assertion ends HERE, and this edge is the only closing
+                    // signal that will ever exist. Leaving the row open
+                    // instead is strictly worse: the first trial week
+                    // accumulated 60+ forever-open incidents.
+                    if let Some(id) = trig.open_incident.take() {
+                        for h in &trig.handlers {
+                            h.on_clear(&id, now_us);
+                        }
+                    }
                     trig.armed = true;
                 }
             }
@@ -120,6 +139,28 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
+
+    /// Records every open and close it sees, so a test can assert the pairing.
+    struct EdgeHandler {
+        opened: std::sync::Mutex<Vec<String>>,
+        cleared: std::sync::Mutex<Vec<(String, i64)>>,
+    }
+    impl EdgeHandler {
+        fn new() -> Self {
+            Self {
+                opened: std::sync::Mutex::new(Vec::new()),
+                cleared: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl crate::handlers::Handler for EdgeHandler {
+        fn on_fire(&self, id: &str, _: i64, _: &str) {
+            self.opened.lock().unwrap().push(id.to_string());
+        }
+        fn on_clear(&self, id: &str, ts_us: i64) {
+            self.cleared.lock().unwrap().push((id.to_string(), ts_us));
+        }
+    }
     fn link(ts: i64, gw: GwVerdict) -> Sample {
         Sample::Link(LinkSample {
             ts_us: ts,
@@ -137,6 +178,33 @@ mod tests {
             fakeip_route_if: None,
             singbox_tun_if: None,
         })
+    }
+
+    #[test]
+    fn the_clear_edge_closes_exactly_the_incident_the_firing_opened() {
+        let h = Arc::new(EdgeHandler::new());
+        let handlers: Vec<Arc<dyn crate::handlers::Handler>> = vec![h.clone()];
+        let trig = Trigger::new(Box::new(GwDrop), handlers, 1_000);
+        let mut eng = TriggerEngine::new(vec![trig]);
+        let mut w = RecentWindow::new(8);
+        w.push(link(0, GwVerdict::Fail));
+        eng.on_sample(&w, 0);
+        // Still asserting: no close yet, and the backoff-suppressed re-fire
+        // must not open (or later close) a second incident.
+        w.push(link(1, GwVerdict::Fail));
+        eng.on_sample(&w, 1);
+        assert!(h.cleared.lock().unwrap().is_empty());
+        // Recovery closes the one incident the firing opened, at recovery time.
+        w.push(link(2, GwVerdict::Ok));
+        eng.on_sample(&w, 2);
+        let opened = h.opened.lock().unwrap().clone();
+        let cleared = h.cleared.lock().unwrap().clone();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(cleared, vec![(opened[0].clone(), 2)]);
+        // A later healthy tick has nothing left to close.
+        w.push(link(3, GwVerdict::Ok));
+        eng.on_sample(&w, 3);
+        assert_eq!(h.cleared.lock().unwrap().len(), 1);
     }
 
     #[test]

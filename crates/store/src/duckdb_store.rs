@@ -90,6 +90,23 @@ impl DuckdbStore {
         })
     }
 
+    /// Close every still-open incident at `ts_us`, returning how many there were.
+    ///
+    /// Called once at daemon startup. An incident's closing edge (the trigger
+    /// condition's Some→None transition) lives in the previous process's
+    /// memory, so a restart would otherwise leave its open incidents open
+    /// FOREVER — the first live-trial week accumulated 60+ such rows. A close
+    /// stamped at startup is an observation bound ("nothing can track this
+    /// past here"), not a recovery claim; the trigger_fired rows keep the
+    /// full firing history either way.
+    pub fn close_open_incidents(&self, ts_us: i64) -> Result<usize, StoreError> {
+        let n = self.conn.lock().unwrap().execute(
+            "UPDATE incident SET closed_us=? WHERE closed_us IS NULL",
+            params![ts_us],
+        )?;
+        Ok(n)
+    }
+
     /// List incidents as `(trigger_id, opened_us, closed_us)`, newest first.
     pub fn list_incidents(&self) -> Result<Vec<(String, i64, Option<i64>)>, StoreError> {
         let conn = self.conn.lock().unwrap();

@@ -40,7 +40,7 @@ use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
-    EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, GwChange, GwDrop, GwMacChange,
+    EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, Gated, GwChange, GwDrop, GwMacChange,
     NeighborMacCollision, PerClientBlock, Starvation, Wedge,
 };
 use triggers::engine::{Trigger, TriggerEngine};
@@ -99,8 +99,18 @@ const WEDGE_CONSECUTIVE: usize = 3;
 const ENDPOINT_BLOCK_CONSECUTIVE: usize = 2;
 
 /// Host load above which a dead tun counts as starvation (read from the `host`
-/// collector's newest sample by the `Starvation` condition).
+/// collector's newest sample by the `Starvation` condition), and above which
+/// the `Gated` fault conditions decline to fire at all — there a probe
+/// failure measures the run queue, not the network.
 const STARVATION_LOAD: f64 = 10.0;
+
+/// How long after a network-identity change (`dhcp_router` moved) the `Gated`
+/// fault conditions hold their fire. Right after a move every layer is
+/// legitimately in flux: netreload restarts sing-box, old flows die with the
+/// NAT, urltest rebuilds its history — ~2 minutes covers the whole settle
+/// (measured 2026-09-16: a coworking move took ~3 min end to end, of which
+/// the last minute was already healthy).
+const SETTLE_US: i64 = 120_000_000;
 
 /// Path to the rendered sing-box config (read at runtime — server addresses are
 /// never compiled in). Deployment writes it here; absent ⇒ proxy emits SKIP.
@@ -325,6 +335,15 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     let store = Arc::new(DuckdbStore::open(&cfg.db_path).context("opening store")?);
 
+    // Incidents left open by the previous process can never be closed by it
+    // again — the closing edge lived in its memory. Stamp them closed at the
+    // observation bound rather than leaving forever-open rows.
+    match store.close_open_incidents(types::now_us()) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(n, "closed stale open incidents from a previous run"),
+        Err(e) => tracing::warn!(error = %e, "failed to close stale open incidents"),
+    }
+
     // The OUI registry for neighbour ROLE inference, loaded ONCE here and shared
     // (Arc) by the passive collector and the active scanner — loading it per tick
     // or per scan would re-read a large file for nothing. `None` when no snapshot
@@ -469,6 +488,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 cfg.collectors.dns.monitored_domain.clone(),
                 cfg.collectors.dns.ru_control_domain.clone(),
                 cfg.collectors.dns.doh_url.clone(),
+                SINGBOX_CONFIG_PATH.to_string(),
             ),
             cfg.collectors.dns.interval,
         )));
@@ -1419,10 +1439,22 @@ fn build_engine(
     let gw_change_handlers: Vec<Arc<dyn Handler>> =
         vec![record.clone(), snap.clone(), freeze.clone()];
 
+    // Fault conditions ride inside `Gated`: the first live-trial days showed
+    // every one of them firing on invalid measurement context (no uplink,
+    // host starvation, the settle window after a network move) — the gates
+    // are the shell watchdog's field-proven guards, applied per signature
+    // according to what its semantics allow. `per-client-block` measures a
+    // DEAD gateway, so it cannot require a live direct path; the rest can.
     let triggers = vec![
         Trigger::new(
-            Box::new(Wedge {
-                consecutive: WEDGE_CONSECUTIVE,
+            Box::new(Gated {
+                inner: Wedge {
+                    consecutive: WEDGE_CONSECUTIVE,
+                },
+                // Wedge's own eval already requires the direct path.
+                require_direct: false,
+                load_below: Some(STARVATION_LOAD),
+                settle_us: Some(SETTLE_US),
             }),
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
@@ -1451,7 +1483,12 @@ fn build_engine(
         // No pcap freeze: the evidence is the recorded counts, and the echoes
         // the gateway never answered are packets that never arrived.
         Trigger::new(
-            Box::new(PerClientBlock),
+            Box::new(Gated {
+                inner: PerClientBlock,
+                require_direct: false,
+                load_below: Some(STARVATION_LOAD),
+                settle_us: Some(SETTLE_US),
+            }),
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
@@ -1470,8 +1507,13 @@ fn build_engine(
         // No pcap freeze: the evidence is the stored per-endpoint verdicts —
         // packets of connections that never opened add nothing.
         Trigger::new(
-            Box::new(EndpointBlock {
-                consecutive: ENDPOINT_BLOCK_CONSECUTIVE,
+            Box::new(Gated {
+                inner: EndpointBlock {
+                    consecutive: ENDPOINT_BLOCK_CONSECUTIVE,
+                },
+                require_direct: true,
+                load_below: Some(STARVATION_LOAD),
+                settle_us: Some(SETTLE_US),
             }),
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
@@ -1479,7 +1521,12 @@ fn build_engine(
         // No pcap freeze: the evidence is the recorded held-stream reading —
         // the scoping verdict is already in the detail string.
         Trigger::new(
-            Box::new(EstablishedStall),
+            Box::new(Gated {
+                inner: EstablishedStall,
+                require_direct: true,
+                load_below: Some(STARVATION_LOAD),
+                settle_us: Some(SETTLE_US),
+            }),
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
