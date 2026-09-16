@@ -67,7 +67,7 @@ flowchart LR
 
     snap --> apisrv{{"api::ApiServer::serve\nUnixListener socket"}}
     bar["net-observer-bar\n(unprivileged socket client)"] <-->|"Request/Response\n(net-observer-ipc)"| apisrv
-    cli["net-observer-cli\n(status/incidents: socket;\nquery <SQL>: offline DB)"] <-->|"Request/Response\n(net-observer-ipc)"| apisrv
+    cli["net-observer-cli\n(status/incidents/diagnoses: socket;\nquery <SQL>: offline DB)"] <-->|"Request/Response\n(net-observer-ipc)"| apisrv
     cli -->|"query <SQL>\n(offline, read-only)"| store
 ```
 
@@ -299,7 +299,7 @@ graph TD
     config["config\nfigment per-subsystem toggles"]
     macos["macos\nreal adapters: ICMP, IP_BOUND_IF,\nClash API, DHCP/ARP, pcap ring,\nDNS resolve, PF_ROUTE, loadavg"]
     net-observerd["bin/net-observerd\nroot LaunchDaemon"]
-    cli["bin/net-observer-cli\nstatus/incidents via socket;\nquery <SQL> via offline DB"]
+    cli["bin/net-observer-cli\nstatus/incidents/diagnoses via socket;\nquery <SQL> via offline DB"]
     bar["bin/net-observer-bar\ngpui menu-bar (NSStatusItem\n+ panel); socket client (no DB)"]
 
     types --> ccore
@@ -484,10 +484,15 @@ daemon read back with a `NULL` cause, which the gap derivation treats as
 `crates/store/src/diagnosis.rs` is the read side: the canned SQL that turns the
 record into *which layer failed*, so the reading of an outage is reproducible
 instead of re-derived by hand. Each is a `*_sql()` builder plus a `DuckdbStore`
-method that runs it with the defaults (`DEFAULT_STARVATION_LOAD` = 10.0, matching
+method that runs it with the defaults (`DEFAULT_STARVATION_LOAD` = 10.0, which IS
 the daemon's `STARVATION_LOAD`; `DEFAULT_EPISODE_GAP_US` = 30 s;
 `DEFAULT_RAMP_WINDOW_US` = 120 s). Correlation across cadences is by `ASOF JOIN`
-— the join the whole storage choice was made for.
+— the join the whole storage choice was made for. The two read primitives the
+builders run on (`query_table` / `query_prepared`) sit on the `Store` trait, so
+the daemon's socket server can run the same builders through its `dyn Store`
+handle while the daemon runs (`Request::Query`, see [Local socket
+API](#local-socket-api)); `HistoryWindow`, the one parameter type a diagnosis
+carries, lives in `types` for the same reason.
 
 | Query | Answers |
 | --- | --- |
@@ -585,6 +590,51 @@ the durable record; the socket is the live, low-latency read path.
   newline-delimited JSON:
   - `Request::Status` → `Response::Status(StatusSnapshot)`
   - `Request::Incidents { limit }` → `Response::Incidents(Vec<IncidentSummary>)`
+  - `Request::Query(DiagnosticQuery)` → `Response::Table(Table)` — one of the
+    named diagnoses of [Diagnosis queries](#diagnosis-queries) (`why`,
+    `incident-context`, `wedge-or-starvation`, `gateway-ramp` and the drop list
+    it defaults from, `gaps`, `neighbors`, `vulns`, `segments`, `history`,
+    `topology`), run by the daemon against its **own** store while it keeps
+    collecting — the only reader that can, since the daemon's per-process lock
+    keeps every other opener out, and the moment of an incident is exactly when
+    these are wanted. Read-only, in the same class as `Status`: no peer gate.
+    DuckDB is synchronous, so `api_query::run_query` runs on
+    `tokio::task::spawn_blocking`, never on the runtime — and at most **one at
+    a time** (`api::MAX_QUERIES_IN_FLIGHT`, a one-permit `Semaphore` claimed
+    with `try_acquire`): a diagnosis holds the store mutex the pipeline writes
+    through, and on a world-connectable socket a queue of them would be a stall
+    any local process could inflict, so a second concurrent `Query` is refused
+    at once with `Response::Error("a diagnosis is already running; retry")`
+    (`api::QUERY_BUSY`) rather than queued. Not a per-peer rate limit — a
+    deliberate non-goal. The one run is itself **bounded**: the daemon interrupts
+    the statement at `api::QUERY_DEADLINE` (30 s) through DuckDB's interrupt
+    handle (`Store::query_prepared_within`, a watchdog armed and stood down
+    inside the connection lock, so no late interrupt can reach the writer's next
+    statement) and answers `Response::Error("diagnosis exceeded 30 s and was
+    interrupted")`; a client that had already hung up cannot leave the mutex
+    held. The client's own read budget (`DIAGNOSIS_TIMEOUT`, 45 s) is longer on
+    purpose, so the daemon's report is what the operator reads. A panic under
+    the connection lock is caught (`StoreError::Panicked`) so the mutex is
+    released unpoisoned and the writer's next `lock()` does not panic the
+    consumer loop. The threshold a query needs but does not carry is the
+    daemon's own `STARVATION_LOAD`, so a live reading agrees with the
+    incidents the daemon recorded. `Table` is the
+    stringified `columns` + `rows` shape the CLI renders on both paths (the
+    offline `store::QueryTable` is converted into it). A diagnosis the daemon
+    read but could not run — a filter the store could never have written, a
+    DuckDB error — answers `Response::Error` in the daemon's words, while a
+    daemon built before `Query` answers the generic `bad request: …` it gives
+    any undecodable frame; `net_observer_ipc::diagnose` tells the two apart
+    (`QueryOutcome::Failed` vs `Unsupported`, on the pinned
+    `UNDECODABLE_REQUEST_PREFIX`). The CLI asks the daemon first and opens the
+    DB file only when nothing listens on the socket or the daemon is too old to
+    read the request (naming the socket it tried, on stderr) — never over a
+    diagnosis that ran and failed, where the file would only meet the lock and
+    report the wrong problem. An explicit `--db` names the record and means
+    the socket is not asked at all, and every diagnosis prints which record
+    answered (`source: net-observerd via <socket>` or `source: file <path>`)
+    on stderr, so a forensic reader never mistakes one record for the other.
+    (realm net-observer, node #58)
   - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
     write/control path (see [Control path](#control-path) below); the only
     non-read request. Six commands today — `ControlCmd::KickstartProxy`,
@@ -651,9 +701,10 @@ the durable record; the socket is the live, low-latency read path.
   three are load-bearing: without the timeout, silent connections fill the
   connection cap and lock legitimate clients out permanently; without the cap, an
   attacker opens fds faster than the timeout reaps them. Then either
-  answer a **one-shot** request (`Status` / `Incidents` / `Control`) from the
-  shared `Arc<Mutex<StatusSnapshot>>` the pipeline keeps current (or, for a
-  `Control`, pass the peer-credential gate and then run the command),
+  answer a **one-shot** request (`Status` / `Incidents` / `Query` / `Control`)
+  from the shared `Arc<Mutex<StatusSnapshot>>` the pipeline keeps current (or,
+  for a `Query`, run the named diagnosis against the store on the blocking pool;
+  for a `Control`, pass the peer-credential gate and then run the command),
   write one `Response`, and close; or, for a `Subscribe`, **hold the connection
   open** and stream `StreamFrame`s until the client disconnects (see [Event bus
   and live subscriptions](#event-bus-and-live-subscriptions)). The lock is held
@@ -666,7 +717,8 @@ the durable record; the socket is the live, low-latency read path.
   collecting).
 
 - **Client** (`net_observer_ipc::query`, used by `bin/net-observer-bar` and by
-  `net-observer-cli`'s `status` / `incidents`) — a *blocking* round-trip: connect, write
+  `net-observer-cli`'s `status` / `incidents`; `net_observer_ipc::diagnose` by
+  the CLI's named diagnoses) — a *blocking* round-trip: connect, write
   one request frame, read one response frame. A missing socket / connection-refused
   (daemon down) / protocol error all map to an `Err`, which the bar renders as the
   "net-observer offline" state and retries on its next ~3s tick, and which the CLI turns

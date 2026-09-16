@@ -11,7 +11,9 @@ pub use air::{
     OverlapConfidence, overlap_hypothesis,
 };
 pub use incident::{BlobRef, Incident, TriggerFired};
-pub use neighbor::{NeighborLifetime, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence};
+pub use neighbor::{
+    HistoryWindow, NeighborLifetime, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence,
+};
 pub use observing::{ObservingCause, ObservingEdge};
 pub use sample::{
     DnsSample, HostSample, LinkSample, ProxySample, RouteEvent, Sample, WifiSample, now_us,

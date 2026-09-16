@@ -39,8 +39,8 @@ use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
 use types::{
-    AirSample, DnsSample, HostSample, LinkSample, NeighborLifetime, NeighborsSample, ObservingEdge,
-    ProxySample, RouteEvent, TopologyLifetime, TopologyLink, WifiSample,
+    AirSample, DnsSample, HistoryWindow, HostSample, LinkSample, NeighborLifetime, NeighborsSample,
+    ObservingEdge, ProxySample, RouteEvent, TopologyLifetime, TopologyLink, WifiSample,
 };
 
 /// A request from a client (the bar or cli) to the daemon.
@@ -50,6 +50,18 @@ pub enum Request {
     Status,
     /// Fetch the most recent incidents, newest first, capped at `limit`.
     Incidents { limit: usize },
+    /// Ask the daemon to run one named diagnosis against its own store,
+    /// read-only, and answer with the result [`Table`]. A read, in the same
+    /// class as `Status`/`Incidents`: no peer-credential gate. What IS bounded
+    /// is concurrency: the daemon runs at most ONE diagnosis at a time — a
+    /// query holds the store mutex its pipeline writes through — and answers a
+    /// second one at once with `Response::Error("a diagnosis is already
+    /// running; retry")` rather than queueing it. That refusal is a
+    /// [`QueryOutcome::Failed`], never [`QueryOutcome::Unsupported`]: the daemon
+    /// can answer, it is busy. The blocking [`diagnose`] helper drives this path
+    /// and tells an old daemon that cannot read the request apart from one that
+    /// ran (or refused) the query.
+    Query(DiagnosticQuery),
     /// Ask the daemon to run a write/control action. The daemon executes it as
     /// root for an authorised peer — the peer-credential check is the one gate
     /// on this path; no config switch stands in front of a command the operator
@@ -170,6 +182,73 @@ pub struct ControlResult {
     /// A readable explanation (e.g. `"control refused: …"`, or the actuator
     /// output).
     pub message: String,
+}
+
+/// A named diagnosis the daemon runs against its own store, read-only.
+/// Mirrors the builders in `store::diagnosis`; parameters are the ones the
+/// CLI's offline commands take. (realm net-observer, node #58)
+///
+/// Why it travels: the daemon holds DuckDB's per-process lock, so while it runs
+/// nobody else can open the record — and the moment of an incident is exactly
+/// when the diagnoses are wanted. Every variant is a `SELECT`; the daemon
+/// answers [`Response::Table`], or [`Response::Error`] when the query was read
+/// but could not be run (a key the store could never have written, a DuckDB
+/// error). The thresholds a variant needs but does not carry (starvation
+/// load, episode gap) are the daemon's own, so a live reading and an offline
+/// one of the same record cannot disagree.
+///
+/// A daemon built before this vocabulary rejects the WHOLE request with the
+/// one-shot `Response::Error("bad request: …")` it gives any frame it cannot
+/// decode; [`diagnose`] reports that as [`QueryOutcome::Unsupported`], never as
+/// a failed query.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DiagnosticQuery {
+    /// Which layer failed at `ts_us` (`verdict_at_sql`).
+    Why { ts_us: i64 },
+    /// Every incident with the layer state just before it opened
+    /// (`incident_context_sql`).
+    IncidentContext,
+    /// The wedge-vs-starvation verdict over each `tun=000` episode
+    /// (`wedge_vs_starvation_sql`).
+    WedgeVsStarvation,
+    /// Every gateway drop in the record, oldest first (`GW_DROPS_SQL`) — what
+    /// `gateway-ramp` looks back from when the operator names no drop.
+    GwDrops,
+    /// The gateway RTT series over `window_us` before `drop_ts_us`, with its
+    /// slope (`gateway_ramp_sql`). Both values are the CLI's `--drop` and
+    /// `--window-us`; carrying the window rather than defaulting it keeps a
+    /// live answer from silently plotting a different interval than the one
+    /// asked for.
+    GatewayRamp { drop_ts_us: i64, window_us: i64 },
+    /// Every observation gap the record contains (`observation_gaps_sql`).
+    Gaps,
+    /// The neighbours on every segment, or on `network` (`neighbors_sql`).
+    Neighbors { network: Option<String> },
+    /// The CVEs hypothesised for open ports, on every segment or on `network`
+    /// (`vulns_sql`).
+    Vulns { network: Option<String> },
+    /// Every segment the record has seen (`segments_sql`).
+    Segments,
+    /// One segment's neighbours over `window` (`history_sql`).
+    History {
+        network: String,
+        window: HistoryWindow,
+    },
+    /// The switch-topology uplinks, on every interface or on `iface`
+    /// (`topology_sql`).
+    Topology { iface: Option<String> },
+}
+
+/// A result table: the daemon's answer to [`Request::Query`], and the shape the
+/// CLI renders in both the live and the offline path.
+///
+/// Cells are already strings, SQL `NULL` spelled as the empty string — the same
+/// rendering `store::QueryTable` uses, so a reader's "withheld" / "absent"
+/// tokens mean the same thing whichever path the table came by.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Table {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
 }
 
 /// A compact, serializable view of one incident for the live API.
@@ -819,6 +898,8 @@ pub enum Response {
     Incidents(Vec<IncidentSummary>),
     /// The outcome of a [`Request::Control`] command.
     Control(ControlResult),
+    /// The result of a [`Request::Query`] the daemon read and ran.
+    Table(Table),
     Error(String),
 }
 
@@ -828,6 +909,19 @@ pub enum Response {
 /// would park the whole UI.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The read budget of a [`diagnose`] round-trip. A named diagnosis is an
+/// `ASOF JOIN` across the whole record, run under the daemon's store lock, and
+/// its caller is a terminal user who asked for it — so it gets a budget the
+/// bar's per-tick status poll must never have, rather than failing on a record
+/// long enough to make the question interesting.
+///
+/// Deliberately LONGER than the daemon's own deadline on a diagnosis
+/// (`net-observerd`'s `QUERY_DEADLINE`, 30 s, after which it interrupts the
+/// statement and answers `Response::Error`): the daemon's "interrupted" must
+/// reach the operator, and a client that gives up first reads its own timeout
+/// instead — a worse report, and one that leaves the daemon's answer unread.
+const DIAGNOSIS_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Blocking client for the bar: connect, write one newline-JSON request, read one
 /// newline-JSON response. Framing = serde_json + `'\n'`. Connection-refused / no
 /// socket ⇒ `Err` (the caller renders an "offline" state).
@@ -836,8 +930,14 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// the connection but never answers fails the call instead of hanging the caller's
 /// thread forever.
 pub fn query(sock_path: &str, req: &Request) -> std::io::Result<Response> {
+    query_within(sock_path, req, QUERY_TIMEOUT)
+}
+
+/// [`query`] with an explicit read budget; the write budget stays
+/// [`QUERY_TIMEOUT`], because a request frame is small whatever the answer costs.
+fn query_within(sock_path: &str, req: &Request, read: Duration) -> std::io::Result<Response> {
     let stream = UnixStream::connect(sock_path)?;
-    stream.set_read_timeout(Some(QUERY_TIMEOUT))?;
+    stream.set_read_timeout(Some(read))?;
     stream.set_write_timeout(Some(QUERY_TIMEOUT))?;
     let mut writer = &stream;
     write_frame(&mut writer, req)?;
@@ -1088,6 +1188,67 @@ fn classify_control(response: Response) -> std::io::Result<ControlOutcome> {
         other => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("expected a Control response, got {other:?}"),
+        )),
+    }
+}
+
+/// The outcome of a [`Request::Query`]: what the daemon ANSWERED, kept apart
+/// from what it could not understand.
+///
+/// Three facts a reader must not collapse: the daemon ran the diagnosis; it
+/// read the diagnosis and could not run it; it could not read the request at
+/// all. The CLI acts differently on each — render, report and exit non-zero,
+/// fall back to the offline record — and conflating the last two would send a
+/// reader to the DB file over a bad segment key, where the daemon's lock then
+/// answers with the wrong error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryOutcome {
+    /// The daemon ran the diagnosis; here is its table.
+    Table(Table),
+    /// The daemon read the diagnosis and did not run it — a key the store
+    /// could never have written, a query error, or another diagnosis already
+    /// in flight (the daemon runs one at a time and says "retry"). Carries the
+    /// daemon's own message.
+    Failed(String),
+    /// The daemon could not decode the request — [`Request::Query`] did not
+    /// exist when it was built. Carries the daemon's own message.
+    Unsupported(String),
+}
+
+/// The prefix `net-observerd` puts on the one-shot `Response::Error` it answers
+/// a request it cannot DECODE with (`api.rs`, the `Err` arm of its request
+/// dispatch), as opposed to a request it decoded and could not answer. The
+/// daemon spells it; this crate pins it so [`diagnose`] can tell the two apart,
+/// and the `Err(String)` a decoded diagnosis produces must never start with it.
+pub const UNDECODABLE_REQUEST_PREFIX: &str = "bad request: ";
+
+/// Send one [`DiagnosticQuery`] and classify the answer.
+///
+/// The forward-compatibility counterpart of [`control`] for the read path — but
+/// stricter, because a decoded diagnosis CAN legitimately answer
+/// `Response::Error` (see [`QueryOutcome::Failed`]), so only the daemon's own
+/// "cannot decode" spelling ([`UNDECODABLE_REQUEST_PREFIX`]) is read as
+/// [`QueryOutcome::Unsupported`]. Bounded by [`DIAGNOSIS_TIMEOUT`] on the read.
+pub fn diagnose(sock_path: &str, q: DiagnosticQuery) -> std::io::Result<QueryOutcome> {
+    classify_query(query_within(
+        sock_path,
+        &Request::Query(q),
+        DIAGNOSIS_TIMEOUT,
+    )?)
+}
+
+/// The pure half of [`diagnose`]: which outcome a given [`Response`] means.
+/// Separated so the classification is testable without a socket.
+fn classify_query(response: Response) -> std::io::Result<QueryOutcome> {
+    match response {
+        Response::Table(table) => Ok(QueryOutcome::Table(table)),
+        Response::Error(message) if message.starts_with(UNDECODABLE_REQUEST_PREFIX) => {
+            Ok(QueryOutcome::Unsupported(message))
+        }
+        Response::Error(message) => Ok(QueryOutcome::Failed(message)),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("expected a Table response, got {other:?}"),
         )),
     }
 }
@@ -1366,6 +1527,134 @@ mod tests {
             Request::Control(ControlCmd::ScanAir) => {}
             other => panic!("expected ScanAir, got {other:?}"),
         }
+    }
+
+    /// Every named diagnosis, with every parameter it carries.
+    fn every_diagnostic_query() -> Vec<DiagnosticQuery> {
+        vec![
+            DiagnosticQuery::Why {
+                ts_us: 1_756_731_900_000_000,
+            },
+            DiagnosticQuery::IncidentContext,
+            DiagnosticQuery::WedgeVsStarvation,
+            DiagnosticQuery::GwDrops,
+            DiagnosticQuery::GatewayRamp {
+                drop_ts_us: 7,
+                window_us: 120_000_000,
+            },
+            DiagnosticQuery::Gaps,
+            DiagnosticQuery::Neighbors { network: None },
+            DiagnosticQuery::Neighbors {
+                network: Some("a4:83:e7:1b:2c:3d".into()),
+            },
+            DiagnosticQuery::Vulns {
+                network: Some("unknown".into()),
+            },
+            DiagnosticQuery::Segments,
+            DiagnosticQuery::History {
+                network: "a4:83:e7:1b:2c:3d".into(),
+                window: HistoryWindow::At(5),
+            },
+            DiagnosticQuery::History {
+                network: "unknown".into(),
+                window: HistoryWindow::Range { since: 1, until: 9 },
+            },
+            DiagnosticQuery::Topology { iface: None },
+            DiagnosticQuery::Topology {
+                iface: Some("en0".into()),
+            },
+        ]
+    }
+
+    /// Every diagnosis must survive the wire with its parameters intact — the
+    /// CLI's `--at` and the daemon's `verdict_at_sql` must be talking about the
+    /// same moment.
+    #[test]
+    fn frame_round_trip_query_request() {
+        for q in every_diagnostic_query() {
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &Request::Query(q.clone())).unwrap();
+            // Exactly one frame => exactly one trailing newline.
+            assert_eq!(buf.iter().filter(|&&b| b == b'\n').count(), 1);
+            let mut reader = std::io::BufReader::new(&buf[..]);
+            let back: Request = read_frame(&mut reader).unwrap();
+            match back {
+                Request::Query(back) => assert_eq!(back, q),
+                other => panic!("unexpected request variant: {other:?}"),
+            }
+        }
+    }
+
+    /// A table round-trips cell for cell, an empty-string cell (SQL `NULL`)
+    /// included — the reader's "absent" token depends on it staying empty.
+    #[test]
+    fn frame_round_trip_table_response() {
+        let table = Table {
+            columns: vec!["ts_us".into(), "layer".into(), "load1".into()],
+            rows: vec![
+                vec!["1000".into(), "healthy".into(), "1.2".into()],
+                vec!["".into(), "gap".into(), "".into()],
+            ],
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &Response::Table(table.clone())).unwrap();
+        assert_eq!(buf.iter().filter(|&&b| b == b'\n').count(), 1);
+        let mut reader = std::io::BufReader::new(&buf[..]);
+        let back: Response = read_frame(&mut reader).unwrap();
+        match back {
+            Response::Table(back) => assert_eq!(back, table),
+            other => panic!("unexpected response variant: {other:?}"),
+        }
+    }
+
+    /// The live failure `subscribe_or_widen` and `control` already guard
+    /// against, on the read path: a CLI built after `Request::Query` asks a
+    /// daemon built before it. That daemon rejects the whole frame with its
+    /// one-shot `Response::Error("bad request: …")`, and the client must read
+    /// that as "this daemon cannot answer diagnoses" — the cue to fall back to
+    /// the offline record — never as a diagnosis that ran and failed.
+    #[test]
+    fn a_query_against_the_pre_query_vocabulary_is_unsupported_not_failed() {
+        /// The request vocabulary as a pre-`Query` daemon decodes it.
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        enum OldRequest {
+            Status,
+            Incidents { limit: usize },
+            Control(ControlCmd),
+            Subscribe { kinds: Option<Vec<EventKind>> },
+        }
+        let line = String::from_utf8(
+            encode_frame(&Request::Query(DiagnosticQuery::IncidentContext)).unwrap(),
+        )
+        .unwrap();
+        let e = serde_json::from_str::<OldRequest>(&line)
+            .expect_err("an old daemon cannot decode a Query request");
+        // What `api.rs` answers for a frame it cannot decode.
+        let answer = Response::Error(format!("{UNDECODABLE_REQUEST_PREFIX}{e}"));
+        match classify_query(answer).unwrap() {
+            QueryOutcome::Unsupported(m) => assert!(m.contains("Query"), "{m}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// ...whereas a daemon that DID read the request and could not run it is a
+    /// failure to show, not a cue to fall back — the offline path would only
+    /// meet the daemon's lock and report the wrong problem.
+    #[test]
+    fn a_diagnosis_the_daemon_could_not_run_is_failed_not_unsupported() {
+        let refused = Response::Error("not a segment key: nope (expected a gateway MAC)".into());
+        match classify_query(refused).unwrap() {
+            QueryOutcome::Failed(m) => assert!(m.starts_with("not a segment key"), "{m}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let ran = Response::Table(Table::default());
+        assert_eq!(
+            classify_query(ran).unwrap(),
+            QueryOutcome::Table(Table::default())
+        );
+        // Any other one-shot variant is a protocol error, not an outcome.
+        assert!(classify_query(Response::Incidents(Vec::new())).is_err());
     }
 
     #[test]

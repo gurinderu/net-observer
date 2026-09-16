@@ -7,13 +7,19 @@
 //! - **LIVE** — `status` and `incidents` read the daemon's in-memory snapshot
 //!   over its Unix-domain socket (`net-observer-ipc`). No DB is opened, so there is
 //!   zero contention with the running daemon.
-//! - **OFFLINE** — `query <SQL>` opens the DuckDB file directly for ad-hoc
-//!   forensics, and the `diagnose` commands (`why`, `incident-context`,
-//!   `wedge-or-starvation`, `gateway-ramp`, `gaps`) run the canned
-//!   `store::diagnosis` queries over the same path, so "which layer failed" is
-//!   reachable without writing SQL. This only works while the daemon is stopped;
-//!   if `net-observerd` is running it holds the lock and the open fails with a
-//!   clear message rather than a panic.
+//! - **LIVE FIRST, THEN OFFLINE** — the named diagnoses (`why`,
+//!   `incident-context`, `wedge-or-starvation`, `gateway-ramp`, `gaps`,
+//!   `neighbors`, `vulns`, `segments`, `history`, `topology`) run the canned
+//!   `store::diagnosis` queries, so "which layer failed" is reachable without
+//!   writing SQL. Each asks the running daemon first (`Request::Query`, answered
+//!   from the daemon's own store while it keeps collecting) and opens the
+//!   DuckDB file itself only when no daemon answers on the socket — unless the
+//!   operator gave `--db`, which names the record and means the socket is not
+//!   asked at all. Every diagnosis prints which record answered (`source:` on
+//!   stderr). See [`route`] for the exact rule. (realm net-observer, node #58)
+//! - **OFFLINE** — `query <SQL>` and `air` open the DuckDB file directly. This
+//!   only works while the daemon is stopped; if `net-observerd` is running it
+//!   holds the lock and the open fails with a clear message rather than a panic.
 
 mod diagnose;
 
@@ -21,12 +27,12 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::Config;
 use net_observer_ipc::{
-    ControlCmd, ControlResult, EventKind, IncidentSummary, Request, Response, ScanOptions,
-    StatusSnapshot, StreamFrame,
+    ControlCmd, ControlResult, DiagnosticQuery, EventKind, IncidentSummary, QueryOutcome, Request,
+    Response, ScanOptions, StatusSnapshot, StreamFrame, Table,
 };
 use std::io::Write;
 use std::process::ExitCode;
-use store::{DuckdbStore, QueryTable, diagnosis};
+use store::{DuckdbStore, QueryTable, Store as _, diagnosis};
 
 /// The `load1` above which a dead tun reads as host starvation rather than a
 /// proxy wedge. The CLI reads the record with the same threshold the daemon
@@ -41,15 +47,49 @@ const LOAD_THRESHOLD: f64 = diagnosis::DEFAULT_STARVATION_LOAD;
 )]
 struct Cli {
     /// Optional path to the observer config file (TOML). Supplies the daemon
-    /// socket path for the live `status`/`incidents` commands.
+    /// socket path for every command that talks to the running daemon.
     #[arg(long)]
     config: Option<String>,
-    /// Path to the observer DuckDB file, used only by the offline `query`
-    /// command (requires the daemon to be stopped — it holds the DB lock).
-    #[arg(long, default_value = "/var/lib/observer/observer.duckdb")]
-    db: String,
+    /// Path to the observer DuckDB file [default: the `db_path` of the daemon config].
+    /// Giving it means "read this file": the diagnoses then never ask the
+    /// daemon's socket. Without it they ask the running daemon first and read
+    /// the config's file only when nothing answers on the socket. `query <SQL>`
+    /// and `air` always read the file. Every diagnosis prints which record
+    /// answered as a `source:` line on stderr.
+    #[arg(long)]
+    db: Option<String>,
     #[command(subcommand)]
     command: Command,
+}
+
+/// The record a command reads, and the socket to ask first when the operator
+/// did not name the record — both from the same place.
+///
+/// `--db` names the file outright and leaves `socket` empty: nothing is asked.
+/// Without it the daemon config is loaded and supplies both the socket and
+/// the file (`db_path`), so the fallback is the file the daemon writes, not a
+/// literal of this binary's own that could drift from it.
+struct Record {
+    socket: Option<String>,
+    db_path: String,
+}
+
+impl Record {
+    fn resolve(cli: &Cli) -> Result<Self> {
+        match &cli.db {
+            Some(db) => Ok(Self {
+                socket: None,
+                db_path: db.clone(),
+            }),
+            None => {
+                let cfg = load_config(cli)?;
+                Ok(Self {
+                    socket: Some(cfg.socket_path),
+                    db_path: cfg.db_path,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -129,24 +169,26 @@ enum Command {
         /// provisioned `collectors.neighbors.cve_snapshot_dir` in the daemon's
         /// config; without both the daemon drops it and says so. Each stored
         /// match is a hypothesis, not a fact. Off unless given. Read the
-        /// findings back offline with `vulns`.
+        /// findings back with `vulns`.
         #[arg(long)]
         cve: bool,
     },
-    /// The neighbours the record knows on each segment, newest sighting first
-    /// (offline): MAC, address, vendor OUI, name if one was ever learned, and
-    /// how it came to be known.
+    /// The neighbours the record knows on each segment, newest sighting first:
+    /// MAC, address, vendor OUI, name if one was ever learned, and how it came
+    /// to be known. Asks the running daemon first, reads the DB file only when
+    /// no daemon answers.
     Neighbors {
         /// Restrict to one segment, by its gateway MAC. Omit for every segment
         /// this machine has recorded.
         #[arg(long)]
         network: Option<String>,
     },
-    /// The CVEs the record hypothesises for open ports, newest sighting first
-    /// (offline): MAC, address, port, CVE id, confidence, whether it is
-    /// known-exploited, and CVSS. Each row is a HYPOTHESIS from matching a
-    /// grabbed banner against the local snapshot, never an asserted fact —
-    /// weigh it by its confidence and the KEV flag.
+    /// The CVEs the record hypothesises for open ports, newest sighting first:
+    /// MAC, address, port, CVE id, confidence, whether it is known-exploited,
+    /// and CVSS. Each row is a HYPOTHESIS from matching a grabbed banner
+    /// against the local snapshot, never an asserted fact — weigh it by its
+    /// confidence and the KEV flag. Asks the running daemon first, reads the DB
+    /// file only when no daemon answers.
     Vulns {
         /// Restrict to one segment, by its gateway MAC. Omit for every segment
         /// this machine has recorded.
@@ -154,10 +196,11 @@ enum Command {
         network: Option<String>,
     },
     /// The switch-topology uplinks learned passively from received LLDP/CDP
-    /// frames, newest sighting first (offline): local interface, remote chassis,
-    /// remote port, the switch/AP's system name and capabilities, and whether
-    /// LLDP or CDP carried it. Each row is a HYPOTHESIS — LLDP/CDP are
-    /// unauthenticated and spoofable — never an asserted fact.
+    /// frames, newest sighting first: local interface, remote chassis, remote
+    /// port, the switch/AP's system name and capabilities, and whether LLDP or
+    /// CDP carried it. Each row is a HYPOTHESIS — LLDP/CDP are unauthenticated
+    /// and spoofable — never an asserted fact. Asks the running daemon first,
+    /// reads the DB file only when no daemon answers.
     Topology {
         /// Restrict to one local interface (e.g. `en0`). Omit for every
         /// interface this machine has recorded an uplink on.
@@ -180,7 +223,8 @@ enum Command {
         sql: String,
     },
     /// Which layer failed at a moment: the state of link, proxy server, tun and
-    /// host load as the record has it, plus the layer it blames (offline).
+    /// host load as the record has it, plus the layer it blames. Asks the
+    /// running daemon first, reads the DB file only when no daemon answers.
     ///
     /// A moment the daemon was paused for is reported as a refusal — the gap and
     /// its bounds — not as a row of blank measurements.
@@ -192,18 +236,21 @@ enum Command {
         #[arg(long, default_value = "now")]
         at: String,
     },
-    /// Every incident with the layer state just before it opened (offline).
+    /// Every incident with the layer state just before it opened. Asks the
+    /// running daemon first, reads the DB file only when no daemon answers.
     ///
     /// An incident that opened inside an observation gap gets no context: the
     /// state from before the pause is not context for it, and is marked withheld.
     IncidentContext,
-    /// The wedge-vs-starvation verdict over each recent `tun=000` episode
-    /// (offline) — the discriminator that decides whether a restart is the cure.
+    /// The wedge-vs-starvation verdict over each recent `tun=000` episode — the
+    /// discriminator that decides whether a restart is the cure. Asks the
+    /// running daemon first, reads the DB file only when no daemon answers.
     ///
     /// An episode the record cannot classify is reported `unknown`, not guessed.
     WedgeOrStarvation,
     /// The gateway RTT series before a drop, with its least-squares slope, so a
-    /// coworking-gateway ramp is visible as data (offline).
+    /// coworking-gateway ramp is visible as data. Asks the running daemon
+    /// first, reads the DB file only when no daemon answers.
     ///
     /// The slope is refused — "not computed" — when the window crosses an
     /// observation gap.
@@ -217,19 +264,23 @@ enum Command {
         window_us: i64,
     },
     /// The observation gaps the record contains — every interval the daemon
-    /// deliberately collected nothing for, and what closed each (offline).
+    /// deliberately collected nothing for, and what closed each. Asks the
+    /// running daemon first, reads the DB file only when no daemon answers.
     Gaps,
     /// The network segments this machine has ever recorded, newest activity
-    /// first (offline): the segment key, a best-effort SSID guess, the gateway
-    /// IP when recoverable, first/last seen, and how many devices it held.
+    /// first: the segment key, a best-effort SSID guess, the gateway IP when
+    /// recoverable, first/last seen, and how many devices it held. Asks the
+    /// running daemon first, reads the DB file only when no daemon answers.
     ///
     /// `ssid_guess` is a TIME-overlap heuristic, never an asserted fact: the
     /// daemon does not join an SSID to a segment. A segment recorded under
     /// `unknown` (the gateway MAC was unreadable) is listed like any other.
     Segments,
-    /// One segment's recorded state (offline): the neighbours that were live at
-    /// an instant (`--at`), or active over a window (`--since`/`--until`), each
+    /// One segment's recorded state: the neighbours that were live at an
+    /// instant (`--at`), or active over a window (`--since`/`--until`), each
     /// with a count of its open ports and hypothesised vulns over that slice.
+    /// Asks the running daemon first, reads the DB file only when no daemon
+    /// answers.
     History {
         /// The segment to read, by its gateway MAC — or the literal `unknown`
         /// for the segment whose gateway MAC was unreadable. A non-key is an
@@ -373,58 +424,96 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
+        // The named diagnoses: the filter is validated HERE, before any socket
+        // or file is touched, so a bad key is the builder's own error and never
+        // a round-trip — then the daemon is asked, and the file read only when
+        // no daemon answers (see `diagnose_table`).
         Command::Neighbors { network } => {
             let sql = diagnosis::neighbors_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
-            let table = run_query(&cli.db, &sql)?;
+            let table = diagnose_table(
+                cli,
+                DiagnosticQuery::Neighbors {
+                    network: network.clone(),
+                },
+                |off| run_query(off, &sql),
+            )?;
             print!("{}", format_table(&table));
         }
         Command::Vulns { network } => {
             let sql = diagnosis::vulns_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
-            let table = run_query(&cli.db, &sql)?;
+            let table = diagnose_table(
+                cli,
+                DiagnosticQuery::Vulns {
+                    network: network.clone(),
+                },
+                |off| run_query(off, &sql),
+            )?;
             print!("{}", format_table(&table));
         }
         Command::Topology { iface } => {
             let sql = diagnosis::topology_sql(iface.as_deref()).map_err(|e| anyhow!("{e}"))?;
-            let table = run_query(&cli.db, &sql)?;
+            let table = diagnose_table(
+                cli,
+                DiagnosticQuery::Topology {
+                    iface: iface.clone(),
+                },
+                |off| run_query(off, &sql),
+            )?;
             print!("{}", format_table(&table));
         }
         Command::Air => {
             // Three reads, one moment: the scan itself (so a SKIP is rendered as
             // a refusal), what it heard, and our own channel to compare against.
-            let scan = run_query(&cli.db, diagnosis::AIR_LATEST_SCAN_SQL)?;
-            let aps = run_query(&cli.db, diagnosis::AIR_LATEST_APS_SQL)?;
-            let own = run_query(&cli.db, diagnosis::AIR_SELF_CHANNEL_SQL)?;
+            let scan =
+                table_from_query(run_query(&file_only(cli)?, diagnosis::AIR_LATEST_SCAN_SQL)?);
+            let aps = table_from_query(run_query(&file_only(cli)?, diagnosis::AIR_LATEST_APS_SQL)?);
+            let own = table_from_query(run_query(
+                &file_only(cli)?,
+                diagnosis::AIR_SELF_CHANNEL_SQL,
+            )?);
             print!("{}", diagnose::format_air(&scan, &aps, &own)?);
         }
         Command::Query { sql } => {
-            let table = run_query(&cli.db, sql)?;
+            let table = table_from_query(run_query(&file_only(cli)?, sql)?);
             print!("{}", format_table(&table));
         }
         Command::Why { at } => {
             let ts_us = diagnose::parse_at(at)?;
-            let table = run_prepared(&cli.db, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))?;
+            let table = diagnose_table(cli, DiagnosticQuery::Why { ts_us }, |off| {
+                run_prepared(off, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))
+            })?;
             print!("{}", diagnose::format_verdict_at(&table, ts_us)?);
         }
         Command::IncidentContext => {
-            let table = run_prepared(&cli.db, &diagnosis::incident_context_sql(LOAD_THRESHOLD))?;
+            let table = diagnose_table(cli, DiagnosticQuery::IncidentContext, |off| {
+                run_prepared(off, &diagnosis::incident_context_sql(LOAD_THRESHOLD))
+            })?;
             print!("{}", diagnose::format_incident_context(&table)?);
         }
         Command::WedgeOrStarvation => {
-            let sql = diagnosis::wedge_vs_starvation_sql(
-                LOAD_THRESHOLD,
-                diagnosis::DEFAULT_EPISODE_GAP_US,
-            );
-            let table = run_prepared(&cli.db, &sql)?;
+            let table = diagnose_table(cli, DiagnosticQuery::WedgeVsStarvation, |off| {
+                run_prepared(
+                    off,
+                    &diagnosis::wedge_vs_starvation_sql(
+                        LOAD_THRESHOLD,
+                        diagnosis::DEFAULT_EPISODE_GAP_US,
+                    ),
+                )
+            })?;
             print!("{}", diagnose::format_wedge_vs_starvation(&table)?);
         }
         Command::GatewayRamp { drop, window_us } => {
             let drop_ts_us = match drop {
                 Some(d) => diagnose::parse_at(d)?,
-                None => latest_gw_drop(&cli.db)?,
+                None => latest_gw_drop(cli)?,
             };
-            let table = run_prepared(
-                &cli.db,
-                &diagnosis::gateway_ramp_sql(drop_ts_us, *window_us),
+            let table = diagnose_table(
+                cli,
+                DiagnosticQuery::GatewayRamp {
+                    drop_ts_us,
+                    window_us: *window_us,
+                },
+                |off| run_prepared(off, &diagnosis::gateway_ramp_sql(drop_ts_us, *window_us)),
             )?;
             print!(
                 "{}",
@@ -432,11 +521,15 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             );
         }
         Command::Gaps => {
-            let table = run_query(&cli.db, &diagnosis::observation_gaps_sql())?;
+            let table = diagnose_table(cli, DiagnosticQuery::Gaps, |off| {
+                run_query(off, &diagnosis::observation_gaps_sql())
+            })?;
             print!("{}", diagnose::format_observation_gaps(&table)?);
         }
         Command::Segments => {
-            let table = run_query(&cli.db, &diagnosis::segments_sql())?;
+            let table = diagnose_table(cli, DiagnosticQuery::Segments, |off| {
+                run_query(off, &diagnosis::segments_sql())
+            })?;
             print!("{}", format_table(&table));
         }
         Command::History {
@@ -457,7 +550,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 _ => diagnosis::HistoryWindow::At(diagnose::parse_at("now")?),
             };
             let sql = diagnosis::history_sql(network, window).map_err(|e| anyhow!("{e}"))?;
-            let table = run_query(&cli.db, &sql)?;
+            let table = diagnose_table(
+                cli,
+                DiagnosticQuery::History {
+                    network: network.clone(),
+                    window,
+                },
+                |off| run_query(off, &sql),
+            )?;
             print!("{}", format_table(&table));
         }
     }
@@ -470,17 +570,137 @@ fn load_config(cli: &Cli) -> Result<Config> {
     Config::load(cli.config.as_deref()).map_err(|e| anyhow!("failed to load observer config: {e}"))
 }
 
+/// Whether a socket error means `net-observerd` is not running at all — no
+/// socket file, or one nobody listens on — as opposed to a daemon that is there
+/// and could not be talked to.
+fn daemon_not_running(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+    matches!(e.kind(), NotFound | ConnectionRefused)
+}
+
 /// Send one request to the daemon over the socket. An absent / refused socket
 /// (`net-observerd` not running) becomes a clear message, never a panic.
 fn daemon_query(socket_path: &str, req: &Request) -> Result<Response> {
     net_observer_ipc::query(socket_path, req).map_err(|e| {
-        use std::io::ErrorKind::{ConnectionRefused, NotFound};
-        if matches!(e.kind(), NotFound | ConnectionRefused) {
+        if daemon_not_running(&e) {
             anyhow!("net-observerd not running (socket {socket_path} unavailable)")
         } else {
             anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
         }
     })
+}
+
+/// Where a diagnosis is read from, with the words that go with it. Decided by
+/// [`route`] from what the operator asked for and what the socket said — and
+/// then printed, always, as one `source:` line on stderr, because a forensic
+/// reader must know which record answered. (realm net-observer, node #58)
+#[derive(Debug, Clone, PartialEq)]
+enum Route {
+    /// The daemon answered over `via`; here is its table.
+    Live { table: Table, via: String },
+    /// Read the file. `why` is the one line saying what sent the reader there
+    /// (`None` when the operator asked for the file with `--db`); `locked` is
+    /// the sentence to print if a daemon turns out to hold the file's lock —
+    /// the same reason again, so the lock message never contradicts what just
+    /// happened.
+    Offline { why: Option<String>, locked: String },
+}
+
+/// The rule, pure: `socket` is `None` when the operator named the record with
+/// `--db` (the socket is then never asked), and `ask` is the round-trip over
+/// the socket it is given.
+///
+/// - `--db` given → the file, no socket, no question asked: an answer from a
+///   running daemon over a file the operator pointed at would be an answer
+///   from the wrong record, silently;
+/// - the daemon answers → its table;
+/// - nothing listens on the socket ([`daemon_not_running`]) → the file, saying
+///   which socket was tried;
+/// - the daemon is there but cannot READ the request (built before
+///   `Request::Query`) → the file too, saying so — that daemon still holds the
+///   lock, and the reader deserves to know why the open that follows will fail;
+/// - the daemon read the request and could not run it, or the socket is there
+///   and broken → an error and a non-zero exit. Never the file: it would only
+///   meet the lock and report the wrong problem.
+fn route(
+    socket: Option<&str>,
+    ask: impl FnOnce(&str) -> std::io::Result<QueryOutcome>,
+) -> Result<Route> {
+    let Some(socket) = socket else {
+        return Ok(Route::Offline {
+            why: None,
+            locked: "--db was given, so the socket was not asked".to_string(),
+        });
+    };
+    let locked = format!("the socket at {socket} did not answer or could not decode the request");
+    match ask(socket) {
+        Ok(QueryOutcome::Table(table)) => Ok(Route::Live {
+            table,
+            via: socket.to_string(),
+        }),
+        Ok(QueryOutcome::Failed(m)) => Err(anyhow!("net-observerd returned an error: {m}")),
+        Ok(QueryOutcome::Unsupported(m)) => Ok(Route::Offline {
+            why: Some(format!(
+                "net-observerd at {socket} cannot decode the request ({m})"
+            )),
+            locked,
+        }),
+        Err(e) if daemon_not_running(&e) => Ok(Route::Offline {
+            why: Some(format!("no daemon answered on {socket} ({e})")),
+            locked,
+        }),
+        Err(e) => Err(anyhow!(
+            "failed to query net-observerd over socket {socket}: {e}"
+        )),
+    }
+}
+
+/// Run one named diagnosis by the rule in [`route`], print its source, and
+/// hand back the table whichever record it came from.
+fn diagnose_table(
+    cli: &Cli,
+    q: DiagnosticQuery,
+    offline: impl FnOnce(&Offline) -> Result<QueryTable>,
+) -> Result<Table> {
+    let record = Record::resolve(cli)?;
+    match route(record.socket.as_deref(), |s| {
+        net_observer_ipc::diagnose(s, q)
+    })? {
+        Route::Live { table, via } => {
+            eprintln!("source: net-observerd via {via}");
+            Ok(table)
+        }
+        Route::Offline { why, locked } => {
+            if let Some(why) = why {
+                eprintln!("{why}; reading the file instead");
+            }
+            eprintln!("source: file {}", record.db_path);
+            offline(&Offline {
+                db_path: record.db_path,
+                locked,
+            })
+            .map(table_from_query)
+        }
+    }
+}
+
+/// The offline record and the sentence to print if a daemon holds its lock —
+/// the reason the reader is at the file, so the lock message never
+/// contradicts what just happened.
+struct Offline {
+    db_path: String,
+    locked: String,
+}
+
+/// `store::QueryTable` → the wire's [`Table`]: the same two fields, moved, so
+/// the offline path renders through exactly the code the live path does. The
+/// daemon carries the same conversion on its side (`api_query`); neither crate
+/// can own it for both, because `net-observer-ipc` must not depend on `store`.
+fn table_from_query(q: QueryTable) -> Table {
+    Table {
+        columns: q.columns,
+        rows: q.rows,
+    }
 }
 
 /// Fetch the live [`StatusSnapshot`] from the daemon.
@@ -565,8 +785,7 @@ impl TailEnd {
 ///   panicking the way `println!` would on a write failure.
 fn stream_events(socket_path: &str, kinds: Option<Vec<EventKind>>) -> Result<ExitCode> {
     let sub = net_observer_ipc::subscribe(socket_path, kinds.as_deref()).map_err(|e| {
-        use std::io::ErrorKind::{ConnectionRefused, NotFound};
-        if matches!(e.kind(), NotFound | ConnectionRefused) {
+        if daemon_not_running(&e) {
             anyhow!("net-observerd not running (socket {socket_path} unavailable)")
         } else {
             anyhow!("failed to subscribe to net-observerd over socket {socket_path}: {e}")
@@ -717,12 +936,12 @@ fn format_control(result: &ControlResult) -> String {
     format!("{tag}: {}\n", result.message)
 }
 
-/// Open the DuckDB file directly and run one query (offline forensics). If
-/// `net-observerd` is running it holds the per-process DuckDB lock, so the open
-/// fails — detect that and print a clear, actionable message instead of leaking
-/// the raw driver error (and never panic).
-fn run_query(db_path: &str, sql: &str) -> Result<QueryTable> {
-    open_store(db_path)?
+/// Open the DuckDB file directly and run one query (offline forensics). If a
+/// daemon holds the per-process DuckDB lock the open fails — detect that and
+/// print a clear message that repeats why the file is being read at all,
+/// instead of leaking the raw driver error (and never panic).
+fn run_query(offline: &Offline, sql: &str) -> Result<QueryTable> {
+    open_store(offline)?
         .query_table(sql)
         .map_err(|e| anyhow!("query failed: {e}"))
 }
@@ -731,31 +950,54 @@ fn run_query(db_path: &str, sql: &str) -> Result<QueryTable> {
 /// parameterized `diagnosis` builders (`why`, `incident-context`,
 /// `wedge-or-starvation`, `gateway-ramp`): the moment/threshold values are
 /// bound, not interpolated.
-fn run_prepared(db_path: &str, p: &diagnosis::PreparedSql) -> Result<QueryTable> {
-    open_store(db_path)?
+fn run_prepared(offline: &Offline, p: &diagnosis::PreparedSql) -> Result<QueryTable> {
+    open_store(offline)?
         .query_prepared(p)
         .map_err(|e| anyhow!("query failed: {e}"))
 }
 
-fn open_store(db_path: &str) -> Result<DuckdbStore> {
-    DuckdbStore::open(db_path).map_err(|e| {
+fn open_store(offline: &Offline) -> Result<DuckdbStore> {
+    DuckdbStore::open(&offline.db_path).map_err(|e| {
         let msg = e.to_string();
         if is_lock_error(&msg) {
-            anyhow!(
-                "net-observerd is running and holds the DuckDB lock; stop it for \
-                 offline SQL, or use `status`/`incidents` (live via socket)"
-            )
+            anyhow!("{}", lock_message(&offline.db_path, &offline.locked))
         } else {
-            anyhow!("failed to open DuckDB at {db_path}: {msg}")
+            anyhow!("failed to open DuckDB at {}: {msg}", offline.db_path)
         }
+    })
+}
+
+/// The message for a file a daemon holds the lock on: the record, and the
+/// reason the reader came to the file — never a claim that the daemon would
+/// have answered, which is exactly what did not happen.
+fn lock_message(db_path: &str, locked: &str) -> String {
+    format!("a daemon holds the lock on {db_path}; {locked}")
+}
+
+/// The offline context of `query <SQL>` and `air`, which read the file by
+/// ruling and never ask the socket.
+fn file_only(cli: &Cli) -> Result<Offline> {
+    Ok(Offline {
+        db_path: Record::resolve(cli)?.db_path,
+        locked: "`query` and `air` read the file only; stop the daemon for them".to_string(),
     })
 }
 
 /// The `ts_us` of the newest gateway drop in the record, used when
 /// `gateway-ramp` is invoked without `--drop`. An empty record is an error
 /// naming the flag rather than a ramp plotted around an arbitrary instant.
-fn latest_gw_drop(db_path: &str) -> Result<i64> {
-    let table = run_query(db_path, diagnosis::GW_DROPS_SQL)?;
+/// Read the way every diagnosis is: the daemon first, the file when it is not
+/// there.
+fn latest_gw_drop(cli: &Cli) -> Result<i64> {
+    let table = diagnose_table(cli, DiagnosticQuery::GwDrops, |off| {
+        run_query(off, diagnosis::GW_DROPS_SQL)
+    })?;
+    newest_drop(&table)
+}
+
+/// The pure half of [`latest_gw_drop`]: the newest drop is the LAST row, since
+/// `GW_DROPS_SQL` lists them oldest first.
+fn newest_drop(table: &Table) -> Result<i64> {
     let last =
         table.rows.last().and_then(|r| r.first()).ok_or_else(|| {
             anyhow!("no gateway drop in the record; pass --drop <time> to pick one")
@@ -875,7 +1117,7 @@ fn format_incidents(rows: &[IncidentSummary]) -> String {
 }
 
 /// Render a generic query result as a simple space-padded table.
-fn format_table(table: &QueryTable) -> String {
+fn format_table(table: &Table) -> String {
     let mut widths: Vec<usize> = table.columns.iter().map(String::len).collect();
     for row in &table.rows {
         for (i, cell) in row.iter().enumerate() {
@@ -1047,13 +1289,163 @@ mod tests {
 
     #[test]
     fn format_table_renders_header_and_cells() {
-        let table = QueryTable {
+        let table = Table {
             columns: vec!["ts_us".into(), "gw".into()],
             rows: vec![vec!["42".into(), "OK".into()]],
         };
         let out = format_table(&table);
         assert!(out.contains("ts_us") && out.contains("gw"));
         assert!(out.contains("42") && out.contains("OK"));
+    }
+
+    /// An explicit `--db` means the operator named the record: the socket is
+    /// NOT asked — a daemon answering over a file the operator pointed at
+    /// would be an answer from the wrong record, silently.
+    #[test]
+    fn an_explicit_db_never_asks_the_socket() {
+        let asked = std::cell::Cell::new(false);
+        let r = route(None, |_| {
+            asked.set(true);
+            Ok(QueryOutcome::Table(Table::default()))
+        })
+        .unwrap();
+        match r {
+            Route::Offline { why: None, locked } => {
+                assert!(locked.contains("--db was given"), "{locked}");
+            }
+            other => panic!("expected Offline without a reason, got {other:?}"),
+        }
+        assert!(
+            !asked.get(),
+            "the socket must not be asked when --db is given"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_answers_is_the_live_source() {
+        let t = Table {
+            columns: vec!["a".into()],
+            rows: vec![],
+        };
+        let r = route(Some("/run/observer.sock"), |s| {
+            assert_eq!(s, "/run/observer.sock");
+            Ok(QueryOutcome::Table(t.clone()))
+        })
+        .unwrap();
+        assert_eq!(
+            r,
+            Route::Live {
+                table: t,
+                via: "/run/observer.sock".into()
+            }
+        );
+    }
+
+    /// Nothing listening on the socket is the ONE case that reads the file by
+    /// itself — and the reason names the socket that was tried, so a reader
+    /// pointed at the wrong socket sees that rather than a silent detour; the
+    /// lock sentence names it again.
+    #[test]
+    fn no_daemon_on_the_socket_reads_the_file_and_names_the_socket() {
+        let r = route(Some("/run/observer.sock"), |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+        })
+        .unwrap();
+        match r {
+            Route::Offline {
+                why: Some(why),
+                locked,
+            } => {
+                assert!(why.contains("/run/observer.sock"), "{why}");
+                assert!(locked.contains("/run/observer.sock"), "{locked}");
+                assert!(locked.contains("did not answer"), "{locked}");
+            }
+            other => panic!("expected Offline with a reason, got {other:?}"),
+        }
+    }
+
+    /// A daemon too old to read the request also sends the reader to the file,
+    /// saying so and naming the socket.
+    #[test]
+    fn an_old_daemon_reads_the_file_and_says_why() {
+        let r = route(Some("/run/observer.sock"), |_| {
+            Ok(QueryOutcome::Unsupported(
+                "bad request: unknown variant `Query`".into(),
+            ))
+        })
+        .unwrap();
+        match r {
+            Route::Offline { why: Some(why), .. } => {
+                assert!(why.contains("/run/observer.sock"), "{why}");
+                assert!(why.contains("unknown variant `Query`"), "{why}");
+            }
+            other => panic!("expected Offline with a reason, got {other:?}"),
+        }
+    }
+
+    /// A daemon that read the request and could not run it, and a socket that
+    /// is there but broken, are errors — never a detour to the file, where the
+    /// lock would report the wrong problem.
+    #[test]
+    fn a_failed_diagnosis_and_a_broken_socket_are_errors_not_detours() {
+        let failed = route(Some("/run/observer.sock"), |_| {
+            Ok(QueryOutcome::Failed("not a segment key: nope".into()))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(failed.contains("not a segment key"), "{failed}");
+
+        let broken = route(Some("/run/observer.sock"), |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "no",
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(broken.contains("/run/observer.sock"), "{broken}");
+    }
+
+    /// The lock message never contradicts what just happened: it names the
+    /// record and repeats the reason the file was read at all.
+    #[test]
+    fn the_lock_message_names_the_record_and_the_reason() {
+        let m = lock_message(
+            "/var/lib/observer/observer.duckdb",
+            "the socket at /run/observer.sock did not answer or could not decode the request",
+        );
+        assert!(m.contains("/var/lib/observer/observer.duckdb"), "{m}");
+        assert!(m.contains("/run/observer.sock"), "{m}");
+        assert!(!m.contains("read the running daemon"), "{m}");
+    }
+
+    /// The offline path renders through the wire shape: the conversion must
+    /// keep every cell, the empty-string `NULL` included.
+    #[test]
+    fn table_from_query_keeps_every_cell() {
+        let q = QueryTable {
+            columns: vec!["a".into(), "b".into()],
+            rows: vec![vec!["1".into(), "".into()], vec!["".into(), "x".into()]],
+        };
+        let t = table_from_query(q.clone());
+        assert_eq!(t.columns, q.columns);
+        assert_eq!(t.rows, q.rows);
+    }
+
+    /// `GW_DROPS_SQL` lists drops oldest first, so the newest is the LAST row;
+    /// an empty record names the flag to pass instead of inventing a moment.
+    #[test]
+    fn newest_drop_is_the_last_row_and_an_empty_record_names_the_flag() {
+        let table = Table {
+            columns: vec!["ts_us".into(), "gw".into()],
+            rows: vec![
+                vec!["100".into(), "FAIL".into()],
+                vec!["900".into(), "NOGW".into()],
+            ],
+        };
+        assert_eq!(newest_drop(&table).unwrap(), 900);
+        let e = newest_drop(&Table::default()).unwrap_err().to_string();
+        assert!(e.contains("--drop"), "{e}");
     }
 
     #[test]

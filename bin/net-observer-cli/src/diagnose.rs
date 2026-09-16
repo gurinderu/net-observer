@@ -15,7 +15,8 @@
 //!   `verdict = 'unknown'`;
 //! - a ramp window overlapping a gap yields a `NULL` slope.
 //!
-//! `QueryTable` stringifies SQL `NULL` as the empty string, which prints as
+//! A result `Table` (the wire shape, which the offline `QueryTable` is converted
+//! into) stringifies SQL `NULL` as the empty string, which prints as
 //! whitespace and reads as a measurement that happened to be blank. So nothing
 //! here goes through the generic table printer: a withheld cell prints
 //! [`WITHHELD`] (a value exists in the record but is not a reading at this
@@ -38,7 +39,7 @@
 //! Anything else is an error naming these forms; nothing silently defaults.
 
 use anyhow::{Result, anyhow};
-use store::QueryTable;
+use net_observer_ipc::Table;
 
 /// Printed for a value the record withheld because the moment lies inside an
 /// observation gap. Not a measurement, and not a missing one either.
@@ -153,7 +154,7 @@ fn at(row: &[String], i: usize) -> &str {
 }
 
 /// A measurement cell: the value, or `null_token` when SQL said `NULL`
-/// (`QueryTable` renders `NULL` as the empty string).
+/// (the store renders `NULL` as the empty string).
 fn measured(row: &[String], i: usize, null_token: &str) -> String {
     let c = at(row, i);
     if c.is_empty() {
@@ -217,7 +218,7 @@ fn gap_bounds(opened: &str, closed: &str) -> String {
 ///
 /// A moment inside an observation gap is rendered as the refusal it is: no
 /// measurement lines at all, the gap's bounds, and why nothing is reported.
-pub(crate) fn format_verdict_at(table: &QueryTable, asked_ts_us: i64) -> Result<String> {
+pub(crate) fn format_verdict_at(table: &Table, asked_ts_us: i64) -> Result<String> {
     let c = Cols(&table.columns);
     let (ts, layer) = (c.idx("ts_us")?, c.idx("layer")?);
     let (go, gc) = (c.idx("gap_opened_us")?, c.idx("gap_closed_us")?);
@@ -273,7 +274,7 @@ pub(crate) fn format_verdict_at(table: &QueryTable, asked_ts_us: i64) -> Result<
 
 /// **Incidents with the layer state just before each opened** — renders
 /// [`store::diagnosis::incident_context_sql`].
-pub(crate) fn format_incident_context(table: &QueryTable) -> Result<String> {
+pub(crate) fn format_incident_context(table: &Table) -> Result<String> {
     let c = Cols(&table.columns);
     let (id, trg) = (c.idx("id")?, c.idx("trigger_id")?);
     let (opened, closed) = (c.idx("opened_us")?, c.idx("closed_us")?);
@@ -355,7 +356,7 @@ pub(crate) fn format_incident_context(table: &QueryTable) -> Result<String> {
 
 /// **Wedge vs starvation** — renders
 /// [`store::diagnosis::wedge_vs_starvation_sql`].
-pub(crate) fn format_wedge_vs_starvation(table: &QueryTable) -> Result<String> {
+pub(crate) fn format_wedge_vs_starvation(table: &Table) -> Result<String> {
     let c = Cols(&table.columns);
     let (ep, opened, closed) = (c.idx("episode")?, c.idx("opened_us")?, c.idx("closed_us")?);
     let (ticks, load, verdict) = (c.idx("ticks")?, c.idx("max_load1")?, c.idx("verdict")?);
@@ -410,7 +411,7 @@ pub(crate) fn format_wedge_vs_starvation(table: &QueryTable) -> Result<String> {
 ///
 /// A `NULL` slope is stated as "not computed", never as flat.
 pub(crate) fn format_gateway_ramp(
-    table: &QueryTable,
+    table: &Table,
     drop_ts_us: i64,
     window_us: i64,
 ) -> Result<String> {
@@ -487,7 +488,7 @@ pub(crate) fn format_gateway_ramp(
 
 /// **The observation gaps the record contains** — renders
 /// [`store::diagnosis::observation_gaps_sql`].
-pub(crate) fn format_observation_gaps(table: &QueryTable) -> Result<String> {
+pub(crate) fn format_observation_gaps(table: &Table) -> Result<String> {
     let c = Cols(&table.columns);
     let (go, gc, by) = (
         c.idx("gap_opened_us")?,
@@ -536,7 +537,7 @@ pub(crate) fn format_observation_gaps(table: &QueryTable) -> Result<String> {
 /// The wording never claims measured interference. macOS reports no channel
 /// occupancy to anybody, so "OVERLAP" is a band-geometry hypothesis and the
 /// legend under the table says exactly that.
-pub(crate) fn format_air(scan: &QueryTable, aps: &QueryTable, own: &QueryTable) -> Result<String> {
+pub(crate) fn format_air(scan: &Table, aps: &Table, own: &Table) -> Result<String> {
     let c = Cols(&scan.columns);
     let (ts_i, air_i, reason_i, count_i) = (
         c.idx("ts_us")?,
@@ -690,7 +691,7 @@ cannot be matched to those of any other scan.\n";
 /// The moment travels with the channel on purpose: this reading has no time
 /// bound of its own, so a channel the radio left days ago would otherwise be
 /// compared against a scan taken now, silently. (realm net-observer, node #48)
-fn own_channel(own: &QueryTable) -> Result<Option<(types::ChannelSpan, Option<i64>)>> {
+fn own_channel(own: &Table) -> Result<Option<(types::ChannelSpan, Option<i64>)>> {
     let Some(row) = own.rows.first() else {
         return Ok(None);
     };
@@ -730,10 +731,10 @@ const OWN_CHANNEL_STALE_US: i64 = 60_000_000;
 mod tests {
     use super::*;
 
-    /// Build a `QueryTable` from column names and rows, with `""` standing for
-    /// SQL `NULL` exactly as `QueryTable` renders it.
-    fn table(columns: &[&str], rows: &[&[&str]]) -> QueryTable {
-        QueryTable {
+    /// Build a `Table` from column names and rows, with `""` standing for
+    /// SQL `NULL` exactly as the store renders it.
+    fn table(columns: &[&str], rows: &[&[&str]]) -> Table {
+        Table {
             columns: columns.iter().map(|c| (*c).to_string()).collect(),
             rows: rows
                 .iter()
@@ -754,7 +755,7 @@ mod tests {
     ];
     const AIR_OWN_COLS: &[&str] = &["ts_us", "channel", "channel_band", "channel_width_mhz"];
 
-    fn own_on(channel: &str, band: &str, width: &str) -> QueryTable {
+    fn own_on(channel: &str, band: &str, width: &str) -> Table {
         table(AIR_OWN_COLS, &[&["1000", channel, band, width]])
     }
 

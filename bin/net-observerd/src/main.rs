@@ -7,6 +7,7 @@
 
 mod acting;
 mod api;
+mod api_query;
 mod pipeline;
 
 use std::path::Path;
@@ -107,7 +108,12 @@ const BAN_CYCLE_MIN_BANS: usize = 3;
 /// collector's newest sample by the `Starvation` condition), and above which
 /// the `Gated` fault conditions decline to fire at all — there a probe
 /// failure measures the run queue, not the network.
-const STARVATION_LOAD: f64 = 10.0;
+///
+/// ONE number, owned by the store's diagnosis module: the daemon judges the
+/// record by it live and the offline reader reads the record by it later, and
+/// two literals could drift apart silently — the reading and the incidents it
+/// was meant to explain would then disagree.
+const STARVATION_LOAD: f64 = store::diagnosis::DEFAULT_STARVATION_LOAD;
 
 /// How long after a network-identity change (`dhcp_router` moved) the `Gated`
 /// fault conditions hold their fire. Right after a move every layer is
@@ -1404,6 +1410,9 @@ fn build_api_server(
         // stays the sole DuckDB owner, so the control path writes through the
         // same handle the pipeline does.
         store: store as Arc<dyn store::Store + Send + Sync>,
+        // One diagnosis at a time: a `Query` holds the store mutex the pipeline
+        // writes through, and the socket is world-connectable.
+        query_gate: Arc::new(tokio::sync::Semaphore::new(api::MAX_QUERIES_IN_FLIGHT)),
         events_tx,
     }
 }
