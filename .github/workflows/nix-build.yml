@@ -2,13 +2,15 @@ name: nix-build
 
 # Proves that the crate2nix packaging the darwin module consumes actually
 # builds, which until this job existed had no carrier but the owner's own
-# Mac (realm net-observer, node #79). Runs on macos-latest because
-# evaluating the darwin package attributes needs a darwin evaluator: from a
-# Linux runner only `packages.x86_64-linux.*` evaluates, since the darwin
-# attributes would build the crate2nix generator for a target the runner
-# isn't. Evaluation is import-from-derivation: `Cargo.nix` is generated from
-# `Cargo.lock` at eval time, so evaluation itself needs network, not just the
-# later build (realm net-observer, node #78).
+# Mac (realm net-observer, node #79). Runs on macos-latest because the
+# daemon links the `macos` adapter crate and the bar links AppKit:
+# `Cargo.nix` is checked in, so every system's attributes evaluate purely
+# from any host — no import from derivation, no network at evaluation —
+# but only a darwin builder can build what the module ships. The first
+# step guards the checked-in file itself: it is regenerated from
+# Cargo.lock by the crate2nix CLI, and a stale copy would package
+# yesterday's dependency graph without anyone noticing (realm
+# net-observer, node #95).
 
 on:
   push:
@@ -18,8 +20,9 @@ on:
 jobs:
   nix-build:
     runs-on: macos-latest
-    # Cold: crate2nix's generator, every crate built from scratch, and the
-    # DuckDB C++ engine (bundled) all in the same run.
+    # Cold: the dev shell (toolchain plus the crate2nix CLI), every crate
+    # built from scratch, and the DuckDB C++ engine (bundled) all in the
+    # same run.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +38,18 @@ jobs:
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      # Regenerate with the dev shell's crate2nix — the rev the flake pins
+      # and the cargo rust-toolchain.toml pins, the same pair that produced
+      # the checked-in file — so the output is byte-comparable; a floating
+      # `nix run github:nix-community/crate2nix` could differ merely because
+      # the generator moved. `cargo metadata` fetches the duckdb-rs fork and
+      # the registry index, so this step needs network like the builds do.
+      # A diff means Cargo.lock moved and nobody ran `crate2nix generate`.
+      - name: Cargo.nix is fresh
+        run: |
+          nix develop --command crate2nix generate
+          git diff --exit-code Cargo.nix crate-hashes.json
 
       - name: build the daemon and the CLI
         run: nix build --print-build-logs .#net-observerd .#net-observer-cli
