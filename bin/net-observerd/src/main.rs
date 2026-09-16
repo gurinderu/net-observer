@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use collector_air::AirCollector;
-use collector_core::{Collector, CollectorMeta, EventSource, Os, Readiness, Source};
+use collector_core::{Collector, CollectorMeta, EventSource, Os, ProbingState, Readiness, Source};
 use collector_dns::DnsCollector;
 use collector_host::HostCollector;
 use collector_link::{LinkCollector, LinkFacts};
@@ -46,7 +46,7 @@ use triggers::conditions::{
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
-use types::Sample;
+use types::{ProbingEdge, ProbingTier, Sample};
 
 use pipeline::{
     AirScanner, FreezePcapHandler, NeighborScanner, OnDemandAirScan, PcapFreezer, PcapRingSlot,
@@ -322,6 +322,45 @@ fn record_startup_edge(
     edge
 }
 
+/// Record that THIS process began in probing tier `tier` — the configured
+/// default — at `ts_us`.
+///
+/// The tier itself is process-scoped and never persisted; what is durable is
+/// the boundary: one `probing_edge` row with `peer_uid = NULL` (nobody asked;
+/// the process booted with this default), published on the realtime bus as the
+/// same `StreamFrame::Probing` an operator switch produces. A record that
+/// starts passive therefore says so, instead of leaving a run of `SKIP`s to be
+/// read as probes that could not run. Same two sinks as `api::set_probing`, not
+/// a second mechanism. (realm net-observer, node #88)
+///
+/// A store failure is logged as a gap and never fails startup, for the same
+/// reason as [`record_startup_edge`].
+fn record_startup_probing_edge(
+    store: &DuckdbStore,
+    events_tx: &tokio::sync::broadcast::Sender<EncodedFrame>,
+    ts_us: i64,
+    tier: ProbingTier,
+) -> ProbingEdge {
+    use store::Store as _;
+
+    let edge = ProbingEdge {
+        ts_us,
+        tier,
+        peer_uid: None,
+    };
+    match EncodedFrame::encode(&net_observer_ipc::StreamFrame::Probing(edge)) {
+        Ok(frame) => {
+            let _ = events_tx.send(frame);
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to encode startup probing frame"),
+    }
+    if let Err(e) = store.write_probing_edge(&edge) {
+        tracing::error!(error = %e,
+            "store write failed; startup probing edge not recorded (gap logged)");
+    }
+    edge
+}
+
 /// The async daemon body: load config, open the store, spawn the enabled
 /// collectors, run the consumer loop, and shut down on SIGTERM/SIGINT. The final
 /// drain is bounded (see [`SHUTDOWN_GRACE`]) so an un-abortable event source can
@@ -381,6 +420,10 @@ async fn run_daemon() -> anyhow::Result<()> {
         // something that can never fill — nor hide the switch he is looking for.
         // Config is read once and never reloaded, so this never goes stale.
         capabilities: Some(declared_capabilities(&cfg.collectors)),
+        // The tier this daemon boots into, from config — NOT the snapshot's own
+        // default, which is the pre-tier daemon's `Active` and would report a
+        // passive daemon as probing until the first switch.
+        probing: cfg.probing.default,
         ..StatusSnapshot::default()
     }));
 
@@ -404,20 +447,34 @@ async fn run_daemon() -> anyhow::Result<()> {
     // `observing`, deliberately never persisted — a restart resumes probing.
     let quiet = Arc::new(AtomicBool::new(false));
 
+    // The probing tier: which emission classes the link, proxy and dns
+    // collectors may put on the wire. Boots into the configured default —
+    // `passive`, nothing on the wire, unless the operator's config says
+    // otherwise — and is shared with those three collectors and the control
+    // socket exactly the way `quiet` is. Process-scoped and, like `quiet`,
+    // deliberately never persisted: a restart returns to the configured
+    // default, and only `SetProbing` moves it while the daemon runs.
+    // (realm net-observer, node #88)
+    let probing = Arc::new(ProbingState::new(cfg.probing.default));
+
     // The observing state is process-scoped and deliberately NEVER persisted: a
     // root forensics collector silently staying blind across a restart nobody
     // noticed is the dangerous failure mode, whereas restart-resumes fails safe.
     // Logged so the choice is explicit at every boot rather than accidental.
     tracing::info!(
         observing = true,
+        probing = %cfg.probing.default,
         "collection enabled at startup; the observing state is process-scoped and \
-         deliberately never persisted — a restart always resumes collecting"
+         deliberately never persisted — a restart always resumes collecting, in the \
+         configured probing tier"
     );
 
-    // `ts_us` of the most recent RESUME edge. The control socket publishes it on
-    // every `SetObserving(true)` transition; the pipeline consumer watches it and
-    // drops its recent-sample window so a count-based condition cannot span the
-    // observation gap the pause opened. `0` = the daemon has never resumed.
+    // `ts_us` of the most recent window-clearing edge. The control socket
+    // publishes it on every `SetObserving(true)` transition and on every real
+    // `SetProbing` switch (either direction); the pipeline consumer watches it
+    // and drops its recent-sample window so a count-based condition cannot
+    // span the observation gap a pause opened, nor the passive stretch a tier
+    // switch opened or closed. `0` = no such edge yet.
     let resume_at_us = Arc::new(AtomicI64::new(0));
 
     // The realtime event bus (push, not poll): the pipeline consumer publishes a
@@ -441,7 +498,13 @@ async fn run_daemon() -> anyhow::Result<()> {
     // infer where the silence ended. Written through the same two sinks as an
     // operator edge, immediately after the bus exists and before any collector
     // can produce a sample, so it precedes the evidence it replaces.
-    record_startup_edge(store.as_ref(), &events_tx, types::now_us());
+    let booted_us = types::now_us();
+    record_startup_edge(store.as_ref(), &events_tx, booted_us);
+    // The same for the probing tier: the configured default is a transition
+    // too, and a record that begins passive must say so before the first
+    // withheld probe lands as `SKIP`. Same instant as the observing edge — one
+    // boot, one `ts_us`.
+    record_startup_probing_edge(store.as_ref(), &events_tx, booted_us, probing.tier());
 
     let (tx, rx) = mpsc::channel::<Sample>(CHANNEL_CAP);
     // A sender for the control socket's on-demand air scan, taken BEFORE the
@@ -477,6 +540,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             .with_singbox_config(SINGBOX_CONFIG_PATH),
             cfg.collectors.link.interval,
             quiet.clone(),
+            probing.clone(),
         )));
     }
     if cfg.collectors.proxy.enabled {
@@ -498,6 +562,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             cfg.collectors.proxy.tun_probe_url.clone(),
             phys_iface.clone().unwrap_or_default(),
             cfg.collectors.proxy.interval,
+            probing.clone(),
         ))));
     }
     if cfg.collectors.dns.enabled {
@@ -509,6 +574,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 SINGBOX_CONFIG_PATH.to_string(),
             ),
             cfg.collectors.dns.interval,
+            probing.clone(),
         )));
     }
     if cfg.collectors.host.enabled {
@@ -609,9 +675,12 @@ async fn run_daemon() -> anyhow::Result<()> {
         // shared `observing` flag: the interval loop skips its probe while paused,
         // the event thread drops batches while paused.
         match c.source() {
-            Source::Interval(_) => {
-                handles.push(spawn_interval_collector(c, tx.clone(), observing.clone()))
-            }
+            Source::Interval(_) => handles.push(spawn_interval_collector(
+                c,
+                tx.clone(),
+                observing.clone(),
+                resume_at_us.clone(),
+            )),
             Source::Event => handles.push(spawn_event_collector(c, tx.clone(), observing.clone())),
         }
     }
@@ -689,6 +758,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             snapshot.clone(),
             observing.clone(),
             quiet.clone(),
+            probing.clone(),
             freezer.clone(),
             resume_at_us.clone(),
             store.clone(),
@@ -1128,8 +1198,14 @@ pub(crate) struct FakeCollector {
     pub(crate) interval: std::time::Duration,
     /// Flipped by the test to make preflight succeed.
     pub(crate) ready: Arc<std::sync::atomic::AtomicBool>,
-    /// Ticks on which `collect()` actually ran.
+    /// Ticks on which `collect()` actually ran — counted on ENTRY, before the
+    /// gate below, so a test can see a tick being held open.
     pub(crate) collects: Arc<std::sync::atomic::AtomicUsize>,
+    /// When `Some`, `collect()` parks here until the test adds a permit: a
+    /// tick held open in flight, so a pause or a probing-tier switch can land
+    /// while the probe is "running" and the spawner's post-probe re-checks can
+    /// be reached. `None` = collect at once.
+    pub(crate) gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[cfg(test)]
@@ -1150,6 +1226,14 @@ impl Collector for FakeCollector {
     async fn collect(&self, ts_us: i64) -> Vec<Sample> {
         self.collects
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        if let Some(gate) = &self.gate {
+            // One permit per released tick: the test decides when this probe
+            // "returns", and the next tick parks again.
+            gate.acquire()
+                .await
+                .expect("the test gate is never closed")
+                .forget();
+        }
         vec![Sample::Link(types::LinkSample {
             ts_us,
             gw: types::GwVerdict::Ok,
@@ -1349,6 +1433,7 @@ fn build_api_server(
     snapshot: Arc<Mutex<StatusSnapshot>>,
     observing: Arc<AtomicBool>,
     quiet: Arc<AtomicBool>,
+    probing: Arc<ProbingState>,
     freezer: Arc<PcapRingSlot>,
     resume_at_us: Arc<AtomicI64>,
     store: Arc<DuckdbStore>,
@@ -1385,10 +1470,11 @@ fn build_api_server(
         // control path.
         policy: api::ControlPolicy::from_config(cfg.socket_owner_uid, cfg.control_uids.clone()),
         observing: observing.clone(),
-        // Shared, never fresh — for `quiet` the same reason as `observing`, and
-        // the ring handle so `FreezePcap` copies the ring that is actually
-        // running rather than refusing next to a live capture.
+        // Shared, never fresh — for `quiet` and `probing` the same reason as
+        // `observing`, and the ring handle so `FreezePcap` copies the ring that
+        // is actually running rather than refusing next to a live capture.
         quiet,
+        probing,
         freezer,
         // Built unconditionally: whether there is anything to scan is decided
         // per request (an interface with an IPv4 subnet), not once at boot.
@@ -2006,6 +2092,7 @@ mod tests {
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let observing = Arc::new(AtomicBool::new(true));
         let quiet = Arc::new(AtomicBool::new(false));
+        let probing = Arc::new(ProbingState::new(ProbingTier::Passive));
         let resume_at_us = Arc::new(AtomicI64::new(0));
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         // A broadcast channel needs no runtime, so this whole test is a plain
@@ -2018,6 +2105,7 @@ mod tests {
             snapshot.clone(),
             observing.clone(),
             quiet.clone(),
+            probing.clone(),
             // No pcap ring in this test: `FreezePcap` must refuse rather than
             // panic, which is the empty slot's whole job.
             Arc::new(PcapRingSlot::empty()),
@@ -2121,6 +2209,12 @@ mod tests {
              while the capture is being gathered to prove it is not us"
         );
         assert!(
+            Arc::ptr_eq(&srv.probing, &probing),
+            "a fresh `probing` leaves the control socket acking a tier no \
+             collector reads, so \"Probe network\" would light up while every \
+             probe stays withheld — or the reverse"
+        );
+        assert!(
             Arc::ptr_eq(&srv.resume_at_us, &resume_at_us),
             "a fresh `resume_at_us` leaves the pipeline's trigger window never \
              cleared, so a count-based condition spans the observation gap"
@@ -2192,6 +2286,43 @@ mod tests {
             .expect("bus payload must decode as a StreamFrame");
         match decoded {
             net_observer_ipc::StreamFrame::Observing(back) => assert_eq!(back, edge),
+            other => panic!("unexpected frame variant: {other:?}"),
+        }
+    }
+
+    /// Startup writes the configured tier as a boundary too: one durable
+    /// `probing_edge` row (`tier` as configured, no peer) AND the same value on
+    /// the realtime bus — so a record that begins passive says so, before the
+    /// first withheld probe lands as `SKIP`.
+    #[test]
+    fn startup_records_a_probing_edge_through_both_sinks() {
+        let store = DuckdbStore::in_memory().unwrap();
+        let (events_tx, mut events_rx) = tokio::sync::broadcast::channel::<EncodedFrame>(8);
+
+        let edge = record_startup_probing_edge(&store, &events_tx, 4_243, ProbingTier::Passive);
+
+        assert_eq!(edge.ts_us, 4_243);
+        assert_eq!(edge.tier, ProbingTier::Passive);
+        assert_eq!(edge.peer_uid, None, "nobody asked; the process booted");
+
+        // Sink 1, durable.
+        assert_eq!(
+            store
+                .query_scalar_i64(
+                    "SELECT count(*) FROM probing_edge \
+                     WHERE ts_us = 4243 AND tier = 'passive' AND peer_uid IS NULL"
+                )
+                .unwrap(),
+            1,
+            "the startup tier must be durable, or a passive start is an inference"
+        );
+
+        // Sink 2, realtime: the same value, decoded off the bus.
+        let frame = events_rx.try_recv().expect("a frame must reach the bus");
+        let decoded: net_observer_ipc::StreamFrame = serde_json::from_slice(frame.bytes())
+            .expect("bus payload must decode as a StreamFrame");
+        match decoded {
+            net_observer_ipc::StreamFrame::Probing(back) => assert_eq!(back, edge),
             other => panic!("unexpected frame variant: {other:?}"),
         }
     }

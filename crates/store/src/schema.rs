@@ -40,6 +40,9 @@ ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS medium VARCHAR;
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS lease_start_us BIGINT;
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS lease_secs UINTEGER;
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS if_mac_private BOOLEAN;
+-- `tun_code`: the HTTP status the TUN probe got; 0 = probed, no HTTP status
+-- (the shell oracle's curl 000) — the dead tun every reading takes it for;
+-- NULL = not probed (passive tier, preflight skip), neither health nor fault.
 CREATE TABLE IF NOT EXISTS proxy_sample (
   ts_us BIGINT, server_ip VARCHAR, tcp VARCHAR, rtt_ms DOUBLE, tun_code USMALLINT, selector VARCHAR);
 -- Established-flow discriminator: whether the held reference streams (direct
@@ -172,4 +175,13 @@ CREATE TABLE IF NOT EXISTS observing_edge (
 -- rows read back with a NULL cause, which the gap derivation treats as
 -- 'control': that is what they in fact were.
 ALTER TABLE observing_edge ADD COLUMN IF NOT EXISTS cause VARCHAR;
+-- One row per switch of the probing tier (realm net-observer, node #88). A
+-- passive stretch is not a gap — every withheld probe still lands as a SKIP
+-- row — but this is what says WHY those rows carry no measurement and who
+-- asked for it. `tier` is the tier entered ('passive' / 'active'); `peer_uid`
+-- is NULL for the startup edge, which records the configured default so a
+-- record that begins passive says so. Added after the store first shipped, so
+-- an older DB file gains the table on open like `topology_link` above.
+CREATE TABLE IF NOT EXISTS probing_edge (
+  ts_us BIGINT, tier VARCHAR, peer_uid BIGINT);
 "#;
