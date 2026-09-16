@@ -1,6 +1,7 @@
 //! Wi-Fi facts: the current SSID (`networksetup -getairportnetwork`), the
-//! link's identity pair — the associated AP's BSSID (`ipconfig getsummary`)
-//! and the interface's own MAC (`ifconfig <iface> ether`) — and whether the
+//! link's identity triple — the associated AP's BSSID (`ipconfig getsummary`),
+//! the interface's own MAC (`ifconfig <iface> ether`) and the medium that MAC
+//! belongs to (`networksetup -listallhardwareports`) — and whether the
 //! CoreCapture Wi-Fi driver has recently dumped a diagnostic bundle (a strong
 //! signal of a driver-level Wi-Fi wedge).
 
@@ -105,11 +106,14 @@ fn parse_ether(output: &str) -> Option<String> {
 
 /// Return the medium of `iface` from the hardware-port table
 /// (`networksetup -listallhardwareports`, an external surface: realm
-/// net-observer, node #93) — readable by root without Location Services,
+/// net-observer, node #118) — readable by root without Location Services,
 /// which is what makes it the medium signal where the SSID and BSSID are not
-/// (node #108). `None` when the table cannot be read or does not list the
-/// interface. Read every tick, one command, like the identity pair: the
-/// default route can move between adapters between two ticks.
+/// (node #108). As #118 records, the output shape this parser expects
+/// (`Hardware Port:` / `Device:` blocks) is from documentation and has not
+/// yet been observed on the owner's Mac; the parser answers `None` on any
+/// shape it does not recognise, never a guess. `None` also when the table
+/// cannot be read or does not list the interface. Read every tick, one
+/// command, from the interface the tick resolved.
 pub async fn interface_medium(iface: &str) -> Option<LinkMedium> {
     let out = Command::new("networksetup")
         .args(["-listallhardwareports"])
