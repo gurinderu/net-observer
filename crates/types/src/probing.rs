@@ -42,6 +42,14 @@ pub enum EmissionClass {
 /// recorder of what the OS already knows; `Active` emits everything. A third
 /// tier (a lighter one, say) is one more arm of `emits`, not a new mechanism.
 ///
+/// Passive means **no emission the daemon makes on its own** — nothing on a
+/// timer. An operator's scan (`ScanNeighbors`) is not the daemon's emission:
+/// the command is the sanction (realm net-observer, node #91), and the scan
+/// writes its own `neighbor_scan` row, so passive does NOT refuse it. Quiet is
+/// a different promise: the *evidence* protocol (realm net-observer, node
+/// #26) — a capture taken under quiet must contain none of our packets, so
+/// quiet refuses the scan while passive lets it through.
+///
 /// Process-scoped like the observing and quiet switches: never persisted, and
 /// a restart returns to the configured default. Every switch is bracketed by a
 /// durable [`ProbingEdge`]. (realm net-observer, node #88)

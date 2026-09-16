@@ -548,6 +548,17 @@ sequence is not assumed to be well-formed pairs: a resume with no preceding paus
 opens no gap, and databases written before the startup edge existed still close
 their gaps by the `sample` inference.
 
+**Passive stretches are the second bracket, derived the same way but kept
+apart.** `probing_stretch` opens at a `passive` edge whose predecessor is not
+`passive` (a passive startup edge after a crash continues a stretch rather than
+opening a second one) and closes at the first later `active` edge —
+`gap_closed_by` = `active` (a peer asked) or `startup` (a boot whose default is
+active) — never at a sample, because samples keep landing under passive. It is
+deliberately not folded into `observation_gap`: a moment inside a stretch has a
+row and reads `unknown` from its `SKIP`s, never `gap`. `silences_sql` lists
+both brackets under a `kind` column (`pause` | `passive`); `observation_gaps_sql`
+stays pauses-only. (realm net-observer, node #88)
+
 ### Verdict vocabulary
 
 Ported from the oracle and cross-checked against recorded log excerpts:
@@ -599,8 +610,12 @@ the durable record; the socket is the live, low-latency read path.
   - `Request::Query(DiagnosticQuery)` → `Response::Table(Table)` — one of the
     named diagnoses of [Diagnosis queries](#diagnosis-queries) (`why`,
     `incident-context`, `wedge-or-starvation`, `gateway-ramp` and the drop list
-    it defaults from, `gaps`, `neighbors`, `vulns`, `segments`, `history`,
-    `topology`), run by the daemon against its **own** store while it keeps
+    it defaults from, `gaps` and `silences` — the latter every bracketed
+    silence with a `kind` column, pauses and passive stretches; `Gaps` keeps
+    its pauses-only shape because a reader built before the tier asks for it
+    by that id and would print a stretch as a pause — `neighbors`, `vulns`,
+    `segments`, `history`, `topology`), run by the daemon against its **own**
+    store while it keeps
     collecting — the only reader that can, since the daemon's per-process lock
     keeps every other opener out, and the moment of an incident is exactly when
     these are wanted. Read-only, in the same class as `Status`: no peer gate.
@@ -652,9 +667,12 @@ the durable record; the socket is the live, low-latency read path.
     realtime pub/sub path (see [Event bus and live
     subscriptions](#event-bus-and-live-subscriptions) below). The stream opens
     with a **mandatory** `StreamFrame::Ready` ack carrying the `kinds` the daemon
-    actually accepted and its current `observing` state, so a fresh subscriber
-    learns whether collection is live immediately instead of inferring it from
-    silence. Five other frame kinds follow: `Event` (a live sample or incident),
+    actually accepted, its current `observing` state and its current `probing`
+    tier, so a fresh subscriber learns whether collection is live — and whether
+    the `SKIP`s it is about to see are withheld probes — immediately instead of
+    inferring either from silence (`probing` defaults to `active` on decode, as
+    `StatusSnapshot::probing` does: a pre-tier daemon probed). Five other frame
+    kinds follow: `Event` (a live sample or incident),
     `Gap` (this subscriber fell behind the bus and lost `skipped` events),
     `Observing` (a real pause/resume transition — the state at subscribe time
     rides on `Ready` instead, so a state report can never be mistaken for an edge
@@ -1017,10 +1035,26 @@ already-authorised command:
    unlike quiet every real switch is **bracketed**: one `types::ProbingEdge`
    goes to two sinks, a `probing_edge` row via the `Store` and a
    `StreamFrame::Probing` on the bus, and the startup default is written as a
-   peerless edge too. A no-op switch writes nothing. Clients: the bar menu's
-   **Probe network**/**Stop probing** row and `net-observer-cli probe
-   passive|active`; `gaps` lists passive stretches as `kind = passive` next to
-   the pauses.
+   peerless edge too. A no-op switch writes nothing. A real switch, in either
+   direction, closes and re-opens detection exactly as a resume does — it
+   publishes the same `resume_at_us` epoch, so `pipeline::run` clears the
+   recent-sample window and re-arms every trigger — which is what closes an
+   open incident *at* the switch (the `probing_edge` row at that `ts_us` is its
+   bracket) rather than letting the first passive `SKIP`s read as a recovery,
+   and keeps dead ticks from before a stretch out of the count after it.
+   Clients: the bar menu's **Probe network**/**Stop probing** row and
+   `net-observer-cli probe passive|active`; `gaps` asks the `Silences`
+   diagnosis, which lists passive stretches as `kind = passive` next to the
+   pauses (`Gaps` itself stays pauses-only for readers built before the tier).
+
+   Passive and quiet are two different promises, which is why only one of them
+   refuses a manual scan. Passive promises **no emission the daemon makes on
+   its own** — nothing on a timer; an operator's `ScanNeighbors` is not the
+   daemon's emission, the command is the sanction (realm net-observer, node
+   #91) and the scan writes its own `neighbor_scan` row, so passive lets it
+   through. Quiet is the **evidence protocol** (realm net-observer, node #26):
+   a capture taken under quiet must contain none of our packets, so quiet
+   keeps refusing the sweep.
 
 4. **Self-control — `ControlCmd::FreezePcap`.** Copy the pcap ring out now, into
    a fresh freeze directory — the same passive artifact the `gw-change` trigger

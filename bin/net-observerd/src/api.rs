@@ -1217,7 +1217,15 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
     //
     // Quiet: quiet means this daemon addresses no packet at the gateway; a sweep
     // addresses the whole subnet. Honouring the click would make quiet a lie the
-    // operator has no way to see.
+    // operator has no way to see — quiet is the EVIDENCE protocol (realm
+    // net-observer, node #26): a capture taken under it must contain none of
+    // our packets.
+    //
+    // The passive probing tier is deliberately NOT a third refusal. Passive
+    // promises no emission the daemon makes on its own; an operator's scan is
+    // not the daemon's — the command is the sanction (realm net-observer, node
+    // #91) — and the scan writes its own `neighbor_scan` row, so the record
+    // shows exactly what was sent inside the passive stretch. (node #88)
     if !cx.observing.load(Ordering::Acquire) {
         return ControlResult {
             ok: false,

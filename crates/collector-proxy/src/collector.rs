@@ -37,8 +37,9 @@ pub struct ProxyCollector<T: TcpProber, F: ProxyFacts, S: StallProbe> {
     /// every one is withheld: no 204 through the TUN, no connect to any
     /// endpoint, and the held reference streams are CLOSED rather than kept
     /// open and exercised. The selector read (loopback, sing-box's own API)
-    /// and the endpoint list (a config read) are passive and continue.
-    /// (realm net-observer, node #88)
+    /// is passive and continues; the endpoint list is NOT read at all under
+    /// passive — it exists only to be connected to, and the tick lands as the
+    /// single `SKIP` placeholder row instead. (realm net-observer, node #88)
     probing: Arc<ProbingState>,
 }
 
