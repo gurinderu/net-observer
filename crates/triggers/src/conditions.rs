@@ -145,10 +145,10 @@ impl<C: Condition> Condition for Gated<C> {
                 return None;
             }
         }
-        if let Some(threshold) = self.load_below {
-            if w.last_host().is_some_and(|h| h.load1 >= threshold) {
-                return None;
-            }
+        if let Some(threshold) = self.load_below
+            && w.last_host().is_some_and(|h| h.load1 >= threshold)
+        {
+            return None;
         }
         if let Some(settle_us) = self.settle_us {
             let links = w.recent_link(GW_CHANGE_SCAN);
@@ -158,10 +158,10 @@ impl<C: Condition> Condition for Gated<C> {
                     .iter()
                     .take_while(|l| l.ts_us >= horizon)
                     .filter_map(|l| l.dhcp_router.as_deref());
-                if let Some(first) = identities.next() {
-                    if identities.any(|r| r != first) {
-                        return None;
-                    }
+                if let Some(first) = identities.next()
+                    && identities.any(|r| r != first)
+                {
+                    return None;
                 }
             }
         }
