@@ -97,6 +97,14 @@ enabled = true
 enabled = true
 interval = "15s"
 
+# The `connections` collector: what this machine talks to -- the live flows
+# sing-box carries, read from its Clash API (the `clash_api` of
+# [collectors.proxy]) and folded per destination each tick. Reads a loopback
+# API, sends nothing. Read back with `net-observer-cli connections --by host`.
+[collectors.connections]
+enabled = true
+interval = "15s"
+
 # The `pcap_ring` collector keeps a rolling in-memory capture (via tcpdump) so a
 # passive incident trigger can freeze the last few MB to disk for forensics.
 [collectors.pcap_ring]

@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 use collector_core::{Readiness, Source};
 
 use crate::AnyCollector;
-use net_observer_ipc::{EncodedFrame, Event, IncidentSummary, StatusSnapshot, StreamFrame};
+use net_observer_ipc::{
+    ConnectionsSummary, EncodedFrame, Event, IncidentSummary, StatusSnapshot, StreamFrame,
+};
 use store::{DuckdbStore, Store};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -340,6 +342,10 @@ pub async fn run(
                 // own channel. It is published live below all the same, and it
                 // still bumps `generated_us` above.
                 Sample::Air(_) => {}
+                // The flow table is not a "latest sample" field either: a tick
+                // is many rows, read on demand through `DiagnosticQuery::
+                // Connections`. Published live below as its summary.
+                Sample::Connections(_) => {}
                 // Route events are a stream, not a "latest sample" field of the
                 // snapshot; they still bump `generated_us` above.
                 Sample::Route(_) => {}
@@ -359,6 +365,9 @@ pub async fn run(
                 Sample::Wifi(w) => Event::Wifi(w.clone()),
                 Sample::Neighbors(n) => Event::Neighbors(n.clone()),
                 Sample::Air(a) => Event::Air(a.clone()),
+                // The summary only — a tick can be hundreds of rows and the
+                // bus fans every frame out to every subscriber.
+                Sample::Connections(c) => Event::Connections(ConnectionsSummary::of(c)),
                 Sample::Route(r) => Event::Route(r.clone()),
             };
             // Serialise ONCE here; every subscriber then clones an Arc, not a

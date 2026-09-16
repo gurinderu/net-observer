@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use collector_air::AirCollector;
+use collector_connections::ConnectionsCollector;
 use collector_core::{Collector, CollectorMeta, EventSource, Os, Readiness, Source};
 use collector_dns::DnsCollector;
 use collector_host::HostCollector;
@@ -33,9 +34,9 @@ use collector_wifi::WifiCollector;
 use config::Config;
 use macos::LldpCapture;
 use macos::{
-    BoundTcpProber, CoreWlanFacts, DnsResolver, HeldReferenceStreams, HostLoad, IcmpPinger,
-    PcapRing, PfRouteSource, ProxySystemFacts, SystemFacts, SystemNeighbors, SystemProfilerAir,
-    TcpdumpLldpCapture,
+    BoundTcpProber, ConnectionSystemFacts, CoreWlanFacts, DnsResolver, HeldReferenceStreams,
+    HostLoad, IcmpPinger, PcapRing, PfRouteSource, ProxySystemFacts, SystemFacts, SystemNeighbors,
+    SystemProfilerAir, TcpdumpLldpCapture,
 };
 use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
@@ -552,6 +553,17 @@ async fn run_daemon() -> anyhow::Result<()> {
             oui.clone(),
         )));
     }
+    if cfg.collectors.connections.enabled {
+        // Shares the proxy collector's Clash API base: the flow table comes
+        // from the same sing-box the selector is read from. Reads a loopback
+        // API and sends nothing (realm net-observer, node #75).
+        collectors.push(AnyCollector::Connections(ConnectionsCollector::new(
+            Arc::new(ConnectionSystemFacts::new(
+                cfg.collectors.proxy.clash_api.clone(),
+            )),
+            cfg.collectors.connections.interval,
+        )));
+    }
     if cfg.collectors.route.enabled {
         // The route collector is Event-cadence, driven by a persistent PF_ROUTE
         // socket. Opening it here decides its readiness; if it cannot open, the
@@ -786,6 +798,7 @@ pub(crate) enum AnyCollector {
     Wifi(WifiCollector<CoreWlanFacts>),
     Neighbors(NeighborsCollector<SystemNeighbors>),
     Air(AirCollector<SystemProfilerAir>),
+    Connections(ConnectionsCollector<ConnectionSystemFacts>),
     /// Test-only: an interval collector with a flippable preflight (see
     /// [`FakeCollector`]).
     #[cfg(test)]
@@ -804,6 +817,7 @@ impl AnyCollector {
             Self::Wifi(c) => c.meta(),
             Self::Neighbors(c) => c.meta(),
             Self::Air(c) => c.meta(),
+            Self::Connections(c) => c.meta(),
             #[cfg(test)]
             Self::Fake(c) => c.meta(),
         }
@@ -820,6 +834,7 @@ impl AnyCollector {
             Self::Wifi(c) => c.source(),
             Self::Neighbors(c) => c.source(),
             Self::Air(c) => c.source(),
+            Self::Connections(c) => c.source(),
             #[cfg(test)]
             Self::Fake(c) => c.source(),
         }
@@ -836,6 +851,7 @@ impl AnyCollector {
             Self::Wifi(c) => c.preflight().await,
             Self::Neighbors(c) => c.preflight().await,
             Self::Air(c) => c.preflight().await,
+            Self::Connections(c) => c.preflight().await,
             #[cfg(test)]
             Self::Fake(c) => c.preflight().await,
         }
@@ -854,6 +870,7 @@ impl AnyCollector {
             Self::Wifi(c) => c.collect(ts_us).await,
             Self::Neighbors(c) => c.collect(ts_us).await,
             Self::Air(c) => c.collect(ts_us).await,
+            Self::Connections(c) => c.collect(ts_us).await,
             #[cfg(test)]
             Self::Fake(c) => c.collect(ts_us).await,
         }
@@ -871,6 +888,7 @@ impl AnyCollector {
             Self::Wifi(c) => c.skip(ts_us),
             Self::Neighbors(c) => c.skip(ts_us),
             Self::Air(c) => c.skip(ts_us),
+            Self::Connections(c) => c.skip(ts_us),
             #[cfg(test)]
             Self::Fake(c) => c.skip(ts_us),
         }
@@ -890,6 +908,7 @@ impl AnyCollector {
             Self::Wifi(c) => Box::new(c).into_event_source(),
             Self::Neighbors(c) => Box::new(c).into_event_source(),
             Self::Air(c) => Box::new(c).into_event_source(),
+            Self::Connections(c) => Box::new(c).into_event_source(),
             #[cfg(test)]
             Self::Fake(c) => Box::new(c).into_event_source(),
         }
@@ -1115,6 +1134,7 @@ fn collector_switch(kind: EventKind, c: &config::Collectors) -> Option<bool> {
         EventKind::Wifi => c.wifi.enabled,
         EventKind::Air => c.air.enabled,
         EventKind::Neighbors => c.neighbors.enabled,
+        EventKind::Connections => c.connections.enabled,
         // Not a collector: incidents are what the triggers write about the
         // collectors' samples. `pcap_ring` is absent for the same reason from the
         // other side — it produces no event kind at all.
@@ -1634,6 +1654,7 @@ mod tests {
             collector_wifi::META.name,
             collector_neighbors::META.name,
             collector_air::META.name,
+            collector_connections::META.name,
         ];
 
         let cfg = config::Config::default();

@@ -41,6 +41,10 @@ pub struct Collectors {
     #[serde(default)]
     pub air: AirCfg,
     pub neighbors: NeighborsCfg,
+    /// Tolerated absent: a config written before the collector existed keeps
+    /// loading, with the collector on.
+    #[serde(default)]
+    pub connections: ConnectionsCfg,
     pub pcap_ring: PcapCfg,
 }
 
@@ -132,6 +136,28 @@ impl Default for AirCfg {
         AirCfg {
             enabled: false,
             interval: Duration::from_secs(300),
+        }
+    }
+}
+
+/// The `connections` collector: what this machine talks to — the live flows
+/// sing-box carries, read from its Clash API (`GET /connections`, the same API
+/// and base URL `[collectors.proxy].clash_api` names) and folded per
+/// destination each tick (realm net-observer, node #75). Reading a local API
+/// on the loopback sends nothing on the wire, so it is on by default like the
+/// other passive collectors, at the proxy collector's cadence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionsCfg {
+    pub enabled: bool,
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+}
+
+impl Default for ConnectionsCfg {
+    fn default() -> Self {
+        ConnectionsCfg {
+            enabled: true,
+            interval: Duration::from_secs(15),
         }
     }
 }
@@ -261,6 +287,7 @@ impl Default for Config {
                     cve_snapshot_dir: None,
                     oui_snapshot_dir: None,
                 },
+                connections: ConnectionsCfg::default(),
                 pcap_ring: PcapCfg {
                     enabled: true,
                     ring_mb: 8,
@@ -365,6 +392,32 @@ mod tests {
         let c = Config::load(Some(p.to_str().unwrap())).unwrap();
         assert!(!c.collectors.wifi.enabled);
         assert_eq!(c.collectors.wifi.interval.as_secs(), 30);
+    }
+    /// On by default at the proxy cadence; a file that never names the section
+    /// loads with the collector on, and one that names it can switch it off.
+    #[test]
+    fn connections_default_on_and_the_section_is_optional() {
+        let c = Config::load(None).unwrap();
+        assert!(c.collectors.connections.enabled);
+        assert_eq!(
+            c.collectors.connections.interval,
+            c.collectors.proxy.interval
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        std::fs::write(&p, "[collectors.host]\nenabled = false\n").unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert!(c.collectors.connections.enabled);
+
+        std::fs::write(
+            &p,
+            "[collectors.connections]\nenabled = false\ninterval = \"1m\"\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert!(!c.collectors.connections.enabled);
+        assert_eq!(c.collectors.connections.interval.as_secs(), 60);
     }
     /// The gates this section used to carry (`acting.enabled`, the
     /// `collectors.neighbors.scan.*` rung permissions) are gone, but the owner's
