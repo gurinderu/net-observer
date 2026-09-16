@@ -41,6 +41,7 @@ flowchart LR
         proxy["proxy\nInterval(15s)"]
         dns["dns\nInterval"]
         host["host\nInterval"]
+        conns["connections\nInterval (Clash API)"]
         evt["route-events\nEvent (PF_ROUTE)"]
     end
 
@@ -48,6 +49,7 @@ flowchart LR
     proxy -- "Sample::Proxy" --> stream
     dns -- "Sample::Dns" --> stream
     host -- "Sample::Host" --> stream
+    conns -- "Sample::Connections" --> stream
     evt -- "Sample::Route (event)" --> stream
 
     stream(["mpsc stream (Sample)"]) --> consumer{{"consumer loop\n(pipeline::run)"}}
@@ -86,6 +88,21 @@ flowchart LR
   writes each sample to the store (a write error is *logged as a gap*, never
   silently dropped), mirrors the sample into the live `StatusSnapshot`, pushes
   into the `RecentWindow`, and evaluates the engine.
+- **`connections`** — what this machine talks to. `netstat` cannot say: every
+  destination it shows is a fakeip. sing-box's Clash API (`GET /connections`,
+  the same API and base URL the `proxy` collector reads the selector from)
+  lists every live flow with the name asked for, the real destination, the
+  process and the outbound chain; the collector reads it each tick over the
+  loopback (it sends nothing), folds the flows by
+  `(host, dst_ip, dst_port, process, network, chain)` into a
+  `Sample::Connections`, and the consumer stores the rows and publishes the
+  tick as a **summary** on the bus (`Event::Connections`: verdict, flow count,
+  host count — never the rows, which can be hundreds per tick). A tick on
+  which the API did not answer is a `SKIP` sample with no rows, distinct from
+  an `OK` tick that listed nothing. The table is read on demand
+  (`DiagnosticQuery::Connections`, `net-observer-cli connections --by …`)
+  rather than carried on the status snapshot (realm net-observer, nodes #75,
+  #127).
 - **TriggerEngine** — rules ported from the oracle and grown since: `wedge`,
   `gw-drop`, `gw-change` (unconditional pcap freeze on any gateway change),
   `roam` (a BSSID hop or a new link address on Wi-Fi, classified by whether
@@ -300,6 +317,7 @@ graph TD
     croute["collector-route\nRouteCollector, META (Event);\nEventSource-driven"]
     chost["collector-host\nHostFacts, build_host_sample,\nHostCollector, META (Interval)"]
     cwifi["collector-wifi\nWifiFacts, build_wifi_sample,\nWifiCollector, META (Interval)"]
+    cconns["collector-connections\nConnectionFacts, build_connections_sample,\nConnectionsCollector, META (Interval)"]
     triggers["triggers\nCondition/Handler/Trigger, engine"]
     config["config\nfigment per-subsystem toggles"]
     macos["macos\nreal adapters: ICMP, IP_BOUND_IF,\nClash API, DHCP/ARP, pcap ring,\nDNS resolve, PF_ROUTE, loadavg"]
@@ -317,11 +335,13 @@ graph TD
     ccore --> croute
     ccore --> chost
     ccore --> cwifi
+    ccore --> cconns
     types --> clink
     types --> cproxy
     types --> cdns
     types --> croute
     types --> chost
+    types --> cconns
 
     ccore --> macos
     clink --> macos
@@ -329,6 +349,7 @@ graph TD
     cdns --> macos
     croute --> macos
     chost --> macos
+    cconns --> macos
 
     store --> triggers
 
@@ -338,6 +359,7 @@ graph TD
     cdns --> net-observerd
     croute --> net-observerd
     chost --> net-observerd
+    cconns --> net-observerd
     macos --> net-observerd
     store --> net-observerd
     triggers --> net-observerd
@@ -359,11 +381,11 @@ graph TD
   `async fn` traits need no runtime crate, and `Source` / `EventSource` keep the
   crate runtime-agnostic. The async driving of both cadences lives in `net-observerd`.
 - `collector-link` / `collector-proxy` / `collector-dns` / `collector-host` /
-  `collector-wifi` are `Interval` collectors; each depends on `types` +
-  `collector-core` and holds its port trait (`LinkFacts` / `ProxyFacts` /
-  `DnsFacts` / `HostFacts` / `WifiFacts`), the pure
-  `build_*` mapping logic (unit-tested with fakes), a static `META`, and the
-  `Collector` impl.
+  `collector-wifi` / `collector-connections` are `Interval` collectors; each
+  depends on `types` + `collector-core` and holds its port trait (`LinkFacts` /
+  `ProxyFacts` / `DnsFacts` / `HostFacts` / `WifiFacts` / `ConnectionFacts`),
+  the pure `build_*` mapping logic (unit-tested with fakes), a static `META`,
+  and the `Collector` impl.
 - `collector-route` is the first **Event**-cadence collector: it wraps a
   `Box<dyn EventSource>` (the real PF_ROUTE source lives in `macos`) and reports
   `Source::Event`; `net-observerd` drives its blocking `next()` loop on a dedicated
@@ -371,7 +393,8 @@ graph TD
 - `macos` implements every port trait with the real adapters, all on
   **async-native I/O** on the daemon's tokio runtime: `surge-ping` (raw ICMP),
   `socket2` + `tokio::net::TcpStream` with `IP_BOUND_IF` (bound TCP probes),
-  `reqwest`'s **async** client (Clash API, TUN 204 probe, DoH), and
+  `reqwest`'s **async** client (Clash API — the selector and the live flow
+  list, TUN 204 probe, DoH), and
   `tokio::process::Command` (DHCP/ARP + Wi-Fi subprocesses); `getloadavg` stays
   an inline syscall inside its `async fn`, as does the CoreWLAN read behind
   `WifiFacts` (hand-declared `objc2` message sends — no subprocess and no text
@@ -460,6 +483,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `route_event` | `ts_us, kind, iface, detail` | PF_ROUTE event stream (`kind` = `iface` / `addr` / `route`): iface up/down, addr add/loss, default-route change. |
 | `host_sample` | `ts_us, load1, load5, load15, disk_used_pct, disk_free_mb, swap_used_mb` | Host load averages — the `starvation` discriminator — plus the usage of the volume holding the record (`disk_used_pct` as `df` computes capacity, `disk_free_mb` what a writer can still take, in MiB) and the swap in use in MiB: the ENOSPC and memory-pressure discriminators the shell oracle carried. A store write that fails for want of space is logged as a gap; these columns let the record name the cause. NULL = not measured, never a zero. |
 | `wifi_sample` | `ts_us, wifi, reason, rssi_dbm, noise_dbm, snr_db, tx_rate_mbps, phy_mode, channel, channel_width_mhz, channel_band` | Wi-Fi air quality from CoreWLAN. `rssi_dbm`/`noise_dbm` are the raw pair and `snr_db` is derived (`rssi - noise`), so the derivation can be revisited from the columns actually measured. `wifi = SKIP` with a `reason` when the radio could not be read (no interface, powered off, not associated) — a row every tick, never an absent one. No SSID/BSSID: macOS gates them behind Location Services, which a LaunchDaemon cannot obtain. |
+| `connection_sample` | `ts_us, verdict, host, dst_ip, dst_port, process, network, chain, count, upload, download` | What this machine talks to: the live flows sing-box's Clash API lists (`GET /connections`, realm net-observer, node #127), aggregated per tick by `(host, dst_ip, dst_port, process, network, chain)` — `count` flows shared the key, `upload`/`download` their bytes summed. `host` is the name asked for (a sniffed SNI is whatever the client put there), `dst_ip` the real destination (NULL when the proxy resolves the name on the far side), `process` the client's executable name, `chain` the outbound the flow actually left through (the last element of the API's chain). One row per aggregate row per tick with the tick's `verdict` on each; a tick with no rows — the API did not answer (`SKIP`) or it listed nothing (`OK`) — writes ONE row with every key column NULL, so "could not look" and "nothing is talking" are different rows and neither is an absent tick (realm net-observer, node #75). |
 | `incident` | `id PK, opened_us, closed_us, trigger_id, signature` | Open incident ⇒ `closed_us IS NULL`. |
 | `blob_ref` | `id, incident_id, ts_us, kind, path` | On-disk forensics blobs (pcap freeze, dumps) referenced by path. |
 | `trigger_fired` | `ts_us, trigger_id, incident_id, detail` | One row per trigger fire. |
@@ -509,6 +533,7 @@ carries, lives in `types` for the same reason.
 | `gateway_ramp(drop_ts_us)` | gateway RTT over the window before a drop, with a least-squares `slope_ms_per_s` over the answered ticks — the ~40 s coworking climb as data |
 | `fakeip_bugs()` | `FAKEIP` on a `.ru` name, which is always a bug |
 | `observation_gaps()` | one row per interval the daemon deliberately collected nothing |
+| `connections(group_by)` | the newest `connection_sample` tick, grouped by `host` / `ip` / `ip-port` / `process` (`ConnectionsGroupBy`, in `types` like `HistoryWindow`): `ts_us, verdict, key, count, upload, download, hosts`, ordered by `count DESC`, `hosts` the distinct names seen behind the key; a tick with no rows answers one row carrying only `ts_us` and `verdict`, so a `SKIP` is never an empty table |
 
 The `layer` vocabulary is `link` / `vless` / `proxy` / `host` / `healthy` /
 `unknown` / `gap`. **The refusals are the point.** No query counts a `SKIP` as
@@ -600,7 +625,7 @@ the durable record; the socket is the live, low-latency read path.
     named diagnoses of [Diagnosis queries](#diagnosis-queries) (`why`,
     `incident-context`, `wedge-or-starvation`, `gateway-ramp` and the drop list
     it defaults from, `gaps`, `neighbors`, `vulns`, `segments`, `history`,
-    `topology`), run by the daemon against its **own** store while it keeps
+    `topology`, `connections`), run by the daemon against its **own** store while it keeps
     collecting — the only reader that can, since the daemon's per-process lock
     keeps every other opener out, and the moment of an incident is exactly when
     these are wanted. Read-only, in the same class as `Status`: no peer gate.
