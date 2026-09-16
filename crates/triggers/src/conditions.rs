@@ -400,9 +400,29 @@ const ENDPOINT_BLOCK_SCAN: usize = 64;
 /// history does not survive a resume (only the link change basis is carried),
 /// so after `clear_for_resume` this simply waits for `consecutive` fresh
 /// cohorts. (realm net-observer, node #69)
+///
+/// The engine evaluates on every row, so the newest cohort is usually still
+/// being written. It is judged only once it is COMPLETE — its row count equals
+/// the immediately preceding cohort's — and until then it is not there yet:
+/// the `consecutive` cohorts before it are judged instead, so the fire lands
+/// on the last row of the completing cohort, never on its first. A fleet that
+/// changed size (config reload) reads incomplete until the next cohort matches
+/// it — one tick late, never suppressed. The `-` skip placeholder is a lone row
+/// and the tick's whole output, so it is complete by construction and breaks
+/// the run as before. (realm net-observer, node #73)
 pub struct EndpointBlock {
     pub consecutive: usize,
 }
+
+/// One per-tick cohort of proxy rows as `endpoint-block` folds them.
+struct Cohort {
+    ts_us: i64,
+    rows: usize,
+    all_fail: bool,
+    /// Holds the `-` skip placeholder: no endpoints were parsed this tick.
+    skipped: bool,
+}
+
 impl Condition for EndpointBlock {
     fn id(&self) -> &'static str {
         "endpoint-block"
@@ -416,39 +436,61 @@ impl Condition for EndpointBlock {
             TcpVerdict::Ok => {}
             TcpVerdict::Fail | TcpVerdict::Skip => return None,
         }
-        // Per-tick cohorts, newest first: `(ts_us, rows, all Fail so far)`.
-        // One `collect()` stamps every per-endpoint row with one `ts_us`, so
-        // the shared timestamp is the cohort key.
-        let mut cohorts: Vec<(i64, usize, bool)> = Vec::new();
+        // Per-tick cohorts, newest first. One `collect()` stamps every
+        // per-endpoint row with one `ts_us`, so the shared timestamp is the
+        // cohort key.
+        let mut cohorts: Vec<Cohort> = Vec::new();
         for p in w.recent_proxy(ENDPOINT_BLOCK_SCAN) {
             // Exhaustive over the verdict: `Skip` carries no measurement, so
             // it can never count toward "every endpoint failed".
-            let fail = match p.tcp {
-                TcpVerdict::Fail => true,
-                TcpVerdict::Ok | TcpVerdict::Skip => false,
+            let (fail, skip) = match p.tcp {
+                TcpVerdict::Fail => (true, false),
+                TcpVerdict::Ok => (false, false),
+                TcpVerdict::Skip => (false, true),
             };
             match cohorts.last_mut() {
-                Some((ts, rows, all_fail)) if *ts == p.ts_us => {
-                    *rows += 1;
-                    *all_fail = *all_fail && fail;
+                Some(c) if c.ts_us == p.ts_us => {
+                    c.rows += 1;
+                    c.all_fail = c.all_fail && fail;
+                    c.skipped = c.skipped || skip;
                 }
                 _ => {
-                    // A new cohort begins; past `consecutive` of them the
-                    // verdict is already decided.
-                    if cohorts.len() == self.consecutive {
+                    // A new cohort begins. One more than `consecutive` is
+                    // read: the newest may prove incomplete and be set aside,
+                    // and the run is then judged from the cohort after it.
+                    if cohorts.len() > self.consecutive {
                         break;
                     }
-                    cohorts.push((p.ts_us, 1, fail));
+                    cohorts.push(Cohort {
+                        ts_us: p.ts_us,
+                        rows: 1,
+                        all_fail: fail,
+                        skipped: skip,
+                    });
                 }
             }
         }
-        if cohorts.len() < self.consecutive {
+        // The newest cohort is complete when it matches its predecessor's row
+        // count, or when it is the skip placeholder (a lone row, the tick's
+        // whole output). With no predecessor it cannot be shown complete.
+        let complete = match cohorts.as_slice() {
+            [newest, prev, ..] => newest.skipped || newest.rows == prev.rows,
+            [newest] => newest.skipped,
+            [] => false,
+        };
+        let judged = if complete {
+            cohorts.as_slice()
+        } else {
+            cohorts.get(1..).unwrap_or_default()
+        };
+        if judged.len() < self.consecutive {
             return None;
         }
-        if !cohorts.iter().all(|(_, _, all_fail)| *all_fail) {
+        let judged = &judged[..self.consecutive];
+        if !judged.iter().all(|c| c.all_fail) {
             return None;
         }
-        let (_, n, _) = *cohorts.first()?;
+        let n = judged.first()?.rows;
         Some(Fire {
             detail: format!(
                 "all {n} endpoints dead from the underlay across {k} ticks \
@@ -1456,6 +1498,80 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         w.push(link(1, TcpVerdict::Ok));
         push_dead_cohort(&mut w, 10);
         assert!(c.eval(&w).is_none());
+    }
+
+    /// The engine evaluates on EVERY row, so the first `Fail` row of a new
+    /// cohort already read as a whole all-`Fail` cohort — one row early, on a
+    /// cohort still being written. A cohort is complete only once its row
+    /// count matches its predecessor's; until then it is not there yet, and
+    /// the fire lands on the LAST row of the completing cohort. Dies under the
+    /// row-agnostic scan that fired on the first row. (node #73)
+    #[test]
+    fn endpoint_block_waits_for_the_newest_cohort_to_complete() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        w.push(proxy_ep(20, "1.1.1.1:443", TcpVerdict::Fail));
+        assert!(
+            c.eval(&w).is_none(),
+            "one row of a two-endpoint cohort is not a cohort yet"
+        );
+        w.push(proxy_ep(20, "2.2.2.2:2053", TcpVerdict::Fail));
+        assert!(
+            c.eval(&w).is_some(),
+            "the second row completes the cohort and the run"
+        );
+    }
+
+    /// A fleet that grew on a config reload reads incomplete until the next
+    /// cohort matches it: the fire is delayed one tick, never suppressed.
+    #[test]
+    fn endpoint_block_fires_one_tick_late_when_the_fleet_grows() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        // Three rows now: the third makes the cohort larger than its
+        // predecessor, so it cannot be shown complete this tick.
+        push_dead_cohort(&mut w, 20);
+        w.push(proxy_ep(20, "3.3.3.3:443", TcpVerdict::Fail));
+        assert!(
+            c.eval(&w).is_none(),
+            "a cohort larger than its predecessor is not shown complete"
+        );
+        push_dead_cohort(&mut w, 30);
+        w.push(proxy_ep(30, "3.3.3.3:443", TcpVerdict::Fail));
+        let fire = c
+            .eval(&w)
+            .expect("two matching three-row cohorts complete the run");
+        assert!(
+            fire.detail.contains("all 3 endpoints"),
+            "the detail must carry the newest judged cohort size: {}",
+            fire.detail
+        );
+    }
+
+    /// The preflight-skip placeholder is a lone row and the tick's whole
+    /// output, so it is complete by construction and still breaks the run —
+    /// the completeness rule must not turn it transparent by setting a
+    /// one-row cohort aside as unfinished.
+    #[test]
+    fn endpoint_block_skip_placeholder_still_breaks_a_complete_run() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        push_dead_cohort(&mut w, 20);
+        assert!(
+            c.eval(&w).is_some(),
+            "control: the run fires before the skip"
+        );
+        w.push(proxy_ep(30, "-", TcpVerdict::Skip));
+        assert!(
+            c.eval(&w).is_none(),
+            "a skip placeholder is the absence of a measurement and breaks the run"
+        );
     }
 
     /// A link sample pinning what `PerClientBlock` reads: the gateway verdict
