@@ -327,11 +327,18 @@ fn record_startup_edge(
 /// drain is bounded (see [`SHUTDOWN_GRACE`]) so an un-abortable event source can
 /// never keep the daemon from exiting.
 async fn run_daemon() -> anyhow::Result<()> {
+    // Local time with an explicit numeric offset (`+03:00`), so a reader beside
+    // local wall clocks never misreads a bare-UTC line as a silence that did not
+    // happen. `ChronoLocal` parses the zone itself, cached per thread; the timer
+    // choice and the rejected `time`-based one: realm net-observer, node #116.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+            "%Y-%m-%dT%H:%M:%S%.6f%:z".into(),
+        ))
         .init();
 
     let cli = Cli::parse();
