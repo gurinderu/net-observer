@@ -33,6 +33,7 @@ use net_observer_ipc::{
 use std::io::Write;
 use std::process::ExitCode;
 use store::{DuckdbStore, QueryTable, Store as _, diagnosis};
+use types::ProbingTier;
 
 /// The `load1` above which a dead tun reads as host starvation rather than a
 /// proxy wedge. The CLI reads the record with the same threshold the daemon
@@ -142,6 +143,19 @@ enum Command {
         /// `on` resumes collection; `off` pauses it.
         #[arg(value_enum)]
         state: ObserveState,
+    },
+    /// Set the daemon's probing tier, sent as a `Control(SetProbing)` request
+    /// over the socket. `passive` (the daemon's default) puts nothing on the
+    /// wire: every link, proxy and dns probe is withheld and lands as `SKIP`,
+    /// and the held reference streams are closed. `active` runs every probe.
+    /// Benign self-control like `observe`, process-scoped, and every real
+    /// switch is recorded as a `probing_edge` row (see `gaps`). Exits non-zero
+    /// if the request failed, the daemon refused it, or the daemon is
+    /// unreachable.
+    Probe {
+        /// `passive` withholds every probe; `active` sends them.
+        #[arg(value_enum)]
+        tier: ProbeTier,
     },
     /// Ask the running daemon to go and find out who is on this segment NOW:
     /// sweep the local IPv4 subnet and browse mDNS for names, sent as a
@@ -318,6 +332,27 @@ impl ObserveState {
     }
 }
 
+/// The tier accepted by the `probe` subcommand. A thin CLI mirror of
+/// [`ProbingTier`] so `clap` renders `<passive|active>` in the help without
+/// leaking the wire type into the argument surface.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProbeTier {
+    /// Nothing on the wire; every probe lands as `SKIP`.
+    Passive,
+    /// Every probe runs.
+    Active,
+}
+
+impl ProbeTier {
+    /// The tier carried in `ControlCmd::SetProbing`.
+    fn to_tier(self) -> ProbingTier {
+        match self {
+            ProbeTier::Passive => ProbingTier::Passive,
+            ProbeTier::Active => ProbingTier::Active,
+        }
+    }
+}
+
 /// The event kind accepted by `events --kind`. A thin CLI mirror of
 /// [`EventKind`] so `clap` renders
 /// `<link|proxy|dns|route|host|wifi|neighbors|air|incident>` in the help without
@@ -401,6 +436,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             print!("{}", format_control(&result));
             // The request round-trips fine; a non-`ok` result means the daemon
             // declined or failed, which is a non-zero exit.
+            if !result.ok {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Probe { tier } => {
+            let cfg = load_config(cli)?;
+            let result = fetch_set_probing(&cfg.socket_path, tier.to_tier())?;
+            print!("{}", format_control(&result));
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
@@ -915,6 +958,29 @@ fn fetch_set_observing(socket_path: &str, observing: bool) -> Result<ControlResu
     }
 }
 
+/// Ask the daemon to switch its probing tier over the socket
+/// (`Control(SetProbing)`) and return its [`ControlResult`]. Benign
+/// self-control, like [`fetch_set_observing`]: it changes what the daemon's
+/// own collectors put on the wire and nothing else. A daemon built before the
+/// tier existed cannot decode the request; that is reported as "cannot", not
+/// as a refusal, through [`net_observer_ipc::control`]. Never panics.
+fn fetch_set_probing(socket_path: &str, tier: ProbingTier) -> Result<ControlResult> {
+    let outcome =
+        net_observer_ipc::control(socket_path, ControlCmd::SetProbing(tier)).map_err(|e| {
+            if daemon_not_running(&e) {
+                anyhow!("net-observerd not running (socket {socket_path} unavailable)")
+            } else {
+                anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
+            }
+        })?;
+    match outcome {
+        net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
+        net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
+            "net-observerd cannot set a probing tier (built before it existed): {e}"
+        )),
+    }
+}
+
 /// Send `Control(ScanNeighbors)` and return the daemon's verdict.
 fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
     match daemon_query(
@@ -1032,6 +1098,16 @@ fn format_status(snap: &StatusSnapshot) -> String {
     } else {
         "observing      off (paused - samples below are stale)\n"
     });
+
+    // The tier says what the SKIPs below mean: passive = withheld on purpose,
+    // nothing on the wire; active = every probe was sent.
+    out.push_str(&format!(
+        "probing        {}\n",
+        match snap.probing {
+            ProbingTier::Passive => "passive (nothing on the wire - probe verdicts read SKIP)",
+            ProbingTier::Active => "active",
+        }
+    ));
 
     match &snap.link {
         Some(l) => out.push_str(&format!(
@@ -1242,6 +1318,7 @@ mod tests {
             ],
             observing,
             quiet: false,
+            probing: ProbingTier::Active,
             capabilities: None,
         }
     }
@@ -1251,6 +1328,7 @@ mod tests {
         let out = format_status(&snapshot(true));
         assert!(out.contains(&format!("generated_us   {}", diagnose::stamp_us(100))));
         assert!(out.contains("observing      on"));
+        assert!(out.contains("probing        active"));
         assert!(out.contains(&format!(
             "link           gw=OK direct=OK ts_us={}",
             diagnose::stamp_us(42)
@@ -1277,6 +1355,23 @@ mod tests {
             "link           gw=OK direct=OK ts_us={}",
             diagnose::stamp_us(42)
         )));
+    }
+
+    /// A passive daemon says so on its own line, and says what it means for
+    /// the verdicts below — a reader must not take their SKIPs for failed
+    /// probes.
+    #[test]
+    fn format_status_names_the_passive_tier() {
+        let snap = StatusSnapshot {
+            probing: ProbingTier::Passive,
+            ..snapshot(true)
+        };
+        let out = format_status(&snap);
+        assert!(
+            out.contains("probing        passive (nothing on the wire - probe verdicts read SKIP)"),
+            "{out}"
+        );
+        assert!(!out.contains("probing        active"));
     }
 
     #[test]
