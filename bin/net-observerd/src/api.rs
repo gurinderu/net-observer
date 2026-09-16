@@ -1129,14 +1129,16 @@ fn control_response(
 /// (`RecentWindow::clear_for_resume`, gateway-change basis kept), re-arms every
 /// trigger (`TriggerEngine::rearm_all`) and keeps the bounded pre-edge drain out
 /// of the window; the interval collectors drop a tick that straddled the edge
-/// at the source as well. So an incident open at the switch closes at the
-/// first sample after the switch, exactly as after a resume — its `closed_us`
-/// is that sample's `ts_us`, and the `probing_edge` row at the switch's own
-/// `ts_us` is the bracket that explains it. The probe-fed conditions do not
-/// read the first passive `SKIP`s as a recovery, and after a switch back no
-/// dead tick from before the stretch can join the ticks after it. Without
-/// this, the switch to passive turned every probe-fed condition to `None` at
-/// once and the engine closed open incidents as "recovered" at that instant.
+/// at the source as well. So the cleared window makes the first post-edge
+/// sample judge afresh, exactly as after a resume: a condition that no longer
+/// holds closes its open incident at that sample's `ts_us`; one that still
+/// holds — a `NoGw` gw-drop, a fakeip hijack, both readable under passive —
+/// keeps it open. The `probing_edge` row at the switch's own `ts_us` is the
+/// bracket that explains either. The probe-fed conditions do not read the
+/// first passive `SKIP`s as a recovery, and after a switch back no dead tick
+/// from before the stretch can join the ticks after it. Without this, the
+/// switch to passive turned every probe-fed condition to `None` at once and
+/// the engine closed open incidents as "recovered" at that instant.
 fn set_probing(
     tier: ProbingTier,
     authorized: PeerAuthorized,
@@ -1154,7 +1156,13 @@ fn set_probing(
             // The epoch is published BEFORE the tier flips, as on a resume: a
             // collector that reads the new tier has already synchronised with
             // it, so no sample taken under the new tier can reach the consumer
-            // while it still reads the old epoch.
+            // while it still reads the old epoch. The residual, named: a
+            // control task preempted between these two stores for longer than
+            // a collector's own epoch-read-to-tier-read gap lets ONE old-tier
+            // tick, stamped with a post-edge `ts_us`, pass both of the
+            // spawner's re-checks. Swapping the order would open the
+            // consumer-side hole above instead. Accepted as bounded (one tick,
+            // one switch) and left as is.
             cx.resume_at_us.store(ts_us, Ordering::Release);
             cx.probing.set(tier);
             snap.probing = tier;

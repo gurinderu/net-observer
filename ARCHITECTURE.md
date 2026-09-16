@@ -1045,12 +1045,14 @@ already-authorised command:
    direction, closes and re-opens detection exactly as a resume does — it
    publishes the same `resume_at_us` epoch, so `pipeline::run` clears the
    recent-sample window and re-arms every trigger, and the interval collectors
-   drop a tick that straddled the edge at the source — so an open incident
-   closes at the first sample after the switch, exactly as after a resume
-   (its `closed_us` is that sample's `ts_us`; the `probing_edge` row at the
-   switch's own `ts_us` is the bracket), rather than the first passive `SKIP`s
-   reading as a recovery, and dead ticks from before a stretch stay out of the
-   count after it. Clients: the bar menu's **Probe network**/**Stop probing**
+   drop a tick that straddled the edge at the source — so the cleared window
+   makes the first post-edge sample judge afresh, exactly as after a resume: a
+   condition that no longer holds closes its open incident at that sample's
+   `ts_us`, one that still holds (a `NoGw` gw-drop, a fakeip hijack — both
+   readable under passive) keeps it open, and the `probing_edge` row at the
+   switch's own `ts_us` is the bracket either way; the first passive `SKIP`s
+   never read as a recovery, and dead ticks from before a stretch stay out of
+   the count after it. Clients: the bar menu's **Probe network**/**Stop probing**
    row and `net-observer-cli probe passive|active`; `gaps` asks the `Silences`
    diagnosis, which lists passive stretches as `kind = passive` next to the
    pauses (`Gaps` itself stays pauses-only for readers built before the tier;
