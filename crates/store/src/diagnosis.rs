@@ -236,8 +236,6 @@ layer_state AS (
          p.tun_code,
          h.load1,
          CASE
-           -- Dead-tun vocabulary matches the shell oracle's `tun != 204`
-           -- (realm net-observer, node #122).
            -- The local network died: infrastructure, not us.
            WHEN l.gw IN ('FAIL', 'NOGW') THEN 'link'
            -- A probe that did not run is neither health nor fault.
@@ -248,7 +246,9 @@ layer_state AS (
            -- tun=000, but without load there is no telling wedge from starvation.
            WHEN p.tun_code = 0 AND h.load1 IS NULL THEN 'unknown'
            WHEN p.tun_code = 0 AND h.load1 > ? THEN 'host'
-           -- Any answer but 204 means the tunnel did not reach its far end (a captive portal answers 200).
+           -- Any answer but 204 means the tunnel did not reach its far end
+           -- (a captive portal answers 200) — the shell oracle's `tun != 204`
+           -- vocabulary (realm net-observer, node #122).
            WHEN p.tun_code <> 204 THEN 'proxy'
            WHEN l.gw <> 'OK' OR l.direct <> 'OK' THEN 'unknown'
            ELSE 'healthy'
@@ -1270,12 +1270,13 @@ mod tests {
 
     // ---- 3. wedge vs starvation --------------------------------------------
 
-    /// Push `n` ticks of a dead tun over a healthy link, at `load1`.
-    fn tun_dead_episode(s: &DuckdbStore, from_us: i64, n: i64, load1: f64) {
+    /// Push `n` ticks of a dead tun (answering `code`, anything but 204) over
+    /// a healthy link, at `load1`.
+    fn tun_dead_episode(s: &DuckdbStore, from_us: i64, n: i64, code: u16, load1: f64) {
         for i in 0..n {
             let ts = from_us + i * SEC;
             link(s, ts, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
-            proxy(s, ts, TcpVerdict::Ok, Some(0));
+            proxy(s, ts, TcpVerdict::Ok, Some(code));
             host(s, ts, load1);
         }
     }
@@ -1283,7 +1284,7 @@ mod tests {
     #[test]
     fn a_dead_tun_on_an_idle_host_is_a_wedge() {
         let s = DuckdbStore::in_memory().unwrap();
-        tun_dead_episode(&s, 10 * SEC, 4, 1.3);
+        tun_dead_episode(&s, 10 * SEC, 4, 0, 1.3);
         let t = s.wedge_vs_starvation().unwrap();
         assert_eq!(t.rows.len(), 1);
         assert_eq!(cell(&t, 0, "verdict"), "wedge");
@@ -1297,23 +1298,12 @@ mod tests {
     #[test]
     fn the_same_dead_tun_under_load_is_starvation_not_a_wedge() {
         let s = DuckdbStore::in_memory().unwrap();
-        tun_dead_episode(&s, 10 * SEC, 4, 31.0);
+        tun_dead_episode(&s, 10 * SEC, 4, 0, 31.0);
         let t = s.wedge_vs_starvation().unwrap();
         assert_eq!(t.rows.len(), 1);
         assert_eq!(cell(&t, 0, "verdict"), "starvation");
         assert_ne!(cell(&t, 0, "verdict"), "wedge");
         assert_eq!(cell(&t, 0, "max_load1"), "31");
-    }
-
-    /// Push `n` ticks of a proxy answering with `code` (not 204) over a
-    /// healthy link, at `load1`.
-    fn tun_wrong_answer_episode(s: &DuckdbStore, from_us: i64, n: i64, code: u16, load1: f64) {
-        for i in 0..n {
-            let ts = from_us + i * SEC;
-            link(s, ts, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
-            proxy(s, ts, TcpVerdict::Ok, Some(code));
-            host(s, ts, load1);
-        }
     }
 
     /// A captive portal's 200 under load is still a wedge, not starvation:
@@ -1323,7 +1313,25 @@ mod tests {
     #[test]
     fn a_captive_portal_answer_under_load_is_a_wedge_not_starvation() {
         let s = DuckdbStore::in_memory().unwrap();
-        tun_wrong_answer_episode(&s, 10 * SEC, 4, 200, 31.0);
+        tun_dead_episode(&s, 10 * SEC, 4, 200, 31.0);
+        let t = s.wedge_vs_starvation().unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "verdict"), "wedge");
+        assert_ne!(cell(&t, 0, "verdict"), "starvation");
+    }
+
+    /// A single answered tick breaks silence for the whole episode: `max(tun_code)`
+    /// is taken over a `USMALLINT` column, so one `200` among three `0`s is
+    /// enough to read the episode as a wedge, not starvation, even under load.
+    #[test]
+    fn one_answered_tick_in_a_silent_episode_makes_it_a_wedge() {
+        let s = DuckdbStore::in_memory().unwrap();
+        for (i, code) in [0u16, 0, 200, 0].into_iter().enumerate() {
+            let ts = 10 * SEC + i as i64 * SEC;
+            link(&s, ts, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+            proxy(&s, ts, TcpVerdict::Ok, Some(code));
+            host(&s, ts, 31.0);
+        }
         let t = s.wedge_vs_starvation().unwrap();
         assert_eq!(t.rows.len(), 1);
         assert_eq!(cell(&t, 0, "verdict"), "wedge");
@@ -1334,9 +1342,9 @@ mod tests {
     #[test]
     fn the_two_episodes_are_separated_and_named_individually() {
         let s = DuckdbStore::in_memory().unwrap();
-        tun_dead_episode(&s, 10 * SEC, 3, 1.0);
+        tun_dead_episode(&s, 10 * SEC, 3, 0, 1.0);
         healthy_tick(&s, 60 * SEC);
-        tun_dead_episode(&s, 120 * SEC, 3, 25.0);
+        tun_dead_episode(&s, 120 * SEC, 3, 0, 25.0);
         let t = s.wedge_vs_starvation().unwrap();
         assert_eq!(t.rows.len(), 2);
         assert_eq!(cell(&t, 0, "verdict"), "wedge");
