@@ -1,0 +1,46 @@
+name: nix-build
+
+# Proves that the crate2nix packaging the darwin module consumes actually
+# builds, which until this job existed had no carrier but the owner's own
+# Mac (realm net-observer, node #79). Runs on macos-latest because
+# evaluating the darwin package attributes needs a darwin evaluator: from a
+# Linux runner only `packages.x86_64-linux.*` evaluates, since the darwin
+# attributes would build the crate2nix generator for a target the runner
+# isn't. Evaluation is import-from-derivation: `Cargo.nix` is generated from
+# `Cargo.lock` at eval time, so evaluation itself needs network, not just the
+# later build (realm net-observer, node #78).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  nix-build:
+    runs-on: macos-latest
+    # Cold: crate2nix's generator, every crate built from scratch, and the
+    # DuckDB C++ engine (bundled) all in the same run.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # v31 enables the flakes and nix-command experimental features by
+      # default, so no extra_nix_config is needed here.
+      - uses: cachix/install-nix-action@v31
+
+      # Store cache keyed on both lockfiles: a crate2nix rebuild is driven by
+      # Cargo.lock, a flake input bump by flake.lock. No account or secret
+      # needed — it uses the workflow's own github.token.
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - name: build the daemon and the CLI
+        run: nix build --print-build-logs .#net-observerd .#net-observer-cli
+
+      # Same reasoning as the bar step in lints.yml/tests.yml: its own step
+      # so the daemon/CLI verdict above stays readable when the GUI is what
+      # failed.
+      - name: build the menu bar
+        run: nix build --print-build-logs .#net-observer-bar
