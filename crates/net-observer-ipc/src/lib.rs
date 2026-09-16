@@ -101,38 +101,30 @@ pub enum ControlCmd {
     /// nothing on the network. Refused (`ok: false`) when the ring is disabled
     /// or never started.
     FreezePcap,
-    /// Turn "quiet" on (`true`) or off (`false`): while quiet the daemon
-    /// addresses NO packet AT the gateway — in this daemon that is the link
-    /// collector's ICMP echo, and only that. Passive facts (ARP table, DHCP
-    /// lease) keep being read, and the link collector keeps emitting one sample
-    /// per tick with `gw = SKIP` — quiet silences the wire, never the record.
-    /// **Self-control**, like [`ControlCmd::SetObserving`], and process-scoped:
-    /// a restart resumes normal probing.
-    SetQuiet(bool),
     /// Set the probing tier: `Passive` puts NOTHING on the wire — every probe
     /// of the link, proxy and dns collectors is withheld and lands as `SKIP`,
     /// the held reference streams are closed — while `Active` runs every
-    /// emission class (quiet still withholds the gateway echo inside it). The
-    /// daemon boots into the tier its config names, `passive` by default, and
-    /// only this command moves it: the daemon never changes tier by itself
-    /// (realm net-observer, node #88).
+    /// emission class. The daemon boots into the tier its config names,
+    /// `passive` by default, and only this command moves it: the daemon never
+    /// changes tier by itself (realm net-observer, node #88).
     ///
-    /// **Self-control**, like [`ControlCmd::SetQuiet`], and process-scoped.
-    /// Unlike quiet, every real switch is bracketed: a durable `probing_edge`
-    /// row and a [`StreamFrame::Probing`] frame, so a run of `SKIP`s reads as
-    /// withheld, not failed. A `SetProbing` to the tier already in force is not
-    /// an edge and writes nothing.
+    /// **Self-control**, like [`ControlCmd::SetObserving`], and process-scoped:
+    /// a restart returns to the configured default. Every real switch is
+    /// bracketed: a durable `probing_edge` row and a [`StreamFrame::Probing`]
+    /// frame, so a run of `SKIP`s reads as withheld, not failed. A
+    /// `SetProbing` to the tier already in force is not an edge and writes
+    /// nothing.
     SetProbing(ProbingTier),
     /// Go and find out who else is on this segment NOW: sweep the local IPv4
     /// subnet so the kernel resolves every address, and browse mDNS for names.
     ///
     /// The one command in this daemon that deliberately addresses machines that
     /// are not this one, which is why every run writes a `neighbor_scan` row
-    /// saying what was probed — and why the daemon refuses it while paused or
-    /// quiet, the two states a sweep would contradict. No config switch gates
-    /// it: the operator's command is the sanction (realm net-observer, node
-    /// #91). The passive `neighbors` collector needs none of this: it only ever
-    /// reads caches the OS already filled.
+    /// saying what was probed — and why the daemon refuses it while paused,
+    /// a state a sweep would contradict. No config switch gates it: the
+    /// operator's command is the sanction (realm net-observer, node #91). The
+    /// passive `neighbors` collector needs none of this: it only ever reads
+    /// caches the OS already filled.
     ///
     /// Carries [`ScanOptions`]: which rungs of the scan this run should include.
     /// Every requested rung runs; a rung whose dependency is missing (banners
@@ -142,11 +134,11 @@ pub enum ControlCmd {
     /// Read the radio environment ONCE, now — the same slice the `air` collector
     /// produces on its slow period, taken on operator demand instead.
     ///
-    /// **Self-control, like [`ControlCmd::FreezePcap`] and [`ControlCmd::SetQuiet`].**
-    /// The daemon asks the operating system for its own radio's report; it
-    /// addresses no host and originates no frame of its own on the air. That is
-    /// the whole difference from [`ControlCmd::ScanNeighbors`], which speaks to
-    /// machines that are not this one — and is why quiet does not refuse it.
+    /// **Self-control, like [`ControlCmd::FreezePcap`].** The daemon asks the
+    /// operating system for its own radio's report; it addresses no host and
+    /// originates no frame of its own on the air. That is the whole difference
+    /// from [`ControlCmd::ScanNeighbors`], which speaks to machines that are
+    /// not this one.
     ///
     /// One press, one scan: the daemon starts at most one on-demand scan at a
     /// time and refuses a second while the first runs, or too soon after it — the
@@ -880,21 +872,11 @@ pub struct StatusSnapshot {
     /// would fail to decode — a live daemon rendered as "offline" by the bar.
     #[serde(default = "observing_default")]
     pub observing: bool,
-    /// Whether the daemon is in "quiet" mode: still collecting, but addressing no
-    /// packet at the gateway (the link collector's ICMP echo is suppressed and
-    /// its gateway verdict reads `SKIP`). Distinct from `observing == false`,
-    /// which stops collection altogether.
-    ///
-    /// `serde(default)` — `false` — for the same forward-compatibility reason as
-    /// `observing`: a pre-quiet daemon emits no such field and the bar must still
-    /// decode its answer.
-    #[serde(default)]
-    pub quiet: bool,
     /// The probing tier in force: `Passive` = nothing on the wire, every probe
     /// verdict `SKIP`; `Active` = every emission class runs (realm
-    /// net-observer, node #88). Orthogonal to `observing` (a paused daemon
-    /// collects nothing at all) and stronger than `quiet` (which withholds only
-    /// the gateway echo, and only inside `Active`).
+    /// net-observer, node #88). Orthogonal to `observing`: a paused daemon
+    /// collects nothing at all, while the tier governs what a collecting
+    /// daemon puts on the wire.
     ///
     /// `serde(default)` = `Active`, NOT the daemon's `passive` default: a
     /// pre-tier daemon emits no such field, and that daemon probes — reading its
@@ -965,7 +947,6 @@ impl Default for StatusSnapshot {
             topology_lifetimes: Vec::new(),
             incidents: Vec::new(),
             observing: observing_default(),
-            quiet: false,
             probing: probing_default(),
             capabilities: None,
         }
@@ -1840,14 +1821,10 @@ mod tests {
                 signature: "sig".into(),
             }],
             observing: false,
-            // Deliberately `true`: `quiet` carries `serde(default)` = `false`, so
-            // a field that silently failed to serialize would still round-trip as
-            // `false` and the assertion below would pass on a broken wire format.
-            quiet: true,
-            // Same trick: the serde default is `Active`, so `Passive` is what
-            // proves the tier actually travelled.
+            // Deliberately non-default: the serde default is `Active`, so
+            // `Passive` is what proves the tier actually travelled.
             probing: ProbingTier::Passive,
-            // Same trick as `quiet`: `capabilities` defaults to `None`, so a
+            // Same trick as `probing`: `capabilities` defaults to `None`, so a
             // non-default value here is what proves the declaration is actually
             // on the wire rather than being reconstructed by the default.
             capabilities: Some(Capabilities::from_pairs([("air", false)])),
@@ -1867,7 +1844,6 @@ mod tests {
         assert_eq!(back.incidents[0].id, "inc-1");
         assert_eq!(back.incidents[0].closed_us, Some(2000));
         assert!(!back.observing);
-        assert!(back.quiet);
         assert_eq!(back.probing, ProbingTier::Passive);
         assert_eq!(back.capabilities, snap.capabilities);
         assert_eq!(
@@ -1898,6 +1874,22 @@ mod tests {
         assert_eq!(snap.generated_us, 1);
         assert!(snap.observing);
         // Same frame, same reasoning for the tier: that daemon probed.
+        assert_eq!(snap.probing, ProbingTier::Active);
+    }
+
+    /// The reverse direction: a daemon built before quiet was retired still
+    /// sends the field (realm net-observer, node #119). A reader built after
+    /// the retirement has no `quiet` in its `StatusSnapshot` at all, and must
+    /// still decode the frame — serde's ordinary unknown-field tolerance,
+    /// pinned here so a `deny_unknown_fields` added elsewhere on this type
+    /// would fail this test rather than silently breaking every old sender.
+    #[test]
+    fn status_snapshot_ignores_a_stale_quiet_field() {
+        let old = r#"{"generated_us":1,"link":null,"proxy":null,"dns":null,"host":null,
+            "incidents":[],"observing":true,"quiet":true,"probing":"active"}"#;
+        let snap: StatusSnapshot = serde_json::from_str(old).unwrap();
+        assert_eq!(snap.generated_us, 1);
+        assert!(snap.observing);
         assert_eq!(snap.probing, ProbingTier::Active);
     }
 
