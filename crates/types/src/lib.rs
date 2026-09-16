@@ -7,8 +7,8 @@ pub mod topology;
 pub mod verdict;
 
 pub use air::{
-    AirObservation, AirSample, Band, ChannelOverlapHypothesis, ChannelSpan, FrequencyExtent,
-    OverlapConfidence, overlap_hypothesis,
+    AirObservation, AirSample, ApGrade, Band, ChannelOverlapHypothesis, ChannelSpan, Confidence,
+    FrequencyExtent, Grade, OverlapConfidence, Signal, overlap_hypothesis,
 };
 pub use incident::{BlobRef, Incident, TriggerFired};
 pub use neighbor::{
