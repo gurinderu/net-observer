@@ -1780,7 +1780,7 @@ mod tests {
         });
         assert_eq!(
             format_frame_line(&ready),
-            "1970-01-01 00:00:00  subscribed  collection off; kinds: all"
+            "1970-01-01 00:00:00  subscribed  collection off; probing active; kinds: all"
         );
     }
 

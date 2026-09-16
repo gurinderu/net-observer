@@ -635,9 +635,12 @@ impl StreamFrame {
     /// event log share one rendering of every frame instead of drifting copies.
     pub fn detail(&self) -> String {
         match self {
+            // The tier is named on the opening line, so a tail opened inside
+            // a passive stretch reads its SKIPs as withheld, not unavailable.
             StreamFrame::Ready(r) => format!(
-                "collection {}; kinds: {}",
+                "collection {}; probing {}; kinds: {}",
                 if r.observing { "on" } else { "off" },
+                r.probing,
                 r.kinds_label()
             ),
             StreamFrame::Event(e) => e.detail(),
@@ -2483,16 +2486,21 @@ mod tests {
             probing: ProbingTier::Active,
         });
         assert_eq!(ready.label(), "subscribed");
-        assert_eq!(ready.detail(), "collection off; kinds: all");
+        // The tier is named: a tail opened mid-stretch must be able to tell
+        // withheld SKIPs from unavailable ones from its very first line.
+        assert_eq!(ready.detail(), "collection off; probing active; kinds: all");
         assert_eq!(ready.ts_us(), 7);
 
         let ready_filtered = StreamFrame::Ready(Ready {
             ts_us: 8,
             kinds: Some(vec![EventKind::Route, EventKind::Dns]),
             observing: true,
-            probing: ProbingTier::Active,
+            probing: ProbingTier::Passive,
         });
-        assert_eq!(ready_filtered.detail(), "collection on; kinds: route,dns");
+        assert_eq!(
+            ready_filtered.detail(),
+            "collection on; probing passive; kinds: route,dns"
+        );
 
         let event = StreamFrame::Event(Event::Incident(IncidentSummary {
             id: "inc-1".into(),

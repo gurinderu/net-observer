@@ -997,7 +997,10 @@ mod tests {
             observing: false,
             probing: types::ProbingTier::Active,
         }));
-        assert_eq!(row.line, "subscribed  collection off; kinds: all");
+        assert_eq!(
+            row.line,
+            "subscribed  collection off; probing active; kinds: all"
+        );
         assert!(row.kind.is_none());
         assert!(!row.alert, "an ack is not an alert");
     }
