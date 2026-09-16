@@ -135,6 +135,10 @@ where
         // node #59).
         let bssid = self.facts.bssid().await;
         let if_mac = self.facts.if_mac().await;
+        // The medium `if_mac` belongs to, measured from the hardware-port table
+        // (not inferred from a readable Wi-Fi name): the identity rules judge
+        // an `if_mac` change by it, and a wired hop must never read as a roam.
+        let medium = self.facts.medium().await;
         let wifi_present = self.facts.wifi_capture_present().await;
         // Two local reads, not probes: the fakeip pool's route egress and the
         // interface carrying sing-box's own TUN address (the sing-box-alive
@@ -157,6 +161,7 @@ where
             ssid,
             bssid,
             if_mac,
+            medium,
             wifi_present,
         ))]
     }
@@ -174,6 +179,7 @@ where
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -186,6 +192,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use types::LinkMedium;
 
     /// A pinger that records the echoes actually sent — the gateway count and
     /// the exact neighbor addresses — so "quiet" can be asserted on the packet
@@ -239,6 +246,7 @@ mod tests {
         ready: bool,
         bssid: Option<String>,
         if_mac: Option<String>,
+        medium: Option<LinkMedium>,
     }
     impl Default for FakeFacts {
         fn default() -> Self {
@@ -246,6 +254,7 @@ mod tests {
                 ready: true,
                 bssid: Some("3c:22:fb:12:34:56".into()),
                 if_mac: Some("f0:18:98:0a:0b:0c".into()),
+                medium: Some(LinkMedium::Wifi),
             }
         }
     }
@@ -287,6 +296,9 @@ mod tests {
         }
         async fn if_mac(&self) -> Option<String> {
             self.if_mac.clone()
+        }
+        async fn medium(&self) -> Option<LinkMedium> {
+            self.medium
         }
         async fn wifi_capture_present(&self) -> bool {
             false
@@ -421,6 +433,7 @@ mod tests {
         let c = collector_with_facts(FakeFacts {
             bssid: None,
             if_mac: None,
+            medium: None,
             ..FakeFacts::default()
         });
         let samples = c.collect(42).await;
@@ -429,6 +442,30 @@ mod tests {
         };
         assert_eq!(l.bssid, None);
         assert_eq!(l.if_mac, None);
+        assert_eq!(l.medium, None);
+    }
+
+    /// The medium the facts port measured lands in the sample as read —
+    /// Wi-Fi, wired, or not determinable — and is never derived from whether
+    /// the Wi-Fi identity was readable: a Wi-Fi tick whose SSID and BSSID
+    /// are both unreadable (the root reader's view) still says `Wifi`, and a
+    /// wired tick still says `Wired` with no Wi-Fi identity at all.
+    #[tokio::test]
+    async fn the_medium_lands_in_the_sample_unchanged() {
+        for medium in [Some(LinkMedium::Wifi), Some(LinkMedium::Wired), None] {
+            let c = collector_with_facts(FakeFacts {
+                bssid: None,
+                if_mac: Some("f0:18:98:0a:0b:0c".into()),
+                medium,
+                ..FakeFacts::default()
+            });
+            let samples = c.collect(42).await;
+            let Sample::Link(l) = &samples[0] else {
+                panic!("expected a link sample")
+            };
+            assert_eq!(l.medium, medium, "medium {medium:?} must land as read");
+            assert_eq!(l.bssid, None);
+        }
     }
 
     /// A silent gateway triggers the probe-on-suspicion: at most

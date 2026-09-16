@@ -4,6 +4,7 @@
 //! `macos` crate.
 
 use collector_core::Readiness;
+use types::LinkMedium;
 
 /// Static/link facts gathered from the OS (route table, DHCP lease, ARP, Wi-Fi).
 ///
@@ -38,6 +39,11 @@ pub trait LinkFacts: Send + Sync {
     /// The link interface's own MAC as currently assigned, lowercase; `None`
     /// = not determinable. Private Wi-Fi Address rotates it per SSID.
     async fn if_mac(&self) -> Option<String>;
+    /// The medium of the link interface — the one `if_mac` belongs to — as
+    /// measured from the hardware-port table, never inferred from whether a
+    /// Wi-Fi name was readable; `None` = not determinable (the table could
+    /// not be read or does not list the interface).
+    async fn medium(&self) -> Option<LinkMedium>;
     async fn wifi_capture_present(&self) -> bool;
     /// Runtime capability probe: Ready iff the `link` collector can work here/now
     /// (e.g. a physical interface is resolvable), else `Unavailable(reason)`.

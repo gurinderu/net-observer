@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime};
 
 use tokio::process::Command;
 
+use types::LinkMedium;
+
 use crate::neighbors::normalize_mac;
 
 /// Directory macOS writes Wi-Fi driver capture bundles into on a fault.
@@ -99,6 +101,45 @@ fn parse_ether(output: &str) -> Option<String> {
         let rest = line.trim().strip_prefix("ether ")?;
         normalize_mac(rest.split_whitespace().next()?)
     })
+}
+
+/// Return the medium of `iface` from the hardware-port table
+/// (`networksetup -listallhardwareports`, an external surface: realm
+/// net-observer, node #93) — readable by root without Location Services,
+/// which is what makes it the medium signal where the SSID and BSSID are not
+/// (node #108). `None` when the table cannot be read or does not list the
+/// interface. Read every tick, one command, like the identity pair: the
+/// default route can move between adapters between two ticks.
+pub async fn interface_medium(iface: &str) -> Option<LinkMedium> {
+    let out = Command::new("networksetup")
+        .args(["-listallhardwareports"])
+        .output()
+        .await
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_medium(&text, iface)
+}
+
+/// Classify `iface` from the hardware-port table: the port whose `Device:`
+/// line names the interface is Wi-Fi when its `Hardware Port:` is `Wi-Fi` (or
+/// `AirPort`, the older name) and wired otherwise; an interface no port
+/// names is `None` — not determinable, never guessed.
+fn parse_medium(output: &str, iface: &str) -> Option<LinkMedium> {
+    let mut port: Option<&str> = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix("Hardware Port:") {
+            port = Some(name.trim());
+        } else if let Some(device) = line.strip_prefix("Device:")
+            && device.trim() == iface
+        {
+            return match port? {
+                "Wi-Fi" | "AirPort" => Some(LinkMedium::Wifi),
+                _ => Some(LinkMedium::Wired),
+            };
+        }
+    }
+    None
 }
 
 /// `true` if a CoreCapture Wi-Fi bundle was written within `window` — i.e. the
@@ -246,6 +287,47 @@ mod tests {
             let out = format!("en0: flags=8863<UP> mtu 1500\n\tether {value}\n");
             assert_eq!(parse_ether(&out), None, "value {value:?} must not parse");
         }
+    }
+
+    /// `networksetup -listallhardwareports`: one block per port, the Wi-Fi
+    /// adapter on `en0` and a Thunderbolt Ethernet adapter on `en5`, then the
+    /// VLAN trailer.
+    const HARDWARE_PORTS_OUT: &str = "\n\
+        Hardware Port: Wi-Fi\n\
+        Device: en0\n\
+        Ethernet Address: f0:18:98:0a:0b:0c\n\
+        \n\
+        Hardware Port: Thunderbolt Ethernet\n\
+        Device: en5\n\
+        Ethernet Address: 00:11:22:33:44:55\n\
+        \n\
+        VLAN Configurations\n\
+        ===================\n";
+
+    /// The medium is the port's kind, looked up by device: Wi-Fi for the
+    /// Wi-Fi port, wired for any other, and the older `AirPort` name still
+    /// reads as Wi-Fi.
+    #[test]
+    fn medium_is_read_from_the_hardware_port_table() {
+        assert_eq!(
+            parse_medium(HARDWARE_PORTS_OUT, "en0"),
+            Some(LinkMedium::Wifi)
+        );
+        assert_eq!(
+            parse_medium(HARDWARE_PORTS_OUT, "en5"),
+            Some(LinkMedium::Wired)
+        );
+        let airport = "Hardware Port: AirPort\nDevice: en1\n";
+        assert_eq!(parse_medium(airport, "en1"), Some(LinkMedium::Wifi));
+    }
+
+    /// An interface no port names is not determinable — `None`, never a
+    /// guess: a `utun` or a bridge the table does not list must not read as
+    /// wired.
+    #[test]
+    fn no_medium_for_an_unlisted_interface() {
+        assert_eq!(parse_medium(HARDWARE_PORTS_OUT, "utun6"), None);
+        assert_eq!(parse_medium("", "en0"), None);
     }
 
     /// Both parsers hand their value to the shared [`normalize_mac`]: octets

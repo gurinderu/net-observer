@@ -12,6 +12,7 @@ use std::time::Duration;
 use collector_core::Readiness;
 use collector_link::LinkFacts;
 use tokio::process::Command;
+use types::LinkMedium;
 
 use crate::wifi;
 
@@ -152,6 +153,11 @@ impl LinkFacts for SystemFacts {
     async fn if_mac(&self) -> Option<String> {
         let iface = self.phys_iface().await?;
         wifi::interface_mac(&iface).await
+    }
+
+    async fn medium(&self) -> Option<LinkMedium> {
+        let iface = self.phys_iface().await?;
+        wifi::interface_medium(&iface).await
     }
 
     async fn wifi_capture_present(&self) -> bool {
