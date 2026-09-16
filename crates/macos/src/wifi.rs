@@ -26,12 +26,19 @@ pub async fn current_ssid(iface: &str) -> Option<String> {
     parse_ssid(&text)
 }
 
-/// Extract the SSID from `networksetup -getairportnetwork` output.
+/// What `networksetup` prints in place of the SSID to a reader without
+/// location permission — a root LaunchDaemon among them (realm net-observer,
+/// nodes #93, #108). It is the tool withholding the value, not a network
+/// name, so it is recorded as absence: stored as a name it would compare
+/// unequal to the real SSID and read as a network move that never happened.
+const REDACTED_SSID: &str = "<redacted>";
+
+/// Extract the SSID from `networksetup -getairportnetwork` output. `None`
+/// when not associated or when the value is [`REDACTED_SSID`].
 fn parse_ssid(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("Current Wi-Fi Network: ")
-            .map(|s| s.trim().to_string())
+        let ssid = line.trim().strip_prefix("Current Wi-Fi Network: ")?.trim();
+        (ssid != REDACTED_SSID).then(|| ssid.to_string())
     })
 }
 
@@ -136,6 +143,16 @@ mod tests {
     #[test]
     fn no_ssid_when_not_associated() {
         let out = "You are not associated with an AirPort network.\n";
+        assert_eq!(parse_ssid(out), None);
+    }
+
+    /// A root reader without location permission gets `<redacted>` in place
+    /// of the name (nodes #93, #108): the tool withholding the value is no
+    /// measurement, and must never be stored as a network called
+    /// `<redacted>` — a later identity comparison would read it as a move.
+    #[test]
+    fn redacted_ssid_is_no_measurement() {
+        let out = "Current Wi-Fi Network: <redacted>\n";
         assert_eq!(parse_ssid(out), None);
     }
 
