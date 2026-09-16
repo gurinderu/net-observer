@@ -537,6 +537,13 @@ pub(crate) fn format_observation_gaps(table: &Table) -> Result<String> {
 /// The wording never claims measured interference. macOS reports no channel
 /// occupancy to anybody, so "OVERLAP" is a band-geometry hypothesis and the
 /// legend under the table says exactly that.
+///
+/// Each AP also carries two more marks, computed from the same four columns
+/// as OVERLAP but answering different questions (the rubric decided at realm
+/// net-observer, node #89): GRADE is the AP's own configuration
+/// (security/band/width/generation), never its distance from us; SIGNAL is
+/// the RSSI-noise gap, never its configuration. WHY carries the reasons
+/// behind both.
 pub(crate) fn format_air(scan: &Table, aps: &Table, own: &Table) -> Result<String> {
     let c = Cols(&scan.columns);
     let (ts_i, air_i, reason_i, count_i) = (
@@ -615,7 +622,10 @@ pub(crate) fn format_air(scan: &Table, aps: &Table, own: &Table) -> Result<Strin
         let channel = at(row, ch_i).parse::<i32>().ok();
         let band = at(row, band_i);
         let width = at(row, width_i).parse::<i32>().ok();
+        let phy = at(row, phy_i);
+        let sec = at(row, sec_i);
         let rssi = at(row, rssi_i).parse::<i32>().ok();
+        let noise = at(row, noise_i).parse::<i32>().ok();
         let their = types::ChannelSpan::new(
             channel,
             if band.is_empty() { None } else { Some(band) },
@@ -641,6 +651,46 @@ pub(crate) fn format_air(scan: &Table, aps: &Table, own: &Table) -> Result<Strin
             // nothing to compute, and a zero would read as "does not overlap".
             None => (ABSENT.to_string(), ABSENT.to_string(), (i64::MIN, i32::MIN)),
         };
+        // Two more marks, deliberately separate: GRADE is this AP's own
+        // configuration, SIGNAL is how loudly it arrives — a wide-open network
+        // heard faintly is still wide open, and a pristine one heard faintly is
+        // still pristine (realm net-observer, node #89).
+        let observation = types::AirObservation {
+            channel,
+            channel_band: if band.is_empty() {
+                None
+            } else {
+                Some(band.to_string())
+            },
+            channel_width_mhz: width,
+            phy_mode: if phy.is_empty() {
+                None
+            } else {
+                Some(phy.to_string())
+            },
+            security: if sec.is_empty() {
+                None
+            } else {
+                Some(sec.to_string())
+            },
+            rssi_dbm: rssi,
+            noise_dbm: noise,
+        };
+        let grade = observation.grade();
+        let grade_cell = if grade.confidence == types::Confidence::Low {
+            format!("{}?", grade.grade.as_str())
+        } else {
+            grade.grade.as_str().to_string()
+        };
+        let signal_cell = observation
+            .signal()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let why_cell = if grade.reasons.is_empty() {
+            "-".to_string()
+        } else {
+            grade.reasons.join("; ")
+        };
         ranked.push((
             rank,
             vec![
@@ -653,6 +703,9 @@ pub(crate) fn format_air(scan: &Table, aps: &Table, own: &Table) -> Result<Strin
                 confidence_cell,
                 measured(row, phy_i, ABSENT),
                 measured(row, sec_i, ABSENT),
+                grade_cell,
+                signal_cell,
+                why_cell,
             ],
         ));
     }
@@ -666,7 +719,8 @@ pub(crate) fn format_air(scan: &Table, aps: &Table, own: &Table) -> Result<Strin
     out.push('\n');
     out.push_str(&aligned(
         &[
-            "CH", "BAND", "WIDTH", "RSSI", "NOISE", "OVERLAP", "CONF", "PHY", "SECURITY",
+            "CH", "BAND", "WIDTH", "RSSI", "NOISE", "OVERLAP", "CONF", "PHY", "SECURITY", "GRADE",
+            "SIGNAL", "WHY",
         ],
         &rows,
     ));
@@ -682,7 +736,12 @@ band, ordered loudest-first within equal overlap. It is NOT measured \n\
 interference and NOT airtime taken: macOS reports no channel occupancy to any \n\
 program, so no such number exists here. CONF says how much of it was reported \n\
 rather than assumed. The report also carries no BSSID, so these access points \n\
-cannot be matched to those of any other scan.\n";
+cannot be matched to those of any other scan.\n\
+GRADE is the AP's own configuration (security/band/width/generation), A-F, \n\
+never a claim about how far away it is; a `?` suffix means one of those four \n\
+inputs was not reported, so the letter is computed from the rest. SIGNAL is the \n\
+RSSI-noise gap (good/fair/poor, `-` when either was not reported) - distance, \n\
+not configuration. WHY lists the reasons behind both, `-` when there are none.\n";
 
 /// Our own channel as the record last had it, with the moment it was read, or
 /// `None` when the radio never reported one (never associated, or the `wifi`
@@ -903,6 +962,59 @@ mod tests {
         let unplaceable = out.find("-55").unwrap();
         let placed = out.find("-80").unwrap();
         assert!(placed < unplaceable);
+    }
+
+    /// The three new marks, computed from the same columns as OVERLAP but
+    /// answering different questions (realm net-observer, node #89): a fully
+    /// reported WPA3/5 GHz/80 MHz/ax AP grades A on a good signal, with
+    /// nothing in WHY.
+    #[test]
+    fn format_air_carries_grade_signal_and_why_columns() {
+        let scan = table(AIR_SCAN_COLS, &[&["1000", "OK", "", "1"]]);
+        let aps = table(
+            AIR_AP_COLS,
+            &[&["36", "5ghz", "80", "802.11ax", "wpa3", "-50", "-90"]],
+        );
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80")).unwrap();
+        assert!(out.contains("GRADE"), "{out}");
+        assert!(out.contains("SIGNAL"), "{out}");
+        assert!(out.contains("WHY"), "{out}");
+        assert!(out.contains("good"), "SNR 40 must read good:\n{out}");
+        // The legend itself explains the `?` hedge marker, so a bare
+        // `contains('?')` would always be true; check the row's own grade
+        // cell instead.
+        assert!(
+            !out.contains("A?"),
+            "full confidence must not hedge:\n{out}"
+        );
+    }
+
+    /// A rubric input the scan did not report lowers confidence but never the
+    /// grade computed from what remains — the missing input costs nothing
+    /// against the AP, and the letter carries a `?` to say so.
+    #[test]
+    fn format_air_marks_a_low_confidence_grade_with_a_question_mark() {
+        let scan = table(AIR_SCAN_COLS, &[&["1000", "OK", "", "1"]]);
+        let aps = table(
+            AIR_AP_COLS,
+            // security column blank: the report did not carry it.
+            &[&["36", "5ghz", "80", "802.11ax", "", "-50", "-90"]],
+        );
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80")).unwrap();
+        assert!(out.contains("A?"), "{out}");
+        assert!(out.contains("security: unmeasured"), "{out}");
+    }
+
+    /// Open or legacy security grades F outright, and WHY says exactly why.
+    #[test]
+    fn format_air_explains_an_open_or_legacy_grade_in_why() {
+        let scan = table(AIR_SCAN_COLS, &[&["1000", "OK", "", "1"]]);
+        let aps = table(
+            AIR_AP_COLS,
+            &[&["6", "2ghz", "20", "802.11n", "open", "-50", "-90"]],
+        );
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80")).unwrap();
+        assert!(out.contains("open or legacy security"), "{out}");
     }
 
     const VERDICT_COLS: &[&str] = &[
