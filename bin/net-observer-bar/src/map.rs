@@ -3,8 +3,9 @@
 //!
 //! The data is the latest [`NeighborsSample`] carried on the
 //! [`StatusSnapshot`](net_observer_ipc::StatusSnapshot) the panel already
-//! refreshes on its ~3s timer (see [`crate::menubar`]) — this module opens no
-//! socket and adds no collection. It only reshapes that sample into a picture:
+//! refreshes on its ~3s timer (see [`crate::menubar`]) — this module adds no
+//! collection (its one socket read of its own, the findings query, is described
+//! below). It only reshapes that sample into a picture:
 //! the segment's identity (the gateway, whose MAC *is* the `network_key`) sits in
 //! the middle, the other neighbours ring it, and a hairline edge joins each to the
 //! gateway because they share the segment.
@@ -24,19 +25,33 @@
 //! instead of duplicating it. Its live-update wiring is the panel's own transport,
 //! not a new one: the map reads `snapshot.neighbors` off the shared [`Glance`],
 //! which the menu-bar refresh timer re-reads every ~3s (see [`crate::menubar`]).
-//! [`MapView`] observes that model and re-renders on every tick — no socket, no
+//! [`MapView`] observes that model and re-renders on every tick — no
 //! subscription of its own.
+//!
+//! ## The audit ladder and its findings
+//!
+//! The window's controls are the four rungs of the audit ladder — `Scan ·
+//! Ports · Banners · CVE` — each a `ControlCmd::ScanNeighbors(ScanOptions)`
+//! carrying the ladder up to itself, sent through the same wiring as every
+//! other control button ([`crate::ui::spawn_control_then`]). While one is in
+//! flight the rungs are inert and the control line says so; the daemon's answer
+//! lands in the line under them, verbatim. The **Findings** reading lists what
+//! the record hypothesises for the open ports it has seen — the one place this
+//! window does open the socket on its own: a read-only
+//! `DiagnosticQuery::Vulns` on the background executor, when the window opens
+//! and after each rung completes ([`crate::ui::fetch_findings`]). (realm
+//! net-observer, node #90)
 
 use std::f32::consts::PI;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyWindowHandle, App, Bounds, Context, Entity, Pixels, Rgba, SharedString, Subscription,
-    TitlebarOptions, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions, canvas, div,
-    point, px, rgb, rgba, size,
+    AnyWindowHandle, App, AsyncApp, Bounds, Context, Entity, Pixels, Rgba, SharedString,
+    Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    canvas, div, point, px, rgb, rgba, size,
 };
 
-use net_observer_ipc::StatusSnapshot;
+use net_observer_ipc::{StatusSnapshot, Table};
 use types::{
     LearnedVia, NeighborLifetime, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence,
     TopologyLink,
@@ -1265,6 +1280,187 @@ fn neighbour_list(snapshot: &StatusSnapshot, theme: Theme) -> gpui::AnyElement {
     .into_any_element()
 }
 
+/// One host's findings as the section draws them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostFindings {
+    /// The host the findings belong to: its address, or its MAC when the record
+    /// carries no address for that port (the `Vulns` diagnosis LEFT-JOINs the
+    /// port row, so a finding can outlive the address it was seen at).
+    host: String,
+    /// `host:port  cve_id · confidence · cvss · KEV` — `KEV` only when the
+    /// daemon flagged the CVE as known-exploited, and a cvss the record does
+    /// not carry simply absent rather than drawn as a blank slot.
+    lines: Vec<String>,
+}
+
+/// Reduce the daemon's `Vulns` table to what the section draws, grouped by host
+/// in order of first appearance (the daemon orders by newest sighting first).
+///
+/// Columns are found by NAME, never by position: a table missing one of the
+/// seven is an `Err` naming it, so a daemon whose diagnosis grew or shrank is
+/// reported rather than drawn misaligned. Pure over its input so the grouping
+/// and the line format are testable without a window.
+fn finding_lines(table: &Table) -> Result<Vec<HostFindings>, String> {
+    let col = |name: &str| {
+        table
+            .columns
+            .iter()
+            .position(|c| c == name)
+            .ok_or_else(|| format!("findings table has no `{name}` column"))
+    };
+    let mac = col("mac")?;
+    let ip = col("ip")?;
+    let port = col("port")?;
+    let cve_id = col("cve_id")?;
+    let confidence = col("confidence")?;
+    let known_exploited = col("known_exploited")?;
+    let cvss = col("cvss")?;
+
+    let mut hosts: Vec<HostFindings> = Vec::new();
+    for row in &table.rows {
+        let cell = |i: usize| row.get(i).map_or("", String::as_str);
+        let host = if cell(ip).is_empty() {
+            cell(mac)
+        } else {
+            cell(ip)
+        };
+        // The store spells a BOOLEAN cell `true`/`false`; anything else is not
+        // a flag and must not read as one.
+        let kev = if cell(known_exploited) == "true" {
+            "KEV"
+        } else {
+            ""
+        };
+        let line = format!(
+            "{host}:{}  {}",
+            cell(port),
+            join_parts(&[cell(cve_id), cell(confidence), cell(cvss), kev])
+        );
+        match hosts.iter().position(|h| h.host == host) {
+            Some(i) => hosts[i].lines.push(line),
+            None => hosts.push(HostFindings {
+                host: host.to_string(),
+                lines: vec![line],
+            }),
+        }
+    }
+    Ok(hosts)
+}
+
+/// The **findings** reading: every CVE the record hypothesises for an open
+/// port, one line each, grouped by host — rendered from the window's last
+/// `DiagnosticQuery::Vulns` answer (see [`MapView::spawn_findings_fetch`]).
+///
+/// Every state has words, never a blank area: not read yet, nothing found, or
+/// why the daemon could not say (a diagnosis it could not run, a daemon built
+/// before `Request::Query`, a transport failure) — each in the daemon's own
+/// words, under a selector carrying those words so a headless test can assert
+/// what the section says. Each finding is a hypothesis carrying its
+/// confidence, never an asserted fact, and the caption says so. (realm
+/// net-observer, node #90)
+fn findings_section(findings: Option<&Result<Table, String>>, theme: Theme) -> gpui::AnyElement {
+    let base = div().flex().flex_col().px_3().py_2();
+    let table = match findings {
+        None => {
+            return findings_note(
+                base,
+                "map-findings-pending",
+                "findings not read yet",
+                theme.muted,
+            );
+        }
+        Some(Err(why)) => {
+            return findings_note(
+                base,
+                "map-findings-error",
+                format!("findings unavailable: {why}"),
+                theme.warn,
+            );
+        }
+        Some(Ok(table)) => table,
+    };
+    let hosts = match finding_lines(table) {
+        Ok(hosts) => hosts,
+        Err(why) => {
+            return findings_note(
+                base,
+                "map-findings-error",
+                format!("findings unavailable: {why}"),
+                theme.warn,
+            );
+        }
+    };
+    if hosts.is_empty() {
+        return findings_note(base, "map-findings-empty", "no findings", theme.muted);
+    }
+
+    let total: usize = hosts.iter().map(|h| h.lines.len()).sum();
+    let mut rows = div().flex().flex_col().w_full();
+    for host in &hosts {
+        rows = rows.child(
+            div()
+                .pt_1()
+                .text_size(px(10.0))
+                .text_color(rgb(theme.muted))
+                .child(host.host.clone()),
+        );
+        for line in &host.lines {
+            // Test handle only: the selector carries the line itself, so a
+            // headless test can assert the words a finding was drawn with.
+            let selector = format!("map-finding:{line}");
+            rows = rows.child(
+                div()
+                    .debug_selector(move || selector)
+                    .py_0p5()
+                    .text_size(px(11.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(line.clone()),
+            );
+        }
+    }
+
+    base.child(
+        div()
+            .pb_1()
+            .text_size(px(11.0))
+            .text_color(rgb(theme.muted))
+            .child(format!(
+                "{total} finding{} on {} host{} \u{00b7} hypotheses with their confidence, \
+                 not asserted facts",
+                if total == 1 { "" } else { "s" },
+                hosts.len(),
+                if hosts.len() == 1 { "" } else { "s" }
+            )),
+    )
+    .child(rows)
+    .into_any_element()
+}
+
+/// A one-line findings state under a selector that carries the words shown, so
+/// a headless test asserts what the section says rather than only that it said
+/// something. The caller picks the ink: warn for an absence the daemon caused,
+/// muted for one that is simply the state of the record.
+fn findings_note(
+    base: gpui::Div,
+    kind: &'static str,
+    message: impl Into<String>,
+    color: u32,
+) -> gpui::AnyElement {
+    let message: String = message.into();
+    let selector = format!("{kind}:{message}");
+    base.child(
+        div()
+            .debug_selector(move || selector)
+            .py_1()
+            .text_size(px(11.0))
+            .text_color(rgb(color))
+            .child(message),
+    )
+    .into_any_element()
+}
+
 /// A muted, single-line honest empty state — shown instead of a blank map area.
 fn empty_state(
     base: gpui::Div,
@@ -1328,26 +1524,45 @@ fn offline_note(reason: &str, theme: Theme) -> impl IntoElement + use<> {
 /// [`network_map_section`]).
 pub(crate) struct MapView {
     model: Entity<Glance>,
-    /// Which of the two readings of the same sample is on screen. The star is the
-    /// shape of the segment; the list is its full contents.
+    /// Which reading is on screen. The star is the shape of the segment; the
+    /// list is its full contents; the findings are what the record hypothesises
+    /// about the open ports on it.
     mode: MapMode,
+    /// Raised by the click that starts a rung's round-trip and lowered by its
+    /// completion hook ([`MapView::scan_finished`]). While raised the rungs are
+    /// inert and the control line says `scanning…`: a scan takes seconds by
+    /// design, and a second click in that window would queue a second sweep
+    /// behind the first.
+    scan_in_flight: bool,
+    /// The daemon's last answer to `DiagnosticQuery::Vulns`: `None` until the
+    /// first read returns, then the table or the daemon's words for why there is
+    /// none. Fetched on the background executor when the window opens and after
+    /// each rung completes ([`MapView::spawn_findings_fetch`]) — never on a
+    /// timer, because the record changes only when a scan runs.
+    findings: Option<Result<Table, String>>,
     _observe: Subscription,
 }
 
-/// The two ways this window shows one neighbour sample.
+/// The readings this window offers: two of one neighbour sample, and one of the
+/// record behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MapMode {
     /// The gateway-centred star.
     Graph,
     /// Every neighbour as a row (see [`neighbour_list`]).
     List,
+    /// Every CVE the record hypothesises for an open port (see
+    /// [`findings_section`]). Its own reading rather than a strip under the star,
+    /// because the star claims the whole viewport below the chrome and a list
+    /// appended there would be laid out past the window's bottom edge.
+    Findings,
 }
 
-/// Vertical space the window's own chrome (header row, control line, captions,
-/// legend and the uplink tree) takes before the star gets any, in gpui logical
-/// px. Subtracted from the viewport so the plot is sized to what is actually
-/// left rather than to the whole window.
-const MAP_CHROME_H: f32 = 150.0;
+/// Vertical space the window's own chrome (header row, the rung row, control
+/// line, captions, legend and the uplink tree) takes before the star gets any,
+/// in gpui logical px. Subtracted from the viewport so the plot is sized to
+/// what is actually left rather than to the whole window.
+const MAP_CHROME_H: f32 = 174.0;
 
 /// Horizontal padding the section applies (`px_3` on both sides).
 const MAP_SIDE_PAD: f32 = 24.0;
@@ -1360,8 +1575,52 @@ impl MapView {
         Self {
             model,
             mode: MapMode::Graph,
+            scan_in_flight: false,
+            findings: None,
             _observe: observe,
         }
+    }
+
+    /// Ask the daemon for its findings on the background executor and keep the
+    /// answer (see [`crate::ui::fetch_findings`]) — the same shape as a control
+    /// round-trip: never on the gpui main thread, written back through a weak
+    /// handle so a closed window just drops it.
+    ///
+    /// Not part of [`MapView::new`]: the open path ([`open_window`]) calls it,
+    /// so a headless test can build the view with an injected `findings` state
+    /// that no socket read then races to overwrite.
+    fn spawn_findings_fetch(&self, cx: &mut Context<Self>) {
+        let socket = self.model.read(cx).socket_path.clone();
+        cx.spawn(async move |view, acx: &mut AsyncApp| {
+            let findings = acx
+                .background_spawn(async move { crate::ui::fetch_findings(&socket) })
+                .await;
+            view.update(acx, |v, cx| {
+                v.findings = Some(findings);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Start one rung's round-trip: raise the in-flight flag (the rungs go
+    /// inert on the next paint) and run it through the shared control wiring
+    /// with [`MapView::scan_finished`] as the completion hook.
+    fn start_scan(&mut self, round_trip: crate::ui::ControlRoundTrip, cx: &mut Context<Self>) {
+        self.scan_in_flight = true;
+        crate::ui::spawn_control_then(&self.model, cx, round_trip, Self::scan_finished);
+        cx.notify();
+    }
+
+    /// The rung's completion hook: the daemon's answer is already on the shared
+    /// model (the control line shows it), so lower the flag and re-read the
+    /// findings the run may have produced. Runs whether the command succeeded,
+    /// was refused, or found no daemon — a flag that stayed raised would leave
+    /// the rungs inert for good.
+    fn scan_finished(&mut self, cx: &mut Context<Self>) {
+        self.scan_in_flight = false;
+        self.spawn_findings_fetch(cx);
     }
 }
 
@@ -1381,6 +1640,7 @@ impl Render for MapView {
                 .map_or_else(|| "no answer".to_string(), |e| e.message().to_string())
         });
         let mode = self.mode;
+        let scan_in_flight = self.scan_in_flight;
 
         // The star is fitted to the space this window actually has right now.
         let viewport = window.viewport_size();
@@ -1392,6 +1652,7 @@ impl Render for MapView {
         let body = match mode {
             MapMode::Graph => network_map_section(&snapshot, plot, theme).into_any_element(),
             MapMode::List => neighbour_list(&snapshot, theme),
+            MapMode::Findings => findings_section(self.findings.as_ref(), theme),
         };
 
         div()
@@ -1402,27 +1663,34 @@ impl Render for MapView {
             .text_color(rgb(theme.fg))
             .font_family(".SystemUIFont")
             .text_size(px(13.0))
-            .child(map_toolbar(mode, control_msg, theme, cx))
+            .child(map_toolbar(mode, control_msg, scan_in_flight, theme, cx))
             .children(offline.map(|reason| offline_note(&reason, theme)))
             .child(separator(theme))
             .child(body)
     }
 }
 
-/// The map window's own controls: the graph/list switch and Rescan.
+/// The map window's own controls: the reading switch and the audit ladder.
 ///
-/// Rescan runs the **same** round-trip the panel's "Scan" button runs
-/// ([`crate::ui::scan_round_trip_base`]) — a neighbour sweep addresses other
+/// The ladder is four rungs — `Scan · Ports · Banners · CVE` — and each sends
+/// the ladder up to itself (see [`crate::ui::scan_round_trip_cve`]); the bottom
+/// rung is the **same** round-trip the panel's "Scan" button runs
+/// ([`crate::ui::scan_round_trip_base`]). A neighbour sweep addresses other
 /// machines, and the daemon runs it when asked: the click is the sanction, no
 /// config switch gates it (realm net-observer, node #91). When it cannot run
 /// (paused, quiet, no subnet) or the peer uid is not authorised it answers
-/// `ok: false` with a reason, which lands in the line below the buttons as
-/// `failed: …`. There is no timer behind it: it fires on a click and only on a
-/// click. (v1 = observe, never act — that rule is about what the daemon does by
-/// itself; an operator's click is not the daemon acting on its own.)
+/// `ok: false` with a reason, which lands in the line below the rungs as
+/// `failed: …`; a rung it had to drop for a missing dependency is named in the
+/// same line. There is no timer behind any of them: a rung fires on a click and
+/// only on a click. (v1 = observe, never act — that rule is about what the
+/// daemon does by itself; an operator's click is not the daemon acting on its
+/// own.) While a rung is in flight all four are inert and `scanning…` stands
+/// beside them, so a second click cannot queue a second sweep. (realm
+/// net-observer, node #90)
 fn map_toolbar(
     mode: MapMode,
     control_msg: Option<String>,
+    scan_in_flight: bool,
     theme: Theme,
     cx: &mut Context<MapView>,
 ) -> impl IntoElement {
@@ -1445,21 +1713,53 @@ fn map_toolbar(
             }))
     };
 
-    let rescan = div()
-        .id("map-rescan")
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_size(px(12.0))
-        // Warn-coloured for the same reason the panel's Scan is: this one is not
-        // routine, it addresses machines that are not this one.
-        .text_color(rgb(theme.warn))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme.hover)))
-        .child("Rescan")
-        .on_click(cx.listener(|view, _, _window, cx| {
-            crate::ui::spawn_control_on(&view.model, cx, crate::ui::scan_round_trip_base);
-        }));
+    // One rung: a button that is pressable only while nothing is in flight.
+    // Built the way the air map's scan button is — the click wiring is added
+    // only when pressable, so an inert rung has no hover and no cursor either.
+    let rung = |label: &'static str,
+                id: &'static str,
+                round_trip: crate::ui::ControlRoundTrip,
+                theme: Theme,
+                cx: &mut Context<MapView>| {
+        let mut button = div()
+            .id(id)
+            // Test handle only: the four rungs are the window's control surface,
+            // so a headless test must be able to find each by name.
+            .debug_selector(move || id.into())
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .text_size(px(12.0))
+            // Warn-coloured for the same reason the panel's Scan is: none of
+            // these is routine, each addresses machines that are not this one.
+            .text_color(rgb(if scan_in_flight {
+                theme.muted
+            } else {
+                theme.warn
+            }))
+            .child(label);
+        if !scan_in_flight {
+            button = button
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme.hover)))
+                .on_click(cx.listener(move |view, _, _window, cx| {
+                    view.start_scan(round_trip, cx);
+                }));
+        }
+        button
+    };
+
+    // Present only while a rung is in flight, so a headless window opened in
+    // either state can say which one it drew.
+    let scanning = scan_in_flight.then(|| {
+        div()
+            .debug_selector(|| "map-scanning".into())
+            .px_2()
+            .py_1()
+            .text_size(px(11.0))
+            .text_color(rgb(theme.muted))
+            .child("scanning\u{2026}")
+    });
 
     div()
         .flex()
@@ -1470,16 +1770,45 @@ fn map_toolbar(
             div()
                 .flex()
                 .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(tab("Graph", MapMode::Graph, theme, cx))
-                        .child(tab("List", MapMode::List, theme, cx)),
-                )
-                .child(rescan),
+                .gap_1()
+                .child(tab("Graph", MapMode::Graph, theme, cx))
+                .child(tab("List", MapMode::List, theme, cx))
+                .child(tab("Findings", MapMode::Findings, theme, cx)),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(rung(
+                    "Scan",
+                    "scan-rung-base",
+                    crate::ui::scan_round_trip_base,
+                    theme,
+                    cx,
+                ))
+                .child(rung(
+                    "Ports",
+                    "scan-rung-ports",
+                    crate::ui::scan_round_trip_ports,
+                    theme,
+                    cx,
+                ))
+                .child(rung(
+                    "Banners",
+                    "scan-rung-banners",
+                    crate::ui::scan_round_trip_banners,
+                    theme,
+                    cx,
+                ))
+                .child(rung(
+                    "CVE",
+                    "scan-rung-cve",
+                    crate::ui::scan_round_trip_cve,
+                    theme,
+                    cx,
+                ))
+                .children(scanning),
         )
         // The outcome of the last control action, shown verbatim: a refusal
         // ("control refused: …", "quiet is on; …") must read as a refusal, never
@@ -1528,7 +1857,13 @@ pub(crate) fn open_or_focus(cx: &mut App, glance: &Entity<Glance>) {
 fn open_window(cx: &mut App, model: Entity<Glance>) -> Option<WindowHandle<MapView>> {
     let options = window_options(cx);
     match cx.open_window(options, move |_window, cx| {
-        cx.new(|cx| MapView::new(model, cx))
+        cx.new(|cx| {
+            let view = MapView::new(model, cx);
+            // The first findings read belongs to the open, not to the
+            // constructor (see `MapView::spawn_findings_fetch`).
+            view.spawn_findings_fetch(cx);
+            view
+        })
     }) {
         Ok(handle) => Some(handle),
         Err(e) => {
@@ -1789,6 +2124,113 @@ mod tests {
         );
         // The floor is never breached, however small the window gets.
         assert!(plot_for(10.0, 10.0).r >= min_ring_radius() - 0.01);
+    }
+
+    /// The daemon's `Vulns` table, as the section reads it: the seven columns in
+    /// the daemon's own order. Shared with the headless suite.
+    pub(super) fn vulns_table(rows: Vec<[&str; 7]>) -> Table {
+        Table {
+            columns: [
+                "mac",
+                "ip",
+                "port",
+                "cve_id",
+                "confidence",
+                "known_exploited",
+                "cvss",
+            ]
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+            rows: rows
+                .into_iter()
+                .map(|r| r.iter().map(|c| c.to_string()).collect())
+                .collect(),
+        }
+    }
+
+    /// Findings are grouped by host in order of first appearance, one line per
+    /// finding; `KEV` is written only for a flagged CVE, a missing cvss leaves
+    /// no blank slot, and a finding with no address falls back to its MAC.
+    #[test]
+    fn findings_group_by_host_and_spell_each_line() {
+        let table = vulns_table(vec![
+            [
+                "aa:bb:cc:dd:ee:01",
+                "192.168.1.5",
+                "22",
+                "CVE-2024-1234",
+                "high",
+                "true",
+                "9.8",
+            ],
+            [
+                "aa:bb:cc:dd:ee:02",
+                "192.168.1.7",
+                "80",
+                "CVE-2023-0001",
+                "low",
+                "false",
+                "",
+            ],
+            [
+                "aa:bb:cc:dd:ee:01",
+                "192.168.1.5",
+                "443",
+                "CVE-2024-9999",
+                "medium",
+                "false",
+                "7.5",
+            ],
+            [
+                "aa:bb:cc:dd:ee:03",
+                "",
+                "8080",
+                "CVE-2022-0002",
+                "low",
+                "false",
+                "5.0",
+            ],
+        ]);
+        let hosts = finding_lines(&table).expect("a well-formed table");
+        assert_eq!(
+            hosts,
+            vec![
+                HostFindings {
+                    host: "192.168.1.5".to_string(),
+                    lines: vec![
+                        "192.168.1.5:22  CVE-2024-1234 \u{00b7} high \u{00b7} 9.8 \u{00b7} KEV"
+                            .to_string(),
+                        "192.168.1.5:443  CVE-2024-9999 \u{00b7} medium \u{00b7} 7.5".to_string(),
+                    ],
+                },
+                HostFindings {
+                    host: "192.168.1.7".to_string(),
+                    lines: vec!["192.168.1.7:80  CVE-2023-0001 \u{00b7} low".to_string()],
+                },
+                HostFindings {
+                    host: "aa:bb:cc:dd:ee:03".to_string(),
+                    lines: vec![
+                        "aa:bb:cc:dd:ee:03:8080  CVE-2022-0002 \u{00b7} low \u{00b7} 5.0"
+                            .to_string()
+                    ],
+                },
+            ]
+        );
+    }
+
+    /// A table without one of the seven columns is reported by name, never
+    /// drawn from whatever happened to sit at that position.
+    #[test]
+    fn a_findings_table_missing_a_column_is_named_not_misread() {
+        let mut table = vulns_table(vec![]);
+        table.columns.retain(|c| c != "cvss");
+        let why = finding_lines(&table).expect_err("a missing column is an error");
+        assert!(why.contains("`cvss`"), "must name the column: {why}");
+        assert!(
+            finding_lines(&vulns_table(vec![])).unwrap().is_empty(),
+            "an empty table has no hosts"
+        );
     }
 
     /// A separator is only ever written between two fields that exist — the
@@ -2162,7 +2604,7 @@ mod tests {
 /// and scene construction run for real, rasterization does not.
 #[cfg(test)]
 mod headless_tests {
-    use super::tests::topology_link;
+    use super::tests::{topology_link, vulns_table};
     use super::*;
     use crate::ui::Glance;
     use gpui::{Entity, Size, TestAppContext, VisualTestContext};
@@ -2349,6 +2791,168 @@ mod headless_tests {
         vcx.simulate_resize(viewport);
         vcx.run_until_parked();
         (model, vcx)
+    }
+
+    /// A fresh window opened ALREADY in the findings reading, over an injected
+    /// findings state and in-flight flag — the state is set before the first
+    /// paint, like `map_window` sets the mode, and for the same reason. The
+    /// socket is never driven: `MapView::new` fetches nothing (the open path
+    /// does), so what the window draws is exactly what was injected.
+    fn findings_window(
+        cx: &mut TestAppContext,
+        findings: Option<Result<Table, String>>,
+        scan_in_flight: bool,
+    ) -> VisualTestContext {
+        let model = cx.update(|cx| {
+            cx.new(|_| {
+                Glance::new(
+                    StatusSnapshot::default(),
+                    None,
+                    "/tmp/net-observer-map-test.sock".to_string(),
+                )
+            })
+        });
+        let window = cx.add_window(|_, cx| {
+            let mut view = MapView::new(model, cx);
+            view.mode = MapMode::Findings;
+            view.findings = findings;
+            view.scan_in_flight = scan_in_flight;
+            view
+        });
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_resize(size(px(WIN_W), px(WIN_H)));
+        vcx.run_until_parked();
+        vcx
+    }
+
+    /// The two findings the drawn-rows tests inject, and the exact lines the
+    /// section must draw them as — shared so the absence test names the very
+    /// selectors the presence test found.
+    fn two_findings() -> (Table, [&'static str; 2]) {
+        (
+            vulns_table(vec![
+                [
+                    "aa:bb:cc:dd:ee:05",
+                    "192.168.1.5",
+                    "22",
+                    "CVE-2024-1234",
+                    "high",
+                    "true",
+                    "9.8",
+                ],
+                [
+                    "aa:bb:cc:dd:ee:07",
+                    "192.168.1.7",
+                    "80",
+                    "CVE-2023-0001",
+                    "low",
+                    "false",
+                    "",
+                ],
+            ]),
+            [
+                "map-finding:192.168.1.5:22  CVE-2024-1234 \u{00b7} high \u{00b7} 9.8 \u{00b7} KEV",
+                "map-finding:192.168.1.7:80  CVE-2023-0001 \u{00b7} low",
+            ],
+        )
+    }
+
+    /// The audit ladder is the window's control surface: all four rungs are
+    /// drawn, whichever reading is on screen, and no rung is laid out past the
+    /// window's edge where nothing is painted.
+    #[gpui::test]
+    fn the_four_rungs_are_drawn(cx: &mut TestAppContext) {
+        let viewport = size(px(WIN_W), px(WIN_H));
+        for mode in [MapMode::Graph, MapMode::List, MapMode::Findings] {
+            let (_model, mut vcx) = map_window(cx, StatusSnapshot::default(), None, mode, viewport);
+            for rung in [
+                "scan-rung-base",
+                "scan-rung-ports",
+                "scan-rung-banners",
+                "scan-rung-cve",
+            ] {
+                let bounds = vcx
+                    .debug_bounds(rung)
+                    .unwrap_or_else(|| panic!("{mode:?} did not draw `{rung}`"));
+                assert!(
+                    contains(viewport, bounds),
+                    "`{rung}` leaves the window in {mode:?}: {bounds:?}"
+                );
+            }
+        }
+    }
+
+    /// A findings table is drawn one line per finding, with the words the
+    /// section promises: `host:port  cve_id · confidence · cvss · KEV`.
+    #[gpui::test]
+    fn a_findings_table_draws_one_line_per_finding(cx: &mut TestAppContext) {
+        let (table, lines) = two_findings();
+        let mut vcx = findings_window(cx, Some(Ok(table)), false);
+        for line in lines {
+            assert!(
+                vcx.debug_bounds(line).is_some(),
+                "the findings reading did not draw `{line}`"
+            );
+        }
+        assert!(
+            vcx.debug_bounds("map-findings-empty:no findings").is_none(),
+            "a table with findings must not also say there are none"
+        );
+    }
+
+    /// An empty table says so, in a FRESH window — gpui's debug-bounds map only
+    /// grows over a window's life, so only a window that never drew a finding
+    /// can say there is none — and draws no finding line.
+    #[gpui::test]
+    fn an_empty_findings_table_says_no_findings_and_draws_no_row(cx: &mut TestAppContext) {
+        let (_table, lines) = two_findings();
+        let mut vcx = findings_window(cx, Some(Ok(vulns_table(vec![]))), false);
+        assert!(
+            vcx.debug_bounds("map-findings-empty:no findings").is_some(),
+            "an empty table must say `no findings` rather than leave a blank area"
+        );
+        for line in lines {
+            assert!(
+                vcx.debug_bounds(line).is_none(),
+                "an empty table drew a finding: `{line}`"
+            );
+        }
+    }
+
+    /// A read the daemon could not answer shows the daemon's own words, never a
+    /// blank section and never a crash.
+    #[gpui::test]
+    fn a_failed_findings_read_shows_the_daemons_words(cx: &mut TestAppContext) {
+        let why = "daemon cannot answer Vulns (older daemon): bad request: unknown variant";
+        let mut vcx = findings_window(cx, Some(Err(why.to_string())), false);
+        let selector: &'static str =
+            Box::leak(format!("map-findings-error:findings unavailable: {why}").into_boxed_str());
+        assert!(
+            vcx.debug_bounds(selector).is_some(),
+            "the findings reading did not show the daemon's words: `{why}`"
+        );
+    }
+
+    /// While a rung is in flight the control row says so; when nothing is, it
+    /// does not — each in its own fresh window, because a window that once
+    /// drew `scanning…` can never afterwards say it is gone.
+    #[gpui::test]
+    fn a_rung_in_flight_says_scanning_and_an_idle_window_does_not(cx: &mut TestAppContext) {
+        let mut busy = findings_window(cx, None, true);
+        assert!(
+            busy.debug_bounds("map-scanning").is_some(),
+            "a rung in flight must be visible as `scanning…`"
+        );
+        assert!(
+            busy.debug_bounds("map-findings-pending:findings not read yet")
+                .is_some(),
+            "before the first read the reading must say it has not read yet"
+        );
+        let mut idle = findings_window(cx, None, false);
+        assert!(
+            idle.debug_bounds("map-scanning").is_none(),
+            "an idle window must not claim a scan is running"
+        );
     }
 
     /// A neighbours sample the daemon answered with, carrying nobody.
