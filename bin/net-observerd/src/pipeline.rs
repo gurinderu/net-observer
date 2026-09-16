@@ -223,7 +223,10 @@ impl ResumeGate {
 /// window is dropped before the next sample is pushed
 /// ([`RecentWindow::clear_for_resume`]), so the count-based conditions (`Wedge`)
 /// can never span an observation gap: two bad pre-pause ticks plus one
-/// post-resume tick must not read as "tun dead 3 ticks".
+/// post-resume tick must not read as "tun dead 3 ticks". A probing-tier switch
+/// (`api::set_probing`, either direction) publishes the same epoch and is
+/// handled here identically: a passive stretch is bracketed for the triggers
+/// exactly as a pause is (realm net-observer, node #88).
 ///
 /// A RESUME edge RE-OPENS detection; it does not dedup it. The recent-sample
 /// window is cleared and every trigger is re-armed
@@ -296,8 +299,10 @@ pub async fn run(
     mut rx: mpsc::Receiver<Sample>,
     snapshot: Arc<Mutex<StatusSnapshot>>,
     events_tx: broadcast::Sender<EncodedFrame>,
-    // `ts_us` of the most recent RESUME edge, published by the control socket.
-    // `0` = the daemon has never resumed.
+    // `ts_us` of the most recent window-clearing edge published by the control
+    // socket: a RESUME, or a probing-tier switch in either direction, which
+    // clears and re-arms by exactly this path (realm net-observer, node #88).
+    // `0` = no such edge yet.
     resume_at_us: Arc<AtomicI64>,
 ) {
     let mut window = RecentWindow::new(triggers::WINDOW_CAP);
@@ -381,8 +386,9 @@ pub async fn run(
             window.clear_for_resume();
             engine.rearm_all();
             tracing::info!(
-                resume_us = gate.applied_resume_us(),
-                "collection resumed; window cleared (gateway-change basis kept), triggers re-armed"
+                edge_us = gate.applied_resume_us(),
+                "resume or probing-tier switch; window cleared (gateway-change basis kept), \
+                 triggers re-armed"
             );
         }
         // A sample produced before the resume is on the far side of the

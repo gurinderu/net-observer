@@ -408,9 +408,10 @@ pub struct ApiServer {
     /// Where a manual freeze writes its copy: the daemon's blob directory, the
     /// same root the `gw-change` freeze handler uses.
     pub blob_dir: PathBuf,
-    /// `ts_us` of the most recent RESUME edge, published here and consumed by
-    /// `pipeline::run` to drop its pre-pause trigger window. `0` = never
-    /// resumed.
+    /// `ts_us` of the most recent window-clearing edge — a RESUME, or a
+    /// probing-tier switch in either direction — published here and consumed
+    /// by `pipeline::run` to drop its pre-edge trigger window. `0` = no such
+    /// edge yet.
     pub resume_at_us: Arc<AtomicI64>,
     pub snapshot: Arc<Mutex<StatusSnapshot>>,
     /// Durable sink for pause/resume boundary records.
@@ -1121,6 +1122,19 @@ fn control_response(
 /// still `ok` — the requested tier does hold. A store failure is logged as a
 /// gap and reported in the message but never fails the control, because the
 /// tier really did change and `ok: false` would say otherwise.
+///
+/// A real switch, in EITHER direction, closes and re-opens detection exactly
+/// as a resume does: it publishes the same `resume_at_us` epoch the observing
+/// resume publishes, and `pipeline::run` then clears the recent-sample window
+/// (`RecentWindow::clear_for_resume`, gateway-change basis kept), re-arms every
+/// trigger (`TriggerEngine::rearm_all`) and keeps the bounded pre-edge drain out
+/// of the window. So an incident open at the switch closes at the switch — by
+/// the mechanism the record already explains, the `probing_edge` row at the
+/// same `ts_us` being its bracket — the probe-fed conditions do not read the
+/// first passive `SKIP`s as a recovery, and after a switch back no dead tick
+/// from before the stretch can join the ticks after it. Without this, the
+/// switch to passive turned every probe-fed condition to `None` at once and
+/// the engine closed open incidents as "recovered" at that instant.
 fn set_probing(
     tier: ProbingTier,
     authorized: PeerAuthorized,
@@ -1128,11 +1142,19 @@ fn set_probing(
 ) -> ControlResult {
     let transition = {
         let mut snap = cx.snapshot.lock().unwrap_or_else(|e| e.into_inner());
-        let was = cx.probing.set(tier);
+        // Read-then-set is safe: the snapshot lock serialises every control
+        // connection and this is the tier's only writer.
+        let was = cx.probing.tier();
         if was == tier {
             None
         } else {
             let ts_us = types::now_us();
+            // The epoch is published BEFORE the tier flips, as on a resume: a
+            // collector that reads the new tier has already synchronised with
+            // it, so no sample taken under the new tier can reach the consumer
+            // while it still reads the old epoch.
+            cx.resume_at_us.store(ts_us, Ordering::Release);
+            cx.probing.set(tier);
             snap.probing = tier;
             let edge = ProbingEdge {
                 ts_us,
@@ -2174,6 +2196,8 @@ mod tests {
         let cx = test_ctx(&srv);
         assert_eq!(srv.probing.tier(), ProbingTier::Active);
 
+        assert_eq!(srv.resume_at_us.load(Ordering::Acquire), 0);
+
         let res = control_request(
             ControlCmd::SetProbing(ProbingTier::Passive),
             Some(TEST_DAEMON_UID),
@@ -2186,6 +2210,14 @@ mod tests {
         // The tier is orthogonal to the pause and to quiet.
         assert!(srv.observing.load(Ordering::Acquire));
         assert!(!srv.quiet.load(Ordering::Acquire));
+        // The switch closes and re-opens detection the way a resume does: the
+        // window-clearing epoch moves to the edge's own instant, which is what
+        // `pipeline::run` keys `clear_for_resume` + `rearm_all` off.
+        let epoch_after_passive = srv.resume_at_us.load(Ordering::Acquire);
+        assert_ne!(
+            epoch_after_passive, 0,
+            "a tier switch must publish the epoch"
+        );
 
         // Sink 1: exactly one durable row, attributable to the peer.
         assert_eq!(
@@ -2201,6 +2233,10 @@ mod tests {
             .store
             .query_scalar_i64("SELECT ts_us FROM probing_edge")
             .unwrap();
+        assert_eq!(
+            epoch_after_passive, row_ts,
+            "the epoch is the edge's own instant: the probing_edge row is the bracket"
+        );
         // Sink 2: exactly one frame, describing the same transition.
         let frame = rx.try_recv().expect("a tier switch must publish one frame");
         let decoded: StreamFrame = serde_json::from_slice(frame.bytes()).unwrap();
@@ -2233,6 +2269,11 @@ mod tests {
             "a no-op must not write a second boundary row"
         );
         assert!(rx.try_recv().is_err(), "a no-op must not publish a frame");
+        assert_eq!(
+            srv.resume_at_us.load(Ordering::Acquire),
+            epoch_after_passive,
+            "a no-op must not clear the window either"
+        );
 
         // And back: a second real edge.
         let back = control_request(
@@ -2250,6 +2291,14 @@ mod tests {
             1
         );
         assert!(rx.try_recv().is_ok(), "the second edge publishes its frame");
+        // Either direction clears: the switch back moves the epoch again, so
+        // no dead tick from before the stretch can join the ticks after it.
+        assert_eq!(
+            srv.resume_at_us.load(Ordering::Acquire),
+            srv.store
+                .query_scalar_i64("SELECT ts_us FROM probing_edge WHERE tier = 'active'")
+                .unwrap()
+        );
         // A tier switch is not a pause: the observing bracket stays untouched.
         assert_eq!(
             srv.store

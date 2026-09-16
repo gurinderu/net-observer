@@ -462,10 +462,12 @@ async fn run_daemon() -> anyhow::Result<()> {
          configured probing tier"
     );
 
-    // `ts_us` of the most recent RESUME edge. The control socket publishes it on
-    // every `SetObserving(true)` transition; the pipeline consumer watches it and
-    // drops its recent-sample window so a count-based condition cannot span the
-    // observation gap the pause opened. `0` = the daemon has never resumed.
+    // `ts_us` of the most recent window-clearing edge. The control socket
+    // publishes it on every `SetObserving(true)` transition and on every real
+    // `SetProbing` switch (either direction); the pipeline consumer watches it
+    // and drops its recent-sample window so a count-based condition cannot
+    // span the observation gap a pause opened, nor the passive stretch a tier
+    // switch opened or closed. `0` = no such edge yet.
     let resume_at_us = Arc::new(AtomicI64::new(0));
 
     // The realtime event bus (push, not poll): the pipeline consumer publishes a
