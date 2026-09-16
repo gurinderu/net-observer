@@ -661,9 +661,12 @@ async fn run_daemon() -> anyhow::Result<()> {
         // shared `observing` flag: the interval loop skips its probe while paused,
         // the event thread drops batches while paused.
         match c.source() {
-            Source::Interval(_) => {
-                handles.push(spawn_interval_collector(c, tx.clone(), observing.clone()))
-            }
+            Source::Interval(_) => handles.push(spawn_interval_collector(
+                c,
+                tx.clone(),
+                observing.clone(),
+                resume_at_us.clone(),
+            )),
             Source::Event => handles.push(spawn_event_collector(c, tx.clone(), observing.clone())),
         }
     }

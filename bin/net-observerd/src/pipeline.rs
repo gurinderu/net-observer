@@ -434,10 +434,20 @@ pub async fn run(
 /// instead of letting it advance `generated_us` after the control socket has
 /// already acked `observing: false`. The daemon and its socket stay alive
 /// throughout, so `SetObserving(true)` resumes probing on the next tick.
+///
+/// The same source-side drop guards a probing-tier switch: `resume_at_us` is
+/// the window-clearing epoch the control socket publishes on a resume and on
+/// every real `SetProbing`, read before `collect()` and again after it, and a
+/// tick that straddled an edge is dropped here rather than forwarded. Without
+/// it a proxy tick in flight across active→passive, whose probes all time out,
+/// lands after the consumer's bounded drain has closed and stays the newest
+/// MEASURED tick for the whole passive stretch — a dead tun the record would
+/// keep blaming the load for (realm net-observer, node #88).
 pub(crate) fn spawn_interval_collector(
     c: AnyCollector,
     tx: mpsc::Sender<Sample>,
     observing: Arc<AtomicBool>,
+    resume_at_us: Arc<AtomicI64>,
 ) -> JoinHandle<()> {
     let Source::Interval(interval) = c.source() else {
         unreachable!("interval spawner")
@@ -456,6 +466,8 @@ pub(crate) fn spawn_interval_collector(
             if !observing.load(Ordering::Acquire) {
                 continue;
             }
+            // The epoch this tick starts under; compared again after the probe.
+            let epoch = resume_at_us.load(Ordering::Acquire);
             let ts_us = types::now_us();
             // Preflight is a per-tick CONDITION, not a startup gate. A missing
             // prerequisite (no interface up yet at boot, a config file not
@@ -499,6 +511,16 @@ pub(crate) fn spawn_interval_collector(
             // Re-check after the probe: a pause that landed while `collect()` was
             // in flight is already acked, so this result must not be forwarded.
             if !observing.load(Ordering::Acquire) {
+                continue;
+            }
+            // Same for a window-clearing edge (a resume, or a tier switch in
+            // either direction): a tick that straddled it was taken under the
+            // old tier and is dropped at the source, like the paused one above.
+            if resume_at_us.load(Ordering::Acquire) != epoch {
+                tracing::info!(
+                    collector = name,
+                    "tick straddled a resume or tier switch; in-flight sample dropped"
+                );
                 continue;
             }
             for s in samples {
@@ -1827,7 +1849,7 @@ mod tests {
         ));
         let (tx, mut rx) = mpsc::channel(4);
         let observing = Arc::new(AtomicBool::new(true));
-        let handle = spawn_interval_collector(c, tx, observing);
+        let handle = spawn_interval_collector(c, tx, observing, no_resume());
 
         // First tick forwards a Host sample (bounded so a stuck loop fails fast).
         let first = time::timeout(Duration::from_secs(5), rx.recv())
@@ -1856,7 +1878,7 @@ mod tests {
         ));
         let (tx, mut rx) = mpsc::channel(4);
         let observing = Arc::new(AtomicBool::new(false));
-        let handle = spawn_interval_collector(c, tx, observing.clone());
+        let handle = spawn_interval_collector(c, tx, observing.clone(), no_resume());
 
         // Paused: several tick intervals must elapse with no sample forwarded.
         let paused = time::timeout(Duration::from_millis(100), rx.recv()).await;
@@ -1912,7 +1934,7 @@ mod tests {
     async fn interval_collector_emits_skip_while_preflight_is_unavailable() {
         let (c, _ready, collects) = fake_collector(false);
         let (tx, mut rx) = mpsc::channel(8);
-        let handle = spawn_interval_collector(c, tx, Arc::new(AtomicBool::new(true)));
+        let handle = spawn_interval_collector(c, tx, Arc::new(AtomicBool::new(true)), no_resume());
 
         for _ in 0..3 {
             let s = time::timeout(Duration::from_secs(5), rx.recv())
@@ -1948,7 +1970,7 @@ mod tests {
     async fn interval_collector_recovers_when_preflight_becomes_ready() {
         let (c, ready, collects) = fake_collector(false);
         let (tx, mut rx) = mpsc::channel(8);
-        let handle = spawn_interval_collector(c, tx, Arc::new(AtomicBool::new(true)));
+        let handle = spawn_interval_collector(c, tx, Arc::new(AtomicBool::new(true)), no_resume());
 
         // N ticks with the prerequisite missing: SKIP, every one of them.
         for _ in 0..3 {
@@ -1997,7 +2019,9 @@ mod tests {
     /// genuinely testable needs a `#[cfg(test)]` collector whose `collect()` can be
     /// held open, which is a production change out of proportion to the line. Named
     /// here so the next auditor does not re-trip on the name (this test used to be
-    /// called `interval_collector_drops_in_flight_probe_on_pause`).
+    /// called `interval_collector_drops_in_flight_probe_on_pause`). The epoch
+    /// re-check beside it — the tier-switch drop — is out of reach for exactly
+    /// the same reason, and is covered by the same reading of the source.
     #[tokio::test]
     async fn interval_collector_forwards_nothing_after_a_pause() {
         let c = AnyCollector::Host(HostCollector::new(
@@ -2006,7 +2030,7 @@ mod tests {
         ));
         let (tx, mut rx) = mpsc::channel(4);
         let observing = Arc::new(AtomicBool::new(true));
-        let handle = spawn_interval_collector(c, tx, observing.clone());
+        let handle = spawn_interval_collector(c, tx, observing.clone(), no_resume());
 
         // Observing: the first tick forwards a sample.
         let first = time::timeout(Duration::from_secs(5), rx.recv())
