@@ -52,9 +52,15 @@ pub enum Request {
     Incidents { limit: usize },
     /// Ask the daemon to run one named diagnosis against its own store,
     /// read-only, and answer with the result [`Table`]. A read, in the same
-    /// class as `Status`/`Incidents`: no peer-credential gate. The blocking
-    /// [`diagnose`] helper drives this path and tells an old daemon that cannot
-    /// read the request apart from one that ran the query and failed.
+    /// class as `Status`/`Incidents`: no peer-credential gate. What IS bounded
+    /// is concurrency: the daemon runs at most ONE diagnosis at a time — a
+    /// query holds the store mutex its pipeline writes through — and answers a
+    /// second one at once with `Response::Error("a diagnosis is already
+    /// running; retry")` rather than queueing it. That refusal is a
+    /// [`QueryOutcome::Failed`], never [`QueryOutcome::Unsupported`]: the daemon
+    /// can answer, it is busy. The blocking [`diagnose`] helper drives this path
+    /// and tells an old daemon that cannot read the request apart from one that
+    /// ran (or refused) the query.
     Query(DiagnosticQuery),
     /// Ask the daemon to run a write/control action. The daemon executes it as
     /// root for an authorised peer — the peer-credential check is the one gate
@@ -1193,9 +1199,10 @@ fn classify_control(response: Response) -> std::io::Result<ControlOutcome> {
 pub enum QueryOutcome {
     /// The daemon ran the diagnosis; here is its table.
     Table(Table),
-    /// The daemon read the diagnosis and could not run it — a key the store
-    /// could never have written, a query error. Carries the daemon's own
-    /// message.
+    /// The daemon read the diagnosis and did not run it — a key the store
+    /// could never have written, a query error, or another diagnosis already
+    /// in flight (the daemon runs one at a time and says "retry"). Carries the
+    /// daemon's own message.
     Failed(String),
     /// The daemon could not decode the request — [`Request::Query`] did not
     /// exist when it was built. Carries the daemon's own message.

@@ -3,9 +3,14 @@
 //! `net-observerd` is the sole DuckDB owner (DuckDB takes a per-process file lock, so
 //! a second opener — even read-only — is blocked while the daemon runs). Every
 //! other process reads live status over this Unix-domain socket instead of
-//! opening the database. The server answers entirely from the in-memory
-//! [`StatusSnapshot`] the pipeline keeps current — no DB read on the request
-//! path, zero contention with the writer, always live.
+//! opening the database. `Status`, `Incidents` and `Subscribe` are answered
+//! entirely from the in-memory [`StatusSnapshot`] and the bus the pipeline keeps
+//! current — no DB read, zero contention with the writer, always live. The one
+//! request that DOES read the database is [`Request::Query`], a named diagnosis
+//! (`crate::api_query`): read-only, run on the blocking pool because DuckDB is
+//! synchronous, and at most ONE in flight ([`MAX_QUERIES_IN_FLIGHT`]) because
+//! it holds the store mutex the writer needs. It exists because the daemon's
+//! lock leaves no other way to read the record while collection runs.
 //!
 //! The wire format is `net_observer_ipc`'s: frames are encoded with
 //! `net_observer_ipc::encode_frame` (the same bytes `write_frame` produces) — one
@@ -28,11 +33,12 @@ use std::time::{Duration, Instant};
 use net_observer_ipc::{
     ControlCmd, ControlResult, EncodedFrame, Event, EventKind, Gap, Ready, Request, Response,
     ScanOptions, StatusSnapshot, StreamError, StreamErrorCode, StreamFrame,
+    UNDECODABLE_REQUEST_PREFIX,
 };
 use store::Store;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 use types::{NeighborsSample, NeighborsVerdict, ObservingCause, ObservingEdge, Sample};
 
 use crate::acting;
@@ -55,6 +61,24 @@ pub(crate) const MAX_SUBSCRIBERS: usize = 256;
 /// server memory by never terminating its request; an over-long frame is
 /// truncated, fails to parse, and is answered `Response::Error`.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+
+/// How many named diagnoses (`Request::Query`) may run at once: ONE. A diagnosis
+/// holds the store's connection mutex for as long as its `ASOF JOIN` takes, and
+/// the pipeline's next sample write waits behind it; on a world-connectable
+/// socket that is a stall any local process could inflict by looping queries.
+/// `MAX_CONNECTIONS` bounds how many such connections exist, not what they cost,
+/// so the gate is here: a second concurrent query is refused at once with a
+/// decodable `Response::Error` (`try_acquire`, never a queue that would let the
+/// backlog itself become the stall). Not a per-peer rate limit — a deliberate
+/// non-goal (realm net-observer, node #58).
+pub const MAX_QUERIES_IN_FLIGHT: usize = 1;
+
+/// The refusal a `Request::Query` gets while another diagnosis holds the gate.
+/// Deliberately NOT spelled with [`UNDECODABLE_REQUEST_PREFIX`]: the CLI reads
+/// that prefix as "this daemon cannot answer diagnoses" and falls back to the
+/// DB file, which would only meet the lock; this is a daemon that can, and
+/// says try again.
+pub const QUERY_BUSY: &str = "a diagnosis is already running; retry";
 
 /// Hard cap on concurrently handled socket connections, of ANY kind, enforced at
 /// accept time. [`MAX_SUBSCRIBERS`] bounds *subscriptions*; a connection that
@@ -374,6 +398,10 @@ pub struct ApiServer {
     pub snapshot: Arc<Mutex<StatusSnapshot>>,
     /// Durable sink for pause/resume boundary records.
     pub store: Arc<dyn Store + Send + Sync>,
+    /// The one-in-flight gate on `Request::Query` — [`MAX_QUERIES_IN_FLIGHT`]
+    /// permits, claimed with `try_acquire` and never awaited. Shared (`Arc`) so
+    /// a test can hold the permit and observe the refusal without a sleep.
+    pub query_gate: Arc<Semaphore>,
     /// The realtime bus, carrying frames already serialised once.
     pub events_tx: broadcast::Sender<EncodedFrame>,
     /// Bounded log for control refusals — attacker-triggerable on a mode-0666
@@ -398,7 +426,7 @@ impl ApiServer {
     /// daemon runs the actuator, and only on an explicit request — never
     /// automatically.
     ///
-    /// A one-shot request (`Status`, `Incidents`, `Control`) is answered with a
+    /// A one-shot request (`Status`, `Incidents`, `Query`, `Control`) is answered with a
     /// single [`Response`] then the connection closes; a [`Request::Subscribe`]
     /// instead holds the connection open and streams newline-JSON
     /// [`StreamFrame`]s from a per-connection broadcast receiver until the client
@@ -533,12 +561,14 @@ fn log_accept_error(limiter: &RateLimitedLog, error: &std::io::Error, now: Insta
 
 /// Handle one client: read a single newline-JSON [`Request`], then dispatch.
 ///
-/// One-shot requests (`Status`, `Incidents`, `Control`) are answered from the
-/// in-memory snapshot with a single newline-JSON [`Response`], then the connection
-/// closes. A [`Request::Subscribe`] instead holds the connection open and streams
-/// [`StreamFrame`]s via [`stream_events`] until the client disconnects. The
-/// snapshot lock is held only long enough to clone what a response needs — never
-/// across an `.await`.
+/// One-shot requests (`Status`, `Incidents`, `Query`, `Control`) are answered with
+/// a single newline-JSON [`Response`], then the connection closes — from the
+/// in-memory snapshot, except a `Query`, which reads the store on the blocking
+/// pool with at most one in flight ([`MAX_QUERIES_IN_FLIGHT`]; a second is
+/// refused with [`QUERY_BUSY`]). A [`Request::Subscribe`] instead holds the
+/// connection open and streams [`StreamFrame`]s via [`stream_events`] until the
+/// client disconnects. The snapshot lock is held only long enough to clone what
+/// a response needs — never across an `.await`.
 async fn handle_conn(
     stream: UnixStream,
     srv: &ApiServer,
@@ -613,21 +643,33 @@ async fn handle_conn(
             Response::Incidents(incidents)
         }
         // A read, like `Status`: no peer gate. DuckDB is synchronous and a
-        // diagnosis walks the whole record, so it runs off the runtime; the
-        // daemon's own starvation load keeps a live reading in step with the
-        // incidents it recorded (see `api_query`).
-        Ok(Request::Query(q)) => {
-            let store = Arc::clone(&srv.store);
-            match tokio::task::spawn_blocking(move || {
-                crate::api_query::run_query(store.as_ref(), q, crate::STARVATION_LOAD)
-            })
-            .await
-            {
-                Ok(Ok(table)) => Response::Table(table),
-                Ok(Err(message)) => Response::Error(message),
-                Err(e) => Response::Error(format!("diagnosis task failed: {e}")),
+        // diagnosis walks the whole record, so it runs off the runtime — and at
+        // most ONE at a time (`MAX_QUERIES_IN_FLIGHT`): the permit is claimed
+        // with `try_acquire`, so a second concurrent query is refused at once
+        // rather than queued behind the store mutex, and it is held only for
+        // the blocking run, not the reply. The daemon's own starvation load
+        // keeps a live reading in step with the incidents it recorded (see
+        // `api_query`).
+        Ok(Request::Query(q)) => match srv.query_gate.try_acquire() {
+            Err(_busy) => {
+                // Client-triggerable on a mode-0666 socket: never above `debug!`.
+                tracing::debug!("query refused: another diagnosis is running");
+                Response::Error(QUERY_BUSY.to_string())
             }
-        }
+            Ok(permit) => {
+                let store = Arc::clone(&srv.store);
+                let ran = tokio::task::spawn_blocking(move || {
+                    crate::api_query::run_query(store.as_ref(), q, crate::STARVATION_LOAD)
+                })
+                .await;
+                drop(permit);
+                match ran {
+                    Ok(Ok(table)) => Response::Table(table),
+                    Ok(Err(message)) => Response::Error(message),
+                    Err(e) => Response::Error(format!("diagnosis task failed: {e}")),
+                }
+            }
+        },
         Ok(Request::Control(cmd)) => {
             let cx = ControlCtx {
                 policy: &srv.policy,
@@ -647,7 +689,10 @@ async fn handle_conn(
             };
             Response::Control(control_request(cmd, peer_uid, &cx))
         }
-        Err(e) => Response::Error(format!("bad request: {e}")),
+        // The one spelling a client may read as "this daemon cannot decode
+        // that request" — pinned in the ipc crate so the CLI's fallback rule
+        // and this line cannot drift apart.
+        Err(e) => Response::Error(format!("{UNDECODABLE_REQUEST_PREFIX}{e}")),
     };
 
     let buf = net_observer_ipc::encode_frame(&response)?;
@@ -1275,7 +1320,7 @@ fn snapshot_clone(snapshot: &Mutex<StatusSnapshot>) -> StatusSnapshot {
 mod tests {
     use super::*;
     use crate::pipeline::ScanReport;
-    use net_observer_ipc::{Event, IncidentSummary};
+    use net_observer_ipc::{DiagnosticQuery, Event, IncidentSummary, QueryOutcome};
     use types::{GwVerdict, HostSample, LinkSample, RouteEvent, TcpVerdict};
 
     /// The uid the tests' policies claim as the daemon's own — an arbitrary value
@@ -1444,6 +1489,7 @@ mod tests {
             resume_at_us: Arc::new(AtomicI64::new(0)),
             snapshot: Arc::new(Mutex::new(StatusSnapshot::default())),
             store: Arc::new(store::DuckdbStore::in_memory().unwrap()),
+            query_gate: Arc::new(Semaphore::new(MAX_QUERIES_IN_FLIGHT)),
             events_tx,
             control_refusals: RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
             sub_refusals: RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
@@ -1676,6 +1722,88 @@ mod tests {
             }
             other => panic!("expected Incidents, got {other:?}"),
         }
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The named diagnoses over the socket, against the daemon's OWN store —
+    /// the one reader the DuckDB lock does not shut out. `Gaps` is the cheapest
+    /// variant (no parameters, one CTE); the columns are the ones the CLI's
+    /// renderer looks up by name, and a store nobody paused holds no gap.
+    #[tokio::test]
+    async fn serve_answers_a_query_from_the_store() {
+        let dir = temp_dir("api-query");
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let srv = test_server(&sock_str, test_acting(), TEST_DAEMON_UID);
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
+
+        let sp = sock_str.clone();
+        let answer = tokio::task::spawn_blocking(move || {
+            net_observer_ipc::query(&sp, &Request::Query(DiagnosticQuery::Gaps))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        match answer {
+            Response::Table(t) => {
+                assert_eq!(
+                    t.columns,
+                    ["gap_opened_us", "gap_closed_us", "gap_closed_by"]
+                );
+                assert!(t.rows.is_empty(), "no pause, no gap: {:?}", t.rows);
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One diagnosis in flight, and a second is refused AT ONCE with
+    /// [`QUERY_BUSY`] — which the CLI's classifier must read as a failure to
+    /// show, never as "this daemon cannot answer diagnoses" (that would send it
+    /// to the DB file, where the lock waits). The test holds the permit itself,
+    /// so no query has to be slow and nothing sleeps; releasing it must let the
+    /// next query through, or a refusal would be a permanent state.
+    #[tokio::test]
+    async fn serve_refuses_a_second_query_while_one_runs() {
+        let dir = temp_dir("api-query-busy");
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let srv = test_server(&sock_str, test_acting(), TEST_DAEMON_UID);
+        let gate = Arc::clone(&srv.query_gate);
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
+
+        // With the one permit held, the gate is full.
+        let held = gate.acquire().await.unwrap();
+        let sp = sock_str.clone();
+        let refused = tokio::task::spawn_blocking(move || {
+            net_observer_ipc::diagnose(&sp, DiagnosticQuery::Gaps)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(refused, QueryOutcome::Failed(QUERY_BUSY.to_string()));
+
+        // Released, the same query runs.
+        drop(held);
+        let sp = sock_str.clone();
+        let answered = tokio::task::spawn_blocking(move || {
+            net_observer_ipc::diagnose(&sp, DiagnosticQuery::Gaps)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(answered, QueryOutcome::Table(_)),
+            "after the permit is released: {answered:?}"
+        );
 
         handle.abort();
         let _ = std::fs::remove_dir_all(&dir);

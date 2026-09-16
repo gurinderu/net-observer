@@ -14,8 +14,11 @@
 //! record: the caller (`api::handle_conn`) runs [`run_query`] on
 //! `tokio::task::spawn_blocking`, never on the runtime. The store's connection
 //! mutex is still held for the duration, so a long diagnosis delays the
-//! pipeline's next write by that much — the price of a single connection, and
-//! bounded by the record's size rather than by a client.
+//! pipeline's next write by that much — the price of a single connection.
+//! What keeps a client from turning that into a stall is the caller's gate:
+//! one diagnosis in flight at a time (`api::MAX_QUERIES_IN_FLIGHT`), a second
+//! refused at once rather than queued. So the delay is bounded by the
+//! record's size, never by how many queries someone sends.
 
 use net_observer_ipc::{DiagnosticQuery, Table};
 use store::{QueryTable, Store, diagnosis};

@@ -599,9 +599,16 @@ the durable record; the socket is the live, low-latency read path.
     keeps every other opener out, and the moment of an incident is exactly when
     these are wanted. Read-only, in the same class as `Status`: no peer gate.
     DuckDB is synchronous, so `api_query::run_query` runs on
-    `tokio::task::spawn_blocking`, never on the runtime; the threshold a query
-    needs but does not carry is the daemon's own `STARVATION_LOAD`, so a live
-    reading agrees with the incidents the daemon recorded. `Table` is the
+    `tokio::task::spawn_blocking`, never on the runtime — and at most **one at
+    a time** (`api::MAX_QUERIES_IN_FLIGHT`, a one-permit `Semaphore` claimed
+    with `try_acquire`): a diagnosis holds the store mutex the pipeline writes
+    through, and on a world-connectable socket a queue of them would be a stall
+    any local process could inflict, so a second concurrent `Query` is refused
+    at once with `Response::Error("a diagnosis is already running; retry")`
+    (`api::QUERY_BUSY`) rather than queued. Not a per-peer rate limit — a
+    deliberate non-goal. The threshold a query needs but does not carry is the
+    daemon's own `STARVATION_LOAD`, so a live reading agrees with the
+    incidents the daemon recorded. `Table` is the
     stringified `columns` + `rows` shape the CLI renders on both paths (the
     offline `store::QueryTable` is converted into it). A diagnosis the daemon
     read but could not run — a filter the store could never have written, a

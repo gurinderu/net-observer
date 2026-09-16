@@ -1405,6 +1405,9 @@ fn build_api_server(
         // stays the sole DuckDB owner, so the control path writes through the
         // same handle the pipeline does.
         store: store as Arc<dyn store::Store + Send + Sync>,
+        // One diagnosis at a time: a `Query` holds the store mutex the pipeline
+        // writes through, and the socket is world-connectable.
+        query_gate: Arc::new(tokio::sync::Semaphore::new(api::MAX_QUERIES_IN_FLIGHT)),
         events_tx,
     }
 }
