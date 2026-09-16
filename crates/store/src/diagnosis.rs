@@ -8,12 +8,14 @@
 //! The rules, verbatim from the docs:
 //!
 //! - `gw=FAIL` ⇒ the local network or Wi-Fi died: infrastructure, not us.
-//! - `gw=OK`, `direct=OK`, `vless=OK`, `tun=000` ⇒ the proxy is wedged; a
-//!   restart cures it.
+//! - `gw=OK`, `direct=OK`, `vless=OK`, tun answered anything but 204 (`000` =
+//!   no status at all, a captive portal's 200, a 5xx) ⇒ the proxy is wedged; a
+//!   restart cures it (realm net-observer, node #122).
 //! - `vless=FAIL` with the rest OK ⇒ that proxy server is dead or blocked from
 //!   this path.
 //! - `tun=000` **with `load1` in the tens** ⇒ host starvation, NOT a wedge: a
-//!   restart does not cure it and tears down live flows.
+//!   restart does not cure it and tears down live flows. Only a silent probe
+//!   reads as starvation — an answered non-204 under load is still the proxy's.
 //! - A `.ru` name answered from the fakeip range is ALWAYS a bug.
 //! - `SKIP` means the probe did not run — neither health nor fault.
 //!
