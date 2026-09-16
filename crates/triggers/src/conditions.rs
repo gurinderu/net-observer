@@ -628,13 +628,14 @@ const BAN_MIN_PERIOD_S: i64 = 60;
 /// a maximal run of dead gateway readings (`Fail` or `NoGw`: one run class,
 /// the same fold the CLI's `gw_drops()` uses) of at least
 /// `BAN_MIN_RUN_TICKS` measured ticks with an `Ok` reading on either side,
-/// the newest run possibly still open — and the mean interval between ban
-/// starts is at least `BAN_MIN_PERIOD_S`. The coworking ban-cycle
-/// signature: the client is admitted, blocked, admitted again, and each round
-/// otherwise lands as its own `gw-drop`/`gw-change`/`per-client-block`
-/// incident with the cycle itself readable nowhere. This one names the cycle
-/// and its period, and stays asserted while the pattern is in the window so
-/// the engine's clear edge closes the one incident when it ages out.
+/// the newest run possibly still open, holding at least one `Fail` — and the
+/// mean interval between ban starts is at least `BAN_MIN_PERIOD_S`. The
+/// coworking ban-cycle signature: the client is admitted, blocked, admitted
+/// again, and each round otherwise lands as its own
+/// `gw-drop`/`gw-change`/`per-client-block` incident with the cycle itself
+/// readable nowhere. This one names the cycle and its period, and stays
+/// asserted while the pattern is in the window so the engine's clear edge
+/// closes the one incident when it ages out.
 ///
 /// The detail is written when the incident opens, so the count and span it
 /// carries are those of the first firing — `min_bans` bans; the full count
@@ -642,11 +643,14 @@ const BAN_MIN_PERIOD_S: i64 = 60;
 /// detail. `Skip` is the absence of a measurement and is transparent: it
 /// neither splits a run nor starts one (node #25). `NoGw` at the roam (the
 /// default gateway momentarily absent before the echoes start failing) is the
-/// start of that ban, not a wall that hides it. A run the window cut off (no
-/// `Ok` older than it) has no known start and is not counted. The match is
-/// exhaustive over the verdict so a future token cannot join a set by
-/// accident. A cycle has a period only from two bans on, so `min_bans` below
-/// 2 reads as 2.
+/// start of that ban, not a wall that hides it — but a run of `NoGw` alone is
+/// no route (the interface was down, or the roam was still in progress), not
+/// a gateway that answered and then went silent toward this client: without
+/// a `Fail` it is not a ban, so three Wi-Fi toggles do not read as a cycle
+/// (node #97). A run the window cut off (no `Ok` older than it) has no known
+/// start and is not counted. The match is exhaustive over the verdict so a
+/// future token cannot join a set by accident. A cycle has a period only from
+/// two bans on, so `min_bans` below 2 reads as 2.
 ///
 /// The daemon registers this behind the settle gate on purpose: a different
 /// router IP is a different segment, not one gateway's ban, so a roam that
@@ -662,19 +666,24 @@ impl Condition for BanCycle {
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         // Ban starts, newest first: the `ts_us` of the oldest dead reading in
         // each run, recorded once the `Ok` before that run is reached — if
-        // the run measured enough dead ticks to be a ban.
+        // the run measured enough dead ticks, at least one of them a `Fail`,
+        // to be a ban.
         let mut starts: Vec<i64> = Vec::new();
-        // The run being walked: its oldest dead reading so far and how many
-        // measured dead readings it holds.
-        let mut run: Option<(i64, usize)> = None;
+        // The run being walked: its oldest dead reading so far, how many
+        // measured dead readings it holds, and whether any of them is a
+        // `Fail` (a `NoGw`-only run is no route, not a ban).
+        let mut run: Option<(i64, usize, bool)> = None;
         for l in w.recent_link(BAN_CYCLE_SCAN) {
             match l.gw {
                 GwVerdict::Fail | GwVerdict::NoGw => {
-                    run = Some((l.ts_us, run.map_or(1, |(_, ticks)| ticks + 1)));
+                    let (ticks, failed) =
+                        run.map_or((0, false), |(_, ticks, failed)| (ticks, failed));
+                    run = Some((l.ts_us, ticks + 1, failed || l.gw == GwVerdict::Fail));
                 }
                 GwVerdict::Ok => {
-                    if let Some((start, ticks)) = run.take()
+                    if let Some((start, ticks, failed)) = run.take()
                         && ticks >= BAN_MIN_RUN_TICKS
+                        && failed
                     {
                         starts.push(start);
                     }
@@ -2453,6 +2462,34 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             fire.detail,
             "gateway ban cycle: 3 bans in ~300s, period ~150s (min 150s, max 150s)"
         );
+    }
+
+    /// A run of `NoGw` alone is no route — the interface was down, or the
+    /// roam was still in progress — not a gateway that answered and then
+    /// went silent toward this client. Three Wi-Fi toggles must not read as
+    /// a ban cycle: a run is a ban only if it holds a `Fail`. Dies under the
+    /// one-run-class fold that counted `NoGw`-only runs (node #97).
+    #[test]
+    fn ban_cycle_ignores_runs_of_no_gateway_alone() {
+        let c = BanCycle { min_bans: 3 };
+        let mut w = RecentWindow::new(64);
+        let round = [
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::NoGw,
+            GwVerdict::NoGw,
+            GwVerdict::NoGw,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+        ];
+        let mut next = 0;
+        for _ in 0..3 {
+            next = push_gw_ticks(&mut w, next, &round);
+        }
+        assert!(c.eval(&w).is_none());
     }
 
     /// Wi-Fi jitter loses single echoes: a one-tick `Fail` or `NoGw` between
