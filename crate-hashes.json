@@ -1,0 +1,4 @@
+{
+  "git+https://github.com/gurinderu/duckdb-rs?rev=76b8eba#duckdb@1.10505.0": "1wsvw2dzhjkpz6am1bm4rjii5fljq5bh94a376rz538i9w051lgn",
+  "git+https://github.com/gurinderu/duckdb-rs?rev=76b8eba#libduckdb-sys@1.10505.0": "1wsvw2dzhjkpz6am1bm4rjii5fljq5bh94a376rz538i9w051lgn"
+}
