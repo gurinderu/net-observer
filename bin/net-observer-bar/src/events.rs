@@ -895,6 +895,9 @@ mod tests {
                     load1: i as f64,
                     load5: 0.0,
                     load15: 0.0,
+                    disk_used_pct: None,
+                    disk_free_mb: None,
+                    swap_used_mb: None,
                 },
             )))));
         }
@@ -902,7 +905,7 @@ mod tests {
         // The 50 oldest were dropped, so the front is now the i=50 event.
         assert_eq!(
             log.events.front().unwrap().line,
-            "host  load 50.00/0.00/0.00"
+            "host  load 50.00/0.00/0.00; disk - used, - free; swap -"
         );
     }
 
@@ -937,6 +940,9 @@ mod tests {
                 load1: 0.0,
                 load5: 0.0,
                 load15: 0.0,
+                disk_used_pct: None,
+                disk_free_mb: None,
+                swap_used_mb: None,
             },
         )))));
         assert!(

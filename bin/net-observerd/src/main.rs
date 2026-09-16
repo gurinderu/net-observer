@@ -512,8 +512,15 @@ async fn run_daemon() -> anyhow::Result<()> {
         )));
     }
     if cfg.collectors.host.enabled {
+        // The record's volume is the filesystem holding the DB file: its
+        // directory, created above before the store was opened, so it exists
+        // from the first tick (realm net-observer, node #123).
+        let record_volume = Path::new(&cfg.db_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         collectors.push(AnyCollector::Host(HostCollector::new(
-            Arc::new(HostLoad::new()),
+            Arc::new(HostLoad::new(record_volume)),
             cfg.collectors.host.interval,
         )));
     }
@@ -1964,6 +1971,9 @@ mod tests {
             load1,
             load5: load1,
             load15: load1,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         })
     }
 

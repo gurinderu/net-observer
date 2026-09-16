@@ -119,13 +119,33 @@ pub struct RouteEvent {
     pub detail: String,
 }
 
-/// Host load sample (1/5/15-min averages) — the starvation discriminator.
+/// Host resource sample: load averages (1/5/15-min) — the starvation
+/// discriminator — plus the usage of the volume holding the record and the
+/// swap in use, the ENOSPC and memory-pressure discriminators the retired
+/// shell oracle carried (the oracle backlog: realm net-observer, node #114),
+/// measured as decided at node #123. A store write that fails for want of
+/// space is logged as a gap; this is the row that lets the record name the
+/// cause.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostSample {
     pub ts_us: i64,
     pub load1: f64,
     pub load5: f64,
     pub load15: f64,
+    /// Used fraction of the filesystem holding the record (the DB file's
+    /// volume), 0–100, as `df` computes capacity. `None` = not measured —
+    /// never a fabricated value (realm net-observer, node #123).
+    /// `serde(default)` so a pre-field daemon's samples still decode.
+    #[serde(default)]
+    pub disk_used_pct: Option<f64>,
+    /// Free MiB on that same filesystem, available to a writer. `None`
+    /// = not measured; `Some` exactly when `disk_used_pct` is.
+    #[serde(default)]
+    pub disk_free_mb: Option<u64>,
+    /// Swap in use, MiB. `None` = not measured (realm net-observer,
+    /// node #123). `serde(default)` as above.
+    #[serde(default)]
+    pub swap_used_mb: Option<u64>,
 }
 
 /// Wi-Fi air quality for one tick, read from CoreWLAN.
@@ -273,6 +293,9 @@ mod tests {
             load1: 1.0,
             load5: 2.0,
             load15: 3.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         });
         assert_eq!(h.ts_us(), 23);
 
@@ -306,6 +329,27 @@ mod tests {
             }],
         });
         assert_eq!(a.ts_us(), 37);
+    }
+
+    /// A host sample written by a daemon that shipped before the disk and swap
+    /// columns existed carries only the load triple; it must still decode,
+    /// with the new fields reading as "not measured" rather than failing.
+    #[test]
+    fn pre_disk_host_sample_decodes_with_unmeasured_disk_and_swap() {
+        let older = r#"{"ts_us":23,"load1":1.0,"load5":2.0,"load15":3.0}"#;
+        let h: HostSample = serde_json::from_str(older).expect("older host sample must decode");
+        assert_eq!(
+            h,
+            HostSample {
+                ts_us: 23,
+                load1: 1.0,
+                load5: 2.0,
+                load15: 3.0,
+                disk_used_pct: None,
+                disk_free_mb: None,
+                swap_used_mb: None,
+            }
+        );
     }
 
     #[test]

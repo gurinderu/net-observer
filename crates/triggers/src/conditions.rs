@@ -1058,6 +1058,9 @@ mod tests {
             load1,
             load5: load1,
             load15: load1,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         })
     }
 

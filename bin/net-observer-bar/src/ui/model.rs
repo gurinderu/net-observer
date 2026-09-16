@@ -240,6 +240,9 @@ mod tests {
                 load1: i as f64,
                 load5: 0.0,
                 load15: 0.0,
+                disk_used_pct: None,
+                disk_free_mb: None,
+                swap_used_mb: None,
             });
             g.record_tick();
             assert!(
@@ -304,6 +307,9 @@ mod tests {
                 load1: 3.0,
                 load5: 0.0,
                 load15: 0.0,
+                disk_used_pct: None,
+                disk_free_mb: None,
+                swap_used_mb: None,
             }),
             ..Default::default()
         };
