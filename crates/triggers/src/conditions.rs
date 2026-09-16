@@ -398,8 +398,11 @@ fn wifi_if_mac(l: &LinkSample) -> Option<&str> {
 /// comparison against the basis carried across a pause is labelled, so the
 /// incident never reads as two consecutive ticks. The daemon registers it
 /// with NO firing backoff: the #57 cadence is a hop every 2.5–3 min, and
-/// every hop is its own incident — the shared 5 min backoff would silently
-/// drop most of them. The aggregate's rate limit lives on `wifi-churn`.
+/// each hop at the field cadence is its own incident — the shared 5 min
+/// backoff would silently drop most of them. Hops on consecutive ticks merge
+/// into one incident under the engine's latch (the condition never returns
+/// `None` between them), and the link rows still record both. The
+/// aggregate's rate limit lives on `wifi-churn`.
 pub struct Roam;
 impl Condition for Roam {
     fn id(&self) -> &'static str {
@@ -531,8 +534,10 @@ fn identity_changes(
 /// is in the window so the engine's clear edge closes the one incident when
 /// it ages out. The daemon registers it WITH the shared firing backoff
 /// (5 min): that is the aggregate's rate limit the field asked for, while
-/// `roam` itself runs with none so that every hop stays its own incident.
-/// (realm net-observer, node #109)
+/// `roam` itself runs with none so that each hop at the field cadence stays
+/// its own incident (hops on consecutive ticks merge into one under the
+/// engine's latch; the rows still record both). (realm net-observer,
+/// node #109)
 ///
 /// A tick with a field unmeasured (`None`) is skipped in that field's
 /// comparison and never counted as a change (node #25); the address is

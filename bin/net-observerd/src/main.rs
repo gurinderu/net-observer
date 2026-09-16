@@ -1482,9 +1482,11 @@ fn build_engine(
         // masquerade as. Not gated: the settle window would suppress exactly
         // this event. No pcap freeze: the evidence is the two identities in
         // the record. NO backoff: the field cadence is a hop every 2.5–3 min
-        // and every hop is its own incident — under `BACKOFF_US` most would
-        // be silently dropped; `wifi-churn` below carries the aggregate's
-        // rate limit. (realm net-observer, node #59)
+        // and each hop at that cadence is its own incident — under
+        // `BACKOFF_US` most would be silently dropped. Hops on consecutive
+        // ticks merge into one under the engine's latch; the rows still
+        // record both. `wifi-churn` below carries the aggregate's rate
+        // limit. (realm net-observer, node #59)
         Trigger::new(Box::new(Roam), vec![record.clone(), snap.clone()], 0),
         // Four or more identity changes in a quarter hour are one churn
         // incident, not a string of roams. A change signature, so not gated;

@@ -99,8 +99,10 @@ flowchart LR
   direct reference answers), `established-stall` (a held long-lived stream
   through the tunnel stops carrying while fresh probes succeed; the direct
   underlay stream's fate scopes the verdict), `starvation`. Each fires at most
-  once per 5 min (backoff) — except `roam`, which has no backoff so that every
-  hop is its own incident — and disarms until the signal returns to OK.
+  once per 5 min (backoff) — except `roam`, which has no backoff so that each
+  hop at the field cadence is its own incident (hops on consecutive ticks
+  merge into one under the engine's latch; the rows still record both) — and
+  disarms until the signal returns to OK.
 - **Live snapshot + local socket API** — the consumer keeps an in-memory
   `StatusSnapshot` (the latest sample per collector + `generated_us`) current on
   every tick, and a passive `SnapshotHandler` mirrors each fired incident into a
