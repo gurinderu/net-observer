@@ -553,6 +553,16 @@ sequence is not assumed to be well-formed pairs: a resume with no preceding paus
 opens no gap, and databases written before the startup edge existed still close
 their gaps by the `sample` inference.
 
+**The air scan's access points also carry a grade, computed rather than
+stored.** `air_ap` (read by `AIR_LATEST_APS_SQL`, rendered by the CLI's `air`
+command and the bar's air-map window) is judged on two independent axes, both
+pure functions of `AirObservation` with no query of their own: a configuration
+letter A-F (`AirObservation::grade`, penalised over security/band/width/PHY
+generation) and a signal bucket good/fair/poor (`AirObservation::signal`, the
+RSSI-noise gap) — the rubric decided at (realm net-observer, node #89). A rubric
+input the scan did not report costs the AP nothing and only lowers the grade's
+confidence, named in its reasons.
+
 ### Verdict vocabulary
 
 Ported from the oracle and cross-checked against recorded log excerpts:
