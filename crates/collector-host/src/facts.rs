@@ -1,7 +1,7 @@
 //! The `host` collector's port trait: host load averages, the record volume's
 //! usage and the swap in use, read from the OS behind a trait boundary so the
 //! mapping logic stays unit-testable with fakes. The real macOS adapter
-//! (`libc::getloadavg`, `libc::statfs`, `sysctl vm.swapusage`) lives in the
+//! (`libc::getloadavg`, `libc::statfs`, `sysctlbyname` on `vm.swapusage`) lives in the
 //! `macos` crate.
 
 use collector_core::Readiness;

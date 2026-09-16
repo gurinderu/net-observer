@@ -1,5 +1,6 @@
 //! Host facts read from the OS: load via `libc::getloadavg(3)`, the record
-//! volume's usage via `libc::statfs(2)`, swap via `sysctl vm.swapusage`.
+//! volume's usage via `libc::statfs(2)`, swap via `sysctlbyname(3)` on
+//! `vm.swapusage`.
 //!
 //! `getloadavg` is the standard 1/5/15-minute load-average interface on macOS
 //! (and Linux). It reads the kernel's exponentially-weighted run-queue average,
@@ -11,19 +12,20 @@
 //! panic — "absence is a signal".
 
 use std::ffi::CString;
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, size_of};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use collector_core::Readiness;
 use collector_host::HostFacts;
 
-/// One mebibyte — the unit `df -m` and `sysctl vm.swapusage` both report in.
+/// One mebibyte — the unit `df -m` reports in and the sample's disk and swap
+/// figures are stored in.
 const MIB: u64 = 1024 * 1024;
 
 /// macOS implementation of [`HostFacts`]: `libc::getloadavg(3)` for load,
-/// `libc::statfs(2)` on the record's volume for disk, `sysctl vm.swapusage`
-/// for swap.
+/// `libc::statfs(2)` on the record's volume for disk, `sysctlbyname(3)` on
+/// `vm.swapusage` for swap.
 #[derive(Debug, Clone)]
 pub struct HostLoad {
     /// The path whose filesystem is the record's volume — the directory
@@ -69,8 +71,9 @@ impl HostFacts for HostLoad {
     }
 
     async fn swap(&self) -> Option<u64> {
-        let out = crate::dhcp_arp::run("sysctl", &["vm.swapusage"]).await?;
-        parse_swap_used_mb(&out)
+        // `sysctlbyname` copies the kernel's swap accounting out in place —
+        // instant, so inline like the two above.
+        swap_usage().map(|u| swap_used_mb_from(u.xsu_used))
     }
 
     async fn preflight(&self) -> Readiness {
@@ -120,27 +123,39 @@ fn usage_from_blocks(bsize: u64, blocks: u64, bfree: u64, bavail: u64) -> Option
     Some((used_pct, free_mb))
 }
 
-/// Parse the `used = <n>M` figure out of `sysctl vm.swapusage` output into
-/// whole megabytes (nearest), or `None` when the text does not have the
-/// documented shape.
-///
-/// The shape is taken from `sysctl(8)`'s source and documentation, NOT
-/// observed on this machine: the tool renders the kernel's `xsw_usage` as
-/// `vm.swapusage: total = 3072.00M  used = 1234.56M  free = 1837.44M  (encrypted)`,
-/// every figure in mebibytes with an `M` suffix. Anything else — no
-/// `vm.swapusage` line, no `used`, another suffix, a non-number — is `None`,
-/// never a guess.
-pub(crate) fn parse_swap_used_mb(text: &str) -> Option<u64> {
-    let line = text
-        .lines()
-        .find(|l| l.trim_start().starts_with("vm.swapusage:"))?;
-    let (_, rest) = line.split_once("used = ")?;
-    let token = rest.split_whitespace().next()?;
-    let mb: f64 = token.strip_suffix('M')?.parse().ok()?;
-    if !mb.is_finite() || mb < 0.0 {
+/// `sysctlbyname("vm.swapusage")` into the kernel's `xsw_usage` (byte counts:
+/// `xsu_total`, `xsu_avail`, `xsu_used`). `None` when the call fails or the
+/// kernel reports having written a different number of bytes than the struct
+/// this crate declares — a layout the reader does not know is not a
+/// measurement.
+fn swap_usage() -> Option<libc::xsw_usage> {
+    let mut buf = MaybeUninit::<libc::xsw_usage>::uninit();
+    let mut size = size_of::<libc::xsw_usage>();
+    // SAFETY: `oldp` points at `*oldlenp` writable bytes (the whole struct);
+    // the kernel writes at most that many and stores the count it wrote back
+    // into `*oldlenp`. `newp` NULL with `newlen` 0 makes the call read-only.
+    // The name is a NUL-terminated literal.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"vm.swapusage".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size != size_of::<libc::xsw_usage>() {
+        tracing::debug!(rc, size, errno = ?std::io::Error::last_os_error(), "sysctlbyname vm.swapusage failed");
         return None;
     }
-    Some(mb.round() as u64)
+    // SAFETY: `rc == 0` and the kernel reported writing exactly the struct's
+    // size, so every field is initialised.
+    Some(unsafe { buf.assume_init() })
+}
+
+/// Pure: swap bytes in use (`xsu_used`) → whole MiB, rounded down.
+fn swap_used_mb_from(xsu_used: u64) -> u64 {
+    xsu_used / MIB
 }
 
 #[cfg(test)]
@@ -206,36 +221,17 @@ mod tests {
         assert_eq!(usage_from_blocks(4096, 100, 200, 0), None);
     }
 
-    /// The documented line shape (authored from `sysctl(8)`, not observed).
-    const SWAPUSAGE_LINE: &str =
-        "vm.swapusage: total = 3072.00M  used = 1234.56M  free = 1837.44M  (encrypted)\n";
-
-    #[test]
-    fn swap_used_is_parsed_from_the_documented_line() {
-        assert_eq!(parse_swap_used_mb(SWAPUSAGE_LINE), Some(1235));
+    /// `vm.swapusage` exists on every macOS the daemon runs on; the kernel's
+    /// struct and libc's declaration agree in size, so the read lands.
+    #[tokio::test]
+    async fn swap_of_this_host_is_readable() {
+        assert!(HostLoad::new("/").swap().await.is_some());
     }
 
     #[test]
-    fn swap_used_is_parsed_when_no_swap_is_in_use() {
-        assert_eq!(
-            parse_swap_used_mb(
-                "vm.swapusage: total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)\n"
-            ),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn unrecognised_swapusage_shapes_are_not_measured() {
-        for text in [
-            "",
-            "vm.swapusage: total = 3072.00M  free = 1837.44M\n",
-            "vm.swapusage: total = 3072.00M  used = 1234.56K  free = 1837.44M\n",
-            "vm.swapusage: total = 3072.00M  used = lots  free = 1837.44M\n",
-            "vm.swapusage: total = 3072.00M  used = -1.00M  free = 1837.44M\n",
-            "sysctl: unknown oid 'vm.swapusage'\n",
-        ] {
-            assert_eq!(parse_swap_used_mb(text), None, "{text:?}");
-        }
+    fn swap_used_mb_is_whole_mebibytes_rounded_down() {
+        assert_eq!(swap_used_mb_from(0), 0);
+        assert_eq!(swap_used_mb_from(MIB - 1), 0);
+        assert_eq!(swap_used_mb_from(1234 * MIB + 512 * 1024), 1234);
     }
 }
