@@ -65,7 +65,10 @@ impl TriggerEngine {
     /// resume does NOT do is reset the firing budget: `last_fire_us` survives it,
     /// so each trigger still fires at most once per `backoff_us` and a toggled
     /// switch cannot storm the incident log. The `observing_edge` rows bound the
-    /// gap between the two records.
+    /// gap between the two records. The incident the PREVIOUS session had open
+    /// closes at the edge that ends it ([`TriggerEngine::close_all`]), called
+    /// before the re-arm, so no row is left open across the bracket (realm
+    /// net-observer, node #124).
     pub fn on_sample(&mut self, w: &RecentWindow, now_us: i64) {
         for trig in &mut self.triggers {
             match trig.condition.eval(w) {
@@ -120,6 +123,36 @@ impl TriggerEngine {
     pub fn rearm_all(&mut self) {
         for trig in &mut self.triggers {
             trig.armed = true;
+        }
+    }
+
+    /// Close every currently open incident at `ts_us` — the edge that ENDED
+    /// their observation session (a pause's own `ts_us`, or a tier switch's),
+    /// never the timestamp of whatever sample happens to land after it.
+    ///
+    /// Called by `pipeline::run` immediately BEFORE `RecentWindow::clear_for_resume`
+    /// and `rearm_all`. Without this, a trigger still latched at the edge (its
+    /// condition never returned `None` before the session ended) keeps its
+    /// `open_incident` across the clear; the first post-edge sample that still
+    /// asserts the fault then fires a NEW incident on top of it, and the old one
+    /// is silently overwritten — its `incident` row never gets `closed_us`. A
+    /// resume RE-OPENS detection as a NEW incident (see [`Self::on_sample`]); this
+    /// is what makes the OLD one closed rather than merely abandoned (realm
+    /// net-observer, node #124).
+    ///
+    /// For every trigger with an open incident: every handler's `on_clear` runs
+    /// at `ts_us`, the id is taken (so a later `close_all` or the next `None`
+    /// edge finds nothing to close twice), and the trigger is armed — the same
+    /// effect the `None` arm has. `last_fire_us` is left untouched, so the
+    /// backoff still bounds how soon a re-open may fire.
+    pub fn close_all(&mut self, ts_us: i64) {
+        for trig in &mut self.triggers {
+            if let Some(id) = trig.open_incident.take() {
+                for h in &trig.handlers {
+                    h.on_clear(&id, ts_us);
+                }
+                trig.armed = true;
+            }
         }
     }
 }
@@ -264,5 +297,106 @@ mod tests {
             2,
             "a fault still present in a new observation session is recorded again"
         );
+    }
+
+    /// (a) `close_all` clears exactly the incident a firing left open, stamped
+    /// with the EDGE's `ts_us` — never the firing's own — and re-arms the
+    /// trigger. A second `close_all` right after finds nothing left open
+    /// (`open_incident` was actually taken to `None`, not merely re-armed with
+    /// the id still latched) — the same proof [`Trigger`]'s own invariant relies
+    /// on (realm net-observer, node #124).
+    #[test]
+    fn close_all_closes_the_open_incident_at_the_edge_ts() {
+        let h = Arc::new(EdgeHandler::new());
+        let handlers: Vec<Arc<dyn crate::handlers::Handler>> = vec![h.clone()];
+        let trig = Trigger::new(Box::new(GwDrop), handlers, 1_000);
+        let mut eng = TriggerEngine::new(vec![trig]);
+        let mut w = RecentWindow::new(8);
+        w.push(link(0, GwVerdict::Fail));
+        eng.on_sample(&w, 0);
+        let opened = h.opened.lock().unwrap().clone();
+        assert_eq!(opened.len(), 1, "the fire must open exactly one incident");
+
+        eng.close_all(50);
+        assert_eq!(
+            h.cleared.lock().unwrap().clone(),
+            vec![(opened[0].clone(), 50)],
+            "close_all must clear the open incident at the edge ts, not the firing ts"
+        );
+
+        // Nothing left open: a second close_all right after records nothing.
+        eng.close_all(51);
+        assert_eq!(
+            h.cleared.lock().unwrap().len(),
+            1,
+            "close_all must take the id, leaving nothing for a later close_all to re-clear"
+        );
+
+        // Armed: the very next sample, past the untouched backoff, fires again.
+        w.push(link(1_001, GwVerdict::Fail));
+        eng.on_sample(&w, 1_001);
+        assert_eq!(
+            h.opened.lock().unwrap().len(),
+            2,
+            "close_all must re-arm the trigger"
+        );
+    }
+
+    /// (b) The pin for the hole itself, stated positively: fire (A) -> `close_all`
+    /// at the edge -> `rearm_all` (the exact pair `pipeline::run` calls at a
+    /// resume/tier-switch edge) -> a sample past the backoff still asserting ->
+    /// a NEW incident (B) fires, and EXACTLY ONE clear exists — A, at the edge.
+    /// Without `close_all` this sequence would produce two fires and ZERO
+    /// clears: A silently overwritten, its `incident` row never closed (realm
+    /// net-observer, node #124).
+    #[test]
+    fn close_all_then_rearm_all_lets_a_persistent_fault_open_a_new_incident_with_one_clear() {
+        let h = Arc::new(EdgeHandler::new());
+        let handlers: Vec<Arc<dyn crate::handlers::Handler>> = vec![h.clone()];
+        let trig = Trigger::new(Box::new(GwDrop), handlers, 1_000);
+        let mut eng = TriggerEngine::new(vec![trig]);
+        let mut w = RecentWindow::new(8);
+        w.push(link(0, GwVerdict::Fail));
+        eng.on_sample(&w, 0);
+
+        // The edge: exactly the pair `pipeline::run` calls, in that order.
+        eng.close_all(10);
+        w.clear_for_resume();
+        eng.rearm_all();
+
+        // Still asserting, past the (untouched) backoff: a NEW incident.
+        w.push(link(1_001, GwVerdict::Fail));
+        eng.on_sample(&w, 1_001);
+
+        let opened = h.opened.lock().unwrap().clone();
+        assert_eq!(
+            opened.len(),
+            2,
+            "the persistent fault opens a second incident"
+        );
+        assert_ne!(
+            opened[0], opened[1],
+            "the post-edge firing must be a NEW incident id, not a reuse of A's"
+        );
+        assert_eq!(
+            h.cleared.lock().unwrap().clone(),
+            vec![(opened[0].clone(), 10)],
+            "exactly one clear: A, closed at the edge — never zero, never B"
+        );
+    }
+
+    /// (c) `close_all` on an engine with nothing open is a no-op: no handler is
+    /// called and nothing changes.
+    #[test]
+    fn close_all_with_nothing_open_is_a_no_op() {
+        let h = Arc::new(EdgeHandler::new());
+        let handlers: Vec<Arc<dyn crate::handlers::Handler>> = vec![h.clone()];
+        let trig = Trigger::new(Box::new(GwDrop), handlers, 1_000);
+        let mut eng = TriggerEngine::new(vec![trig]);
+
+        eng.close_all(99);
+
+        assert!(h.opened.lock().unwrap().is_empty());
+        assert!(h.cleared.lock().unwrap().is_empty());
     }
 }
