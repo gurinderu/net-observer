@@ -70,6 +70,11 @@
           # from Cargo.toml/Cargo.lock, so `runtime_shaders` reaches the
           # generated Cargo.nix without any help from this file.
           gpui = _attrs: { nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ]; };
+          # rav1e's and av-scenechange's build scripts `unwrap()` CARGO_ENCODED_RUSTFLAGS,
+          # a variable cargo exports to build scripts and buildRustCrate does not. An empty
+          # value is what cargo would export for a build without RUSTFLAGS. (realm net-observer, node #80)
+          rav1e = _attrs: { CARGO_ENCODED_RUSTFLAGS = ""; };
+          av-scenechange = _attrs: { CARGO_ENCODED_RUSTFLAGS = ""; };
           # libduckdb-sys builds DuckDB from source (the `bundled` feature,
           # via the `cc` crate) and needs nothing beyond the C++ compiler
           # stdenv already provides: `default-features = false` on the
