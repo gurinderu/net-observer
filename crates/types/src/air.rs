@@ -163,7 +163,7 @@ impl AirObservation {
                     reasons.push("WPA2 with TKIP allowed".to_string());
                 } else {
                     forced_f = true;
-                    reasons.push("open or legacy security".to_string());
+                    reasons.push("open, legacy or unrecognised security".to_string());
                 }
             }
             None => {
@@ -173,15 +173,19 @@ impl AirObservation {
         }
 
         let band = self.channel_band.as_deref().and_then(Band::parse);
-        match self.channel_band.as_deref() {
-            Some(_) => {
-                if band == Some(Band::TwoGhz) {
-                    penalties += 1;
-                    reasons.push("2.4 GHz: crowded band".to_string());
-                }
-                // 5/6 GHz, or a label this rubric could not parse: no penalty.
+        match (self.channel_band.as_deref(), band) {
+            (Some(_), Some(Band::TwoGhz)) => {
+                penalties += 1;
+                reasons.push("2.4 GHz: crowded band".to_string());
             }
-            None => {
+            (Some(_), Some(_)) => {}
+            // A label the rubric cannot parse is as good as no label: the
+            // band-dependent width rule cannot fire, so the grade is hedged.
+            (Some(_), None) => {
+                confidence = Confidence::Low;
+                reasons.push("channel_band: unrecognised".to_string());
+            }
+            (None, _) => {
                 confidence = Confidence::Low;
                 reasons.push("channel_band: unmeasured".to_string());
             }
@@ -826,7 +830,8 @@ mod tests {
             let g = ap.grade();
             assert_eq!(g.grade, Grade::F, "{sec}: {g:?}");
             assert!(
-                g.reasons.contains(&"open or legacy security".to_string()),
+                g.reasons
+                    .contains(&"open, legacy or unrecognised security".to_string()),
                 "{sec}: {g:?}"
             );
         }
@@ -927,6 +932,22 @@ mod tests {
         );
         // Grade is computed from what remains — the missing input costs
         // nothing against the AP.
+        assert_eq!(g.grade, Grade::A, "{g:?}");
+    }
+
+    /// A band label the rubric cannot parse disables the width rule exactly
+    /// as a missing band does, so it hedges the grade the same way.
+    #[test]
+    fn an_unrecognised_band_label_is_low_confidence_not_silently_high() {
+        let mut ap = best_ap();
+        ap.channel_band = Some("7GHz".to_string());
+        let g = ap.grade();
+        assert_eq!(g.confidence, Confidence::Low);
+        assert!(
+            g.reasons
+                .contains(&"channel_band: unrecognised".to_string()),
+            "{g:?}"
+        );
         assert_eq!(g.grade, Grade::A, "{g:?}");
     }
 

@@ -1029,7 +1029,10 @@ mod tests {
             &[&["6", "2ghz", "20", "802.11n", "open", "-50", "-90"]],
         );
         let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80")).unwrap();
-        assert!(out.contains("open or legacy security"), "{out}");
+        assert!(
+            out.contains("open, legacy or unrecognised security"),
+            "{out}"
+        );
     }
 
     const VERDICT_COLS: &[&str] = &[

@@ -582,16 +582,6 @@ sequence is not assumed to be well-formed pairs: a resume with no preceding paus
 opens no gap, and databases written before the startup edge existed still close
 their gaps by the `sample` inference.
 
-**The air scan's access points also carry a grade, computed rather than
-stored.** `air_ap` (read by `AIR_LATEST_APS_SQL`, rendered by the CLI's `air`
-command and the bar's air-map window) is judged on two independent axes, both
-pure functions of `AirObservation` with no query of their own: a configuration
-letter A-F (`AirObservation::grade`, penalised over security/band/width/PHY
-generation) and a signal bucket good/fair/poor (`AirObservation::signal`, the
-RSSI-noise gap) — the rubric decided at (realm net-observer, node #89). A rubric
-input the scan did not report costs the AP nothing and only lowers the grade's
-confidence, named in its reasons.
-
 **Passive stretches are the second bracket, derived the same way but kept
 apart.** `probing_stretch` opens at a `passive` edge whose predecessor is not
 `passive` (a passive startup edge after a crash continues a stretch rather than
@@ -602,6 +592,26 @@ deliberately not folded into `observation_gap`: a moment inside a stretch has a
 row and reads `unknown` from its `SKIP`s, never `gap`. `silences_sql` lists
 both brackets under a `kind` column (`pause` | `passive`); `observation_gaps_sql`
 stays pauses-only. (realm net-observer, node #88)
+
+### Air scan
+
+The wifi collector's air scan records the radio neighbourhood as `system_profiler
+SPAirPortDataType` reports it — one `air_sample` row per scan (or a `SKIP` with
+its reason) and one `air_ap` row per access point heard: channel, band, width,
+PHY mode, security label and signal/noise; the report carries no BSSID and
+redacts every SSID (realm net-observer, node #47). `AIR_LATEST_SCAN_SQL`,
+`AIR_LATEST_APS_SQL` and `AIR_SELF_CHANNEL_SQL` read the newest scan for the CLI's
+`air` and the bar's air map.
+
+**The air scan's access points also carry a grade, computed rather than
+stored.** `air_ap` (read by `AIR_LATEST_APS_SQL`, rendered by the CLI's `air`
+command and the bar's air-map window) is judged on two independent axes, both
+pure functions of `AirObservation` with no query of their own: a configuration
+letter A-F (`AirObservation::grade`, penalised over security/band/width/PHY
+generation) and a signal bucket good/fair/poor (`AirObservation::signal`, the
+RSSI-noise gap) — the rubric decided at (realm net-observer, node #89). A rubric
+input the scan did not report costs the AP nothing and only lowers the grade's
+confidence, named in its reasons.
 
 ### Verdict vocabulary
 
