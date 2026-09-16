@@ -399,8 +399,7 @@ const ENDPOINT_BLOCK_SCAN: usize = 64;
 /// breaks the run; a cohort with any `Ok` is not a fleet-wide block. Proxy
 /// history does not survive a resume (only the link change basis is carried),
 /// so after `clear_for_resume` this simply waits for `consecutive` fresh
-/// cohorts. (realm net-observer, node: pending — rationale in the PR body
-/// until a graph session records it)
+/// cohorts. (realm net-observer, node #69)
 pub struct EndpointBlock {
     pub consecutive: usize,
 }
@@ -469,8 +468,7 @@ while the reference host answers",
 /// gateway, quiet mode, no gateway): no measurement, no fire. A probed tick
 /// where nobody answered is the whole segment dead — `gw-drop` territory, not
 /// a selective ban. The gateway match is exhaustive so a future verdict token
-/// cannot join the fault set by accident. (realm net-observer, node: pending —
-/// rationale in the PR body until a graph session records it)
+/// cannot join the fault set by accident. (realm net-observer, node #70)
 pub struct PerClientBlock;
 impl Condition for PerClientBlock {
     fn id(&self) -> &'static str {
@@ -526,8 +524,7 @@ fn is_tunnel_or_discard_iface(name: &str) -> bool {
 ///
 /// `None` means the pool route could not be determined (no config, no range, no
 /// route) or sing-box's TUN is not up: the absence of a measurement, never a
-/// hijack. (realm net-observer, node: pending — rationale in the PR body until
-/// a graph session records it)
+/// hijack. (realm net-observer, node #71)
 pub struct FakeIpHijack;
 impl Condition for FakeIpHijack {
     fn id(&self) -> &'static str {
@@ -576,8 +573,7 @@ impl Condition for FakeIpHijack {
 /// a young direct stream is not proof the underlay was healthy across the
 /// window, so it reads "underlay-ambiguous" rather than exonerating the
 /// underlay. Proxy history does not survive a resume, so after
-/// `clear_for_resume` this waits for a fresh reading. (realm net-observer,
-/// node: pending — rationale in the PR body until a graph session records it)
+/// `clear_for_resume` this waits for a fresh reading. (realm net-observer, node #72)
 pub struct EstablishedStall;
 impl Condition for EstablishedStall {
     fn id(&self) -> &'static str {
