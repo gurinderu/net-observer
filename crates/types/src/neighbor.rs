@@ -129,6 +129,26 @@ pub struct NeighborLifetime {
     pub last_seen_us: i64,
 }
 
+/// Which slice of one segment's recorded history to read: a single instant, or
+/// a window. The predicate is over a [`NeighborLifetime`]'s bounds (and the
+/// same bounds on the ports and vulns the store keeps per neighbour).
+///
+/// Lives here, not in `store`, because it travels: the CLI parses it from
+/// `--at` / `--since` / `--until`, `store::diagnosis::history_sql` turns it into
+/// SQL, and `net_observer_ipc::DiagnosticQuery::History` carries it to a running
+/// daemon — one type on both sides of the socket, and the bar (a pure socket
+/// client) never has to depend on `store` to name it. (realm net-observer,
+/// node #58)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryWindow {
+    /// The neighbours (and their ports/vulns) live at exactly this `ts_us`:
+    /// `first_seen_us <= at <= last_seen_us`.
+    At(i64),
+    /// The neighbours (and their ports/vulns) whose lifetime overlaps
+    /// `[since, until]`: `first_seen_us <= until AND last_seen_us >= since`.
+    Range { since: i64, until: i64 },
+}
+
 /// One tick of the `neighbors` collector.
 ///
 /// `network_key` is what separates the coworking segment from the home one: the

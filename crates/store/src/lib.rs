@@ -62,4 +62,16 @@ pub trait Store {
     /// `topology_link.first_seen_us` reaches the socket.
     fn topology_lifetimes(&self) -> Result<Vec<TopologyLifetime>, StoreError>;
     fn query_scalar_i64(&self, sql: &str) -> Result<i64, StoreError>;
+    /// Run one read-only query and return its column names plus stringified
+    /// rows — the primitive every named diagnosis in [`diagnosis`] is built on.
+    ///
+    /// On the trait, not only on [`DuckdbStore`], because the daemon's socket
+    /// server holds its store as `dyn Store` and answers the named diagnoses
+    /// through it while the daemon runs — the only reader that can, since the
+    /// daemon's per-process lock keeps every other opener out. (realm
+    /// net-observer, node #58)
+    fn query_table(&self, sql: &str) -> Result<QueryTable, StoreError>;
+    /// Like [`Store::query_table`], for a [`diagnosis::PreparedSql`] whose
+    /// moment/threshold values are bound, never interpolated.
+    fn query_prepared(&self, p: &diagnosis::PreparedSql) -> Result<QueryTable, StoreError>;
 }

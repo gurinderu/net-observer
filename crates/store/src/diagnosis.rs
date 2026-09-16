@@ -77,8 +77,9 @@
 //! "the nearest proxy/host sample at or before this link sample". That is the
 //! join the whole storage choice was made for.
 
-use crate::{DuckdbStore, QueryTable, StoreError};
+use crate::{DuckdbStore, QueryTable, Store, StoreError};
 use duckdb::types::{ToSql, Value};
+pub use types::HistoryWindow;
 
 /// A prepared query alongside the values bound to its `?` placeholders, in the
 /// order those placeholders appear in the SQL text.
@@ -92,7 +93,11 @@ pub struct PreparedSql {
 }
 
 impl PreparedSql {
-    fn params_as_dyn(&self) -> Vec<&dyn ToSql> {
+    pub(crate) fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    pub(crate) fn params_as_dyn(&self) -> Vec<&dyn ToSql> {
         self.params.iter().map(|v| v as &dyn ToSql).collect()
     }
 }
@@ -613,28 +618,18 @@ ORDER BY s.last_seen_us DESC, s.network_key"
         .to_string()
 }
 
-/// Which slice of one segment's history to read: a single instant, or a window.
-#[derive(Debug, Clone, Copy)]
-pub enum HistoryWindow {
-    /// The neighbours (and their ports/vulns) live at exactly this `ts_us`:
-    /// `first_seen_us <= at <= last_seen_us`.
-    At(i64),
-    /// The neighbours (and their ports/vulns) whose lifetime overlaps
-    /// `[since, until]`: `first_seen_us <= until AND last_seen_us >= since`.
-    Range { since: i64, until: i64 },
-}
-
-impl HistoryWindow {
-    /// The activity predicate for a table carrying `first_seen_us` /
-    /// `last_seen_us`, with those columns qualified by `alias`.
-    fn predicate(self, alias: &str) -> String {
-        match self {
-            HistoryWindow::At(at) => {
-                format!("{alias}.first_seen_us <= {at} AND {alias}.last_seen_us >= {at}")
-            }
-            HistoryWindow::Range { since, until } => {
-                format!("{alias}.first_seen_us <= {until} AND {alias}.last_seen_us >= {since}")
-            }
+/// The activity predicate of a [`HistoryWindow`] for a table carrying
+/// `first_seen_us` / `last_seen_us`, with those columns qualified by `alias`.
+///
+/// The window type itself lives in `types` (it travels over the socket); only
+/// its SQL rendering is this crate's business.
+fn window_predicate(window: HistoryWindow, alias: &str) -> String {
+    match window {
+        HistoryWindow::At(at) => {
+            format!("{alias}.first_seen_us <= {at} AND {alias}.last_seen_us >= {at}")
+        }
+        HistoryWindow::Range { since, until } => {
+            format!("{alias}.first_seen_us <= {until} AND {alias}.last_seen_us >= {since}")
         }
     }
 }
@@ -652,9 +647,9 @@ impl HistoryWindow {
 /// in the segment list.
 pub fn history_sql(network: &str, window: HistoryWindow) -> Result<String, BadNetworkKey> {
     validate_network_key(network)?;
-    let neighbor_pred = window.predicate("n");
-    let port_pred = window.predicate("p");
-    let vuln_pred = window.predicate("v");
+    let neighbor_pred = window_predicate(window, "n");
+    let port_pred = window_predicate(window, "p");
+    let vuln_pred = window_predicate(window, "v");
     Ok(format!(
         "SELECT n.mac, n.ip, n.oui, n.hostname, n.source, n.iface,
        n.first_seen_us, n.last_seen_us,
@@ -751,15 +746,11 @@ fn validate_network_key(n: &str) -> Result<(), BadNetworkKey> {
     }
 }
 
+/// The canned diagnoses with their default thresholds, each one call. The
+/// read primitives they run on (`query_table` / `query_prepared`) are on the
+/// [`Store`] trait, so a caller holding `dyn Store` — the daemon's socket
+/// server — can run the same builders without naming this type.
 impl DuckdbStore {
-    /// Run a [`PreparedSql`] built by one of this module's parameterized
-    /// builders — the moment/threshold values are bound, never interpolated.
-    /// Exposed so callers outside this crate (the CLI's offline `diagnose`
-    /// commands) never need to depend on `duckdb`'s types directly.
-    pub fn query_prepared(&self, p: &PreparedSql) -> Result<QueryTable, StoreError> {
-        self.query_table_params(&p.sql, &p.params_as_dyn())
-    }
-
     /// Run [`verdict_at_sql`] with [`DEFAULT_STARVATION_LOAD`].
     pub fn verdict_at(&self, ts_us: i64) -> Result<QueryTable, StoreError> {
         self.query_prepared(&verdict_at_sql(ts_us, DEFAULT_STARVATION_LOAD))

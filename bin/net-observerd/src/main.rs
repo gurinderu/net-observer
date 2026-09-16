@@ -7,6 +7,7 @@
 
 mod acting;
 mod api;
+mod api_query;
 mod pipeline;
 
 use std::path::Path;

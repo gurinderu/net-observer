@@ -668,6 +668,22 @@ async fn handle_conn(
                 .collect();
             Response::Incidents(incidents)
         }
+        // A read, like `Status`: no peer gate. DuckDB is synchronous and a
+        // diagnosis walks the whole record, so it runs off the runtime; the
+        // daemon's own starvation load keeps a live reading in step with the
+        // incidents it recorded (see `api_query`).
+        Ok(Request::Query(q)) => {
+            let store = Arc::clone(&srv.store);
+            match tokio::task::spawn_blocking(move || {
+                crate::api_query::run_query(store.as_ref(), q, crate::STARVATION_LOAD)
+            })
+            .await
+            {
+                Ok(Ok(table)) => Response::Table(table),
+                Ok(Err(message)) => Response::Error(message),
+                Err(e) => Response::Error(format!("diagnosis task failed: {e}")),
+            }
+        }
         Ok(Request::Control(cmd)) => {
             let cx = ControlCtx {
                 policy: &srv.policy,

@@ -7,13 +7,17 @@
 //! - **LIVE** — `status` and `incidents` read the daemon's in-memory snapshot
 //!   over its Unix-domain socket (`net-observer-ipc`). No DB is opened, so there is
 //!   zero contention with the running daemon.
-//! - **OFFLINE** — `query <SQL>` opens the DuckDB file directly for ad-hoc
-//!   forensics, and the `diagnose` commands (`why`, `incident-context`,
-//!   `wedge-or-starvation`, `gateway-ramp`, `gaps`) run the canned
-//!   `store::diagnosis` queries over the same path, so "which layer failed" is
-//!   reachable without writing SQL. This only works while the daemon is stopped;
-//!   if `net-observerd` is running it holds the lock and the open fails with a
-//!   clear message rather than a panic.
+//! - **LIVE FIRST, THEN OFFLINE** — the named diagnoses (`why`,
+//!   `incident-context`, `wedge-or-starvation`, `gateway-ramp`, `gaps`,
+//!   `neighbors`, `vulns`, `segments`, `history`, `topology`) run the canned
+//!   `store::diagnosis` queries, so "which layer failed" is reachable without
+//!   writing SQL. Each asks the running daemon first (`Request::Query`, answered
+//!   from the daemon's own store while it keeps collecting) and opens the
+//!   DuckDB file itself only when no daemon answers on the socket — see
+//!   [`diagnose_table`] for the exact rule. (realm net-observer, node #58)
+//! - **OFFLINE** — `query <SQL>` and `air` open the DuckDB file directly. This
+//!   only works while the daemon is stopped; if `net-observerd` is running it
+//!   holds the lock and the open fails with a clear message rather than a panic.
 
 mod diagnose;
 
@@ -21,12 +25,12 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::Config;
 use net_observer_ipc::{
-    ControlCmd, ControlResult, EventKind, IncidentSummary, Request, Response, ScanOptions,
-    StatusSnapshot, StreamFrame,
+    ControlCmd, ControlResult, DiagnosticQuery, EventKind, IncidentSummary, QueryOutcome, Request,
+    Response, ScanOptions, StatusSnapshot, StreamFrame, Table,
 };
 use std::io::Write;
 use std::process::ExitCode;
-use store::{DuckdbStore, QueryTable, diagnosis};
+use store::{DuckdbStore, QueryTable, Store as _, diagnosis};
 
 /// The `load1` above which a dead tun reads as host starvation rather than a
 /// proxy wedge. The CLI reads the record with the same threshold the daemon
@@ -41,11 +45,12 @@ const LOAD_THRESHOLD: f64 = diagnosis::DEFAULT_STARVATION_LOAD;
 )]
 struct Cli {
     /// Optional path to the observer config file (TOML). Supplies the daemon
-    /// socket path for the live `status`/`incidents` commands.
+    /// socket path for every command that talks to the running daemon.
     #[arg(long)]
     config: Option<String>,
-    /// Path to the observer DuckDB file, used only by the offline `query`
-    /// command (requires the daemon to be stopped — it holds the DB lock).
+    /// Path to the observer DuckDB file. Opened directly by the offline `query`
+    /// and `air` commands, and by the diagnoses only when no daemon answers on
+    /// the socket (a running daemon holds the DB lock and is asked instead).
     #[arg(long, default_value = "/var/lib/observer/observer.duckdb")]
     db: String,
     #[command(subcommand)]
@@ -129,24 +134,26 @@ enum Command {
         /// `collectors.neighbors.scan.cve` permission, and a provisioned
         /// `collectors.neighbors.cve_snapshot_dir`; without all three the daemon
         /// drops it and says so. Each stored match is a hypothesis, not a fact.
-        /// Off unless given. Read the findings back offline with `vulns`.
+        /// Off unless given. Read the findings back with `vulns`.
         #[arg(long)]
         cve: bool,
     },
-    /// The neighbours the record knows on each segment, newest sighting first
-    /// (offline): MAC, address, vendor OUI, name if one was ever learned, and
-    /// how it came to be known.
+    /// The neighbours the record knows on each segment, newest sighting first:
+    /// MAC, address, vendor OUI, name if one was ever learned, and how it came
+    /// to be known. Asks the running daemon first, reads the DB file only when
+    /// no daemon answers.
     Neighbors {
         /// Restrict to one segment, by its gateway MAC. Omit for every segment
         /// this machine has recorded.
         #[arg(long)]
         network: Option<String>,
     },
-    /// The CVEs the record hypothesises for open ports, newest sighting first
-    /// (offline): MAC, address, port, CVE id, confidence, whether it is
-    /// known-exploited, and CVSS. Each row is a HYPOTHESIS from matching a
-    /// grabbed banner against the local snapshot, never an asserted fact —
-    /// weigh it by its confidence and the KEV flag.
+    /// The CVEs the record hypothesises for open ports, newest sighting first:
+    /// MAC, address, port, CVE id, confidence, whether it is known-exploited,
+    /// and CVSS. Each row is a HYPOTHESIS from matching a grabbed banner
+    /// against the local snapshot, never an asserted fact — weigh it by its
+    /// confidence and the KEV flag. Asks the running daemon first, reads the DB
+    /// file only when no daemon answers.
     Vulns {
         /// Restrict to one segment, by its gateway MAC. Omit for every segment
         /// this machine has recorded.
@@ -154,10 +161,11 @@ enum Command {
         network: Option<String>,
     },
     /// The switch-topology uplinks learned passively from received LLDP/CDP
-    /// frames, newest sighting first (offline): local interface, remote chassis,
-    /// remote port, the switch/AP's system name and capabilities, and whether
-    /// LLDP or CDP carried it. Each row is a HYPOTHESIS — LLDP/CDP are
-    /// unauthenticated and spoofable — never an asserted fact.
+    /// frames, newest sighting first: local interface, remote chassis, remote
+    /// port, the switch/AP's system name and capabilities, and whether LLDP or
+    /// CDP carried it. Each row is a HYPOTHESIS — LLDP/CDP are unauthenticated
+    /// and spoofable — never an asserted fact. Asks the running daemon first,
+    /// reads the DB file only when no daemon answers.
     Topology {
         /// Restrict to one local interface (e.g. `en0`). Omit for every
         /// interface this machine has recorded an uplink on.
@@ -180,7 +188,8 @@ enum Command {
         sql: String,
     },
     /// Which layer failed at a moment: the state of link, proxy server, tun and
-    /// host load as the record has it, plus the layer it blames (offline).
+    /// host load as the record has it, plus the layer it blames. Asks the
+    /// running daemon first, reads the DB file only when no daemon answers.
     ///
     /// A moment the daemon was paused for is reported as a refusal — the gap and
     /// its bounds — not as a row of blank measurements.
@@ -192,18 +201,21 @@ enum Command {
         #[arg(long, default_value = "now")]
         at: String,
     },
-    /// Every incident with the layer state just before it opened (offline).
+    /// Every incident with the layer state just before it opened. Asks the
+    /// running daemon first, reads the DB file only when no daemon answers.
     ///
     /// An incident that opened inside an observation gap gets no context: the
     /// state from before the pause is not context for it, and is marked withheld.
     IncidentContext,
-    /// The wedge-vs-starvation verdict over each recent `tun=000` episode
-    /// (offline) — the discriminator that decides whether a restart is the cure.
+    /// The wedge-vs-starvation verdict over each recent `tun=000` episode — the
+    /// discriminator that decides whether a restart is the cure. Asks the
+    /// running daemon first, reads the DB file only when no daemon answers.
     ///
     /// An episode the record cannot classify is reported `unknown`, not guessed.
     WedgeOrStarvation,
     /// The gateway RTT series before a drop, with its least-squares slope, so a
-    /// coworking-gateway ramp is visible as data (offline).
+    /// coworking-gateway ramp is visible as data. Asks the running daemon
+    /// first, reads the DB file only when no daemon answers.
     ///
     /// The slope is refused — "not computed" — when the window crosses an
     /// observation gap.
@@ -217,19 +229,23 @@ enum Command {
         window_us: i64,
     },
     /// The observation gaps the record contains — every interval the daemon
-    /// deliberately collected nothing for, and what closed each (offline).
+    /// deliberately collected nothing for, and what closed each. Asks the
+    /// running daemon first, reads the DB file only when no daemon answers.
     Gaps,
     /// The network segments this machine has ever recorded, newest activity
-    /// first (offline): the segment key, a best-effort SSID guess, the gateway
-    /// IP when recoverable, first/last seen, and how many devices it held.
+    /// first: the segment key, a best-effort SSID guess, the gateway IP when
+    /// recoverable, first/last seen, and how many devices it held. Asks the
+    /// running daemon first, reads the DB file only when no daemon answers.
     ///
     /// `ssid_guess` is a TIME-overlap heuristic, never an asserted fact: the
     /// daemon does not join an SSID to a segment. A segment recorded under
     /// `unknown` (the gateway MAC was unreadable) is listed like any other.
     Segments,
-    /// One segment's recorded state (offline): the neighbours that were live at
-    /// an instant (`--at`), or active over a window (`--since`/`--until`), each
+    /// One segment's recorded state: the neighbours that were live at an
+    /// instant (`--at`), or active over a window (`--since`/`--until`), each
     /// with a count of its open ports and hypothesised vulns over that slice.
+    /// Asks the running daemon first, reads the DB file only when no daemon
+    /// answers.
     History {
         /// The segment to read, by its gateway MAC — or the literal `unknown`
         /// for the segment whose gateway MAC was unreadable. A non-key is an
@@ -373,58 +389,92 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
+        // The named diagnoses: the filter is validated HERE, before any socket
+        // or file is touched, so a bad key is the builder's own error and never
+        // a round-trip — then the daemon is asked, and the file read only when
+        // no daemon answers (see `diagnose_table`).
         Command::Neighbors { network } => {
             let sql = diagnosis::neighbors_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
-            let table = run_query(&cli.db, &sql)?;
+            let table = diagnose_table(
+                cli,
+                DiagnosticQuery::Neighbors {
+                    network: network.clone(),
+                },
+                |db| run_query(db, &sql),
+            )?;
             print!("{}", format_table(&table));
         }
         Command::Vulns { network } => {
             let sql = diagnosis::vulns_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
-            let table = run_query(&cli.db, &sql)?;
+            let table = diagnose_table(
+                cli,
+                DiagnosticQuery::Vulns {
+                    network: network.clone(),
+                },
+                |db| run_query(db, &sql),
+            )?;
             print!("{}", format_table(&table));
         }
         Command::Topology { iface } => {
             let sql = diagnosis::topology_sql(iface.as_deref()).map_err(|e| anyhow!("{e}"))?;
-            let table = run_query(&cli.db, &sql)?;
+            let table = diagnose_table(
+                cli,
+                DiagnosticQuery::Topology {
+                    iface: iface.clone(),
+                },
+                |db| run_query(db, &sql),
+            )?;
             print!("{}", format_table(&table));
         }
         Command::Air => {
             // Three reads, one moment: the scan itself (so a SKIP is rendered as
             // a refusal), what it heard, and our own channel to compare against.
-            let scan = run_query(&cli.db, diagnosis::AIR_LATEST_SCAN_SQL)?;
-            let aps = run_query(&cli.db, diagnosis::AIR_LATEST_APS_SQL)?;
-            let own = run_query(&cli.db, diagnosis::AIR_SELF_CHANNEL_SQL)?;
+            let scan = table_from_query(run_query(&cli.db, diagnosis::AIR_LATEST_SCAN_SQL)?);
+            let aps = table_from_query(run_query(&cli.db, diagnosis::AIR_LATEST_APS_SQL)?);
+            let own = table_from_query(run_query(&cli.db, diagnosis::AIR_SELF_CHANNEL_SQL)?);
             print!("{}", diagnose::format_air(&scan, &aps, &own)?);
         }
         Command::Query { sql } => {
-            let table = run_query(&cli.db, sql)?;
+            let table = table_from_query(run_query(&cli.db, sql)?);
             print!("{}", format_table(&table));
         }
         Command::Why { at } => {
             let ts_us = diagnose::parse_at(at)?;
-            let table = run_prepared(&cli.db, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))?;
+            let table = diagnose_table(cli, DiagnosticQuery::Why { ts_us }, |db| {
+                run_prepared(db, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))
+            })?;
             print!("{}", diagnose::format_verdict_at(&table, ts_us)?);
         }
         Command::IncidentContext => {
-            let table = run_prepared(&cli.db, &diagnosis::incident_context_sql(LOAD_THRESHOLD))?;
+            let table = diagnose_table(cli, DiagnosticQuery::IncidentContext, |db| {
+                run_prepared(db, &diagnosis::incident_context_sql(LOAD_THRESHOLD))
+            })?;
             print!("{}", diagnose::format_incident_context(&table)?);
         }
         Command::WedgeOrStarvation => {
-            let sql = diagnosis::wedge_vs_starvation_sql(
-                LOAD_THRESHOLD,
-                diagnosis::DEFAULT_EPISODE_GAP_US,
-            );
-            let table = run_prepared(&cli.db, &sql)?;
+            let table = diagnose_table(cli, DiagnosticQuery::WedgeVsStarvation, |db| {
+                run_prepared(
+                    db,
+                    &diagnosis::wedge_vs_starvation_sql(
+                        LOAD_THRESHOLD,
+                        diagnosis::DEFAULT_EPISODE_GAP_US,
+                    ),
+                )
+            })?;
             print!("{}", diagnose::format_wedge_vs_starvation(&table)?);
         }
         Command::GatewayRamp { drop, window_us } => {
             let drop_ts_us = match drop {
                 Some(d) => diagnose::parse_at(d)?,
-                None => latest_gw_drop(&cli.db)?,
+                None => latest_gw_drop(cli)?,
             };
-            let table = run_prepared(
-                &cli.db,
-                &diagnosis::gateway_ramp_sql(drop_ts_us, *window_us),
+            let table = diagnose_table(
+                cli,
+                DiagnosticQuery::GatewayRamp {
+                    drop_ts_us,
+                    window_us: *window_us,
+                },
+                |db| run_prepared(db, &diagnosis::gateway_ramp_sql(drop_ts_us, *window_us)),
             )?;
             print!(
                 "{}",
@@ -432,11 +482,15 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             );
         }
         Command::Gaps => {
-            let table = run_query(&cli.db, &diagnosis::observation_gaps_sql())?;
+            let table = diagnose_table(cli, DiagnosticQuery::Gaps, |db| {
+                run_query(db, &diagnosis::observation_gaps_sql())
+            })?;
             print!("{}", diagnose::format_observation_gaps(&table)?);
         }
         Command::Segments => {
-            let table = run_query(&cli.db, &diagnosis::segments_sql())?;
+            let table = diagnose_table(cli, DiagnosticQuery::Segments, |db| {
+                run_query(db, &diagnosis::segments_sql())
+            })?;
             print!("{}", format_table(&table));
         }
         Command::History {
@@ -457,7 +511,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 _ => diagnosis::HistoryWindow::At(diagnose::parse_at("now")?),
             };
             let sql = diagnosis::history_sql(network, window).map_err(|e| anyhow!("{e}"))?;
-            let table = run_query(&cli.db, &sql)?;
+            let table = diagnose_table(
+                cli,
+                DiagnosticQuery::History {
+                    network: network.clone(),
+                    window,
+                },
+                |db| run_query(db, &sql),
+            )?;
             print!("{}", format_table(&table));
         }
     }
@@ -470,17 +531,76 @@ fn load_config(cli: &Cli) -> Result<Config> {
     Config::load(cli.config.as_deref()).map_err(|e| anyhow!("failed to load observer config: {e}"))
 }
 
+/// Whether a socket error means `net-observerd` is not running at all — no
+/// socket file, or one nobody listens on — as opposed to a daemon that is there
+/// and could not be talked to.
+fn daemon_not_running(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+    matches!(e.kind(), NotFound | ConnectionRefused)
+}
+
 /// Send one request to the daemon over the socket. An absent / refused socket
 /// (`net-observerd` not running) becomes a clear message, never a panic.
 fn daemon_query(socket_path: &str, req: &Request) -> Result<Response> {
     net_observer_ipc::query(socket_path, req).map_err(|e| {
-        use std::io::ErrorKind::{ConnectionRefused, NotFound};
-        if matches!(e.kind(), NotFound | ConnectionRefused) {
+        if daemon_not_running(&e) {
             anyhow!("net-observerd not running (socket {socket_path} unavailable)")
         } else {
             anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
         }
     })
+}
+
+/// Run one named diagnosis: ask the running daemon first, and read the DuckDB
+/// file only when no daemon answers. (realm net-observer, node #58)
+///
+/// The record must be reachable live and post-mortem by one rule, and the
+/// daemon's lock decides which path can work — so the rule keys on what the
+/// socket says, never on guessing whether the file is locked:
+///
+/// - the daemon answers → its table, read while it keeps collecting;
+/// - nothing listens on the socket ([`daemon_not_running`]) → `offline`,
+///   exactly the pre-socket path, against `--db`;
+/// - the daemon is there but cannot READ the request (built before
+///   `Request::Query`) → `offline` too, with one line on stderr saying so —
+///   that daemon still holds the lock, and the reader deserves to know why the
+///   open that follows is about to fail;
+/// - the daemon read the request and could not run it → its own message and a
+///   non-zero exit. Never the offline path: the file would only meet the lock
+///   and report the wrong problem.
+fn diagnose_table(
+    cli: &Cli,
+    q: DiagnosticQuery,
+    offline: impl FnOnce(&str) -> Result<QueryTable>,
+) -> Result<Table> {
+    let cfg = load_config(cli)?;
+    match net_observer_ipc::diagnose(&cfg.socket_path, q) {
+        Ok(QueryOutcome::Table(table)) => return Ok(table),
+        Ok(QueryOutcome::Failed(m)) => return Err(anyhow!("net-observerd returned an error: {m}")),
+        Ok(QueryOutcome::Unsupported(m)) => eprintln!(
+            "net-observerd cannot answer diagnoses over the socket ({m}); reading {} offline",
+            cli.db
+        ),
+        Err(e) if daemon_not_running(&e) => {}
+        Err(e) => {
+            return Err(anyhow!(
+                "failed to query net-observerd over socket {}: {e}",
+                cfg.socket_path
+            ));
+        }
+    }
+    offline(&cli.db).map(table_from_query)
+}
+
+/// `store::QueryTable` → the wire's [`Table`]: the same two fields, moved, so
+/// the offline path renders through exactly the code the live path does. The
+/// daemon carries the same conversion on its side (`api_query`); neither crate
+/// can own it for both, because `net-observer-ipc` must not depend on `store`.
+fn table_from_query(q: QueryTable) -> Table {
+    Table {
+        columns: q.columns,
+        rows: q.rows,
+    }
 }
 
 /// Fetch the live [`StatusSnapshot`] from the daemon.
@@ -565,8 +685,7 @@ impl TailEnd {
 ///   panicking the way `println!` would on a write failure.
 fn stream_events(socket_path: &str, kinds: Option<Vec<EventKind>>) -> Result<ExitCode> {
     let sub = net_observer_ipc::subscribe(socket_path, kinds.as_deref()).map_err(|e| {
-        use std::io::ErrorKind::{ConnectionRefused, NotFound};
-        if matches!(e.kind(), NotFound | ConnectionRefused) {
+        if daemon_not_running(&e) {
             anyhow!("net-observerd not running (socket {socket_path} unavailable)")
         } else {
             anyhow!("failed to subscribe to net-observerd over socket {socket_path}: {e}")
@@ -743,7 +862,8 @@ fn open_store(db_path: &str) -> Result<DuckdbStore> {
         if is_lock_error(&msg) {
             anyhow!(
                 "net-observerd is running and holds the DuckDB lock; stop it for \
-                 offline SQL, or use `status`/`incidents` (live via socket)"
+                 offline SQL — `status`/`incidents` and the named diagnoses read \
+                 the running daemon over its socket instead"
             )
         } else {
             anyhow!("failed to open DuckDB at {db_path}: {msg}")
@@ -754,8 +874,18 @@ fn open_store(db_path: &str) -> Result<DuckdbStore> {
 /// The `ts_us` of the newest gateway drop in the record, used when
 /// `gateway-ramp` is invoked without `--drop`. An empty record is an error
 /// naming the flag rather than a ramp plotted around an arbitrary instant.
-fn latest_gw_drop(db_path: &str) -> Result<i64> {
-    let table = run_query(db_path, diagnosis::GW_DROPS_SQL)?;
+/// Read the way every diagnosis is: the daemon first, the file when it is not
+/// there.
+fn latest_gw_drop(cli: &Cli) -> Result<i64> {
+    let table = diagnose_table(cli, DiagnosticQuery::GwDrops, |db| {
+        run_query(db, diagnosis::GW_DROPS_SQL)
+    })?;
+    newest_drop(&table)
+}
+
+/// The pure half of [`latest_gw_drop`]: the newest drop is the LAST row, since
+/// `GW_DROPS_SQL` lists them oldest first.
+fn newest_drop(table: &Table) -> Result<i64> {
     let last =
         table.rows.last().and_then(|r| r.first()).ok_or_else(|| {
             anyhow!("no gateway drop in the record; pass --drop <time> to pick one")
@@ -875,7 +1005,7 @@ fn format_incidents(rows: &[IncidentSummary]) -> String {
 }
 
 /// Render a generic query result as a simple space-padded table.
-fn format_table(table: &QueryTable) -> String {
+fn format_table(table: &Table) -> String {
     let mut widths: Vec<usize> = table.columns.iter().map(String::len).collect();
     for row in &table.rows {
         for (i, cell) in row.iter().enumerate() {
@@ -1045,13 +1175,42 @@ mod tests {
 
     #[test]
     fn format_table_renders_header_and_cells() {
-        let table = QueryTable {
+        let table = Table {
             columns: vec!["ts_us".into(), "gw".into()],
             rows: vec![vec!["42".into(), "OK".into()]],
         };
         let out = format_table(&table);
         assert!(out.contains("ts_us") && out.contains("gw"));
         assert!(out.contains("42") && out.contains("OK"));
+    }
+
+    /// The offline path renders through the wire shape: the conversion must
+    /// keep every cell, the empty-string `NULL` included.
+    #[test]
+    fn table_from_query_keeps_every_cell() {
+        let q = QueryTable {
+            columns: vec!["a".into(), "b".into()],
+            rows: vec![vec!["1".into(), "".into()], vec!["".into(), "x".into()]],
+        };
+        let t = table_from_query(q.clone());
+        assert_eq!(t.columns, q.columns);
+        assert_eq!(t.rows, q.rows);
+    }
+
+    /// `GW_DROPS_SQL` lists drops oldest first, so the newest is the LAST row;
+    /// an empty record names the flag to pass instead of inventing a moment.
+    #[test]
+    fn newest_drop_is_the_last_row_and_an_empty_record_names_the_flag() {
+        let table = Table {
+            columns: vec!["ts_us".into(), "gw".into()],
+            rows: vec![
+                vec!["100".into(), "FAIL".into()],
+                vec!["900".into(), "NOGW".into()],
+            ],
+        };
+        assert_eq!(newest_drop(&table).unwrap(), 900);
+        let e = newest_drop(&Table::default()).unwrap_err().to_string();
+        assert!(e.contains("--drop"), "{e}");
     }
 
     #[test]

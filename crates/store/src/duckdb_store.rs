@@ -1,4 +1,4 @@
-use crate::{Store, schema::SCHEMA_SQL};
+use crate::{Store, diagnosis::PreparedSql, schema::SCHEMA_SQL};
 use duckdb::{Connection, params};
 use std::sync::Mutex;
 use types::{
@@ -123,11 +123,6 @@ impl DuckdbStore {
             })?
             .collect::<Result<Vec<_>, duckdb::Error>>()?;
         Ok(rows)
-    }
-
-    /// Run an arbitrary query and return its column names plus stringified rows.
-    pub fn query_table(&self, sql: &str) -> Result<QueryTable, StoreError> {
-        self.query_table_params(sql, &[])
     }
 
     /// Run a prepared query with positional `?` parameter values and return its
@@ -519,6 +514,14 @@ impl Store for DuckdbStore {
 
     fn query_scalar_i64(&self, sql: &str) -> Result<i64, StoreError> {
         Ok(self.conn.lock().unwrap().query_row(sql, [], |r| r.get(0))?)
+    }
+
+    fn query_table(&self, sql: &str) -> Result<QueryTable, StoreError> {
+        self.query_table_params(sql, &[])
+    }
+
+    fn query_prepared(&self, p: &PreparedSql) -> Result<QueryTable, StoreError> {
+        self.query_table_params(p.sql(), &p.params_as_dyn())
     }
 }
 
