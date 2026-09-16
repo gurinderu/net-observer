@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use collector_core::Readiness;
-use collector_proxy::ProxyFacts;
+use collector_proxy::{ProxyFacts, TunProbe};
 
 /// HTTP timeout for every Clash/TUN request. A stalled proxy control plane is
 /// itself a signal, so we fail fast.
@@ -131,15 +131,17 @@ impl ProxyFacts for ProxySystemFacts {
         parse_vless_endpoints(&text)
     }
 
-    async fn tun_probe(&self, url: &str) -> Option<u16> {
+    async fn tun_probe(&self, url: &str) -> TunProbe {
         // `reqwest` does not turn 4xx/5xx into `Err` (only `error_for_status`
         // would), so this reports the status code of *any* HTTP response (the 204
-        // probe target) and returns `None` only on a transport/timeout failure.
+        // probe target); a transport/timeout/TLS failure — the request was
+        // attempted and no status came back — is `NoStatus`, which the record
+        // stores as `tun_code = 0`, the shell oracle's curl `000`.
         match self.http.get(url).send().await {
-            Ok(resp) => Some(resp.status().as_u16()),
+            Ok(resp) => TunProbe::Status(resp.status().as_u16()),
             Err(e) => {
                 tracing::debug!(url, error = %e, "tun probe failed");
-                None
+                TunProbe::NoStatus
             }
         }
     }

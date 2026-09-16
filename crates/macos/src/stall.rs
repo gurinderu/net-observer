@@ -203,6 +203,16 @@ impl StallProbe for HeldReferenceStreams {
             tun: self.check_slot(&self.tun, None, now).await,
         }
     }
+
+    /// Drop both held sessions. Dropping the TLS stream closes its socket, so
+    /// after this nothing of ours is open toward the reference host; the next
+    /// `check` establishes fresh streams and reports no measurement, exactly
+    /// as it does after a teardown. Called every passive tick, and a no-op on
+    /// an already-empty slot.
+    async fn close(&self) {
+        *self.direct.lock().await = None;
+        *self.tun.lock().await = None;
+    }
 }
 
 /// One `HEAD` round-trip on the held TLS session, classified into

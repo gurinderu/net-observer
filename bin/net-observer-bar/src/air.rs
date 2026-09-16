@@ -383,7 +383,12 @@ impl AirFeed {
                             format!("skipped a frame this bar cannot read: {}", u.detail).into(),
                         );
                     }
-                    StreamFrame::Gap(_) | StreamFrame::Event(_) => self.offline = None,
+                    // A tier switch is stream-integrity like a gap: proof the
+                    // daemon is alive, and nothing this window draws — the air
+                    // scan reads the OS's report and is not an emission class.
+                    StreamFrame::Gap(_) | StreamFrame::Probing(_) | StreamFrame::Event(_) => {
+                        self.offline = None
+                    }
                 }
             }
             BridgeMsg::Offline(reason) => self.offline = Some(reason.into()),
@@ -2932,6 +2937,7 @@ mod tests {
             ts_us: 1,
             kinds: None,
             observing: false,
+            probing: types::ProbingTier::Active,
         }))));
         assert!(feed.paused);
         feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Observing(

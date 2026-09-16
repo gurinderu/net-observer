@@ -29,6 +29,43 @@ pub struct StallReading {
 #[allow(async_fn_in_trait)] // internal workspace port, not a published API
 pub trait StallProbe: Send + Sync {
     async fn check(&self) -> StallReading;
+    /// Drop every held stream, so nothing is kept open — let alone exercised —
+    /// while the probing tier is passive (realm net-observer, node #88). The
+    /// next `check` re-establishes them, reporting no measurement on that
+    /// tick as it does after any teardown. Idempotent: closing nothing is a
+    /// no-op.
+    async fn close(&self);
+}
+
+/// The outcome of one ATTEMPTED TUN probe: the request went out (or tried
+/// to), and either an HTTP status came back or nothing did.
+///
+/// The port distinguishes the two explicitly so the record can: a status is
+/// stored as itself, [`TunProbe::NoStatus`] as `tun_code = 0` — the shell
+/// oracle's curl `000` — and "not probed at all" (the passive tier, a
+/// preflight skip) is the collector's `None`, stored as `NULL`. The offline
+/// readings (`why`, `wedge-or-starvation`) and the live `starvation` rule
+/// both read that `0` as the dead tun; `NULL` is neither health nor fault.
+/// (realm net-observer, node #88)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunProbe {
+    /// An HTTP response came back with this status (204 is the healthy one).
+    Status(u16),
+    /// The request was attempted and no HTTP status came back: connect
+    /// refused, timeout, TLS or another transport failure.
+    NoStatus,
+}
+
+impl TunProbe {
+    /// The value that lands in `ProxySample::tun_code` for an attempted probe:
+    /// the status, or `0` for no status.
+    #[must_use]
+    pub fn code(self) -> u16 {
+        match self {
+            Self::Status(code) => code,
+            Self::NoStatus => 0,
+        }
+    }
 }
 
 /// Proxy facts: the upstream proxy endpoints, the TUN HTTP 204 probe, and
@@ -37,7 +74,10 @@ pub trait StallProbe: Send + Sync {
 pub trait ProxyFacts: Send + Sync {
     /// The upstream proxy endpoints to TCP-probe, as `"host:port"` strings.
     async fn server_endpoints(&self) -> Vec<String>;
-    async fn tun_probe(&self, url: &str) -> Option<u16>;
+    /// Attempt the HTTP 204 probe through the TUN at `url`. Always an
+    /// attempt: whether to send it at all is the collector's decision (the
+    /// probing tier), taken before this is called.
+    async fn tun_probe(&self, url: &str) -> TunProbe;
     async fn selector(&self) -> Option<String>;
     /// Runtime capability probe: can the proxy collector work here/now?
     async fn preflight(&self) -> Readiness;

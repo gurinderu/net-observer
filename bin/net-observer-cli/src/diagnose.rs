@@ -486,8 +486,12 @@ pub(crate) fn format_gateway_ramp(
     Ok(out)
 }
 
-/// **The observation gaps the record contains** — renders
-/// [`store::diagnosis::observation_gaps_sql`].
+/// **The bracketed silences the record contains** — renders
+/// [`store::diagnosis::silences_sql`]: every operator pause and every passive
+/// stretch, told apart by `KIND`. Also renders the pauses-only
+/// [`store::diagnosis::observation_gaps_sql`] a daemon built before `Silences`
+/// answers instead: its table has no `kind` column, and its rows are all
+/// pauses.
 pub(crate) fn format_observation_gaps(table: &Table) -> Result<String> {
     let c = Cols(&table.columns);
     let (go, gc, by) = (
@@ -495,12 +499,17 @@ pub(crate) fn format_observation_gaps(table: &Table) -> Result<String> {
         c.idx("gap_closed_us")?,
         c.idx("gap_closed_by")?,
     );
+    let kind = c.idx("kind").ok();
     let mut rows = Vec::new();
     let mut open_ended = false;
+    let mut passive = false;
     for row in &table.rows {
         let closed = at(row, gc);
         open_ended |= closed.is_empty();
+        let k = kind.map_or("pause", |i| at(row, i));
+        passive |= k == "passive";
         rows.push(vec![
+            k.to_string(),
             stamp(at(row, go)),
             if closed.is_empty() {
                 "(still open)".to_string()
@@ -511,12 +520,18 @@ pub(crate) fn format_observation_gaps(table: &Table) -> Result<String> {
         ]);
     }
     if rows.is_empty() {
-        return Ok("no observation gaps: the record is unbroken\n".to_string());
+        return Ok(
+            "no observation gaps: the record is unbroken and every probe was sent\n".to_string(),
+        );
     }
-    let mut out = aligned(&["OPENED", "CLOSED", "CLOSED_BY"], &rows);
+    let mut out = aligned(&["KIND", "OPENED", "CLOSED", "CLOSED_BY"], &rows);
     if open_ended {
+        out.push_str("\n(still open)  the record ends inside this bracket - nothing closes it.\n");
+    }
+    if passive {
         out.push_str(
-            "\n(still open)  the record ends inside this pause - nothing at all follows it.\n",
+            "\npassive  the daemon withheld every probe; the samples of this stretch \
+             exist and their probe verdicts read SKIP.\n",
         );
     }
     Ok(out)
@@ -1194,15 +1209,51 @@ mod tests {
         assert!(out.contains("(no answer)"), "{out}");
     }
 
-    const GAP_COLS: &[&str] = &["gap_opened_us", "gap_closed_us", "gap_closed_by"];
+    const GAP_COLS: &[&str] = &["kind", "gap_opened_us", "gap_closed_us", "gap_closed_by"];
 
     #[test]
     fn observation_gaps_render_an_open_ended_pause() {
-        let t = table(GAP_COLS, &[&["1000", "2000", "resume"], &["9000", "", ""]]);
+        let t = table(
+            GAP_COLS,
+            &[
+                &["pause", "1000", "2000", "resume"],
+                &["pause", "9000", "", ""],
+            ],
+        );
         let out = format_observation_gaps(&t).unwrap();
         assert!(out.contains("resume"), "{out}");
         assert!(out.contains("(still open)"), "{out}");
-        assert!(out.contains("nothing at all follows it"), "{out}");
+        assert!(out.contains("nothing closes it"), "{out}");
+        assert!(!out.contains("withheld every probe"), "{out}");
+    }
+
+    /// A passive stretch is listed as its own kind, and the legend says what
+    /// its `SKIP`s mean.
+    #[test]
+    fn observation_gaps_render_a_passive_stretch_with_its_legend() {
+        let t = table(
+            GAP_COLS,
+            &[
+                &["passive", "1000", "5000", "active"],
+                &["pause", "2000", "3000", "resume"],
+            ],
+        );
+        let out = format_observation_gaps(&t).unwrap();
+        assert!(out.contains("KIND"), "{out}");
+        assert!(out.contains("passive"), "{out}");
+        assert!(out.contains("withheld every probe"), "{out}");
+        assert!(!out.contains("(still open)"), "{out}");
+    }
+
+    /// A daemon built before the tier answers without a `kind` column: every
+    /// row is a pause, and the renderer must not fail on the missing column.
+    #[test]
+    fn observation_gaps_from_a_pre_tier_daemon_are_all_pauses() {
+        let old = &["gap_opened_us", "gap_closed_us", "gap_closed_by"];
+        let t = table(old, &[&["1000", "2000", "resume"]]);
+        let out = format_observation_gaps(&t).unwrap();
+        assert!(out.contains("pause"), "{out}");
+        assert!(!out.contains("withheld every probe"), "{out}");
     }
 
     #[test]

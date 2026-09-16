@@ -30,6 +30,7 @@
 //!   flips to the left when there is no room, and slides up to fit.
 
 use net_observer_ipc::{CollectorAvailability, EventKind};
+use types::ProbingTier;
 
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Bounds, Context, Entity, InteractiveElement,
@@ -43,12 +44,12 @@ use std::time::{Duration, Instant};
 
 use crate::ui::{
     Glance, MENU_HEADING_H, MENU_HEADING_TEXT, MENU_ROW_H, MENU_ROW_PX, MENU_ROW_RADIUS,
-    MENU_ROW_TEXT, MENU_SEPARATOR_H, Theme, freeze_round_trip, quiet_round_trip,
-    scan_round_trip_base, separator, spawn_control_on,
+    MENU_ROW_TEXT, MENU_SEPARATOR_H, Theme, freeze_round_trip, probing_round_trip,
+    quiet_round_trip, scan_round_trip_base, separator, spawn_control_on,
 };
 
 /// Menu width in gpui logical pixels. Wide enough for the longest label
-/// ("Freeze pcap") at [`MENU_ROW_TEXT`].
+/// ("Probe network") at [`MENU_ROW_TEXT`].
 ///
 /// There is deliberately no matching height constant: the menu's composition is
 /// not fixed — a row is dropped for a collector this daemon cannot run — so a
@@ -66,8 +67,8 @@ const MENU_PAD: f32 = 4.0;
 const MENU_GAP: f32 = 2.0;
 
 /// The rows every daemon gets, whatever it can collect: events, map, freeze,
-/// quiet, scan, refresh, quit. Only the collector rows come and go.
-const FIXED_ROWS: usize = 7;
+/// quiet, probe, scan, refresh, quit. Only the collector rows come and go.
+const FIXED_ROWS: usize = 8;
 /// The group headings ("windows", "daemon", "panel") and the two rules between
 /// the three groups.
 const HEADINGS: usize = 3;
@@ -224,6 +225,7 @@ impl Render for MenuView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
         let quiet_on = self.model.read(cx).snapshot.quiet;
+        let probing = self.model.read(cx).snapshot.probing;
 
         let events = self.entry("events", "Events", theme.accent, theme, cx, |this, cx| {
             let socket = this.model.read(cx).socket_path.clone();
@@ -285,6 +287,25 @@ impl Render for MenuView {
                 spawn_control_on(&model, cx, quiet_round_trip);
             },
         );
+        // The probing tier, beside quiet. The label says what the click will
+        // do; the colour says which tier the daemon is in now: active is
+        // warn-coloured because it is the tier that puts packets on the wire —
+        // the deliberate, pressed-for state, not the routine one (realm
+        // net-observer, node #88).
+        let probe = self.entry(
+            "probe",
+            probe_label(probing),
+            match probing {
+                ProbingTier::Active => theme.warn,
+                ProbingTier::Passive => theme.accent,
+            },
+            theme,
+            cx,
+            |this, cx| {
+                let model = this.model.clone();
+                spawn_control_on(&model, cx, probing_round_trip);
+            },
+        );
         // Scan is the only entry here that addresses other machines — it runs
         // when asked, no config switch gates it — and is warn-coloured for the
         // same reason as quiet.
@@ -324,11 +345,22 @@ impl Render for MenuView {
             .child(Self::heading("daemon", theme))
             .child(freeze)
             .child(quiet)
+            .child(probe)
             .child(scan)
             .child(separator(theme))
             .child(Self::heading("panel", theme))
             .child(refresh)
             .child(quit)
+    }
+}
+
+/// The probe row's label for the tier the daemon is in NOW — it names the
+/// click's effect, so a passive daemon offers "Probe network" and an active one
+/// "Stop probing". Pure, so the wording is a testable fact.
+pub(crate) fn probe_label(tier: ProbingTier) -> &'static str {
+    match tier {
+        ProbingTier::Passive => "Probe network",
+        ProbingTier::Active => "Stop probing",
     }
 }
 
@@ -721,6 +753,30 @@ mod headless_tests {
         assert!(collector_row(CollectorAvailability::Disabled).is_some_and(|r| r.off));
     }
 
+    /// The probe row is drawn in BOTH tiers — it is the switch, and a switch
+    /// that vanished in one of its states could not be flipped back. Each tier
+    /// gets a fresh window, because a window that once drew the row can never
+    /// say it is gone (its debug-bounds map only grows).
+    #[gpui::test]
+    fn the_probe_row_is_drawn_in_both_tiers(cx: &mut TestAppContext) {
+        for tier in [ProbingTier::Passive, ProbingTier::Active] {
+            let snapshot = StatusSnapshot {
+                probing: tier,
+                capabilities: Some(Capabilities::default()),
+                ..StatusSnapshot::default()
+            };
+            let laid_out = lay_out_menu(cx, snapshot, MenuComposition::new(false));
+            assert!(
+                laid_out.iter().any(|(id, _)| *id == "menu-row:probe"),
+                "the probe row must be drawn in the {tier} tier"
+            );
+            assert_eq!(laid_out.len(), FIXED_ROWS);
+        }
+        // The label names the click's effect, not the state.
+        assert_eq!(probe_label(ProbingTier::Passive), "Probe network");
+        assert_eq!(probe_label(ProbingTier::Active), "Stop probing");
+    }
+
     /// Draw the menu for `snapshot` in a window of exactly the height
     /// `composition` computes, and return every row that was laid out, having
     /// checked that each lies inside the window and none overlaps another.
@@ -761,12 +817,13 @@ mod headless_tests {
 
         // Every action the panel's footer used to carry, in flyout order. The air
         // row is the only one a daemon can be without.
-        let rows: [&'static str; 8] = [
+        let rows: [&'static str; 9] = [
             "menu-row:events",
             "menu-row:map",
             "menu-row:air",
             "menu-row:freeze",
             "menu-row:quiet",
+            "menu-row:probe",
             "menu-row:scan",
             "menu-row:refresh",
             "menu-row:quit",
