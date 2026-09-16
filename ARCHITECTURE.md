@@ -458,6 +458,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `blob_ref` | `id, incident_id, ts_us, kind, path` | On-disk forensics blobs (pcap freeze, dumps) referenced by path. |
 | `trigger_fired` | `ts_us, trigger_id, incident_id, detail` | One row per trigger fire. |
 | `observing_edge` | `ts_us, observing, peer_uid, cause` | One row per collection boundary — the one sanctioned gap in "SKIP, never silence"; `observing` is the state entered, so `false` opens a gap and `true` closes one. `peer_uid` attributes it to the control-socket peer that asked (SQL `NULL` when nobody did), and `cause` (`control` / `startup`) says what produced it. |
+| `probing_edge` | `ts_us, tier, peer_uid` | One row per switch of the probing tier (`tier` is the tier entered, `passive` / `active`). Not a gap — a passive daemon keeps writing a row per tick with every probe verdict `SKIP` — but the bracket that says those `SKIP`s were *withheld*, not failed, and by whom. `peer_uid` is `NULL` for the startup edge, which records the configured default so a record that begins passive says so. (realm net-observer, node #88) |
 
 `dns_sample`, `route_event`, and `host_sample` are created by the v1.1 `dns`,
 `route-events`, and `host-metrics` collectors respectively.
@@ -563,7 +564,12 @@ collector whose per-tick `preflight()` is `Unavailable` (see
 (`ControlCmd::SetQuiet(true)`), where the link collector withholds the gateway
 echo but still emits one sample per tick carrying `gw = SKIP` — quiet silences
 the wire, never the record, and the triggers read that as *no measurement*, never
-as a healthy gateway and never as a drop.
+as a healthy gateway and never as a drop. The **passive probing tier**
+(`ControlCmd::SetProbing`, the daemon's default) is the same rule applied to
+every emission class at once: every probe of the link, proxy and dns collectors
+lands as `SKIP`, and the switch itself is bracketed by a `probing_edge` row so
+the record can tell "withheld" from "could not run" (realm net-observer, node
+#88).
 
 **The one sanctioned exception: an operator pause.** When collection is paused
 (`ControlCmd::SetObserving(false)`) the collectors stop probing entirely rather
@@ -637,10 +643,10 @@ the durable record; the socket is the live, low-latency read path.
     (realm net-observer, node #58)
   - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
     write/control path (see [Control path](#control-path) below); the only
-    non-read request. Six commands today — `ControlCmd::KickstartProxy`,
-    `SetObserving(bool)`, `SetQuiet(bool)`, `FreezePcap`,
-    `ScanNeighbors(ScanOptions)`, `ScanAir` — every one behind the same
-    peer-credential check and none behind a config switch.
+    non-read request. Seven commands today — `ControlCmd::KickstartProxy`,
+    `SetObserving(bool)`, `SetQuiet(bool)`, `SetProbing(ProbingTier)`,
+    `FreezePcap`, `ScanNeighbors(ScanOptions)`, `ScanAir` — every one behind
+    the same peer-credential check and none behind a config switch.
   - `Request::Subscribe { kinds }` → a **held-open stream** of newline-JSON
     `StreamFrame`s (not a single `Response`, and not bare `Event`s) — the
     realtime pub/sub path (see [Event bus and live
@@ -648,13 +654,16 @@ the durable record; the socket is the live, low-latency read path.
     with a **mandatory** `StreamFrame::Ready` ack carrying the `kinds` the daemon
     actually accepted and its current `observing` state, so a fresh subscriber
     learns whether collection is live immediately instead of inferring it from
-    silence. Four other frame kinds follow: `Event` (a live sample or incident),
+    silence. Five other frame kinds follow: `Event` (a live sample or incident),
     `Gap` (this subscriber fell behind the bus and lost `skipped` events),
     `Observing` (a real pause/resume transition — the state at subscribe time
     rides on `Ready` instead, so a state report can never be mistaken for an edge
-    that never happened), and `Error` (a daemon-side refusal or failure, reported
-    **in band** instead of as a bare close). Only `Event` frames are subject to
-    the `kinds` filter (`None` = every `EventKind`, `Some(list)` = server-side);
+    that never happened), `Probing` (a real switch of the probing tier, the same
+    `types::ProbingEdge` the daemon writes to `probing_edge`; the tier in force
+    is read from `StatusSnapshot::probing`), and `Error` (a daemon-side refusal
+    or failure, reported **in band** instead of as a bare close). Only `Event`
+    frames are subject to the `kinds` filter (`None` = every `EventKind`,
+    `Some(list)` = server-side);
     the stream-integrity frames are **always** delivered, because a filtered
     subscriber has more need to know about a hole or a pause, not less. That rule
     lives in exactly one place, `EncodedFrame::passes`. The daemon holds at most
@@ -993,6 +1002,25 @@ already-authorised command:
    `observing` it is a shared `AtomicBool` mirrored into `snapshot.quiet`, is
    process-scoped, and is never persisted. Client: the bar footer's
    **Quiet**/**Unquiet** action.
+
+   **Self-control — `ControlCmd::SetProbing(tier)`.** The probing tier (realm
+   net-observer, node #88): `passive` puts **nothing on the wire** — every
+   emission class of the link, proxy and dns collectors (gateway echo, direct
+   probe, neighbour pings, TUN 204, endpoint connects, the held reference
+   streams, resolver queries; `types::EmissionClass`) is withheld, each tick
+   still lands with its probe verdicts `SKIP`, and the held streams are closed —
+   while `active` runs every class (quiet still withholds the echo inside it).
+   The daemon boots into the tier `[probing] default` names, `passive` when
+   absent, and never changes tier by itself. The three collectors read one
+   shared `collector_core::ProbingState` per tick, mirrored into
+   `snapshot.probing`; process-scoped and never persisted like quiet — but
+   unlike quiet every real switch is **bracketed**: one `types::ProbingEdge`
+   goes to two sinks, a `probing_edge` row via the `Store` and a
+   `StreamFrame::Probing` on the bus, and the startup default is written as a
+   peerless edge too. A no-op switch writes nothing. Clients: the bar menu's
+   **Probe network**/**Stop probing** row and `net-observer-cli probe
+   passive|active`; `gaps` lists passive stretches as `kind = passive` next to
+   the pauses.
 
 4. **Self-control — `ControlCmd::FreezePcap`.** Copy the pcap ring out now, into
    a fresh freeze directory — the same passive artifact the `gw-change` trigger
