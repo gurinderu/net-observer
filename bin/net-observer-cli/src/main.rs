@@ -9,7 +9,8 @@
 //!   zero contention with the running daemon.
 //! - **LIVE FIRST, THEN OFFLINE** — the named diagnoses (`why`,
 //!   `incident-context`, `wedge-or-starvation`, `gateway-ramp`, `gaps`,
-//!   `neighbors`, `vulns`, `segments`, `history`, `topology`) run the canned
+//!   `neighbors`, `vulns`, `segments`, `history`, `topology`, `connections`)
+//!   run the canned
 //!   `store::diagnosis` queries, so "which layer failed" is reachable without
 //!   writing SQL. Each asks the running daemon first (`Request::Query`, answered
 //!   from the daemon's own store while it keeps collecting) and opens the
@@ -33,6 +34,7 @@ use net_observer_ipc::{
 use std::io::Write;
 use std::process::ExitCode;
 use store::{DuckdbStore, QueryTable, Store as _, diagnosis};
+use types::ConnectionsGroupBy;
 
 /// The `load1` above which a dead tun reads as host starvation rather than a
 /// proxy wedge. The CLI reads the record with the same threshold the daemon
@@ -207,6 +209,20 @@ enum Command {
         #[arg(long)]
         iface: Option<String>,
     },
+    /// What this machine talks to: the newest tick of the live flow table
+    /// sing-box carries (its Clash API lists every flow with the name asked
+    /// for, the real destination, the process and the outbound), grouped and
+    /// ordered by how many flows share the key, with the names seen behind
+    /// each key. `netstat` cannot answer this here — every destination it
+    /// shows is a fakeip. A tick on which the API did not answer is one row
+    /// saying SKIP, never an empty table. Asks the running daemon first,
+    /// reads the DB file only when no daemon answers.
+    Connections {
+        /// Group the flows by the name asked for, the destination address,
+        /// address and port, or the client process.
+        #[arg(long, value_enum, default_value_t = GroupByArg::Host)]
+        by: GroupByArg,
+    },
     /// The latest slice of the radio environment (offline): every foreign access
     /// point the last scan heard, with its channel, band, width, signal and
     /// noise, ordered by how likely it is to be sitting in our own band.
@@ -318,9 +334,37 @@ impl ObserveState {
     }
 }
 
+/// The grouping accepted by `connections --by`. A thin CLI mirror of
+/// [`ConnectionsGroupBy`] so `clap` renders `<host|ip|ip-port|process>` in the
+/// help without leaking the wire type into the argument surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum GroupByArg {
+    /// By the name asked for (a bare-address flow is keyed by its address).
+    Host,
+    /// By the real destination address (a flow whose address the proxy never
+    /// learned is keyed by its name).
+    Ip,
+    /// By destination address and port.
+    IpPort,
+    /// By the client process.
+    Process,
+}
+
+impl GroupByArg {
+    /// Map to the wire [`ConnectionsGroupBy`] the daemon and the SQL take.
+    fn to_group_by(self) -> ConnectionsGroupBy {
+        match self {
+            GroupByArg::Host => ConnectionsGroupBy::Host,
+            GroupByArg::Ip => ConnectionsGroupBy::Ip,
+            GroupByArg::IpPort => ConnectionsGroupBy::IpPort,
+            GroupByArg::Process => ConnectionsGroupBy::Process,
+        }
+    }
+}
+
 /// The event kind accepted by `events --kind`. A thin CLI mirror of
 /// [`EventKind`] so `clap` renders
-/// `<link|proxy|dns|route|host|wifi|neighbors|air|incident>` in the help without
+/// `<link|proxy|dns|route|host|wifi|neighbors|air|connections|incident>` in the help without
 /// leaking the wire type into the argument surface.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum EventKindArg {
@@ -332,6 +376,7 @@ enum EventKindArg {
     Wifi,
     Neighbors,
     Air,
+    Connections,
     Incident,
 }
 
@@ -347,6 +392,7 @@ impl EventKindArg {
             EventKindArg::Wifi => EventKind::Wifi,
             EventKindArg::Neighbors => EventKind::Neighbors,
             EventKindArg::Air => EventKind::Air,
+            EventKindArg::Connections => EventKind::Connections,
             EventKindArg::Incident => EventKind::Incident,
         }
     }
@@ -459,6 +505,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
+            print!("{}", format_table(&table));
+        }
+        Command::Connections { by } => {
+            let group_by = by.to_group_by();
+            let sql = diagnosis::connections_sql(group_by);
+            let table = diagnose_table(cli, DiagnosticQuery::Connections { group_by }, |off| {
+                run_query(off, &sql)
+            })?;
             print!("{}", format_table(&table));
         }
         Command::Air => {
@@ -1557,7 +1611,92 @@ mod tests {
         assert_eq!(EventKindArg::Host.to_kind(), EventKind::Host);
         assert_eq!(EventKindArg::Wifi.to_kind(), EventKind::Wifi);
         assert_eq!(EventKindArg::Neighbors.to_kind(), EventKind::Neighbors);
+        assert_eq!(EventKindArg::Connections.to_kind(), EventKind::Connections);
         assert_eq!(EventKindArg::Incident.to_kind(), EventKind::Incident);
+    }
+
+    /// `connections --by` takes the four groupings by their lowercase names,
+    /// defaults to `host`, and maps onto the wire type the daemon reads.
+    #[test]
+    fn connections_by_parses_every_grouping_and_defaults_to_host() {
+        let parse = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                std::iter::once("net-observer-cli").chain(args.iter().copied()),
+            )
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            match cli.command {
+                Command::Connections { by } => by,
+                _ => panic!("{args:?} did not parse as `connections`"),
+            }
+        };
+        assert_eq!(parse(&["connections"]), GroupByArg::Host);
+        for (token, arg, wire) in [
+            ("host", GroupByArg::Host, ConnectionsGroupBy::Host),
+            ("ip", GroupByArg::Ip, ConnectionsGroupBy::Ip),
+            ("ip-port", GroupByArg::IpPort, ConnectionsGroupBy::IpPort),
+            ("process", GroupByArg::Process, ConnectionsGroupBy::Process),
+        ] {
+            let by = parse(&["connections", "--by", token]);
+            assert_eq!(by, arg, "{token}");
+            assert_eq!(by.to_group_by(), wire, "{token}");
+        }
+        assert!(Cli::try_parse_from(["net-observer-cli", "connections", "--by", "port"]).is_err());
+    }
+
+    /// The table the daemon (or the file) answers renders as the grouped
+    /// columns, one line per key, with a SKIP tick's empty cells still on
+    /// their own line rather than vanishing.
+    #[test]
+    fn connections_table_renders_the_grouped_columns() {
+        let table = Table {
+            columns: [
+                "ts_us", "verdict", "key", "count", "upload", "download", "hosts",
+            ]
+            .map(String::from)
+            .to_vec(),
+            rows: vec![
+                [
+                    "1",
+                    "OK",
+                    "194.221.250.50",
+                    "2",
+                    "30",
+                    "0",
+                    "www.google.com",
+                ]
+                .map(String::from)
+                .to_vec(),
+                ["1", "OK", "claude.ai", "1", "100", "5006", "claude.ai"]
+                    .map(String::from)
+                    .to_vec(),
+            ],
+        };
+        let out = format_table(&table);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(
+            lines[0].starts_with("ts_us  verdict  key             count"),
+            "{out}"
+        );
+        assert!(
+            lines[1].contains("194.221.250.50  2      30      0         www.google.com"),
+            "{out}"
+        );
+        assert!(
+            lines[2].contains("claude.ai       1      100     5006      claude.ai"),
+            "{out}"
+        );
+
+        let skipped = Table {
+            columns: table.columns.clone(),
+            rows: vec![["7", "SKIP", "", "", "", "", ""].map(String::from).to_vec()],
+        };
+        let out = format_table(&skipped);
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(
+            out.lines().nth(1).unwrap().starts_with("7      SKIP"),
+            "{out}"
+        );
     }
 
     #[test]
