@@ -504,7 +504,7 @@ carries, lives in `types` for the same reason.
 | --- | --- |
 | `verdict_at(ts_us)` | every layer's state at a moment, plus the `layer` the record blames |
 | `incident_context()` | for each incident, the layer state at or just before it opened |
-| `wedge_vs_starvation()` | contiguous `tun=000` episodes, each named `link` / `vless` / `starvation` / `wedge` / `unknown` |
+| `wedge_vs_starvation()` | episodes of ticks whose tun answered anything but 204 (`0` = a silent probe, a captive portal's 200, a 5xx), each named `link` / `vless` / `starvation` / `wedge` / `unknown` |
 | `gw_drops()` | the first link sample of each run of `FAIL`/`NOGW` (`SKIP` ticks removed first, so a quiet run cannot manufacture an edge) |
 | `gateway_ramp(drop_ts_us)` | gateway RTT over the window before a drop, with a least-squares `slope_ms_per_s` over the answered ticks — the ~40 s coworking climb as data |
 | `fakeip_bugs()` | `FAKEIP` on a `.ru` name, which is always a bug |
@@ -515,11 +515,17 @@ The `layer` vocabulary is `link` / `vless` / `proxy` / `host` / `healthy` /
 health or as fault, and two situations make a query decline outright rather than
 answer:
 
-- **A dead tun with no `load1`.** `tun_code = 0` is a wedge if the host was idle
-  and starvation if it was not, and without a host sample the record cannot tell
-  them apart — so the layer is `unknown`, never a guess at `proxy`. The
-  distinction is the one the project paid nine hours to learn on 2026-07-27: a
-  restart cures a wedge and *tears down live flows* under starvation.
+- **A dead-tun episode with no `load1`.** An episode is a run of ticks whose
+  tun answered anything but 204 (`0` — the probe got no status at all; a
+  captive portal's 200; a 5xx). It is `starvation` only when the host was
+  loaded *and* every tick in the episode was silent (`tun_code = 0`
+  throughout); it is `wedge` otherwise — an episode with even one
+  answered-but-wrong tick is a wedge no matter the load, because the tunnel
+  answered and load does not explain a wrong answer. Without a host sample
+  the record cannot tell wedge from starvation at all, so it declines
+  outright: `unknown`, never a guess. The distinction is the one the project
+  paid nine hours to learn on 2026-07-27: a restart cures a wedge and *tears
+  down live flows* under starvation.
 - **A moment inside an observation gap.** An `ASOF JOIN` would honestly hand back
   the newest sample from *before* a pause as though it were a reading taken at
   the moment asked about, with nothing in the row saying otherwise — a gap that
