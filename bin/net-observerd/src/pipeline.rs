@@ -37,9 +37,6 @@ use triggers::handlers::Handler;
 use triggers::window::RecentWindow;
 use types::{BlobRef, NeighborLifetime, NeighborsSample, Sample};
 
-/// Capacity of the recent-sample window handed to the trigger engine.
-const WINDOW_CAP: usize = 64;
-
 /// How long, in MONOTONIC time, one resume edge's drain filter may stay open.
 ///
 /// The filter exists only to keep samples that were already queued when the pause
@@ -303,7 +300,7 @@ pub async fn run(
     // `0` = the daemon has never resumed.
     resume_at_us: Arc<AtomicI64>,
 ) {
-    let mut window = RecentWindow::new(WINDOW_CAP);
+    let mut window = RecentWindow::new(triggers::WINDOW_CAP);
     // The bounded post-resume drain filter, replacing the raw
     // `now_us < applied_resume_us` comparison a single backwards clock step could
     // otherwise make true for ever.

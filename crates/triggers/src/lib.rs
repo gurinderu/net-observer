@@ -4,3 +4,5 @@ pub mod conditions;
 pub mod engine;
 pub mod handlers;
 pub mod window;
+
+pub use window::WINDOW_CAP;

@@ -2,6 +2,15 @@ use std::collections::VecDeque;
 
 use types::{DnsSample, HostSample, LinkSample, NeighborsSample, ProxySample, Sample};
 
+/// Capacity of the recent-sample window the daemon hands to the trigger
+/// engine, in samples of ALL kinds — the conditions' reach into the past is
+/// this, not their own scan constants. Per 15 s tick the daemon's defaults
+/// emit 1 link + up to 7 proxy rows + 3 dns + 1 host + 1 wifi ≈ 13 samples,
+/// so 2048 ≈ 157 ticks ≈ 40 min: enough for `ban-cycle` to hold three field
+/// rounds at a 2–4 min period, where the previous 64 (≈ 5 ticks) held none.
+/// The memory is trivial.
+pub const WINDOW_CAP: usize = 2048;
+
 /// Where [`RecentWindow::prev_link`]'s answer came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkProvenance {
