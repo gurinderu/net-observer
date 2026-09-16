@@ -22,8 +22,8 @@ name: nix-build
 # missed its primary key was saving its own copy on its own ref, evicting
 # `main`'s stores LRU — a PR's CLI job once restored the bar's store off the
 # shared prefix and rebuilt DuckDB from scratch (realm net-observer, node
-# #125). How long a cold job actually takes is unobserved until the first
-# run lands — 180 minutes is a ceiling, not a measurement.
+# #125). Cold, observed on the first green run: daemon ~30 min, CLI ~23,
+# bar ~21 — 180 minutes is a ceiling with room, not a measurement of need.
 #
 # The daemon job also guards the checked-in `Cargo.nix` itself: it is
 # regenerated from Cargo.lock by the crate2nix CLI, and a stale copy would
