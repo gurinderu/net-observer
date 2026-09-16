@@ -468,6 +468,29 @@ impl Store for DuckdbStore {
                 }
                 0
             }
+            // One row per aggregate row, the verdict replicated — and, for a
+            // tick with none, ONE all-NULL row carrying the verdict, so a SKIP
+            // (could not look) and an empty OK (nothing is talking) are both
+            // rows, and different ones (realm net-observer, node #75).
+            Sample::Connections(cs) => {
+                let verdict = cs.verdict.to_string();
+                if cs.rows.is_empty() {
+                    c.execute(
+                        "INSERT INTO connection_sample (ts_us, verdict) VALUES (?,?)",
+                        params![cs.ts_us, verdict],
+                    )?;
+                }
+                for r in &cs.rows {
+                    c.execute(
+                        "INSERT INTO connection_sample VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        params![
+                            cs.ts_us, verdict, r.host, r.dst_ip, r.dst_port, r.process, r.network,
+                            r.chain, r.count, r.upload, r.download
+                        ],
+                    )?;
+                }
+                0
+            }
         };
         Ok(())
     }
@@ -1533,6 +1556,122 @@ mod tests {
         assert_eq!(
             s.query_scalar_i64("SELECT count(*) FROM air_ap").unwrap(),
             0
+        );
+    }
+
+    fn connection_row(
+        host: Option<&str>,
+        dst_ip: Option<&str>,
+        process: Option<&str>,
+        count: u32,
+    ) -> types::ConnectionRow {
+        types::ConnectionRow {
+            host: host.map(str::to_string),
+            dst_ip: dst_ip.map(str::to_string),
+            dst_port: Some(443),
+            process: process.map(str::to_string),
+            network: "tcp".into(),
+            chain: Some("vless-main".into()),
+            count,
+            upload: 10 * u64::from(count),
+            download: 5000,
+        }
+    }
+
+    /// Every aggregate row reaches its own columns with the tick's verdict on
+    /// it, and an absent fact (no address, no process) is NULL, not an empty
+    /// string.
+    #[test]
+    fn write_and_read_back_connection_sample() {
+        use types::{ConnectionsSample, ConnectionsVerdict};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Connections(ConnectionsSample {
+            ts_us: 8000,
+            verdict: ConnectionsVerdict::Ok,
+            rows: vec![
+                connection_row(Some("claude.ai"), None, None, 3),
+                connection_row(
+                    Some("o540343.ingest.sentry.io"),
+                    Some("35.186.243.94"),
+                    Some("stable"),
+                    1,
+                ),
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM connection_sample WHERE ts_us=8000")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM connection_sample WHERE ts_us=8000 AND verdict='OK' \
+                 AND host='claude.ai' AND dst_ip IS NULL AND dst_port=443 AND process IS NULL \
+                 AND network='tcp' AND chain='vless-main' AND count=3 AND upload=30 \
+                 AND download=5000"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM connection_sample WHERE ts_us=8000 \
+                 AND dst_ip='35.186.243.94' AND process='stable' AND count=1"
+            )
+            .unwrap(),
+            1
+        );
+        // No marker row when the tick had rows.
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM connection_sample WHERE ts_us=8000 AND network IS NULL"
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    /// The distinction the SKIP rule exists for, at the storage layer: a tick
+    /// on which the API did not answer leaves an all-NULL row saying SKIP, a
+    /// tick that answered with nothing leaves an all-NULL row saying OK. Both
+    /// are rows; they are not the same row.
+    #[test]
+    fn a_skipped_connections_tick_is_not_stored_as_nothing_talking() {
+        use types::{ConnectionsSample, ConnectionsVerdict};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Connections(ConnectionsSample {
+            ts_us: 8100,
+            verdict: ConnectionsVerdict::Skip,
+            rows: Vec::new(),
+        }))
+        .unwrap();
+        s.write_sample(&Sample::Connections(ConnectionsSample {
+            ts_us: 8200,
+            verdict: ConnectionsVerdict::Ok,
+            rows: Vec::new(),
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM connection_sample WHERE ts_us=8100 AND verdict='SKIP' \
+                 AND host IS NULL AND network IS NULL AND count IS NULL"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM connection_sample WHERE ts_us=8200 AND verdict='OK' \
+                 AND host IS NULL AND network IS NULL AND count IS NULL"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM connection_sample")
+                .unwrap(),
+            2
         );
     }
 

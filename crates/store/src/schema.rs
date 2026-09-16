@@ -152,6 +152,19 @@ CREATE TABLE IF NOT EXISTS topology_link (
   remote_system_name VARCHAR, capabilities VARCHAR, learned_via VARCHAR,
   first_seen_us BIGINT, last_seen_us BIGINT,
   PRIMARY KEY (iface, remote_chassis, remote_port));
+-- What this machine talks to: the live flows sing-box carries, read from its
+-- Clash API each tick and aggregated by (host, dst_ip, dst_port, process,
+-- network, chain) — `count` is how many flows shared the key, `upload` /
+-- `download` their bytes summed (realm net-observer, nodes #75, #127). One row
+-- per aggregate row per tick, the tick's `verdict` replicated across them. A
+-- tick with NO rows — the API did not answer (`SKIP`) or it listed nothing
+-- (`OK`) — writes ONE row with every key column NULL, carrying the verdict:
+-- so "could not look" and "nothing is talking" are different rows, and both
+-- are rows rather than an absent tick. `network` is NULL only on that row.
+CREATE TABLE IF NOT EXISTS connection_sample (
+  ts_us BIGINT, verdict VARCHAR, host VARCHAR, dst_ip VARCHAR, dst_port USMALLINT,
+  process VARCHAR, network VARCHAR, chain VARCHAR, count UINTEGER, upload UBIGINT,
+  download UBIGINT);
 CREATE TABLE IF NOT EXISTS observing_edge (
   ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT, cause VARCHAR);
 -- `cause` was added after the first daemon shipped rows without it. A database
