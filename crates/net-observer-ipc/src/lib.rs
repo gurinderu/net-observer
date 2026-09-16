@@ -384,18 +384,24 @@ impl Event {
                 format!("{} {} {}", r.kind, iface, r.detail)
             }
             // Disk and swap are optional facts (a pre-field daemon never sends
-            // them): an unmeasured one renders as `-`, never as an omission.
+            // them): each unmeasured one renders as `-` on its own, never as an
+            // omission and never dragging a measured sibling down with it.
             Event::Host(h) => {
-                let disk = match (h.disk_used_pct, h.disk_free_mb) {
-                    (Some(pct), Some(free)) => format!("{pct:.1}% used, {free} MB free"),
-                    _ => "-".to_string(),
-                };
+                let dash = || "-".to_string();
+                let pct = h
+                    .disk_used_pct
+                    .map(|p| format!("{p:.1}%"))
+                    .unwrap_or_else(dash);
+                let free = h
+                    .disk_free_mb
+                    .map(|m| format!("{m} MiB"))
+                    .unwrap_or_else(dash);
                 let swap = h
                     .swap_used_mb
-                    .map(|m| format!("{m} MB"))
-                    .unwrap_or_else(|| "-".to_string());
+                    .map(|m| format!("{m} MiB"))
+                    .unwrap_or_else(dash);
                 format!(
-                    "load {:.2}/{:.2}/{:.2}; disk {disk}; swap {swap}",
+                    "load {:.2}/{:.2}/{:.2}; disk {pct} used, {free} free; swap {swap}",
                     h.load1, h.load5, h.load15
                 )
             }
@@ -2041,7 +2047,7 @@ mod tests {
         });
         assert_eq!(
             host.detail(),
-            "load 1.00/2.00/3.00; disk 42.1% used, 120000 MB free; swap 1024 MB"
+            "load 1.00/2.00/3.00; disk 42.1% used, 120000 MiB free; swap 1024 MiB"
         );
         // Unmeasured disk and swap (a pre-field daemon) print as `-`, never
         // drop out of the line.
@@ -2054,7 +2060,25 @@ mod tests {
             disk_free_mb: None,
             swap_used_mb: None,
         });
-        assert_eq!(host.detail(), "load 1.00/2.00/3.00; disk -; swap -");
+        assert_eq!(
+            host.detail(),
+            "load 1.00/2.00/3.00; disk - used, - free; swap -"
+        );
+        // Each field stands on its own: a measured value is never dropped
+        // because its sibling is not.
+        let host = Event::Host(HostSample {
+            ts_us: 0,
+            load1: 1.0,
+            load5: 2.0,
+            load15: 3.0,
+            disk_used_pct: Some(99.95),
+            disk_free_mb: None,
+            swap_used_mb: Some(0),
+        });
+        assert_eq!(
+            host.detail(),
+            "load 1.00/2.00/3.00; disk 100.0% used, - free; swap 0 MiB"
+        );
 
         let inc = Event::Incident(IncidentSummary {
             id: "inc-1".into(),

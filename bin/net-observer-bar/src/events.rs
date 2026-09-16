@@ -905,7 +905,7 @@ mod tests {
         // The 50 oldest were dropped, so the front is now the i=50 event.
         assert_eq!(
             log.events.front().unwrap().line,
-            "host  load 50.00/0.00/0.00; disk -; swap -"
+            "host  load 50.00/0.00/0.00; disk - used, - free; swap -"
         );
     }
 
