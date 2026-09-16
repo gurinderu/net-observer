@@ -145,4 +145,13 @@ CREATE TABLE IF NOT EXISTS observing_edge (
 -- rows read back with a NULL cause, which the gap derivation treats as
 -- 'control': that is what they in fact were.
 ALTER TABLE observing_edge ADD COLUMN IF NOT EXISTS cause VARCHAR;
+-- One row per switch of the probing tier (realm net-observer, node #88). A
+-- passive stretch is not a gap — every withheld probe still lands as a SKIP
+-- row — but this is what says WHY those rows carry no measurement and who
+-- asked for it. `tier` is the tier entered ('passive' / 'active'); `peer_uid`
+-- is NULL for the startup edge, which records the configured default so a
+-- record that begins passive says so. Added after the store first shipped, so
+-- an older DB file gains the table on open like `topology_link` above.
+CREATE TABLE IF NOT EXISTS probing_edge (
+  ts_us BIGINT, tier VARCHAR, peer_uid BIGINT);
 "#;
