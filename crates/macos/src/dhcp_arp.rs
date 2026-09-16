@@ -1,8 +1,9 @@
 //! Link-layer facts gathered from macOS command-line tools:
 //! default gateway + physical interface (`route -n get default`), the DHCP
-//! lease (`ipconfig getpacket`), the gateway's ARP entry (`arp -n`), the
-//! joined SSID, the link's identity pair (the AP's BSSID and the interface's
-//! own MAC, see `wifi`) and any recent Wi-Fi driver capture.
+//! router/DNS lease pair (`ipconfig getpacket`), the gateway's ARP entry
+//! (`arp -n`), the joined SSID, the link's identity pair plus the current
+//! DHCP lease's start and length — all three from ONE `ipconfig getsummary`
+//! parse, see [`wifi::summary`] — and any recent Wi-Fi driver capture.
 //!
 //! Every field parses defensively: a missing tool, non-zero exit, or
 //! unrecognised output yields `None`, never a panic — "absence is a signal".
@@ -10,7 +11,7 @@
 use std::time::Duration;
 
 use collector_core::Readiness;
-use collector_link::LinkFacts;
+use collector_link::{LinkFacts, LinkSummary};
 use tokio::process::Command;
 use types::LinkMedium;
 
@@ -144,8 +145,17 @@ impl LinkFacts for SystemFacts {
         wifi::current_ssid(iface).await
     }
 
-    async fn bssid(&self, iface: &str) -> Option<String> {
-        wifi::current_bssid(iface).await
+    async fn summary(&self, iface: &str) -> LinkSummary {
+        let wifi::Summary {
+            bssid,
+            lease_start_us,
+            lease_secs,
+        } = wifi::summary(iface).await;
+        LinkSummary {
+            bssid,
+            lease_start_us,
+            lease_secs,
+        }
     }
 
     async fn if_mac(&self, iface: &str) -> Option<String> {

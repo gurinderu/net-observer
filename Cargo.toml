@@ -64,6 +64,11 @@ serde_json = "1"
 figment = { version = "0.10", features = ["toml", "env"] }
 humantime-serde = "1"
 jiff = { version = "0.2", features = ["serde"] }
+# Only `macos` uses this (`chrono::Local`, resolving a DHCP lease's naive
+# timestamp against the machine's local zone — realm net-observer, node #93
+# item 1); already in the tree transitively via `tracing-subscriber`'s
+# `chrono` feature, now a direct dependency for that one adapter.
+chrono = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }

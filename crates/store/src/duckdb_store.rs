@@ -314,7 +314,7 @@ impl Store for DuckdbStore {
         let c = self.conn.lock().unwrap();
         match s {
             Sample::Link(l) => c.execute(
-                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     l.ts_us,
                     l.gw.to_string(),
@@ -332,7 +332,10 @@ impl Store for DuckdbStore {
                     l.singbox_tun_if,
                     l.bssid,
                     l.if_mac,
-                    l.medium.map(|m| m.to_string())
+                    l.medium.map(|m| m.to_string()),
+                    l.lease_start_us,
+                    l.lease_secs,
+                    l.if_mac_private
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
@@ -1111,6 +1114,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1144,6 +1150,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: Some(3),
             lan_alive: Some(1),
@@ -1195,6 +1204,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1232,6 +1244,9 @@ mod tests {
             bssid: Some("3c:22:fb:12:34:56".into()),
             if_mac: Some("f0:18:98:0a:0b:0c".into()),
             medium: Some(LinkMedium::Wifi),
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1285,6 +1300,136 @@ mod tests {
             s.query_scalar_i64(
                 "SELECT count(*) FROM link_sample \
                  WHERE ts_us = 2000 AND bssid IS NULL AND if_mac IS NULL AND medium IS NULL"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    /// The DHCP lease pair and the MAC-class fold land in their own columns,
+    /// and an unmeasured tick lands as NULL — distinguishable from an
+    /// actual zero-length lease or a hardware address (realm net-observer,
+    /// node #93 item 1; node #109 item 1).
+    #[test]
+    fn link_sample_lease_and_mac_class_round_trip() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let base = LinkSample {
+            ts_us: 1000,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            bssid: None,
+            if_mac: Some("ca:8f:38:b3:12:d3".into()),
+            medium: None,
+            lease_start_us: Some(1_758_066_844_000_000),
+            lease_secs: Some(86400),
+            if_mac_private: Some(true),
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        };
+        s.write_sample(&Sample::Link(base.clone())).unwrap();
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 2000,
+            if_mac: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
+            ..base
+        }))
+        .unwrap();
+        let t = s
+            .query_table(
+                "SELECT ts_us, lease_start_us, lease_secs, if_mac_private \
+                 FROM link_sample ORDER BY ts_us",
+            )
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec!["1000", "1758066844000000", "86400", "true"],
+                vec!["2000", "", "", ""],
+            ]
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample \
+                 WHERE ts_us = 2000 AND lease_start_us IS NULL \
+                   AND lease_secs IS NULL AND if_mac_private IS NULL"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    /// A database written by the daemon that shipped `link_sample` with
+    /// `medium` but no lease pair or MAC class keeps its seventeen-column
+    /// table (`CREATE TABLE IF NOT EXISTS` does nothing to an existing one);
+    /// the three new columns are added on open, the old row reads back with
+    /// them NULL, and the new daemon's twenty-value insert lands (realm
+    /// net-observer, node #93 item 1; node #109 item 1).
+    #[test]
+    fn an_old_link_table_without_lease_columns_opens_and_keeps_its_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE link_sample (
+                ts_us BIGINT, gw VARCHAR, gw_rtt_ms DOUBLE, direct VARCHAR, direct_rtt_ms DOUBLE,
+                dhcp_router VARCHAR, dhcp_dns VARCHAR, gw_arp_mac VARCHAR, ssid VARCHAR,
+                wifi_capture_present BOOLEAN, lan_probed USMALLINT, lan_alive USMALLINT,
+                fakeip_route_if VARCHAR, singbox_tun_if VARCHAR, bssid VARCHAR, if_mac VARCHAR,
+                medium VARCHAR);
+             INSERT INTO link_sample VALUES
+                (1000, 'OK', 1.0, 'OK', 1.0, NULL, NULL, NULL, NULL, false, NULL, NULL,
+                 NULL, NULL, NULL, 'f0:18:98:0a:0b:0c', 'wifi');",
+        )
+        .unwrap();
+        let s = DuckdbStore::from_conn(conn).unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample \
+                 WHERE ts_us = 1000 AND if_mac = 'f0:18:98:0a:0b:0c' \
+                   AND lease_start_us IS NULL AND lease_secs IS NULL \
+                   AND if_mac_private IS NULL"
+            )
+            .unwrap(),
+            1,
+            "the old row must survive the added columns"
+        );
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 2000,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            bssid: None,
+            if_mac: Some("ca:8f:38:b3:12:d3".into()),
+            medium: None,
+            lease_start_us: Some(1_758_066_844_000_000),
+            lease_secs: Some(86400),
+            if_mac_private: Some(true),
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample \
+                 WHERE ts_us = 2000 AND lease_start_us = 1758066844000000 \
+                   AND lease_secs = 86400 AND if_mac_private"
             )
             .unwrap(),
             1
@@ -1606,6 +1751,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1839,6 +1987,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

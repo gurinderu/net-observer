@@ -29,6 +29,17 @@ ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS if_mac VARCHAR;
 -- realm net-observer, nodes #93, #108). NULL = not determinable. Same
 -- migration treatment.
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS medium VARCHAR;
+-- The current DHCP lease's start (epoch microseconds, NULL when absent /
+-- unparseable / a DST fold-gap made the local time ambiguous) and length
+-- (seconds), both from the same `ipconfig getsummary` parse as bssid above; a
+-- lease-start change is a fresh DHCP exchange, an INIT-REBOOT every few
+-- minutes a roam. `if_mac_private` is whether if_mac's U/L bit reads as an
+-- administratively-assigned (Private Wi-Fi) address rather than the
+-- hardware-burned one; NULL exactly when if_mac is (realm net-observer, node
+-- #93 item 1; node #109 item 1). Same migration treatment.
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS lease_start_us BIGINT;
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS lease_secs UINTEGER;
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS if_mac_private BOOLEAN;
 CREATE TABLE IF NOT EXISTS proxy_sample (
   ts_us BIGINT, server_ip VARCHAR, tcp VARCHAR, rtt_ms DOUBLE, tun_code USMALLINT, selector VARCHAR);
 -- Established-flow discriminator: whether the held reference streams (direct

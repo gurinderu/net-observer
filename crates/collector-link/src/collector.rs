@@ -10,7 +10,7 @@ use collector_core::{
 };
 use types::{GwVerdict, LinkSample, Sample, TcpVerdict};
 
-use crate::facts::LinkFacts;
+use crate::facts::{LinkFacts, LinkSummary};
 use crate::sample::build_link_sample;
 
 /// Static metadata for the `link` collector: macOS-only in v1.
@@ -142,14 +142,14 @@ where
         // ONE interface this tick resolved; with no interface there is
         // nothing to read them from, and each is the absence of a
         // measurement.
-        let (ssid, bssid, if_mac, medium) = match phys_iface.as_deref() {
+        let (ssid, summary, if_mac, medium) = match phys_iface.as_deref() {
             Some(iface) => (
                 self.facts.ssid(iface).await,
-                self.facts.bssid(iface).await,
+                self.facts.summary(iface).await,
                 self.facts.if_mac(iface).await,
                 self.facts.medium(iface).await,
             ),
-            None => (None, None, None, None),
+            None => (None, LinkSummary::default(), None, None),
         };
         let wifi_present = self.facts.wifi_capture_present().await;
         // Two local reads, not probes: the fakeip pool's route egress and the
@@ -171,7 +171,7 @@ where
             fakeip_route_if,
             singbox_tun_if,
             ssid,
-            bssid,
+            summary,
             if_mac,
             medium,
             wifi_present,
@@ -192,6 +192,9 @@ where
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -251,8 +254,9 @@ mod tests {
             }
         }
     }
-    /// Link facts with a scripted identity triple: `bssid`/`if_mac`/`medium`
-    /// are returned exactly as set, so a test can hand the collector a
+    /// Link facts with a scripted identity triple — `bssid` (now bundled with
+    /// the lease pair into one [`LinkSummary`]), `if_mac` and `medium` — each
+    /// returned exactly as set, so a test can hand the collector a
     /// determinable or an undeterminable identity and read what lands in the
     /// sample. `route_lookups` counts the `phys_iface` resolutions and
     /// `asked_for` records the interface each per-interface read was given,
@@ -260,6 +264,8 @@ mod tests {
     struct FakeFacts {
         ready: bool,
         bssid: Option<String>,
+        lease_start_us: Option<i64>,
+        lease_secs: Option<u32>,
         if_mac: Option<String>,
         medium: Option<LinkMedium>,
         route_lookups: Arc<std::sync::atomic::AtomicUsize>,
@@ -270,6 +276,8 @@ mod tests {
             Self {
                 ready: true,
                 bssid: Some("3c:22:fb:12:34:56".into()),
+                lease_start_us: None,
+                lease_secs: None,
                 if_mac: Some("f0:18:98:0a:0b:0c".into()),
                 medium: Some(LinkMedium::Wifi),
                 route_lookups: Arc::default(),
@@ -318,9 +326,13 @@ mod tests {
             self.asked(iface);
             None
         }
-        async fn bssid(&self, iface: &str) -> Option<String> {
+        async fn summary(&self, iface: &str) -> LinkSummary {
             self.asked(iface);
-            self.bssid.clone()
+            LinkSummary {
+                bssid: self.bssid.clone(),
+                lease_start_us: self.lease_start_us,
+                lease_secs: self.lease_secs,
+            }
         }
         async fn if_mac(&self, iface: &str) -> Option<String> {
             self.asked(iface);
@@ -455,6 +467,24 @@ mod tests {
         assert_eq!(l.if_mac.as_deref(), Some("f0:18:98:0a:0b:0c"));
     }
 
+    /// The lease pair the ONE `summary` call carries alongside the BSSID
+    /// lands in the sample every tick, untouched (realm net-observer, node
+    /// #93 item 1; node #109 item 1).
+    #[tokio::test]
+    async fn the_lease_pair_lands_in_the_sample() {
+        let c = collector_with_facts(FakeFacts {
+            lease_start_us: Some(1_758_066_844_000_000),
+            lease_secs: Some(86400),
+            ..FakeFacts::default()
+        });
+        let samples = c.collect(42).await;
+        let Sample::Link(l) = &samples[0] else {
+            panic!("expected a link sample")
+        };
+        assert_eq!(l.lease_start_us, Some(1_758_066_844_000_000));
+        assert_eq!(l.lease_secs, Some(86400));
+    }
+
     /// An identity the facts port could not determine stays `None` in the
     /// sample: not associated / not readable is recorded as absence, never as
     /// a placeholder address a roam comparison could mistake for a real one.
@@ -518,7 +548,7 @@ mod tests {
         assert_eq!(
             *asked_for.lock().unwrap(),
             vec!["en0"; 4],
-            "ssid, bssid, if_mac and medium are all read from that interface"
+            "ssid, summary, if_mac and medium are all read from that interface"
         );
     }
 

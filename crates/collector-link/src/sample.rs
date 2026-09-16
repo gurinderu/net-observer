@@ -1,6 +1,8 @@
 use collector_core::PingOutcome;
 use types::{GwVerdict, LinkMedium, LinkSample, TcpVerdict};
 
+use crate::facts::LinkSummary;
+
 /// Pure, SYNC mapping from fetched probe outcomes + link facts to a [`LinkSample`].
 ///
 /// `collect()` `await`s the probes/facts, then hands the fetched values here so
@@ -21,9 +23,11 @@ use types::{GwVerdict, LinkMedium, LinkSample, TcpVerdict};
 /// `fakeip_route_if` is the egress interface the route table resolves for a
 /// fakeip-pool address and `singbox_tun_if` the interface carrying sing-box's
 /// own TUN address (`None` = could not be determined / sing-box not up),
-/// equally untouched. `bssid` and `if_mac` are the link's identity pair — the
-/// AP associated with and the interface's own (rotating) MAC — passed through
-/// as read, `None` meaning not determinable, never a fabricated value.
+/// equally untouched. `summary` is the one `ipconfig getsummary` parse for
+/// this tick — the AP's BSSID and the current DHCP lease's start/length — and
+/// `if_mac` the interface's own (rotating) MAC, passed through as read,
+/// `None` meaning not determinable, never a fabricated value (realm
+/// net-observer, node #93 item 1; node #109 item 1).
 #[allow(clippy::too_many_arguments)]
 pub fn build_link_sample(
     ts_us: i64,
@@ -37,7 +41,7 @@ pub fn build_link_sample(
     fakeip_route_if: Option<String>,
     singbox_tun_if: Option<String>,
     ssid: Option<String>,
-    bssid: Option<String>,
+    summary: LinkSummary,
     if_mac: Option<String>,
     medium: Option<LinkMedium>,
     wifi_present: bool,
@@ -66,6 +70,13 @@ pub fn build_link_sample(
     );
     let (dhcp_router, dhcp_dns) = dhcp;
     let (lan_probed, lan_alive) = lan;
+    let LinkSummary {
+        bssid,
+        lease_start_us,
+        lease_secs,
+    } = summary;
+    // Not yet classified: the U/L-bit fold lands in a follow-up commit.
+    let if_mac_private = None;
     LinkSample {
         ts_us,
         gw,
@@ -79,6 +90,9 @@ pub fn build_link_sample(
         bssid,
         if_mac,
         medium,
+        lease_start_us,
+        lease_secs,
+        if_mac_private,
         wifi_capture_present: wifi_present,
         lan_probed,
         lan_alive,
@@ -113,7 +127,7 @@ mod tests {
             None,
             None,
             Some("cowork".into()),
-            None,
+            LinkSummary::default(),
             None,
             None,
             false,
@@ -137,7 +151,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            LinkSummary::default(),
             None,
             None,
             false,
@@ -161,7 +175,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            LinkSummary::default(),
             None,
             None,
             false,
@@ -186,7 +200,7 @@ mod tests {
             None,
             None,
             Some("cowork".into()),
-            None,
+            LinkSummary::default(),
             None,
             None,
             false,
@@ -215,7 +229,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            LinkSummary::default(),
             None,
             None,
             false,
@@ -237,7 +251,11 @@ mod tests {
             Some("awdl0".into()),
             Some("utun6".into()),
             Some("cowork".into()),
-            Some("3c:22:fb:12:34:56".into()),
+            LinkSummary {
+                bssid: Some("3c:22:fb:12:34:56".into()),
+                lease_start_us: Some(1_758_066_844_000_000),
+                lease_secs: Some(86400),
+            },
             Some("f0:18:98:0a:0b:0c".into()),
             Some(LinkMedium::Wifi),
             true,
@@ -252,6 +270,8 @@ mod tests {
         assert_eq!(s.bssid.as_deref(), Some("3c:22:fb:12:34:56"));
         assert_eq!(s.if_mac.as_deref(), Some("f0:18:98:0a:0b:0c"));
         assert_eq!(s.medium, Some(LinkMedium::Wifi));
+        assert_eq!(s.lease_start_us, Some(1_758_066_844_000_000));
+        assert_eq!(s.lease_secs, Some(86400));
         assert!(s.wifi_capture_present);
     }
 
@@ -272,7 +292,7 @@ mod tests {
             None,
             None,
             Some("cowork".into()),
-            None,
+            LinkSummary::default(),
             None,
             None,
             false,
@@ -281,5 +301,38 @@ mod tests {
         assert_eq!(s.bssid, None);
         assert_eq!(s.if_mac, None);
         assert_eq!(s.medium, None);
+        assert_eq!(s.lease_start_us, None);
+        assert_eq!(s.lease_secs, None);
+        assert_eq!(s.if_mac_private, None);
+    }
+
+    /// The lease start/length carried in the [`LinkSummary`] flow straight
+    /// through into the sample, untouched (realm net-observer, node #93 item
+    /// 1; node #109 item 1).
+    #[test]
+    fn lease_fields_flow_through_from_the_summary() {
+        let s = build_link_sample(
+            9,
+            outcome(true),
+            outcome(true),
+            false,
+            Some("10.20.0.1".into()),
+            (None, None),
+            None,
+            (None, None),
+            None,
+            None,
+            None,
+            LinkSummary {
+                bssid: None,
+                lease_start_us: Some(1_758_066_844_000_000),
+                lease_secs: Some(3600),
+            },
+            None,
+            None,
+            false,
+        );
+        assert_eq!(s.lease_start_us, Some(1_758_066_844_000_000));
+        assert_eq!(s.lease_secs, Some(3600));
     }
 }
