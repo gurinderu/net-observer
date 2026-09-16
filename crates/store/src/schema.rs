@@ -29,6 +29,9 @@ ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS if_mac VARCHAR;
 -- realm net-observer, nodes #93, #108). NULL = not determinable. Same
 -- migration treatment.
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS medium VARCHAR;
+-- `tun_code`: the HTTP status the TUN probe got; 0 = probed, no HTTP status
+-- (the shell oracle's curl 000) — the dead tun every reading takes it for;
+-- NULL = not probed (passive tier, preflight skip), neither health nor fault.
 CREATE TABLE IF NOT EXISTS proxy_sample (
   ts_us BIGINT, server_ip VARCHAR, tcp VARCHAR, rtt_ms DOUBLE, tun_code USMALLINT, selector VARCHAR);
 -- Established-flow discriminator: whether the held reference streams (direct
@@ -52,6 +55,16 @@ CREATE TABLE IF NOT EXISTS route_event (
   ts_us BIGINT, kind VARCHAR, iface VARCHAR, detail VARCHAR);
 CREATE TABLE IF NOT EXISTS host_sample (
   ts_us BIGINT, load1 DOUBLE, load5 DOUBLE, load15 DOUBLE);
+-- The usage of the volume holding this very file (used fraction 0-100 and
+-- free MiB, as `df` computes them) and the swap in use, MiB: the ENOSPC and
+-- memory-pressure discriminators the retired shell oracle carried, measured
+-- as decided at (realm net-observer, node #123). A store write that fails for
+-- want of space is logged as a gap; these columns let the record name the
+-- cause. NULL = not measured, never a zero. Added after the host table first
+-- shipped — same migration treatment as link_sample above.
+ALTER TABLE host_sample ADD COLUMN IF NOT EXISTS disk_used_pct DOUBLE;
+ALTER TABLE host_sample ADD COLUMN IF NOT EXISTS disk_free_mb UBIGINT;
+ALTER TABLE host_sample ADD COLUMN IF NOT EXISTS swap_used_mb UBIGINT;
 -- Wi-Fi air quality. `rssi_dbm`/`noise_dbm` are the raw pair as CoreWLAN reported
 -- them and `snr_db` is derived from them, so a later change of derivation can be
 -- recomputed from the columns that were actually measured.
@@ -151,4 +164,13 @@ CREATE TABLE IF NOT EXISTS observing_edge (
 -- rows read back with a NULL cause, which the gap derivation treats as
 -- 'control': that is what they in fact were.
 ALTER TABLE observing_edge ADD COLUMN IF NOT EXISTS cause VARCHAR;
+-- One row per switch of the probing tier (realm net-observer, node #88). A
+-- passive stretch is not a gap — every withheld probe still lands as a SKIP
+-- row — but this is what says WHY those rows carry no measurement and who
+-- asked for it. `tier` is the tier entered ('passive' / 'active'); `peer_uid`
+-- is NULL for the startup edge, which records the configured default so a
+-- record that begins passive says so. Added after the store first shipped, so
+-- an older DB file gains the table on open like `topology_link` above.
+CREATE TABLE IF NOT EXISTS probing_edge (
+  ts_us BIGINT, tier VARCHAR, peer_uid BIGINT);
 "#;

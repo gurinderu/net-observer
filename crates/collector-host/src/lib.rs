@@ -1,5 +1,6 @@
 //! `collector-host` — the `host` collector: host load / starvation signals
-//! (1/5/15-min averages) mapped into [`types::HostSample`]s.
+//! (1/5/15-min averages), the usage of the volume holding the record and the
+//! swap in use, mapped into [`types::HostSample`]s.
 //!
 //! Holds the [`HostFacts`] port trait (implemented by the `macos` crate), the pure
 //! [`build_host_sample`] mapping, static [`META`], and the [`HostCollector`] that

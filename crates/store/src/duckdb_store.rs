@@ -5,8 +5,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use types::{
-    BlobRef, Incident, NeighborLifetime, ObservingEdge, Sample, TopologyLifetime, TopologyLink,
-    TriggerFired,
+    BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, TopologyLifetime,
+    TopologyLink, TriggerFired,
 };
 
 /// `network_key` for a segment whose gateway MAC could not be read. Neighbours
@@ -366,8 +366,16 @@ impl Store for DuckdbStore {
                 params![r.ts_us, r.kind, r.iface, r.detail],
             )?,
             Sample::Host(h) => c.execute(
-                "INSERT INTO host_sample VALUES (?,?,?,?)",
-                params![h.ts_us, h.load1, h.load5, h.load15],
+                "INSERT INTO host_sample VALUES (?,?,?,?,?,?,?)",
+                params![
+                    h.ts_us,
+                    h.load1,
+                    h.load5,
+                    h.load15,
+                    h.disk_used_pct,
+                    h.disk_free_mb,
+                    h.swap_used_mb
+                ],
             )?,
             Sample::Wifi(w) => c.execute(
                 "INSERT INTO wifi_sample VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -599,6 +607,13 @@ impl Store for DuckdbStore {
                 e.peer_uid.map(i64::from),
                 e.cause.as_str()
             ],
+        )?;
+        Ok(())
+    }
+    fn write_probing_edge(&self, e: &ProbingEdge) -> Result<(), StoreError> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO probing_edge (ts_us, tier, peer_uid) VALUES (?,?,?)",
+            params![e.ts_us, e.tier.as_str(), e.peer_uid.map(i64::from)],
         )?;
         Ok(())
     }
@@ -1321,11 +1336,109 @@ mod tests {
             load1: 12.0,
             load5: 8.0,
             load15: 4.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }))
         .unwrap();
         assert_eq!(
             s.query_scalar_i64("SELECT count(*) FROM host_sample WHERE load1 > 10")
                 .unwrap(),
+            1
+        );
+    }
+
+    /// The record volume's usage and the swap in use land in their own host
+    /// columns; NULL = not measured, distinguishable from an empty disk or an
+    /// idle swap.
+    #[test]
+    fn host_sample_disk_and_swap_columns_round_trip() {
+        use types::{HostSample, Sample};
+        let s = DuckdbStore::in_memory().unwrap();
+        let base = HostSample {
+            ts_us: 1000,
+            load1: 1.0,
+            load5: 2.0,
+            load15: 3.0,
+            disk_used_pct: Some(87.5),
+            disk_free_mb: Some(61_440),
+            swap_used_mb: Some(1235),
+        };
+        s.write_sample(&Sample::Host(base.clone())).unwrap();
+        s.write_sample(&Sample::Host(HostSample {
+            ts_us: 2000,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+            ..base
+        }))
+        .unwrap();
+        let t = s
+            .query_table(
+                "SELECT ts_us, load1, disk_used_pct, disk_free_mb, swap_used_mb \
+                 FROM host_sample ORDER BY ts_us",
+            )
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec!["1000", "1", "87.5", "61440", "1235"],
+                vec!["2000", "1", "", "", ""],
+            ]
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM host_sample \
+                 WHERE ts_us = 2000 AND disk_used_pct IS NULL \
+                   AND disk_free_mb IS NULL AND swap_used_mb IS NULL"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    /// A database written by the daemon that shipped host samples with only
+    /// the load triple keeps its four-column table (CREATE TABLE IF NOT EXISTS
+    /// does nothing to an existing one); the disk and swap columns are added
+    /// on open, the old rows read back with them NULL, and the new daemon's
+    /// seven-value insert lands.
+    #[test]
+    fn an_old_four_column_host_table_opens_and_keeps_its_rows() {
+        use types::{HostSample, Sample};
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE host_sample (ts_us BIGINT, load1 DOUBLE, load5 DOUBLE, load15 DOUBLE);
+             INSERT INTO host_sample VALUES (1000, 12.0, 8.0, 4.0);",
+        )
+        .unwrap();
+        let s = DuckdbStore::from_conn(conn).unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM host_sample \
+                 WHERE ts_us = 1000 AND load1 = 12 AND disk_used_pct IS NULL \
+                   AND disk_free_mb IS NULL AND swap_used_mb IS NULL"
+            )
+            .unwrap(),
+            1,
+            "the old row must survive the added columns"
+        );
+        s.write_sample(&Sample::Host(HostSample {
+            ts_us: 2000,
+            load1: 1.0,
+            load5: 1.0,
+            load15: 1.0,
+            disk_used_pct: Some(99.5),
+            disk_free_mb: Some(120),
+            swap_used_mb: Some(0),
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM host_sample \
+                 WHERE ts_us = 2000 AND disk_used_pct = 99.5 \
+                   AND disk_free_mb = 120 AND swap_used_mb = 0"
+            )
+            .unwrap(),
             1
         );
     }
@@ -1681,6 +1794,45 @@ mod tests {
             s.query_scalar_i64("SELECT count(*) FROM observing_edge WHERE peer_uid IS NULL")
                 .unwrap(),
             1
+        );
+    }
+
+    /// A tier switch lands as one row carrying the tier's token and the peer;
+    /// the startup edge (no peer) stores a NULL, so the two are told apart in
+    /// SQL exactly like `observing_edge`.
+    #[test]
+    fn write_probing_edge_round_trips_in_ts_order() {
+        use types::{ProbingEdge, ProbingTier};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_probing_edge(&ProbingEdge {
+            ts_us: 100,
+            tier: ProbingTier::Passive,
+            peer_uid: None,
+        })
+        .unwrap();
+        s.write_probing_edge(&ProbingEdge {
+            ts_us: 200,
+            tier: ProbingTier::Active,
+            peer_uid: Some(501),
+        })
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM probing_edge WHERE tier = 'passive' AND peer_uid IS NULL"
+            )
+            .unwrap(),
+            1,
+            "the startup default is a peerless edge"
+        );
+        let t = s
+            .query_table("SELECT ts_us, tier, peer_uid FROM probing_edge ORDER BY ts_us")
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec!["100".to_string(), "passive".to_string(), String::new()],
+                vec!["200".to_string(), "active".to_string(), "501".to_string()],
+            ]
         );
     }
 

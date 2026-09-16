@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use collector_core::ProbingState;
 use net_observer_ipc::{
     ControlCmd, ControlResult, EncodedFrame, Event, EventKind, Gap, Ready, Request, Response,
     ScanOptions, StatusSnapshot, StreamError, StreamErrorCode, StreamFrame,
@@ -39,7 +40,10 @@ use store::Store;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, broadcast};
-use types::{NeighborsSample, NeighborsVerdict, ObservingCause, ObservingEdge, Sample};
+use types::{
+    NeighborsSample, NeighborsVerdict, ObservingCause, ObservingEdge, ProbingEdge, ProbingTier,
+    Sample,
+};
 
 use crate::acting;
 use crate::pipeline::{AirScanRequest, AirScanner, NeighborScanner, PcapRingSlot};
@@ -381,6 +385,10 @@ pub struct ApiServer {
     /// The link collector's quiet flag; `SetQuiet` is its only writer. Shared
     /// with the collector — a fresh `Arc` here would ack a quiet nobody honours.
     pub quiet: Arc<AtomicBool>,
+    /// The probing tier the link, proxy and dns collectors read each tick;
+    /// `SetProbing` is its only writer. Shared with the collectors for the same
+    /// reason as `quiet`. (realm net-observer, node #88)
+    pub probing: Arc<ProbingState>,
     /// The slot holding the pcap ring, asked at request time rather than held by
     /// value: the ring can start late (no interface at boot) or die, and
     /// `FreezePcap` must answer about the ring that is running *now*. An empty
@@ -400,9 +408,10 @@ pub struct ApiServer {
     /// Where a manual freeze writes its copy: the daemon's blob directory, the
     /// same root the `gw-change` freeze handler uses.
     pub blob_dir: PathBuf,
-    /// `ts_us` of the most recent RESUME edge, published here and consumed by
-    /// `pipeline::run` to drop its pre-pause trigger window. `0` = never
-    /// resumed.
+    /// `ts_us` of the most recent window-clearing edge — a RESUME, or a
+    /// probing-tier switch in either direction — published here and consumed
+    /// by `pipeline::run` to drop its pre-edge trigger window. `0` = no such
+    /// edge yet.
     pub resume_at_us: Arc<AtomicI64>,
     pub snapshot: Arc<Mutex<StatusSnapshot>>,
     /// Durable sink for pause/resume boundary records.
@@ -633,6 +642,7 @@ async fn handle_conn(
                 StreamCtx {
                     events_tx: &srv.events_tx,
                     observing: &srv.observing,
+                    probing: &srv.probing,
                     subscribers,
                     max_subscribers: srv.max_subscribers,
                     refusals: &srv.sub_refusals,
@@ -694,6 +704,7 @@ async fn handle_conn(
                 acting: &srv.acting,
                 observing: &srv.observing,
                 quiet: &srv.quiet,
+                probing: &srv.probing,
                 freezer: &srv.freezer,
                 scanner: srv.scanner.as_deref(),
                 air_scanner: srv.air_scanner.as_deref(),
@@ -788,11 +799,12 @@ async fn write_stream_frame<W: AsyncWrite + Unpin>(
 /// because the read branch won loses no event; `AsyncReadExt::read` is cancel-safe
 /// too, so a lost race the other way reads nothing.
 /// The shared state one subscription needs, grouped so the signature stays
-/// readable: the bus it reads, the pause flag it reports, and the cap plus its
-/// rate-limited refusal log.
+/// readable: the bus it reads, the pause flag and the probing tier it reports,
+/// and the cap plus its rate-limited refusal log.
 struct StreamCtx<'a> {
     events_tx: &'a broadcast::Sender<EncodedFrame>,
     observing: &'a AtomicBool,
+    probing: &'a ProbingState,
     subscribers: &'a Arc<AtomicUsize>,
     max_subscribers: usize,
     refusals: &'a RateLimitedLog,
@@ -807,6 +819,7 @@ async fn stream_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let StreamCtx {
         events_tx,
         observing,
+        probing,
         subscribers,
         max_subscribers,
         refusals,
@@ -839,17 +852,19 @@ async fn stream_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     //    vanish into the old publish-before-subscribe window.
     let mut rx = events_tx.subscribe();
 
-    // 3. The mandatory ack, carrying the CURRENT collection state so a fresh
-    //    subscriber learns it immediately instead of inferring it from silence.
-    //    `observing` is read AFTER subscribing, deliberately: an edge landing in
-    //    between is then delivered twice (ack + bus frame) rather than lost, and
-    //    duplication is free because the frame carries an absolute state.
+    // 3. The mandatory ack, carrying the CURRENT collection state and probing
+    //    tier so a fresh subscriber learns them immediately instead of
+    //    inferring them from silence (or from a run of SKIPs). Both are read
+    //    AFTER subscribing, deliberately: an edge landing in between is then
+    //    delivered twice (ack + bus frame) rather than lost, and duplication is
+    //    free because the frame carries an absolute state.
     write_stream_frame(
         wr,
         &StreamFrame::Ready(Ready {
             ts_us: types::now_us(),
             kinds: kinds.clone(),
             observing: observing.load(Ordering::Acquire),
+            probing: probing.tier(),
         }),
     )
     .await?;
@@ -911,6 +926,7 @@ pub(crate) struct ControlCtx<'a> {
     pub acting: &'a ActingConfig,
     pub observing: &'a AtomicBool,
     pub quiet: &'a AtomicBool,
+    pub probing: &'a ProbingState,
     pub freezer: &'a PcapRingSlot,
     /// The neighbour scanner, when one could be built for this host.
     pub scanner: Option<&'a dyn NeighborScanner>,
@@ -1080,6 +1096,7 @@ fn control_response(
                 message: format!("quiet {label}"),
             }
         }
+        ControlCmd::SetProbing(tier) => set_probing(tier, authorized, cx),
         ControlCmd::FreezePcap => freeze_now(cx),
         ControlCmd::ScanNeighbors(opts) => scan_now(cx, &opts, Some(authorized.uid())),
         ControlCmd::ScanAir => air_scan_now(cx, authorized.uid()),
@@ -1087,6 +1104,106 @@ fn control_response(
             Ok(message) => ControlResult { ok: true, message },
             Err(message) => ControlResult { ok: false, message },
         },
+    }
+}
+
+/// Switch the probing tier on operator demand (realm net-observer, node #88).
+///
+/// The `SetQuiet` shape — flip the shared state, mirror it into the snapshot,
+/// answer — plus the two sinks `SetObserving` uses, because a tier switch IS
+/// bracketed: one `ProbingEdge` built once, written as a `probing_edge` row and
+/// published as a `StreamFrame::Probing`. The state flip, the clock and the
+/// publish sit under the snapshot lock for the reason `SetObserving` spells
+/// out: two opposite switches must stamp and land in one order, or the rows
+/// read back claim the daemon was probing while it was not. No `.await` and no
+/// store write under the guard.
+///
+/// A switch to the tier already in force is not an edge: no row, no frame,
+/// still `ok` — the requested tier does hold. A store failure is logged as a
+/// gap and reported in the message but never fails the control, because the
+/// tier really did change and `ok: false` would say otherwise.
+///
+/// A real switch, in EITHER direction, closes and re-opens detection exactly
+/// as a resume does: it publishes the same `resume_at_us` epoch the observing
+/// resume publishes, and `pipeline::run` then clears the recent-sample window
+/// (`RecentWindow::clear_for_resume`, gateway-change basis kept), re-arms every
+/// trigger (`TriggerEngine::rearm_all`) and keeps the bounded pre-edge drain out
+/// of the window; the interval collectors drop a tick that straddled the edge
+/// at the source as well. So the cleared window makes the first post-edge
+/// sample judge afresh, exactly as after a resume: a condition that no longer
+/// holds closes its open incident at that sample's `ts_us`; one that still
+/// holds — a `NoGw` gw-drop, a fakeip hijack, both readable under passive —
+/// keeps it open. The `probing_edge` row at the switch's own `ts_us` is the
+/// bracket that explains either. The probe-fed conditions do not read the
+/// first passive `SKIP`s as a recovery, and after a switch back no dead tick
+/// from before the stretch can join the ticks after it. Without this, the
+/// switch to passive turned every probe-fed condition to `None` at once and
+/// the engine closed open incidents as "recovered" at that instant.
+fn set_probing(
+    tier: ProbingTier,
+    authorized: PeerAuthorized,
+    cx: &ControlCtx<'_>,
+) -> ControlResult {
+    let transition = {
+        let mut snap = cx.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        // Read-then-set is safe: the snapshot lock serialises every control
+        // connection and this is the tier's only writer.
+        let was = cx.probing.tier();
+        if was == tier {
+            None
+        } else {
+            let ts_us = types::now_us();
+            // The epoch is published BEFORE the tier flips, as on a resume: a
+            // collector that reads the new tier has already synchronised with
+            // it, so no sample taken under the new tier can reach the consumer
+            // while it still reads the old epoch. The residual, named: a
+            // control task preempted between these two stores for longer than
+            // a collector's own epoch-read-to-tier-read gap lets ONE old-tier
+            // tick, stamped with a post-edge `ts_us`, pass both of the
+            // spawner's re-checks. Swapping the order would open the
+            // consumer-side hole above instead. Accepted as bounded (one tick,
+            // one switch) and left as is.
+            cx.resume_at_us.store(ts_us, Ordering::Release);
+            cx.probing.set(tier);
+            snap.probing = tier;
+            let edge = ProbingEdge {
+                ts_us,
+                tier,
+                peer_uid: Some(authorized.uid()),
+            };
+            match EncodedFrame::encode(&StreamFrame::Probing(edge)) {
+                Ok(frame) => {
+                    let _ = cx.events_tx.send(frame);
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to encode probing frame"),
+            }
+            Some(edge)
+        }
+    };
+    let Some(edge) = transition else {
+        tracing::info!(probing = %tier, changed = false, "probing tier unchanged");
+        return ControlResult {
+            ok: true,
+            message: format!("probing {tier}"),
+        };
+    };
+
+    let mut note = String::new();
+    if let Err(e) = cx.store.write_probing_edge(&edge) {
+        tracing::error!(error = %e, probing = %tier,
+            "store write failed; probing edge not recorded (gap logged)");
+        note = format!(" (boundary record failed: {e})");
+    }
+
+    tracing::info!(
+        probing = %tier,
+        ts_us = edge.ts_us,
+        peer_uid = authorized.uid(),
+        "probing tier changed via control socket"
+    );
+    ControlResult {
+        ok: true,
+        message: format!("probing {tier}{note}"),
     }
 }
 
@@ -1110,7 +1227,15 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
     //
     // Quiet: quiet means this daemon addresses no packet at the gateway; a sweep
     // addresses the whole subnet. Honouring the click would make quiet a lie the
-    // operator has no way to see.
+    // operator has no way to see — quiet is the EVIDENCE protocol (realm
+    // net-observer, node #26): a capture taken under it must contain none of
+    // our packets.
+    //
+    // The passive probing tier is deliberately NOT a third refusal. Passive
+    // promises no emission the daemon makes on its own; an operator's scan is
+    // not the daemon's — the command is the sanction (realm net-observer, node
+    // #91) — and the scan writes its own `neighbor_scan` row, so the record
+    // shows exactly what was sent inside the passive stretch. (node #88)
     if !cx.observing.load(Ordering::Acquire) {
         return ControlResult {
             ok: false,
@@ -1499,6 +1624,9 @@ mod tests {
             },
             observing: Arc::new(AtomicBool::new(true)),
             quiet: Arc::new(AtomicBool::new(false)),
+            // Active, so the pre-tier control tests keep their premises; the
+            // `set_probing` test flips it itself.
+            probing: Arc::new(ProbingState::new(ProbingTier::Active)),
             freezer: Arc::new(PcapRingSlot::empty()),
             scanner: None,
             air_scanner: None,
@@ -1522,6 +1650,7 @@ mod tests {
             acting: &srv.acting,
             observing: &srv.observing,
             quiet: &srv.quiet,
+            probing: &srv.probing,
             freezer: &srv.freezer,
             scanner: srv.scanner.as_deref(),
             air_scanner: srv.air_scanner.as_deref(),
@@ -1769,6 +1898,8 @@ mod tests {
         .unwrap();
         match answer {
             Response::Table(t) => {
+                // The shape `Gaps` shipped with, and keeps: a pre-tier reader
+                // asks for it by this id and prints every row as a pause.
                 assert_eq!(
                     t.columns,
                     ["gap_opened_us", "gap_closed_us", "gap_closed_by"]
@@ -1813,6 +1944,9 @@ mod tests {
         }
         fn write_observing_edge(&self, e: &ObservingEdge) -> Result<(), store::StoreError> {
             self.inner.write_observing_edge(e)
+        }
+        fn write_probing_edge(&self, e: &ProbingEdge) -> Result<(), store::StoreError> {
+            self.inner.write_probing_edge(e)
         }
         fn write_neighbor_scan(&self, s: &store::NeighborScan) -> Result<(), store::StoreError> {
             self.inner.write_neighbor_scan(s)
@@ -2013,6 +2147,7 @@ mod tests {
         for cmd in [
             ControlCmd::SetObserving(false),
             ControlCmd::SetQuiet(true),
+            ControlCmd::SetProbing(ProbingTier::Passive),
             ControlCmd::FreezePcap,
             ControlCmd::KickstartProxy,
             ControlCmd::ScanNeighbors(ScanOptions::default()),
@@ -2022,6 +2157,7 @@ mod tests {
             match cmd {
                 ControlCmd::SetObserving(_)
                 | ControlCmd::SetQuiet(_)
+                | ControlCmd::SetProbing(_)
                 | ControlCmd::FreezePcap
                 | ControlCmd::KickstartProxy
                 | ControlCmd::ScanNeighbors(_)
@@ -2052,7 +2188,144 @@ mod tests {
                 0,
                 "{cmd:?}: a refused pause must leave no boundary row behind"
             );
+            assert_eq!(
+                srv.probing.tier(),
+                ProbingTier::Active,
+                "{cmd:?}: a refused control must not touch the probing tier"
+            );
+            assert_eq!(
+                srv.store
+                    .query_scalar_i64("SELECT count(*) FROM probing_edge")
+                    .unwrap(),
+                0,
+                "{cmd:?}: a refused tier switch must leave no boundary row behind"
+            );
         }
+    }
+
+    /// `SetProbing` flips the tier the three emitting collectors read, mirrors
+    /// it into the live snapshot, and — unlike quiet — brackets the switch:
+    /// one durable `probing_edge` row and one `Probing` frame describing the
+    /// same transition (same `ts_us`, same tier, same peer). A repeat to the
+    /// tier already in force is not an edge: no row, no frame, still `ok`.
+    #[test]
+    fn set_probing_flips_the_tier_and_brackets_the_switch_through_both_sinks() {
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let mut rx = srv.events_tx.subscribe();
+        let cx = test_ctx(&srv);
+        assert_eq!(srv.probing.tier(), ProbingTier::Active);
+
+        assert_eq!(srv.resume_at_us.load(Ordering::Acquire), 0);
+
+        let res = control_request(
+            ControlCmd::SetProbing(ProbingTier::Passive),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert_eq!(res.message, "probing passive");
+        assert_eq!(srv.probing.tier(), ProbingTier::Passive);
+        assert_eq!(srv.snapshot.lock().unwrap().probing, ProbingTier::Passive);
+        // The tier is orthogonal to the pause and to quiet.
+        assert!(srv.observing.load(Ordering::Acquire));
+        assert!(!srv.quiet.load(Ordering::Acquire));
+        // The switch closes and re-opens detection the way a resume does: the
+        // window-clearing epoch moves to the edge's own instant, which is what
+        // `pipeline::run` keys `clear_for_resume` + `rearm_all` off.
+        let epoch_after_passive = srv.resume_at_us.load(Ordering::Acquire);
+        assert_ne!(
+            epoch_after_passive, 0,
+            "a tier switch must publish the epoch"
+        );
+
+        // Sink 1: exactly one durable row, attributable to the peer.
+        assert_eq!(
+            srv.store
+                .query_scalar_i64(&format!(
+                    "SELECT count(*) FROM probing_edge \
+                     WHERE tier = 'passive' AND peer_uid = {TEST_DAEMON_UID}"
+                ))
+                .unwrap(),
+            1
+        );
+        let row_ts = srv
+            .store
+            .query_scalar_i64("SELECT ts_us FROM probing_edge")
+            .unwrap();
+        assert_eq!(
+            epoch_after_passive, row_ts,
+            "the epoch is the edge's own instant: the probing_edge row is the bracket"
+        );
+        // Sink 2: exactly one frame, describing the same transition.
+        let frame = rx.try_recv().expect("a tier switch must publish one frame");
+        let decoded: StreamFrame = serde_json::from_slice(frame.bytes()).unwrap();
+        match decoded {
+            StreamFrame::Probing(edge) => {
+                assert_eq!(
+                    edge.ts_us, row_ts,
+                    "row and frame disagree on the timestamp"
+                );
+                assert_eq!(edge.tier, ProbingTier::Passive);
+                assert_eq!(edge.peer_uid, Some(TEST_DAEMON_UID));
+            }
+            other => panic!("expected a Probing frame, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "one edge, one frame");
+
+        // A no-op: the tier holds, nothing is written or published.
+        let again = control_request(
+            ControlCmd::SetProbing(ProbingTier::Passive),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(again.ok);
+        assert_eq!(again.message, "probing passive");
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM probing_edge")
+                .unwrap(),
+            1,
+            "a no-op must not write a second boundary row"
+        );
+        assert!(rx.try_recv().is_err(), "a no-op must not publish a frame");
+        assert_eq!(
+            srv.resume_at_us.load(Ordering::Acquire),
+            epoch_after_passive,
+            "a no-op must not clear the window either"
+        );
+
+        // And back: a second real edge.
+        let back = control_request(
+            ControlCmd::SetProbing(ProbingTier::Active),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(back.ok);
+        assert_eq!(back.message, "probing active");
+        assert_eq!(srv.probing.tier(), ProbingTier::Active);
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM probing_edge WHERE tier = 'active'")
+                .unwrap(),
+            1
+        );
+        assert!(rx.try_recv().is_ok(), "the second edge publishes its frame");
+        // Either direction clears: the switch back moves the epoch again, so
+        // no dead tick from before the stretch can join the ticks after it.
+        assert_eq!(
+            srv.resume_at_us.load(Ordering::Acquire),
+            srv.store
+                .query_scalar_i64("SELECT ts_us FROM probing_edge WHERE tier = 'active'")
+                .unwrap()
+        );
+        // A tier switch is not a pause: the observing bracket stays untouched.
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM observing_edge")
+                .unwrap(),
+            0,
+            "a tier switch is not a pause and must not write an observing edge"
+        );
     }
 
     /// `SetObserving` flips the shared flag and mirrors the new state into the
@@ -2224,6 +2497,42 @@ mod tests {
                 .query_scalar_i64("SELECT count(*) FROM neighbor")
                 .unwrap(),
             0
+        );
+    }
+
+    /// The sibling of the quiet refusal, in the other direction: the passive
+    /// tier promises no emission the daemon makes on its own, and an operator's
+    /// scan is not the daemon's — the command is the sanction (realm
+    /// net-observer, node #91) and the scan writes its own `neighbor_scan`
+    /// row, so passive lets it through and the record shows what was sent
+    /// inside the stretch. (realm net-observer, node #88)
+    #[test]
+    fn a_neighbour_scan_runs_under_the_passive_tier() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
+        srv.probing.set(ProbingTier::Passive);
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions::default()),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(
+            res.ok,
+            "passive must not refuse a manual scan: {}",
+            res.message
+        );
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM neighbor_scan WHERE method = 'sweep'")
+                .unwrap(),
+            1,
+            "the scan's own row is what shows the packets were sent inside the stretch"
+        );
+        assert_eq!(
+            srv.probing.tier(),
+            ProbingTier::Passive,
+            "a scan does not move the tier"
         );
     }
 
@@ -2652,6 +2961,7 @@ mod tests {
     async fn subscriber_cap_refuses_with_a_decodable_error() {
         let (events_tx, _rx) = broadcast::channel::<EncodedFrame>(16);
         let observing = AtomicBool::new(true);
+        let probing = ProbingState::new(ProbingTier::Active);
         // Cap of 1, already taken.
         let subscribers = Arc::new(AtomicUsize::new(1));
 
@@ -2664,6 +2974,7 @@ mod tests {
             StreamCtx {
                 events_tx: &events_tx,
                 observing: &observing,
+                probing: &probing,
                 subscribers: &subscribers,
                 max_subscribers: 1,
                 refusals: &RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
@@ -2702,11 +3013,13 @@ mod tests {
         // retained for this one too.
         drop(rx);
         let observing = Arc::new(AtomicBool::new(true));
+        let probing = Arc::new(ProbingState::new(ProbingTier::Active));
         let subscribers = Arc::new(AtomicUsize::new(0));
 
         let (client, server) = tokio::io::duplex(64 * 1024);
         let tx = events_tx.clone();
         let obs = Arc::clone(&observing);
+        let tier = Arc::clone(&probing);
         let subs = Arc::clone(&subscribers);
         let task = tokio::spawn(async move {
             let (mut rd, mut wr) = tokio::io::split(server);
@@ -2717,6 +3030,7 @@ mod tests {
                 StreamCtx {
                     events_tx: &tx,
                     observing: &obs,
+                    probing: &tier,
                     subscribers: &subs,
                     max_subscribers: 8,
                     refusals: &RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
@@ -2743,6 +3057,9 @@ mod tests {
                 load1: 0.0,
                 load5: 0.0,
                 load15: 0.0,
+                disk_used_pct: None,
+                disk_free_mb: None,
+                swap_used_mb: None,
             })))
             .unwrap();
             events_tx.send(frame).unwrap();
@@ -2767,11 +3084,15 @@ mod tests {
     async fn subscribe_ack_reports_the_current_observing_state() {
         let (events_tx, _rx) = broadcast::channel::<EncodedFrame>(16);
         let observing = Arc::new(AtomicBool::new(false));
+        // Passive, so the ack is seen to carry the tier the daemon holds
+        // rather than the wire default (`Active`).
+        let probing = Arc::new(ProbingState::new(ProbingTier::Passive));
         let subscribers = Arc::new(AtomicUsize::new(0));
 
         let (client, server) = tokio::io::duplex(4096);
         let tx = events_tx.clone();
         let obs = Arc::clone(&observing);
+        let tier = Arc::clone(&probing);
         let subs = Arc::clone(&subscribers);
         let task = tokio::spawn(async move {
             let (mut rd, mut wr) = tokio::io::split(server);
@@ -2782,6 +3103,7 @@ mod tests {
                 StreamCtx {
                     events_tx: &tx,
                     observing: &obs,
+                    probing: &tier,
                     subscribers: &subs,
                     max_subscribers: 8,
                     refusals: &RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
@@ -2796,6 +3118,11 @@ mod tests {
         match serde_json::from_str::<StreamFrame>(&line).unwrap() {
             StreamFrame::Ready(ready) => {
                 assert!(!ready.observing, "the ack must report the paused state");
+                assert_eq!(
+                    ready.probing,
+                    ProbingTier::Passive,
+                    "the ack must report the tier in force"
+                );
                 assert_eq!(ready.kinds, Some(vec![EventKind::Route]));
             }
             other => panic!("expected a Ready ack as the first frame, got {other:?}"),
@@ -2845,6 +3172,9 @@ mod tests {
                     load1: 0.0,
                     load5: 0.0,
                     load15: 0.0,
+                    disk_used_pct: None,
+                    disk_free_mb: None,
+                    swap_used_mb: None,
                 })))
                 .unwrap(),
             )
@@ -3447,6 +3777,7 @@ mod tests {
 
         let (events_tx, _rx) = broadcast::channel::<EncodedFrame>(16);
         let observing = AtomicBool::new(true);
+        let probing = ProbingState::new(ProbingTier::Active);
         // Cap of 1, already taken, so every attempt below is refused.
         let subscribers = Arc::new(AtomicUsize::new(1));
         let refusals = RateLimitedLog::new(REFUSAL_LOG_INTERVAL);
@@ -3464,6 +3795,7 @@ mod tests {
                 StreamCtx {
                     events_tx: &events_tx,
                     observing: &observing,
+                    probing: &probing,
                     subscribers: &subscribers,
                     max_subscribers: 1,
                     refusals: &refusals,

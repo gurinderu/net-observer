@@ -11,5 +11,5 @@ mod probes;
 mod proxy;
 
 pub use collector::{META, ProxyCollector};
-pub use probes::{ProxyFacts, StallProbe, StallReading, StreamCheck};
+pub use probes::{ProxyFacts, StallProbe, StallReading, StreamCheck, TunProbe};
 pub use proxy::build_proxy_samples;

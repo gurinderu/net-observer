@@ -64,6 +64,7 @@ pub fn run_query(
             window_us,
         } => diagnosis::gateway_ramp_sql(drop_ts_us, window_us),
         DiagnosticQuery::Gaps => PreparedSql::plain(diagnosis::observation_gaps_sql()),
+        DiagnosticQuery::Silences => PreparedSql::plain(diagnosis::silences_sql()),
         DiagnosticQuery::Neighbors { network } => {
             PreparedSql::plain(diagnosis::neighbors_sql(network.as_deref()).map_err(|e| bad(&e))?)
         }
@@ -177,6 +178,10 @@ mod tests {
             &["ts_us", "slope_ms_per_s", "observation_gap_us"],
         );
         expect(DiagnosticQuery::Gaps, &["gap_opened_us", "gap_closed_by"]);
+        expect(
+            DiagnosticQuery::Silences,
+            &["kind", "gap_opened_us", "gap_closed_by"],
+        );
         expect(
             DiagnosticQuery::Neighbors { network: None },
             &["mac", "source"],

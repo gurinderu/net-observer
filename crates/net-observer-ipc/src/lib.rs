@@ -14,8 +14,8 @@
 //!   its broadcast receiver exists, so nothing published once [`subscribe`] has
 //!   returned can fall into a publish-before-subscribe window. Only
 //!   [`StreamFrame::Event`] frames are subject to a subscriber's `kinds` filter;
-//!   the stream-integrity frames (ack, [`Gap`], observing transition,
-//!   [`StreamError`]) are **always** delivered — a filtered subscriber has more
+//!   the stream-integrity frames (ack, [`Gap`], observing and probing
+//!   transitions, [`StreamError`]) are **always** delivered — a filtered subscriber has more
 //!   need to know about a hole or a pause, not less. That rule lives in exactly
 //!   one place, [`EncodedFrame::passes`].
 //!
@@ -40,7 +40,8 @@ use std::time::Duration;
 use serde::{Serialize, de::DeserializeOwned};
 use types::{
     AirSample, DnsSample, HistoryWindow, HostSample, LinkSample, NeighborLifetime, NeighborsSample,
-    ObservingEdge, ProxySample, RouteEvent, TopologyLifetime, TopologyLink, WifiSample,
+    ObservingEdge, ProbingEdge, ProbingTier, ProxySample, RouteEvent, TopologyLifetime,
+    TopologyLink, WifiSample,
 };
 
 /// A request from a client (the bar or cli) to the daemon.
@@ -108,6 +109,20 @@ pub enum ControlCmd {
     /// **Self-control**, like [`ControlCmd::SetObserving`], and process-scoped:
     /// a restart resumes normal probing.
     SetQuiet(bool),
+    /// Set the probing tier: `Passive` puts NOTHING on the wire — every probe
+    /// of the link, proxy and dns collectors is withheld and lands as `SKIP`,
+    /// the held reference streams are closed — while `Active` runs every
+    /// emission class (quiet still withholds the gateway echo inside it). The
+    /// daemon boots into the tier its config names, `passive` by default, and
+    /// only this command moves it: the daemon never changes tier by itself
+    /// (realm net-observer, node #88).
+    ///
+    /// **Self-control**, like [`ControlCmd::SetQuiet`], and process-scoped.
+    /// Unlike quiet, every real switch is bracketed: a durable `probing_edge`
+    /// row and a [`StreamFrame::Probing`] frame, so a run of `SKIP`s reads as
+    /// withheld, not failed. A `SetProbing` to the tier already in force is not
+    /// an edge and writes nothing.
+    SetProbing(ProbingTier),
     /// Go and find out who else is on this segment NOW: sweep the local IPv4
     /// subnet so the kernel resolves every address, and browse mDNS for names.
     ///
@@ -220,8 +235,19 @@ pub enum DiagnosticQuery {
     /// live answer from silently plotting a different interval than the one
     /// asked for.
     GatewayRamp { drop_ts_us: i64, window_us: i64 },
-    /// Every observation gap the record contains (`observation_gaps_sql`).
+    /// Every observation gap the record contains (`observation_gaps_sql`) —
+    /// pauses only, in the shape this variant has had since it shipped. A
+    /// reader built before the probing tier asks for this and prints every
+    /// row as a pause, so the rows must stay pauses; the passive stretches
+    /// live under [`DiagnosticQuery::Silences`], a variant that reader has
+    /// never heard of.
     Gaps,
+    /// Every bracketed silence the record contains (`silences_sql`): the
+    /// pauses of `Gaps` plus the stretches the probing tier was passive for,
+    /// told apart by a `kind` column (`pause` | `passive`). A daemon built
+    /// before it answers `Unsupported`, and the CLI's `gaps` command then asks
+    /// `Gaps` instead, saying so. (realm net-observer, node #88)
+    Silences,
     /// The neighbours on every segment, or on `network` (`neighbors_sql`).
     Neighbors { network: Option<String> },
     /// The CVEs hypothesised for open ports, on every segment or on `network`
@@ -383,7 +409,28 @@ impl Event {
                 let iface = r.iface.as_deref().unwrap_or("-");
                 format!("{} {} {}", r.kind, iface, r.detail)
             }
-            Event::Host(h) => format!("load {:.2}/{:.2}/{:.2}", h.load1, h.load5, h.load15),
+            // Disk and swap are optional facts (a pre-field daemon never sends
+            // them): each unmeasured one renders as `-` on its own, never as an
+            // omission and never dragging a measured sibling down with it.
+            Event::Host(h) => {
+                let dash = || "-".to_string();
+                let pct = h
+                    .disk_used_pct
+                    .map(|p| format!("{p:.1}%"))
+                    .unwrap_or_else(dash);
+                let free = h
+                    .disk_free_mb
+                    .map(|m| format!("{m} MiB"))
+                    .unwrap_or_else(dash);
+                let swap = h
+                    .swap_used_mb
+                    .map(|m| format!("{m} MiB"))
+                    .unwrap_or_else(dash);
+                format!(
+                    "load {:.2}/{:.2}/{:.2}; disk {pct} used, {free} free; swap {swap}",
+                    h.load1, h.load5, h.load15
+                )
+            }
             // A SKIP renders as its reason, so a reader never sees a row of
             // dashes with no explanation for them.
             Event::Wifi(w) => match w.wifi {
@@ -460,6 +507,13 @@ pub enum StreamFrame {
     /// subscribe time rides on [`Ready::observing`] instead, so a state report
     /// can never be mistaken for an edge that never happened.
     Observing(ObservingEdge),
+    /// The probing tier switched (realm net-observer, node #88). Always a real
+    /// transition, like [`StreamFrame::Observing`], and the same value the
+    /// daemon writes to its `probing_edge` table; the tier in force is read
+    /// from [`StatusSnapshot::probing`]. Stream-integrity, so delivered
+    /// regardless of the `kinds` filter: a subscriber watching `SKIP`s arrive
+    /// has more need to know they are withheld, not less.
+    Probing(ProbingEdge),
     /// A daemon-side failure, reported IN BAND instead of a bare close.
     Error(StreamError),
     /// A well-formed JSON frame this build cannot name — typically an
@@ -507,6 +561,16 @@ pub struct Ready {
     /// subscribe is also delivered as a `StreamFrame::Observing` (a redundant
     /// but consistent repeat) rather than lost.
     pub observing: bool,
+    /// The daemon's CURRENT probing tier — a state report, NOT a transition,
+    /// for the same reason as `observing`: a fresh subscriber must know at
+    /// once whether the `SKIP`s it is about to see are withheld probes, rather
+    /// than infer it from a run of them. Transitions arrive as
+    /// [`StreamFrame::Probing`].
+    ///
+    /// `serde(default)` = `Active`, matching a pre-tier daemon, which always
+    /// probed — the rationale [`StatusSnapshot::probing`] gives.
+    #[serde(default = "probing_default")]
+    pub probing: ProbingTier,
 }
 
 /// A hole in ONE subscriber's stream: `skipped` events were dropped because it
@@ -567,6 +631,7 @@ impl StreamFrame {
             StreamFrame::Event(e) => e.ts_us(),
             StreamFrame::Gap(g) => g.ts_us,
             StreamFrame::Observing(o) => o.ts_us,
+            StreamFrame::Probing(p) => p.ts_us,
             StreamFrame::Error(e) => e.ts_us,
             StreamFrame::Unrecognized(u) => u.ts_us,
         }
@@ -580,6 +645,7 @@ impl StreamFrame {
             StreamFrame::Event(e) => e.kind().as_str(),
             StreamFrame::Gap(_) => "gap",
             StreamFrame::Observing(_) => "observing",
+            StreamFrame::Probing(_) => "probing",
             StreamFrame::Error(_) => "error",
             StreamFrame::Unrecognized(_) => "unrecognized",
         }
@@ -590,9 +656,12 @@ impl StreamFrame {
     /// event log share one rendering of every frame instead of drifting copies.
     pub fn detail(&self) -> String {
         match self {
+            // The tier is named on the opening line, so a tail opened inside
+            // a passive stretch reads its SKIPs as withheld, not unavailable.
             StreamFrame::Ready(r) => format!(
-                "collection {}; kinds: {}",
+                "collection {}; probing {}; kinds: {}",
                 if r.observing { "on" } else { "off" },
+                r.probing,
                 r.kinds_label()
             ),
             StreamFrame::Event(e) => e.detail(),
@@ -602,6 +671,7 @@ impl StreamFrame {
             StreamFrame::Observing(o) => {
                 format!("collection {}", if o.observing { "on" } else { "off" })
             }
+            StreamFrame::Probing(p) => format!("probing {}", p.tier),
             StreamFrame::Error(e) => format!("{}: {}", e.code.as_str(), e.message),
             StreamFrame::Unrecognized(u) => {
                 format!("a frame this build cannot read: {}", u.detail)
@@ -617,6 +687,7 @@ impl StreamFrame {
             StreamFrame::Ready(_)
             | StreamFrame::Gap(_)
             | StreamFrame::Observing(_)
+            | StreamFrame::Probing(_)
             | StreamFrame::Error(_)
             | StreamFrame::Unrecognized(_) => None,
         }
@@ -819,6 +890,18 @@ pub struct StatusSnapshot {
     /// decode its answer.
     #[serde(default)]
     pub quiet: bool,
+    /// The probing tier in force: `Passive` = nothing on the wire, every probe
+    /// verdict `SKIP`; `Active` = every emission class runs (realm
+    /// net-observer, node #88). Orthogonal to `observing` (a paused daemon
+    /// collects nothing at all) and stronger than `quiet` (which withholds only
+    /// the gateway echo, and only inside `Active`).
+    ///
+    /// `serde(default)` = `Active`, NOT the daemon's `passive` default: a
+    /// pre-tier daemon emits no such field, and that daemon probes — reading its
+    /// answer as passive would tell the operator the wire is silent while it is
+    /// not.
+    #[serde(default = "probing_default")]
+    pub probing: ProbingTier,
     /// What this daemon can collect at all — the collectors in its build, each
     /// with whether config permits it to run.
     ///
@@ -858,9 +941,15 @@ fn observing_default() -> bool {
     true
 }
 
+/// The serde/`Default` value for [`StatusSnapshot::probing`]: `Active`,
+/// matching a pre-tier daemon, which always probed.
+fn probing_default() -> ProbingTier {
+    ProbingTier::Active
+}
+
 /// Hand-written so a fresh snapshot reads `observing: true` — deriving `Default`
 /// would give `false` for the `bool`, which would misreport a healthy daemon as
-/// paused.
+/// paused — and `probing: Active`, for the same reason in the same direction.
 impl Default for StatusSnapshot {
     fn default() -> Self {
         Self {
@@ -877,6 +966,7 @@ impl Default for StatusSnapshot {
             incidents: Vec::new(),
             observing: observing_default(),
             quiet: false,
+            probing: probing_default(),
             capabilities: None,
         }
     }
@@ -1393,6 +1483,7 @@ mod tests {
             ts_us: 1,
             kinds: Some(vec![EventKind::Air, EventKind::Wifi]),
             observing: true,
+            probing: ProbingTier::Active,
         }))
         .unwrap();
         match decode_handshake(&line) {
@@ -1529,6 +1620,58 @@ mod tests {
         }
     }
 
+    /// `SetProbing` must survive the wire with its tier intact, spelled in the
+    /// lowercase vocabulary the config file and the DB column use — the bar's
+    /// row, the CLI's `probe` and the daemon's dispatch read the same variant.
+    #[test]
+    fn set_probing_round_trips_as_a_control_command() {
+        for tier in [ProbingTier::Passive, ProbingTier::Active] {
+            let line = String::from_utf8(
+                encode_frame(&Request::Control(ControlCmd::SetProbing(tier))).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                line.contains(&format!("\"SetProbing\":\"{}\"", tier.as_str())),
+                "{line}"
+            );
+            match serde_json::from_str::<Request>(&line).unwrap() {
+                Request::Control(ControlCmd::SetProbing(back)) => assert_eq!(back, tier),
+                other => panic!("expected SetProbing, got {other:?}"),
+            }
+        }
+    }
+
+    /// The `EventKind::Air` precedent, on the control path: a daemon built
+    /// before `SetProbing` cannot decode the request at all and answers its
+    /// one-shot `Response::Error("bad request: …")`. The client must read that
+    /// as `Unsupported` — "this daemon cannot do that" — never as a refusal,
+    /// which would claim the daemon CAN switch tier and declined to.
+    #[test]
+    fn an_old_daemon_rejects_set_probing_as_unsupported_not_refused() {
+        /// The control vocabulary as a pre-tier daemon decodes it.
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        enum OldControlCmd {
+            KickstartProxy,
+            SetObserving(bool),
+            FreezePcap,
+            SetQuiet(bool),
+            ScanNeighbors(ScanOptions),
+            ScanAir,
+        }
+        let line =
+            String::from_utf8(encode_frame(&ControlCmd::SetProbing(ProbingTier::Active)).unwrap())
+                .unwrap();
+        let e = serde_json::from_str::<OldControlCmd>(&line)
+            .expect_err("an old daemon cannot decode SetProbing");
+        // What `api.rs` answers for a frame it cannot decode.
+        let answer = Response::Error(format!("{UNDECODABLE_REQUEST_PREFIX}{e}"));
+        match classify_control(answer).unwrap() {
+            ControlOutcome::Unsupported(m) => assert!(m.contains("SetProbing"), "{m}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
     /// Every named diagnosis, with every parameter it carries.
     fn every_diagnostic_query() -> Vec<DiagnosticQuery> {
         vec![
@@ -1543,6 +1686,7 @@ mod tests {
                 window_us: 120_000_000,
             },
             DiagnosticQuery::Gaps,
+            DiagnosticQuery::Silences,
             DiagnosticQuery::Neighbors { network: None },
             DiagnosticQuery::Neighbors {
                 network: Some("a4:83:e7:1b:2c:3d".into()),
@@ -1700,6 +1844,9 @@ mod tests {
             // a field that silently failed to serialize would still round-trip as
             // `false` and the assertion below would pass on a broken wire format.
             quiet: true,
+            // Same trick: the serde default is `Active`, so `Passive` is what
+            // proves the tier actually travelled.
+            probing: ProbingTier::Passive,
             // Same trick as `quiet`: `capabilities` defaults to `None`, so a
             // non-default value here is what proves the declaration is actually
             // on the wire rather than being reconstructed by the default.
@@ -1721,6 +1868,7 @@ mod tests {
         assert_eq!(back.incidents[0].closed_us, Some(2000));
         assert!(!back.observing);
         assert!(back.quiet);
+        assert_eq!(back.probing, ProbingTier::Passive);
         assert_eq!(back.capabilities, snap.capabilities);
         assert_eq!(
             back.collector(EventKind::Air),
@@ -1733,6 +1881,9 @@ mod tests {
         // A fresh snapshot must read as observing (true), not paused — the
         // hand-written `Default` guards against `derive(Default)`'s `false`.
         assert!(StatusSnapshot::default().observing);
+        // And as probing: the snapshot default is the pre-tier daemon's
+        // behaviour, not the new daemon's configured default.
+        assert_eq!(StatusSnapshot::default().probing, ProbingTier::Active);
     }
 
     #[test]
@@ -1746,6 +1897,8 @@ mod tests {
         let snap: StatusSnapshot = serde_json::from_str(old).unwrap();
         assert_eq!(snap.generated_us, 1);
         assert!(snap.observing);
+        // Same frame, same reasoning for the tier: that daemon probed.
+        assert_eq!(snap.probing, ProbingTier::Active);
     }
 
     /// A daemon from before the probe-on-suspicion counts, the route/TUN
@@ -2020,8 +2173,44 @@ mod tests {
             load1: 1.0,
             load5: 2.0,
             load15: 3.0,
+            disk_used_pct: Some(42.06),
+            disk_free_mb: Some(120_000),
+            swap_used_mb: Some(1024),
         });
-        assert_eq!(host.detail(), "load 1.00/2.00/3.00");
+        assert_eq!(
+            host.detail(),
+            "load 1.00/2.00/3.00; disk 42.1% used, 120000 MiB free; swap 1024 MiB"
+        );
+        // Unmeasured disk and swap (a pre-field daemon) print as `-`, never
+        // drop out of the line.
+        let host = Event::Host(HostSample {
+            ts_us: 0,
+            load1: 1.0,
+            load5: 2.0,
+            load15: 3.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        });
+        assert_eq!(
+            host.detail(),
+            "load 1.00/2.00/3.00; disk - used, - free; swap -"
+        );
+        // Each field stands on its own: a measured value is never dropped
+        // because its sibling is not.
+        let host = Event::Host(HostSample {
+            ts_us: 0,
+            load1: 1.0,
+            load5: 2.0,
+            load15: 3.0,
+            disk_used_pct: Some(99.95),
+            disk_free_mb: None,
+            swap_used_mb: Some(0),
+        });
+        assert_eq!(
+            host.detail(),
+            "load 1.00/2.00/3.00; disk 100.0% used, - free; swap 0 MiB"
+        );
 
         let inc = Event::Incident(IncidentSummary {
             id: "inc-1".into(),
@@ -2061,10 +2250,28 @@ mod tests {
             ts_us: 11,
             kinds: Some(vec![EventKind::Route, EventKind::Dns]),
             observing: false,
+            // `Passive`, not the serde default: proves the tier travelled
+            // rather than being reconstructed by the default.
+            probing: ProbingTier::Passive,
         };
         match round_trip_frame(&StreamFrame::Ready(ready.clone())) {
             StreamFrame::Ready(back) => assert_eq!(back, ready),
             other => panic!("unexpected frame variant: {other:?}"),
+        }
+    }
+
+    /// A pre-tier daemon's ack carries no `probing`; it decodes, and reads as
+    /// `Active` — that daemon probed — for the same reason a pre-tier
+    /// `StatusSnapshot` does.
+    #[test]
+    fn a_pre_tier_ready_ack_decodes_as_probing_active() {
+        let old = r#"{"Ready":{"ts_us":1,"kinds":null,"observing":true}}"#;
+        match serde_json::from_str::<StreamFrame>(old).unwrap() {
+            StreamFrame::Ready(r) => {
+                assert!(r.observing);
+                assert_eq!(r.probing, ProbingTier::Active);
+            }
+            other => panic!("expected Ready, got {other:?}"),
         }
     }
 
@@ -2112,6 +2319,64 @@ mod tests {
             StreamFrame::Observing(back) => assert_eq!(back, edge),
             other => panic!("unexpected frame variant: {other:?}"),
         }
+    }
+
+    /// A tier switch rides the wire with its tier and peer intact; the startup
+    /// edge's `None` peer must survive as `None`, never as a fabricated uid.
+    #[test]
+    fn frame_round_trip_stream_frame_probing() {
+        for edge in [
+            ProbingEdge {
+                ts_us: 910,
+                tier: ProbingTier::Active,
+                peer_uid: Some(501),
+            },
+            ProbingEdge {
+                ts_us: 1,
+                tier: ProbingTier::Passive,
+                peer_uid: None,
+            },
+        ] {
+            match round_trip_frame(&StreamFrame::Probing(edge)) {
+                StreamFrame::Probing(back) => assert_eq!(back, edge),
+                other => panic!("unexpected frame variant: {other:?}"),
+            }
+        }
+    }
+
+    /// The reverse of the old-daemon test for `SetProbing`: a NEW daemon pushes
+    /// a `Probing` frame at a client built before it. That client loses one
+    /// frame — named — and keeps its stream, exactly as for an unknown event
+    /// kind.
+    #[test]
+    fn a_probing_frame_costs_a_pre_tier_client_one_frame_not_the_stream() {
+        /// The stream vocabulary as a pre-tier client decodes it.
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code, clippy::large_enum_variant)]
+        enum OldStreamFrame {
+            Ready(Ready),
+            Event(Event),
+            Gap(Gap),
+            Observing(ObservingEdge),
+            Error(StreamError),
+        }
+        let line = String::from_utf8(
+            encode_frame(&StreamFrame::Probing(ProbingEdge {
+                ts_us: 3,
+                tier: ProbingTier::Passive,
+                peer_uid: None,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let e = serde_json::from_str::<OldStreamFrame>(&line)
+            .expect_err("a pre-tier client cannot name the frame");
+        assert_eq!(
+            e.classify(),
+            serde_json::error::Category::Data,
+            "an unknown variant is a data error, which `decode_stream_frame` \
+             turns into one Unrecognized frame rather than a dead stream"
+        );
     }
 
     #[test]
@@ -2163,6 +2428,9 @@ mod tests {
             load1: 1.0,
             load5: 2.0,
             load15: 3.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         }));
         assert_eq!(
             EncodedFrame::encode(&event).unwrap().kind(),
@@ -2176,6 +2444,7 @@ mod tests {
                 ts_us: 0,
                 kinds: None,
                 observing: true,
+                probing: ProbingTier::Active,
             }),
             StreamFrame::Gap(Gap {
                 ts_us: 0,
@@ -2186,6 +2455,11 @@ mod tests {
                 observing: false,
                 peer_uid: Some(0),
                 cause: types::ObservingCause::Control,
+            }),
+            StreamFrame::Probing(ProbingEdge {
+                ts_us: 0,
+                tier: ProbingTier::Passive,
+                peer_uid: Some(0),
             }),
             StreamFrame::Error(StreamError {
                 ts_us: 0,
@@ -2216,6 +2490,9 @@ mod tests {
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
         })))
         .unwrap();
         assert!(!other_kind.passes(kinds));
@@ -2227,6 +2504,7 @@ mod tests {
                 ts_us: 0,
                 kinds: Some(vec![EventKind::Route]),
                 observing: true,
+                probing: ProbingTier::Active,
             }),
             StreamFrame::Gap(Gap {
                 ts_us: 0,
@@ -2237,6 +2515,11 @@ mod tests {
                 observing: false,
                 peer_uid: Some(501),
                 cause: types::ObservingCause::Control,
+            }),
+            StreamFrame::Probing(ProbingEdge {
+                ts_us: 0,
+                tier: ProbingTier::Active,
+                peer_uid: Some(501),
             }),
             StreamFrame::Error(StreamError {
                 ts_us: 0,
@@ -2263,17 +2546,24 @@ mod tests {
             ts_us: 7,
             kinds: None,
             observing: false,
+            probing: ProbingTier::Active,
         });
         assert_eq!(ready.label(), "subscribed");
-        assert_eq!(ready.detail(), "collection off; kinds: all");
+        // The tier is named: a tail opened mid-stretch must be able to tell
+        // withheld SKIPs from unavailable ones from its very first line.
+        assert_eq!(ready.detail(), "collection off; probing active; kinds: all");
         assert_eq!(ready.ts_us(), 7);
 
         let ready_filtered = StreamFrame::Ready(Ready {
             ts_us: 8,
             kinds: Some(vec![EventKind::Route, EventKind::Dns]),
             observing: true,
+            probing: ProbingTier::Passive,
         });
-        assert_eq!(ready_filtered.detail(), "collection on; kinds: route,dns");
+        assert_eq!(
+            ready_filtered.detail(),
+            "collection on; probing passive; kinds: route,dns"
+        );
 
         let event = StreamFrame::Event(Event::Incident(IncidentSummary {
             id: "inc-1".into(),
@@ -2312,6 +2602,22 @@ mod tests {
         });
         assert_eq!(resumed.detail(), "collection on");
 
+        let passive = StreamFrame::Probing(ProbingEdge {
+            ts_us: 13,
+            tier: ProbingTier::Passive,
+            peer_uid: None,
+        });
+        assert_eq!(passive.label(), "probing");
+        assert_eq!(passive.detail(), "probing passive");
+        assert_eq!(passive.ts_us(), 13);
+        assert_eq!(passive.event_kind(), None);
+        let active = StreamFrame::Probing(ProbingEdge {
+            ts_us: 14,
+            tier: ProbingTier::Active,
+            peer_uid: Some(501),
+        });
+        assert_eq!(active.detail(), "probing active");
+
         let err = StreamFrame::Error(StreamError {
             ts_us: 12,
             code: StreamErrorCode::TooManySubscribers,
@@ -2332,6 +2638,7 @@ mod tests {
                 ts_us: 0,
                 kinds: None,
                 observing: true,
+                probing: ProbingTier::Active,
             }
             .kinds_label(),
             "all"
@@ -2341,6 +2648,7 @@ mod tests {
                 ts_us: 0,
                 kinds: Some(vec![EventKind::Route, EventKind::Dns]),
                 observing: true,
+                probing: ProbingTier::Active,
             }
             .kinds_label(),
             "route,dns"

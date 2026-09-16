@@ -7,6 +7,7 @@ use net_observer_ipc::{
     ControlCmd, ControlResult, DiagnosticQuery, QueryOutcome, Request, Response, ScanOptions,
     StatusSnapshot, Table,
 };
+use types::ProbingTier;
 
 use super::model::Glance;
 
@@ -102,6 +103,19 @@ pub fn send_set_quiet(socket_path: &str, on: bool) -> Result<ControlResult, Stri
     control_query(socket_path, ControlCmd::SetQuiet(on))
 }
 
+/// Ask `net-observerd` to switch its probing tier over the local socket
+/// (`Control(SetProbing(tier))`).
+///
+/// `Passive` puts nothing on the wire — every link, proxy and dns probe is
+/// withheld and lands as `SKIP`, the held reference streams are closed;
+/// `Active` runs every probe. Benign **self-control** like quiet, but unlike
+/// quiet every real switch is bracketed by a durable `probing_edge` row. The
+/// daemon checks only the peer uid before running it. Transport failures map to
+/// `Err(String)` for the panel to surface, never a panic.
+pub fn send_set_probing(socket_path: &str, tier: ProbingTier) -> Result<ControlResult, String> {
+    control_query(socket_path, ControlCmd::SetProbing(tier))
+}
+
 /// Ask `net-observerd` to copy its pcap ring out NOW
 /// (`Control(FreezePcap)`) — the same passive artifact the `gw-change` trigger
 /// produces, on operator demand. A daemon with no ring running answers
@@ -186,6 +200,35 @@ pub fn quiet_round_trip(
     };
     let control = send_set_quiet(socket_path, !before.quiet);
     (control, read_fresh(socket_path))
+}
+
+/// The blocking half of the probe toggle, built exactly like
+/// [`quiet_round_trip`] and for the same reason: `SetProbing(tier)` is absolute
+/// on the wire and a second controller exists (`net-observer-cli probe`), so
+/// the target tier is derived from a freshly-read state — the OTHER tier from
+/// the one the daemon holds now — rather than from a snapshot up to one
+/// refresh tick old. Never call it on the gpui main thread.
+pub fn probing_round_trip(
+    socket_path: &str,
+) -> (
+    Result<ControlResult, String>,
+    Result<StatusSnapshot, GlanceError>,
+) {
+    let before = match read_fresh(socket_path) {
+        Ok(s) => s,
+        Err(e) => return (Err(e.to_string()), Err(e)),
+    };
+    let control = send_set_probing(socket_path, opposite_tier(before.probing));
+    (control, read_fresh(socket_path))
+}
+
+/// The tier the probe row switches to from `tier`: the other one. Named so the
+/// toggle's target is a testable fact rather than an inline `if`.
+pub(crate) fn opposite_tier(tier: ProbingTier) -> ProbingTier {
+    match tier {
+        ProbingTier::Passive => ProbingTier::Active,
+        ProbingTier::Active => ProbingTier::Passive,
+    }
 }
 
 /// The blocking half of the "Freeze pcap now" action: send the command, then
@@ -443,6 +486,24 @@ mod tests {
             send_set_observing(missing.to_str().unwrap(), true).is_err(),
             "absent socket must yield a control Err (turning on)"
         );
+    }
+
+    /// The probe toggle degrades the same way: an absent socket is an `Err`,
+    /// never a panic, and its leading read failing means no `SetProbing` is
+    /// sent at all.
+    #[test]
+    fn probing_round_trip_is_offline_safe_and_flips_to_the_other_tier() {
+        assert_eq!(opposite_tier(ProbingTier::Passive), ProbingTier::Active);
+        assert_eq!(opposite_tier(ProbingTier::Active), ProbingTier::Passive);
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sock");
+        assert!(send_set_probing(missing.to_str().unwrap(), ProbingTier::Active).is_err());
+        let (control, fresh) = probing_round_trip(missing.to_str().unwrap());
+        let err = control.expect_err("no premise -> no command, just the error");
+        let fresh = fresh.expect_err("the leading read failed");
+        assert!(matches!(fresh, GlanceError::Unreachable(_)), "{fresh:?}");
+        assert_eq!(err, fresh.to_string());
     }
 
     /// The leading read is the toggle's premise: when it fails there is nothing to

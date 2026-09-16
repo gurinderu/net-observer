@@ -6,8 +6,8 @@ pub use duckdb_store::{
     DuckdbStore, NeighborPort, NeighborScan, NeighborVuln, QueryTable, StoreError,
 };
 use types::{
-    BlobRef, Incident, NeighborLifetime, ObservingEdge, Sample, TopologyLifetime, TopologyLink,
-    TriggerFired,
+    BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, TopologyLifetime,
+    TopologyLink, TriggerFired,
 };
 
 pub trait Store {
@@ -24,6 +24,14 @@ pub trait Store {
     /// collected nothing. That is what makes an operator pause distinguishable,
     /// offline and after the fact, from a wedged collector.
     fn write_observing_edge(&self, e: &ObservingEdge) -> Result<(), StoreError>;
+    /// Record one switch of the probing tier (see [`ProbingEdge`]).
+    ///
+    /// The durable bracket around a passive stretch: the collectors keep
+    /// writing `SKIP` rows while the tier is passive, and `SELECT ts_us, tier
+    /// FROM probing_edge ORDER BY ts_us` is what says those rows are withheld
+    /// probes rather than probes that could not run — and who withheld them.
+    /// (realm net-observer, node #88)
+    fn write_probing_edge(&self, e: &ProbingEdge) -> Result<(), StoreError>;
     /// Record one operator-pressed neighbour scan (see the `neighbor_scan`
     /// table).
     ///
