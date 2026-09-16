@@ -29,6 +29,12 @@ pub struct StallReading {
 #[allow(async_fn_in_trait)] // internal workspace port, not a published API
 pub trait StallProbe: Send + Sync {
     async fn check(&self) -> StallReading;
+    /// Drop every held stream, so nothing is kept open — let alone exercised —
+    /// while the probing tier is passive (realm net-observer, node #88). The
+    /// next `check` re-establishes them, reporting no measurement on that
+    /// tick as it does after any teardown. Idempotent: closing nothing is a
+    /// no-op.
+    async fn close(&self);
 }
 
 /// Proxy facts: the upstream proxy endpoints, the TUN HTTP 204 probe, and

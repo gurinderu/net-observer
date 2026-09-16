@@ -9,11 +9,13 @@ use types::{GwVerdict, LinkSample, TcpVerdict};
 /// the `NoGw` case); `direct` is the iface-bound TCP outcome; `dhcp` is the
 /// `(router, dns)` lease pair; `arp` is the gateway's ARP MAC.
 ///
-/// `quiet` is the operator's "address no packet AT the gateway" switch: the echo
-/// was deliberately not sent, so the verdict is [`GwVerdict::Skip`] with no RTT.
+/// A probe arrives as `None` when it was deliberately NOT sent — the gateway
+/// echo under quiet or in the passive tier, the direct probe in the passive tier
+/// (realm net-observer, node #88) — and its verdict is then `SKIP` with no RTT.
+/// The decision to withhold is the collector's; this mapping only reports it.
 /// The sample is still produced — SKIP, never silence — and every passive fact
-/// (DHCP lease, ARP, SSID) still flows through, because reading them addresses
-/// the gateway with nothing.
+/// (DHCP lease, ARP, SSID) still flows through, because reading them puts
+/// nothing on the wire.
 ///
 /// `lan` is the probe-on-suspicion `(probed, alive)` neighbor-ping count pair,
 /// already gathered by `collect()` on a gateway-FAIL tick and `(None, None)`
@@ -27,9 +29,8 @@ use types::{GwVerdict, LinkSample, TcpVerdict};
 #[allow(clippy::too_many_arguments)]
 pub fn build_link_sample(
     ts_us: i64,
-    ping: PingOutcome,
-    direct: PingOutcome,
-    quiet: bool,
+    ping: Option<PingOutcome>,
+    direct: Option<PingOutcome>,
     gw_addr: Option<String>,
     dhcp: (Option<String>, Option<String>),
     arp: Option<String>,
@@ -41,12 +42,12 @@ pub fn build_link_sample(
     if_mac: Option<String>,
     wifi_present: bool,
 ) -> LinkSample {
-    let (gw, gw_rtt_ms) = match &gw_addr {
-        None => (GwVerdict::NoGw, None),
-        // Quiet outranks the echo outcome: no packet was sent, so there is no
+    let (gw, gw_rtt_ms) = match (&gw_addr, ping) {
+        (None, _) => (GwVerdict::NoGw, None),
+        // Withheld outranks any outcome: no packet was sent, so there is no
         // measurement to report either way.
-        Some(_) if quiet => (GwVerdict::Skip, None),
-        Some(_) => (
+        (Some(_), None) => (GwVerdict::Skip, None),
+        (Some(_), Some(ping)) => (
             if ping.reachable {
                 GwVerdict::Ok
             } else {
@@ -55,14 +56,17 @@ pub fn build_link_sample(
             ping.rtt_ms,
         ),
     };
-    let (direct_verdict, direct_rtt_ms) = (
-        if direct.reachable {
-            TcpVerdict::Ok
-        } else {
-            TcpVerdict::Fail
-        },
-        direct.rtt_ms,
-    );
+    let (direct_verdict, direct_rtt_ms) = match direct {
+        None => (TcpVerdict::Skip, None),
+        Some(direct) => (
+            if direct.reachable {
+                TcpVerdict::Ok
+            } else {
+                TcpVerdict::Fail
+            },
+            direct.rtt_ms,
+        ),
+    };
     let (dhcp_router, dhcp_dns) = dhcp;
     let (lan_probed, lan_alive) = lan;
     LinkSample {
@@ -90,11 +94,11 @@ mod tests {
     use super::*;
     use types::{GwVerdict, TcpVerdict};
 
-    fn outcome(reachable: bool) -> PingOutcome {
-        PingOutcome {
+    fn outcome(reachable: bool) -> Option<PingOutcome> {
+        Some(PingOutcome {
             reachable,
             rtt_ms: reachable.then_some(2.0),
-        }
+        })
     }
 
     #[test]
@@ -103,7 +107,6 @@ mod tests {
             1,
             outcome(false),
             outcome(true),
-            false,
             None,
             (Some("10.20.0.1".into()), None),
             None,
@@ -126,7 +129,6 @@ mod tests {
             1,
             outcome(false),
             outcome(true),
-            false,
             Some("10.20.0.1".into()),
             (None, None),
             Some("aa:bb".into()),
@@ -149,7 +151,6 @@ mod tests {
             1,
             outcome(true),
             outcome(false),
-            false,
             Some("10.20.0.1".into()),
             (None, None),
             Some("aa:bb".into()),
@@ -165,15 +166,15 @@ mod tests {
         assert_eq!(s.direct, TcpVerdict::Fail);
     }
 
-    /// Quiet suppresses the echo verdict, not the sample: the gateway reads
-    /// `SKIP` with no RTT while every passive fact still flows through.
+    /// A withheld echo (quiet, or the passive tier) suppresses the gateway
+    /// verdict, not the sample: the gateway reads `SKIP` with no RTT while
+    /// every passive fact still flows through.
     #[test]
-    fn quiet_skips_the_gateway_verdict_but_still_emits_a_sample() {
+    fn a_withheld_echo_skips_the_gateway_verdict_but_still_emits_a_sample() {
         let s = build_link_sample(
             3,
+            None,
             outcome(true),
-            outcome(true),
-            true,
             Some("10.20.0.1".into()),
             (Some("10.20.0.1".into()), None),
             Some("aa:bb:cc".into()),
@@ -193,15 +194,40 @@ mod tests {
         assert_eq!(s.dhcp_router.as_deref(), Some("10.20.0.1"));
     }
 
-    /// Quiet does not invent a gateway: with no default route the verdict stays
-    /// `NOGW`, the fact that there is nothing to probe.
+    /// The passive tier withholds the direct probe too: it reads `SKIP` with
+    /// no RTT, and the passive facts still land.
     #[test]
-    fn quiet_with_no_gateway_is_still_nogw() {
+    fn a_withheld_direct_probe_reads_skip_with_no_rtt() {
+        let s = build_link_sample(
+            5,
+            None,
+            None,
+            Some("10.20.0.1".into()),
+            (Some("10.20.0.1".into()), None),
+            Some("aa:bb:cc".into()),
+            (None, None),
+            Some("utun8".into()),
+            Some("utun8".into()),
+            Some("cowork".into()),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(s.gw, GwVerdict::Skip);
+        assert_eq!(s.direct, TcpVerdict::Skip);
+        assert_eq!(s.direct_rtt_ms, None);
+        assert_eq!(s.gw_arp_mac.as_deref(), Some("aa:bb:cc"));
+        assert_eq!(s.fakeip_route_if.as_deref(), Some("utun8"));
+    }
+
+    /// A withheld echo does not invent a gateway: with no default route the
+    /// verdict stays `NOGW`, the fact that there is nothing to probe.
+    #[test]
+    fn a_withheld_echo_with_no_gateway_is_still_nogw() {
         let s = build_link_sample(
             4,
-            outcome(false),
+            None,
             outcome(true),
-            true,
             None,
             (None, None),
             None,
@@ -222,7 +248,6 @@ mod tests {
             7,
             outcome(true),
             outcome(true),
-            false,
             Some("10.20.0.1".into()),
             (Some("10.20.0.1".into()), Some("1.1.1.1".into())),
             Some("aa:bb:cc".into()),
@@ -255,7 +280,6 @@ mod tests {
             8,
             outcome(true),
             outcome(true),
-            false,
             Some("10.20.0.1".into()),
             (None, None),
             None,
