@@ -2,91 +2,146 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     systems.url = "github:nix-systems/default";
-    flake-utils = { url = "github:numtide/flake-utils"; inputs.systems.follows = "systems"; };
+    flake-utils = {
+      url = "github:numtide/flake-utils";
+      inputs.systems.follows = "systems";
+    };
     rust-overlay.url = "github:oxalica/rust-overlay";
+    # crate2nix's own flake declares a `nixpkgs` input, so follow ours: one
+    # nixpkgs evaluation for the whole closure instead of two.
+    crate2nix = {
+      url = "github:nix-community/crate2nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, ... }:
-    (flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      rust-overlay,
+      crate2nix,
+      ...
+    }:
+    (flake-utils.lib.eachDefaultSystem (
+      system:
       let
-        pkgs = import nixpkgs { inherit system; overlays = [ rust-overlay.overlays.default ]; };
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ rust-overlay.overlays.default ];
+        };
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-        # buildRustPackage would otherwise take nixpkgs' rustc, silently ignoring
+        # buildRustCrate would otherwise take nixpkgs' rustc, silently ignoring
         # the channel `rust-toolchain.toml` pins — the package and the dev shell
         # must be built by the same compiler or "works in the shell" stops
-        # meaning anything.
-        rustPlatform = pkgs.makeRustPlatform {
-          cargo = rust;
-          rustc = rust;
-        };
+        # meaning anything. Only `buildRustCrateForPkgs` below is pointed at
+        # `rust`; `pkgs.rustc`/`pkgs.cargo` themselves are left alone, or every
+        # nixpkgs-native Rust tool (bindgen among them) would rebuild against
+        # our toolchain too.
 
-        # One cargoLock for every package below: importCargoLock vendors the
-        # whole lock file regardless of which -p graph is built, so the vendor
-        # derivation is shared.
-        cargoLock = {
-          lockFile = ./Cargo.lock;
-          # duckdb comes from a git fork (gurinderu/duckdb-rs, pinned by rev in
-          # Cargo.lock), and importCargoLock cannot fetch a git dependency
-          # without a fixed-output hash. When the rev in Cargo.lock changes,
-          # set this to pkgs.lib.fakeHash, rebuild, and paste the "got:" hash.
-          outputHashes = {
-            "duckdb-1.10505.0" = "sha256-9tFQAE8RjfKzOUORBFfBkroSo8ykrlCV+XdK+JvgW/M=";
+        # (realm net-observer, node #76) — one derivation per crate instead of
+        # one per package, so a change rebuilds only the crate that changed and
+        # its dependents.
+        #
+        # (realm net-observer, node #95) — Cargo.nix is CHECKED IN, generated
+        # by the crate2nix CLI (`crate2nix generate` in the dev shell), not
+        # produced at evaluation time. The eval-time generator vendors the
+        # duckdb-rs git fork without its workspace root, so the fork's
+        # `{ workspace = true }` inheritance breaks `cargo metadata` there;
+        # the CLI runs the real cargo against the full git checkout, where
+        # inheritance resolves. The price is a file that must be regenerated
+        # whenever Cargo.lock changes — CI diffs it against a fresh
+        # generation and fails when it is stale. The gains: no import from
+        # derivation, no network at evaluation, and every system's attributes
+        # evaluate from any host. crate-hashes.json beside it holds the hash
+        # of the fork's source (not in Cargo.lock), which pkgs.fetchgit needs.
+        cargoNix = import ./Cargo.nix { inherit pkgs buildRustCrateForPkgs; };
+
+        # (realm net-observer, node #80) — overrides added here are the ones
+        # evidence on this machine supports; anything that can only be
+        # confirmed by a macOS build is left out and named as a risk instead.
+        crateOverrides = {
+          # gpui's build script runs bindgen over dispatch.h (libclang + SDK
+          # include paths). The workspace pins gpui's `runtime_shaders`
+          # feature (see Cargo.toml), which keeps the OTHER build-time
+          # dependency — `xcrun -sdk macosx metal`, needing the Metal
+          # Toolchain that only ships inside a full Xcode — out of the build
+          # entirely; bindgen is what is left. crate2nix resolves features
+          # from Cargo.toml/Cargo.lock, so `runtime_shaders` reaches the
+          # generated Cargo.nix without any help from this file.
+          gpui = _attrs: { nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ]; };
+          # rav1e's and av-scenechange's build scripts `unwrap()` CARGO_ENCODED_RUSTFLAGS,
+          # a variable cargo exports to build scripts and buildRustCrate does not. An empty
+          # value is what cargo would export for a build without RUSTFLAGS. (realm net-observer, node #80)
+          rav1e = _attrs: { CARGO_ENCODED_RUSTFLAGS = ""; };
+          av-scenechange = _attrs: { CARGO_ENCODED_RUSTFLAGS = ""; };
+          # libduckdb-sys builds DuckDB from source (the `bundled` feature,
+          # via the `cc` crate) and needs nothing beyond the C++ compiler
+          # stdenv already provides: `default-features = false` on the
+          # workspace's `duckdb` dependency turns off libduckdb-sys's
+          # `pkg-config` feature along with the rest of its defaults, so its
+          # build.rs never calls pkg-config and no override belongs here.
+          # `DUCKDB_LIB_DIR` is deliberately never set anywhere in this flake:
+          # nixpkgs' DuckDB is a different version from what this fork wants,
+          # so linking the system library would be a version mismatch — the
+          # bundled, built-from-source engine is the sanctioned exception.
+          #
+          # No workspace crate depends on a `pcap` crate (the pcap ring runs
+          # `tcpdump` as a child process at runtime, not a build-time link),
+          # so libpcap is not carried forward from the old buildRustPackage
+          # flake. Neither is `iconv`: buildRustCrate itself puts `libiconv`
+          # into every crate's buildInputs on a darwin host (nixpkgs
+          # `build-rust-crate/default.nix`), so an override here would only
+          # list it a second time.
+        };
+        buildRustCrateForPkgs =
+          p:
+          p.buildRustCrate.override {
+            rustc = rust;
+            cargo = rust;
+            defaultCrateOverrides = p.defaultCrateOverrides // crateOverrides;
           };
+
+        workspace = cargoNix.workspaceMembers;
+        net-observerd = workspace."net-observerd".build;
+        net-observer-cli = workspace."net-observer-cli".build;
+        # Darwin-only by nature (AppKit/NSStatusItem), and its own derivation:
+        # a pure IPC-socket client of net-observerd, no pcap, no DuckDB — its
+        # store path does not move when the daemon's dependencies do, and vice
+        # versa. Taken as buildRustCrate hands it over: it already sets
+        # `meta.mainProgram` to the crate name, and an `overrideAttrs` that
+        # re-set it would replace the whole `meta` set, `badPlatforms` included.
+        net-observer-bar = workspace."net-observer-bar".build;
+        # Previously `net-observerd` and `net-observer-cli` were aliases of one
+        # `buildRustPackage` derivation holding both binaries. crate2nix builds
+        # each crate as its own derivation, so `net-observer` now joins the two
+        # built outputs instead of being the thing they alias.
+        net-observer = pkgs.symlinkJoin {
+          name = "net-observer";
+          paths = [
+            net-observerd
+            net-observer-cli
+          ];
         };
-        # The daemon and the CLI, without the menu bar — not because the bar is
-        # unbuildable any more (see net-observer-bar below), but so the
-        # network-critical daemon closure does not rebuild when only UI
-        # dependencies move.
-        net-observer = rustPlatform.buildRustPackage {
-          pname = "net-observer";
-          version = "0.0.0";
-          src = ./.;
-          inherit cargoLock;
-          nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.libpcap pkgs.iconv ];
-          cargoBuildFlags = [ "-p" "net-observerd" "-p" "net-observer-cli" ];
-          # buildRustPackage wraps the build in `cargo-auditable` by default, and
-          # that wrapper is built against NIXPKGS' rustc — not the channel
-          # `rust-toolchain.toml` pins. So the default drags a second toolchain
-          # into the build, and when it is not in the binary cache nix starts
-          # compiling rustc from source and the whole thing dies there. The SBOM
-          # it embeds buys us nothing here.
-          auditable = false;
-          # `DUCKDB_LIB_DIR` is deliberately NOT set: libduckdb-sys here wants
-          # DuckDB 1.5.5 and nixpkgs carries 1.5.2, so linking the system library
-          # would be a version mismatch. The crate builds its own engine from
-          # source instead — minutes on a cold build, and correct.
-          # Tests are the dev shell's job (`cargo test --all`).
-          doCheck = false;
-        };
-        # The menu bar as a normal nix package. Buildable at all because the
-        # workspace pins gpui with `runtime_shaders` (see Cargo.toml): without
-        # that feature gpui's build script shells out to `xcrun -sdk macosx
-        # metal`, and Apple's Metal shader compiler ships only inside Xcode
-        # and cannot be redistributed, so it can never enter a nix closure.
-        # With the feature the only build-time codegen left is bindgen over
-        # dispatch.h — hence bindgenHook (libclang + SDK include paths).
-        # Its own derivation, darwin-only by nature (AppKit/NSStatusItem):
-        # a pure IPC-socket client of net-observerd, no pcap, no DuckDB.
-        net-observer-bar = rustPlatform.buildRustPackage {
-          pname = "net-observer-bar";
-          version = "0.0.0";
-          src = ./.;
-          inherit cargoLock;
-          nativeBuildInputs = [ rustPlatform.bindgenHook ];
-          buildInputs = [ pkgs.iconv ];
-          cargoBuildFlags = [ "-p" "net-observer-bar" ];
-          # Same rationale as the daemon package above.
-          auditable = false;
-          doCheck = false;
-          meta.mainProgram = "net-observer-bar";
-        };
-      in {
+      in
+      {
         formatter = pkgs.nixfmt-rfc-style;
         packages = {
-          inherit net-observer net-observer-bar;
-          net-observerd = net-observer;
-          net-observer-cli = net-observer;
+          inherit
+            net-observer
+            net-observerd
+            net-observer-cli
+            net-observer-bar
+            ;
           default = net-observer;
+        };
+        # The two workspace crates with no Apple-only dependency, built through
+        # the same Cargo.nix as the darwin packages: the one place the
+        # crate2nix route (buildRustCrate, the bundled DuckDB engine compiled
+        # by libduckdb-sys's build script) is exercised on a Linux host.
+        checks = {
+          store-crate = workspace."store".build;
+          triggers-crate = workspace."triggers".build;
         };
         devShells.default = pkgs.mkShell {
           name = "net-observer-dev";
@@ -97,10 +152,14 @@
             pkgs.duckdb
             pkgs.libpcap
             pkgs.iconv
+            # The generator of the checked-in Cargo.nix, at the rev the flake
+            # pins, so `crate2nix generate` here reproduces the file CI diffs.
+            crate2nix.packages.${system}.default
           ];
           # duckdb crate links the system lib when DUCKDB_LIB_DIR is set; else it builds bundled.
         };
-      }))
+      }
+    ))
     // {
       # Top-level, NOT inside eachDefaultSystem: a darwin module is not
       # system-scoped, and nesting it would bury it under `aarch64-darwin` and

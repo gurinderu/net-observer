@@ -1,5 +1,5 @@
 use collector_core::PingOutcome;
-use types::{GwVerdict, LinkSample, TcpVerdict};
+use types::{GwVerdict, LinkMedium, LinkSample, TcpVerdict};
 
 /// Pure, SYNC mapping from fetched probe outcomes + link facts to a [`LinkSample`].
 ///
@@ -40,6 +40,7 @@ pub fn build_link_sample(
     ssid: Option<String>,
     bssid: Option<String>,
     if_mac: Option<String>,
+    medium: Option<LinkMedium>,
     wifi_present: bool,
 ) -> LinkSample {
     let (gw, gw_rtt_ms) = match (&gw_addr, ping) {
@@ -81,6 +82,7 @@ pub fn build_link_sample(
         ssid,
         bssid,
         if_mac,
+        medium,
         wifi_capture_present: wifi_present,
         lan_probed,
         lan_alive,
@@ -116,6 +118,7 @@ mod tests {
             Some("cowork".into()),
             None,
             None,
+            None,
             false,
         );
         assert_eq!(s.gw, GwVerdict::NoGw);
@@ -138,6 +141,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         );
         assert_eq!(s.gw, GwVerdict::Fail);
@@ -155,6 +159,7 @@ mod tests {
             (None, None),
             Some("aa:bb".into()),
             (None, None),
+            None,
             None,
             None,
             None,
@@ -184,6 +189,7 @@ mod tests {
             Some("cowork".into()),
             None,
             None,
+            None,
             false,
         );
         assert_eq!(s.gw, GwVerdict::Skip);
@@ -209,6 +215,7 @@ mod tests {
             Some("utun8".into()),
             Some("utun8".into()),
             Some("cowork".into()),
+            None,
             None,
             None,
             false,
@@ -237,6 +244,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         );
         assert_eq!(s.gw, GwVerdict::NoGw);
@@ -257,6 +265,7 @@ mod tests {
             Some("cowork".into()),
             Some("3c:22:fb:12:34:56".into()),
             Some("f0:18:98:0a:0b:0c".into()),
+            Some(LinkMedium::Wifi),
             true,
         );
         assert_eq!(s.ts_us, 7);
@@ -268,6 +277,7 @@ mod tests {
         assert_eq!(s.ssid.as_deref(), Some("cowork"));
         assert_eq!(s.bssid.as_deref(), Some("3c:22:fb:12:34:56"));
         assert_eq!(s.if_mac.as_deref(), Some("f0:18:98:0a:0b:0c"));
+        assert_eq!(s.medium, Some(LinkMedium::Wifi));
         assert!(s.wifi_capture_present);
     }
 
@@ -289,10 +299,12 @@ mod tests {
             Some("cowork".into()),
             None,
             None,
+            None,
             false,
         );
         assert_eq!(s.ssid.as_deref(), Some("cowork"));
         assert_eq!(s.bssid, None);
         assert_eq!(s.if_mac, None);
+        assert_eq!(s.medium, None);
     }
 }

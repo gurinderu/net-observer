@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::window::{LinkProvenance, RecentWindow};
-use types::{DnsVerdict, GwVerdict, LinkSample, NeighborsVerdict, ProxySample, TcpVerdict};
+use types::{
+    DnsVerdict, GwVerdict, LinkMedium, LinkSample, NeighborsVerdict, ProxySample, TcpVerdict,
+};
 
 /// How many recent DNS samples the `fakeip` condition scans (one polling tick
 /// emits several probe rows, so a small window covers the latest tick).
@@ -73,6 +75,19 @@ fn proxy_ticks<'a>(rows: &'a [&'a ProxySample]) -> impl Iterator<Item = ProxyTic
     })
 }
 
+/// How many recent proxy rows `wedge` scans for its dead-tick run. The
+/// reach in time depends on what a tick emits: a MEASURED tick emits one row
+/// per endpoint, ~7 rows with the daemon's defaults, so 64 rows ≈ 9 ticks
+/// ≈ 2 min at the 15 s cadence; a tick whose preflight skipped emits one
+/// placeholder row, so a run of those — the #96 scenario — stretches the
+/// same 64 rows to ≈ 64 ticks ≈ 16 min, which is how far behind the present
+/// a dead run can still be counted. The run it counts is the daemon's
+/// `WEDGE_CONSECUTIVE = 3`, so a few measured ticks beyond that suffice; an
+/// unbounded scan reached across the whole 2048-sample window (≈ 40 min)
+/// and fired on a dead run any number of unmeasured ticks old. Tunable by
+/// the owner.
+const WEDGE_SCAN: usize = 64;
+
 /// Fires when the last `consecutive` link samples all have `direct == Ok` while
 /// the last `consecutive` MEASURED proxy ticks all found the tun dead (anything
 /// but a 204 from the probe — mirroring the shell watchdog's `tun != 204`).
@@ -93,7 +108,9 @@ impl Condition for Wedge {
         }
         // Count MEASURED ticks only (see [`ProxyTick`]): a placeholder neither
         // advances nor resets the dead run; a measured healthy tick breaks it.
-        let rows = w.recent_proxy(usize::MAX);
+        // The scan is bounded by `WEDGE_SCAN`: a dead run further back than
+        // that is history, not the present.
+        let rows = w.recent_proxy(WEDGE_SCAN);
         let mut dead_ticks = 0usize;
         for tick in proxy_ticks(&rows).filter(|t| t.measured) {
             if !tick.dead {
@@ -126,10 +143,12 @@ impl Condition for Wedge {
 /// Each gate is optional so every signature keeps exactly the guards its
 /// semantics allow (`per-client-block` measures a DEAD gateway, so it must
 /// not require a working direct path):
-///   - `require_direct`: the newest MEASURED link sample must say the direct
-///     path works. A destination-fault verdict is meaningless while the
-///     uplink itself is down. `Skip` rows are the absence of a measurement
-///     and satisfy nothing (node #25).
+///   - `require_direct`: the newest MEASURED link sample within the last
+///     [`GATE_DIRECT_SCAN`] must say the direct path works. A
+///     destination-fault verdict is meaningless while the uplink itself is
+///     down. `Skip` rows are the absence of a measurement and satisfy
+///     nothing (node #25), and a `direct` reading older than the scan is not
+///     evidence the uplink works now.
 ///   - `load_below`: the newest host sample's `load1` must be below this —
 ///     above it, probe failures measure the run queue, not the network
 ///     (measured 2026-07-30: at load1 ≥ 64 half of all probes fail). No host
@@ -144,6 +163,13 @@ pub struct Gated<C> {
     pub settle_us: Option<i64>,
 }
 
+/// How many recent link samples the direct-path gate scans for a measured
+/// `direct`: 8 at the 15 s link cadence is ≈ 2 min. Only that lookup uses it
+/// — `gw-change`'s own predecessor scan keeps [`GW_CHANGE_SCAN`], because a
+/// change straddling a long quiet run is still a change, while a `direct`
+/// reading that old is not evidence the uplink works now (#96).
+const GATE_DIRECT_SCAN: usize = 8;
+
 impl<C: Condition> Condition for Gated<C> {
     fn id(&self) -> &'static str {
         self.inner.id()
@@ -151,7 +177,7 @@ impl<C: Condition> Condition for Gated<C> {
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         if self.require_direct {
             let direct_ok = w
-                .recent_link(GW_CHANGE_SCAN)
+                .recent_link(GATE_DIRECT_SCAN)
                 .into_iter()
                 .find(|l| l.direct != TcpVerdict::Skip)
                 .is_some_and(|l| l.direct == TcpVerdict::Ok);
@@ -185,10 +211,12 @@ impl<C: Condition> Condition for Gated<C> {
 
 /// How far back `gw-change` looks for a comparable (non-`SKIP`) predecessor when
 /// the echo has been withheld for a run of ticks — by the operator's quiet mode
-/// or by the passive probing tier. It therefore bounds the rule's reach across
-/// a passive stretch: a change straddling a stretch longer than this many
-/// ticks is not named by `gw-change` (its basis has left the window), while
-/// `gw-drop` still catches a `FAIL` on the first measured tick after it.
+/// or by the passive probing tier; the other change signatures
+/// (`gw-mac-change`, `roam`) reach back the same way past ticks that could not
+/// read their field. It therefore bounds the rule's reach across a passive
+/// stretch: a change straddling a stretch longer than this many ticks is not
+/// named by `gw-change` (its basis has left the window), while `gw-drop` still
+/// catches a `FAIL` on the first measured tick after it.
 const GW_CHANGE_SCAN: usize = 64;
 
 /// Fires when the newest link sample's gateway verdict is `Fail` or `NoGw`.
@@ -242,15 +270,7 @@ impl Condition for GwChange {
             .skip(1)
             .take_while(|l| l.gw == GwVerdict::Skip)
             .count();
-        let (prev, provenance) = match recent.iter().skip(1).find(|l| l.gw != GwVerdict::Skip) {
-            Some(prev) => (*prev, LinkProvenance::Contiguous),
-            // Nothing comparable in the window: fall back to the basis carried
-            // across a pause, which must itself be a measurement.
-            None => match w.prev_link_with_provenance()? {
-                (prev, _) if prev.gw == GwVerdict::Skip => return None,
-                (prev, provenance) => (prev, provenance),
-            },
-        };
+        let (prev, provenance) = measured_predecessor(w, &recent, |l| l.gw != GwVerdict::Skip)?;
         // A change measured against the basis carried across a pause is real —
         // the oracle freezes on ANY gateway change — but it is not two
         // consecutive ticks, and the incident must not read as though it were.
@@ -291,15 +311,7 @@ impl Condition for GwMacChange {
         let comparable = |l: &LinkSample| l.dhcp_router.is_some() && l.gw_arp_mac.is_some();
         let recent = w.recent_link(GW_CHANGE_SCAN);
         let unreadable = recent.iter().skip(1).take_while(|l| !comparable(l)).count();
-        let (prev, provenance) = match recent.iter().skip(1).find(|l| comparable(l)) {
-            Some(prev) => (*prev, LinkProvenance::Contiguous),
-            // Nothing comparable in the window: fall back to the basis carried
-            // across a pause, which must itself carry both values.
-            None => match w.prev_link_with_provenance()? {
-                (prev, _) if !comparable(prev) => return None,
-                (prev, provenance) => (prev, provenance),
-            },
-        };
+        let (prev, provenance) = measured_predecessor(w, &recent, comparable)?;
         let prev_router = prev.dhcp_router.as_deref()?;
         let prev_mac = prev.gw_arp_mac.as_deref()?;
         if last_router != prev_router {
@@ -317,6 +329,277 @@ impl Condition for GwMacChange {
         };
         Some(Fire {
             detail: format!("gateway {last_router} mac {prev_mac} -> {last_mac}{across}"),
+        })
+    }
+}
+
+/// The newest link sample older than the newest one in which `measured`
+/// holds, with the provenance of the answer: found inside `recent` (newest
+/// first, the newest itself at index 0) as a contiguous predecessor, else the
+/// basis carried across a pause — which must itself be measured. `None` when
+/// nothing measured precedes the newest sample. The one predecessor scan of
+/// the change signatures (`gw-change`, `gw-mac-change`, `roam`): reaching
+/// back past unmeasured ticks is how a change that quiet mode, an empty ARP
+/// cache or an unreadable identity straddled is still seen, and falling back
+/// to the carried basis is how a change DURING a pause is seen at resume.
+fn measured_predecessor<'w>(
+    w: &'w RecentWindow,
+    recent: &[&'w LinkSample],
+    measured: impl Fn(&LinkSample) -> bool,
+) -> Option<(&'w LinkSample, LinkProvenance)> {
+    match recent.iter().skip(1).find(|l| measured(l)) {
+        Some(prev) => Some((prev, LinkProvenance::Contiguous)),
+        None => match w.prev_link_with_provenance()? {
+            (prev, _) if !measured(prev) => None,
+            (prev, provenance) => Some((prev, provenance)),
+        },
+    }
+}
+
+/// Whether a link sample was read on a link whose medium was MEASURED as
+/// Wi-Fi (`LinkSample::medium`, from the hardware-port table). The invariant
+/// the identity rules rest on: `LinkSample` has no interface name (a future
+/// field), and `if_mac` is the DEFAULT-ROUTE interface's MAC, so a dock or
+/// undock moves it between the wired and the Wi-Fi adapter — the medium is
+/// what tells a roam from a dock. It is never inferred from a readable SSID
+/// or BSSID: the deployed daemon reads as root, where the SSID is
+/// `<redacted>` (realm net-observer, node #93) and the BSSID line is
+/// unproven (node #108), so readable names would make every Wi-Fi tick look
+/// wired and leave `roam` and `wifi-churn` inert. `None` — the medium not
+/// determinable — is the absence of a measurement on the medium itself
+/// (#25's second obligation: the field's absence is not the medium's
+/// absence), and such a tick is transparent to the address comparison like a
+/// wired one: neither compared nor a comparison basis.
+fn on_wifi(l: &LinkSample) -> bool {
+    l.medium == Some(LinkMedium::Wifi)
+}
+
+/// The link address of a tick measured as Wi-Fi; `None` on a wired or
+/// undetermined medium, where the address may belong to another adapter
+/// ([`on_wifi`]).
+fn wifi_if_mac(l: &LinkSample) -> Option<&str> {
+    if on_wifi(l) {
+        l.if_mac.as_deref()
+    } else {
+        None
+    }
+}
+
+/// Fires when the link's Wi-Fi identity moved between the newest link sample
+/// and its newest measured predecessor: the associated access point
+/// (`bssid`) changed, whatever the SSID did — band steering, or the #57 twin
+/// SSIDs, which have different names (5 GHz / 6 GHz) — or, on a Wi-Fi tick,
+/// the link's own address (`if_mac`) changed, which under Private Wi-Fi
+/// Address is a new DHCP identity toward the network. Either is a roam, and
+/// both on one tick are one roam whose detail names both. The masquerade
+/// this unmasks: a roam otherwise lands as `gw-drop` or `per-client-block`
+/// with the move itself readable nowhere. (realm net-observer, node #59)
+///
+/// The detail says what happened and suppresses nothing: `roam: BSSID <old>
+/// -> <new>`, then `, SSID <old> -> <new>` when the SSID moved, then the link
+/// address class, then `; router <old> -> <new>` when the DHCP router also
+/// changed in the same comparison — whether the hop was a move to another
+/// segment is the reader's call from that record. The address class is what
+/// separates the harmless hop from the harmful one (node #109): with the
+/// address kept, each hop is a sub-second DHCP INIT-REBOOT on the same IP —
+/// `link address kept`; with a per-SSID private address rotating, DHCP
+/// starts from scratch and the link has a 10–20 s hole — `link address
+/// <old> -> <new> (new DHCP identity)`. A BSSID hop whose address could not
+/// be read on either side is `link address unmeasured`, never claimed kept.
+///
+/// Each field is compared against the newest OLDER sample in which that
+/// field is measured, so a tick that could not read the identity is
+/// transparent; `None` on either side is the absence of a measurement and
+/// never one half of a change. The address is compared only between ticks
+/// whose medium was MEASURED as Wi-Fi — a wired or undetermined medium is
+/// transparent to it ([`on_wifi`]): a dock or undock is not a roam, and an
+/// unmeasured medium is no basis. The ARP-resolved gateway
+/// MAC is never read here: it is stored raw and is not comparable to a
+/// normalised BSSID (node #94). Like `gw-change`, this asserts only on the
+/// tick where the newest sample differs from its predecessor, so the
+/// engine's clear edge closes the incident on the next unchanged tick; a
+/// comparison against the basis carried across a pause is labelled, so the
+/// incident never reads as two consecutive ticks. The daemon registers it
+/// with NO firing backoff: the #57 cadence is a hop every 2.5–3 min, and
+/// each hop at the field cadence is its own incident — the shared 5 min
+/// backoff would silently drop most of them. Hops on consecutive ticks merge
+/// into one incident under the engine's latch (the condition never returns
+/// `None` between them), and the link rows still record both. The
+/// aggregate's rate limit lives on `wifi-churn`.
+pub struct Roam;
+impl Condition for Roam {
+    fn id(&self) -> &'static str {
+        "roam"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_link()?;
+        let recent = w.recent_link(GW_CHANGE_SCAN);
+        let mut across_gap = false;
+        // The access point, with the SSID move named when there was one and
+        // the predecessor kept as the router comparison's basis.
+        let bssid_hop = if let Some(new_ap) = last.bssid.as_deref()
+            && let Some((prev, provenance)) =
+                measured_predecessor(w, &recent, |l| l.bssid.is_some())
+            && let Some(old_ap) = prev.bssid.as_deref()
+            && old_ap != new_ap
+        {
+            across_gap |= provenance == LinkProvenance::AcrossGap;
+            let ssid = match (prev.ssid.as_deref(), last.ssid.as_deref()) {
+                (Some(old), Some(new)) if old != new => format!(", SSID {old} -> {new}"),
+                _ => String::new(),
+            };
+            Some((format!("BSSID {old_ap} -> {new_ap}{ssid}"), prev))
+        } else {
+            None
+        };
+        // The link address, compared the same way — on Wi-Fi ticks only.
+        enum Address<'w> {
+            Moved(String, &'w LinkSample),
+            Kept,
+            Unmeasured,
+        }
+        let address = if let Some(new_mac) = wifi_if_mac(last)
+            && let Some((prev, provenance)) =
+                measured_predecessor(w, &recent, |l| wifi_if_mac(l).is_some())
+            && let Some(old_mac) = prev.if_mac.as_deref()
+        {
+            if old_mac == new_mac {
+                Address::Kept
+            } else {
+                across_gap |= provenance == LinkProvenance::AcrossGap;
+                Address::Moved(
+                    format!("link address {old_mac} -> {new_mac} (new DHCP identity)"),
+                    prev,
+                )
+            }
+        } else {
+            Address::Unmeasured
+        };
+        // The predecessor the router is compared against: the access point's
+        // when the access point hopped, else the address's.
+        let (address, basis) = match (&bssid_hop, address) {
+            (_, Address::Moved(moved, prev)) => (moved, bssid_hop.as_ref().map_or(prev, |h| h.1)),
+            (None, _) => return None,
+            (Some((_, prev)), Address::Kept) => ("link address kept".to_string(), *prev),
+            (Some((_, prev)), Address::Unmeasured) => {
+                ("link address unmeasured".to_string(), *prev)
+            }
+        };
+        let router = match (basis.dhcp_router.as_deref(), last.dhcp_router.as_deref()) {
+            (Some(old), Some(new)) if old != new => format!("; router {old} -> {new}"),
+            _ => String::new(),
+        };
+        let across = if across_gap {
+            " (across an observation gap)"
+        } else {
+            ""
+        };
+        let detail = match bssid_hop {
+            Some((ap, _)) => format!("roam: {ap}; {address}{router}{across}"),
+            None => format!("roam: {address}{router}{across}"),
+        };
+        Some(Fire { detail })
+    }
+}
+
+/// The fewest identity changes inside [`WIFI_CHURN_WINDOW_S`] that read as
+/// churn: the field pattern is a hop every ~2.5–3 min, so four is a quarter
+/// hour of it. Tunable by the owner.
+const WIFI_CHURN_MIN_CHANGES: usize = 4;
+
+/// How far behind the newest link sample `wifi-churn` counts identity
+/// changes, in seconds. Tunable by the owner.
+const WIFI_CHURN_WINDOW_S: i64 = 900;
+
+/// How many recent link samples `wifi-churn` walks: the same reach as
+/// `ban-cycle`, the engine window itself, because the reading an in-horizon
+/// change is measured against may sit any number of unmeasured ticks behind
+/// the horizon.
+const WIFI_CHURN_SCAN: usize = BAN_CYCLE_SCAN;
+
+/// The ticks at which `field` changed, newest first: a tick whose measured
+/// reading differs from the previous MEASURED reading of the same field, and
+/// whose `ts_us` is at or after `horizon`. A tick with the field unmeasured
+/// is skipped in the comparison and is never a change. Walked newest-first,
+/// so the reading each change is measured against may lie behind the
+/// horizon.
+fn identity_changes(
+    links: &[&LinkSample],
+    horizon: i64,
+    field: fn(&LinkSample) -> Option<&str>,
+) -> Vec<i64> {
+    let mut changes = Vec::new();
+    // The newest measured reading walked so far and the tick it was read on.
+    let mut newer: Option<(&str, i64)> = None;
+    for l in links {
+        let Some(value) = field(l) else {
+            continue;
+        };
+        if let Some((newer_value, newer_ts)) = newer
+            && newer_value != value
+            && newer_ts >= horizon
+        {
+            changes.push(newer_ts);
+        }
+        newer = Some((value, l.ts_us));
+    }
+    changes
+}
+
+/// Fires when the window holds at least [`WIFI_CHURN_MIN_CHANGES`] Wi-Fi
+/// identity changes within [`WIFI_CHURN_WINDOW_S`] of the newest link sample
+/// — an identity change being a tick whose measured `bssid` or `if_mac`
+/// differs from the previous measured reading of the same field. The field
+/// pattern: macOS hopping between the twin SSIDs of one access point every
+/// ~2.5–3 min, each hop otherwise its own `roam` incident with the churn
+/// itself readable nowhere. This one names the churn, its span and how the
+/// identity moved (per-field counts), and stays asserted while the pattern
+/// is in the window so the engine's clear edge closes the one incident when
+/// it ages out. The daemon registers it WITH the shared firing backoff
+/// (5 min): that is the aggregate's rate limit the field asked for, while
+/// `roam` itself runs with none so that each hop at the field cadence stays
+/// its own incident (hops on consecutive ticks merge into one under the
+/// engine's latch; the rows still record both). (realm net-observer,
+/// node #109)
+///
+/// A tick with a field unmeasured (`None`) is skipped in that field's
+/// comparison and never counted as a change (node #25); the address is
+/// counted only between ticks whose medium was MEASURED as Wi-Fi, so a
+/// wired or undetermined tick is neither counted nor a comparison basis
+/// ([`on_wifi`]). A tick where both fields
+/// moved is one change; the per-field counts in the detail say which moved.
+/// The detail is written when the incident opens, so its counts and span are
+/// those of the first firing.
+pub struct WifiChurn;
+impl Condition for WifiChurn {
+    fn id(&self) -> &'static str {
+        "wifi-churn"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_link()?;
+        let horizon = last.ts_us.saturating_sub(WIFI_CHURN_WINDOW_S * 1_000_000);
+        let links = w.recent_link(WIFI_CHURN_SCAN);
+        let bssid_changes = identity_changes(&links, horizon, |l| l.bssid.as_deref());
+        let mac_changes = identity_changes(&links, horizon, wifi_if_mac);
+        // One change per tick, however many fields moved on it.
+        let mut ticks: Vec<i64> = bssid_changes
+            .iter()
+            .chain(mac_changes.iter())
+            .copied()
+            .collect();
+        ticks.sort_unstable();
+        ticks.dedup();
+        let n = ticks.len();
+        if n < WIFI_CHURN_MIN_CHANGES {
+            return None;
+        }
+        let span_s = (ticks.last()? - ticks.first()?) / 1_000_000;
+        Some(Fire {
+            detail: format!(
+                "wifi identity churn: {n} changes in ~{span_s}s (bssid: {b}, link address: {m})",
+                b = bssid_changes.len(),
+                m = mac_changes.len(),
+            ),
         })
     }
 }
@@ -565,13 +848,14 @@ const BAN_MIN_PERIOD_S: i64 = 60;
 /// a maximal run of dead gateway readings (`Fail` or `NoGw`: one run class,
 /// the same fold the CLI's `gw_drops()` uses) of at least
 /// `BAN_MIN_RUN_TICKS` measured ticks with an `Ok` reading on either side,
-/// the newest run possibly still open — and the mean interval between ban
-/// starts is at least `BAN_MIN_PERIOD_S`. The coworking ban-cycle
-/// signature: the client is admitted, blocked, admitted again, and each round
-/// otherwise lands as its own `gw-drop`/`gw-change`/`per-client-block`
-/// incident with the cycle itself readable nowhere. This one names the cycle
-/// and its period, and stays asserted while the pattern is in the window so
-/// the engine's clear edge closes the one incident when it ages out.
+/// the newest run possibly still open, holding at least one `Fail` — and the
+/// mean interval between ban starts is at least `BAN_MIN_PERIOD_S`. The
+/// coworking ban-cycle signature: the client is admitted, blocked, admitted
+/// again, and each round otherwise lands as its own
+/// `gw-drop`/`gw-change`/`per-client-block` incident with the cycle itself
+/// readable nowhere. This one names the cycle and its period, and stays
+/// asserted while the pattern is in the window so the engine's clear edge
+/// closes the one incident when it ages out.
 ///
 /// The detail is written when the incident opens, so the count and span it
 /// carries are those of the first firing — `min_bans` bans; the full count
@@ -579,11 +863,14 @@ const BAN_MIN_PERIOD_S: i64 = 60;
 /// detail. `Skip` is the absence of a measurement and is transparent: it
 /// neither splits a run nor starts one (node #25). `NoGw` at the roam (the
 /// default gateway momentarily absent before the echoes start failing) is the
-/// start of that ban, not a wall that hides it. A run the window cut off (no
-/// `Ok` older than it) has no known start and is not counted. The match is
-/// exhaustive over the verdict so a future token cannot join a set by
-/// accident. A cycle has a period only from two bans on, so `min_bans` below
-/// 2 reads as 2.
+/// start of that ban, not a wall that hides it — but a run of `NoGw` alone is
+/// no route (the interface was down, or the roam was still in progress), not
+/// a gateway that answered and then went silent toward this client: without
+/// a `Fail` it is not a ban, so three Wi-Fi toggles do not read as a cycle
+/// (node #97). A run the window cut off (no `Ok` older than it) has no known
+/// start and is not counted. The match is exhaustive over the verdict so a
+/// future token cannot join a set by accident. A cycle has a period only from
+/// two bans on, so `min_bans` below 2 reads as 2.
 ///
 /// The daemon registers this behind the settle gate on purpose: a different
 /// router IP is a different segment, not one gateway's ban, so a roam that
@@ -599,19 +886,24 @@ impl Condition for BanCycle {
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         // Ban starts, newest first: the `ts_us` of the oldest dead reading in
         // each run, recorded once the `Ok` before that run is reached — if
-        // the run measured enough dead ticks to be a ban.
+        // the run measured enough dead ticks, at least one of them a `Fail`,
+        // to be a ban.
         let mut starts: Vec<i64> = Vec::new();
-        // The run being walked: its oldest dead reading so far and how many
-        // measured dead readings it holds.
-        let mut run: Option<(i64, usize)> = None;
+        // The run being walked: its oldest dead reading so far, how many
+        // measured dead readings it holds, and whether any of them is a
+        // `Fail` (a `NoGw`-only run is no route, not a ban).
+        let mut run: Option<(i64, usize, bool)> = None;
         for l in w.recent_link(BAN_CYCLE_SCAN) {
             match l.gw {
                 GwVerdict::Fail | GwVerdict::NoGw => {
-                    run = Some((l.ts_us, run.map_or(1, |(_, ticks)| ticks + 1)));
+                    let (ticks, failed) =
+                        run.map_or((0, false), |(_, ticks, failed)| (ticks, failed));
+                    run = Some((l.ts_us, ticks + 1, failed || l.gw == GwVerdict::Fail));
                 }
                 GwVerdict::Ok => {
-                    if let Some((start, ticks)) = run.take()
+                    if let Some((start, ticks, failed)) = run.take()
                         && ticks >= BAN_MIN_RUN_TICKS
+                        && failed
                     {
                         starts.push(start);
                     }
@@ -776,8 +1068,9 @@ mod tests {
     use super::*;
     use crate::window::{RecentWindow, WINDOW_CAP};
     use types::{
-        DnsSample, DnsVerdict, GwVerdict, HostSample, LinkSample, NeighborObs, NeighborRole,
-        NeighborSource, NeighborsSample, NeighborsVerdict, ProxySample, Sample, TcpVerdict,
+        DnsSample, DnsVerdict, GwVerdict, HostSample, LinkMedium, LinkSample, NeighborObs,
+        NeighborRole, NeighborSource, NeighborsSample, NeighborsVerdict, ProxySample, Sample,
+        TcpVerdict,
     };
 
     fn dns(ts: i64, probe: &str, verdict: DnsVerdict, ip: Option<&str>) -> Sample {
@@ -812,6 +1105,7 @@ mod tests {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -835,6 +1129,7 @@ mod tests {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -893,6 +1188,7 @@ mod tests {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1010,6 +1306,33 @@ mod tests {
         assert!(c.eval(&w).is_none());
     }
 
+    /// The dead-tick scan is bounded by `WEDGE_SCAN` proxy rows: a dead run
+    /// that far behind the present is history, not a wedge now. Three dead
+    /// ticks followed by exactly enough skip placeholders to be the oldest
+    /// rows of the scan still fire; one placeholder more pushes the run out
+    /// of reach. Dies under the unbounded `usize::MAX` scan (#96), which
+    /// fired on a run any number of unmeasured ticks old.
+    #[test]
+    fn wedge_does_not_reach_past_the_scan_bound() {
+        let c = Wedge { consecutive: 3 };
+        let stream = |placeholders: usize| {
+            let mut w = RecentWindow::new(WINDOW_CAP);
+            push_wedge_ticks(&mut w, 0, 3);
+            for i in 0..placeholders {
+                w.push(skip_proxy(100 + i as i64));
+            }
+            w
+        };
+        assert!(
+            c.eval(&stream(WEDGE_SCAN - 3)).is_some(),
+            "the dead run as the oldest rows of the scan still fires"
+        );
+        assert!(
+            c.eval(&stream(WEDGE_SCAN - 2)).is_none(),
+            "a dead run beyond WEDGE_SCAN rows is not the present"
+        );
+    }
+
     /// A link sample whose only interesting field is the network identity
     /// (`dhcp_router`) — the settle gate's input.
     fn link_router(ts: i64, router: Option<&str>) -> Sample {
@@ -1052,6 +1375,38 @@ mod tests {
         assert!(c.eval(&w).is_none(), "uplink down voids the verdict");
         w.push(link(2, TcpVerdict::Ok));
         assert!(c.eval(&w).is_some());
+    }
+
+    /// A `direct` reading is evidence the uplink works NOW only within the
+    /// last `GATE_DIRECT_SCAN` link samples: an `Ok` that many quiet ticks
+    /// ago is the oldest reading the gate still accepts, one tick older and
+    /// the gate refuses. Dies under the `GW_CHANGE_SCAN` reach the gate used
+    /// to share with `gw-change` (#96), which accepted a `direct` from 64
+    /// ticks back as the present.
+    #[test]
+    fn gate_refuses_a_direct_reading_older_than_its_scan() {
+        let c = Gated {
+            inner: AlwaysFire,
+            require_direct: true,
+            load_below: None,
+            settle_us: None,
+        };
+        let stream = |quiet: usize| {
+            let mut w = RecentWindow::new(WINDOW_CAP);
+            w.push(link(0, TcpVerdict::Ok));
+            for i in 0..quiet {
+                w.push(link(1 + i as i64, TcpVerdict::Skip));
+            }
+            w
+        };
+        assert!(
+            c.eval(&stream(GATE_DIRECT_SCAN - 1)).is_some(),
+            "an Ok as the oldest sample of the scan still passes"
+        );
+        assert!(
+            c.eval(&stream(GATE_DIRECT_SCAN)).is_none(),
+            "an Ok older than GATE_DIRECT_SCAN samples is not evidence now"
+        );
     }
 
     #[test]
@@ -1486,6 +1841,592 @@ mod tests {
         );
     }
 
+    /// A link sample carrying only what `Roam` reads: the measured medium of
+    /// the default-route interface, the Wi-Fi network name, the associated
+    /// access point and the interface's own MAC, each possibly unmeasured.
+    /// Gateway and direct are healthy, everything else absent.
+    fn link_on(
+        ts: i64,
+        medium: Option<LinkMedium>,
+        ssid: Option<&str>,
+        bssid: Option<&str>,
+        if_mac: Option<&str>,
+    ) -> Sample {
+        Sample::Link(LinkSample {
+            ts_us: ts,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: ssid.map(str::to_string),
+            bssid: bssid.map(str::to_string),
+            if_mac: if_mac.map(str::to_string),
+            medium,
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        })
+    }
+
+    /// [`link_on`] a link whose medium was measured as Wi-Fi — what every
+    /// identity reading in these tests is unless it says otherwise.
+    fn link_identity(
+        ts: i64,
+        ssid: Option<&str>,
+        bssid: Option<&str>,
+        if_mac: Option<&str>,
+    ) -> Sample {
+        link_on(ts, Some(LinkMedium::Wifi), ssid, bssid, if_mac)
+    }
+
+    /// [`link_on`] a link whose medium was measured as wired: no Wi-Fi
+    /// identity, the wired adapter's own address as `if_mac`.
+    fn link_wired(ts: i64, if_mac: &str) -> Sample {
+        link_on(ts, Some(LinkMedium::Wired), None, None, Some(if_mac))
+    }
+
+    const AP_A: &str = "aa:aa:aa:aa:aa:01";
+    const AP_B: &str = "aa:aa:aa:aa:aa:02";
+    const MAC_A: &str = "cc:cc:cc:cc:cc:01";
+    const MAC_B: &str = "cc:cc:cc:cc:cc:02";
+
+    /// Band steering: the same SSID answered by a new BSSID is a roam, and the
+    /// detail names both access points (an unmoved SSID is not named).
+    /// The harmless class: the link address survived the hop, so the DHCP
+    /// exchange was a sub-second INIT-REBOOT on the same IP — and the detail
+    /// says so (node #109).
+    #[test]
+    fn roam_fires_when_the_bssid_moves_at_the_same_ssid() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        assert!(Roam.eval(&w).is_none(), "no predecessor yet");
+        w.push(link_identity(2, Some("Office"), Some(AP_B), Some(MAC_A)));
+        let fire = Roam
+            .eval(&w)
+            .expect("a new BSSID at the same SSID must fire");
+        assert_eq!(
+            fire.detail,
+            format!("roam: BSSID {AP_A} -> {AP_B}; link address kept")
+        );
+    }
+
+    /// Private Wi-Fi Address rotating the link's own address is a new DHCP
+    /// identity toward the network — DHCP from scratch, the harmful class — a
+    /// roam even with the access point unchanged (node #109).
+    #[test]
+    fn roam_fires_when_the_link_address_moves() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), Some(AP_A), Some(MAC_B)));
+        let fire = Roam.eval(&w).expect("a new link address must fire");
+        assert_eq!(
+            fire.detail,
+            format!("roam: link address {MAC_A} -> {MAC_B} (new DHCP identity)")
+        );
+    }
+
+    /// Both identities moving on one tick is one roam of the harmful class,
+    /// and the one detail names both moves.
+    #[test]
+    fn roam_names_both_moves_in_one_detail() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), Some(AP_B), Some(MAC_B)));
+        let fire = Roam.eval(&w).expect("both moves must fire once");
+        assert_eq!(
+            fire.detail,
+            format!(
+                "roam: BSSID {AP_A} -> {AP_B}; \
+link address {MAC_A} -> {MAC_B} (new DHCP identity)"
+            )
+        );
+    }
+
+    /// A BSSID hop whose link address could not be read on either side
+    /// cannot be classified: the detail says the address is unmeasured
+    /// rather than claiming it was kept.
+    #[test]
+    fn roam_says_when_the_link_address_is_unmeasured() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), Some(AP_B), None));
+        let fire = Roam
+            .eval(&w)
+            .expect("a BSSID hop fires whatever the link address reading");
+        assert_eq!(
+            fire.detail,
+            format!("roam: BSSID {AP_A} -> {AP_B}; link address unmeasured")
+        );
+    }
+
+    /// The #57 twin SSIDs have DIFFERENT names (5 GHz / 6 GHz): a hop between
+    /// them is a BSSID change whatever the SSID did, and the detail names the
+    /// SSID move too. With the link address kept it is the harmless class.
+    /// Dies under a "same SSID" guard on the BSSID comparison.
+    #[test]
+    fn roam_fires_on_a_twin_ssid_hop_with_the_address_kept() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office-5G"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office-6G"), Some(AP_B), Some(MAC_A)));
+        let fire = Roam.eval(&w).expect("a hop between twin SSIDs must fire");
+        assert_eq!(
+            fire.detail,
+            format!("roam: BSSID {AP_A} -> {AP_B}, SSID Office-5G -> Office-6G; link address kept")
+        );
+    }
+
+    /// The same twin-SSID hop with Private Wi-Fi Address rotating the link
+    /// address per SSID: both the SSID move and the new address are in the
+    /// detail — the harmful class.
+    #[test]
+    fn roam_fires_on_a_twin_ssid_hop_with_a_per_ssid_address() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office-5G"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office-6G"), Some(AP_B), Some(MAC_B)));
+        let fire = Roam
+            .eval(&w)
+            .expect("a twin-SSID hop with a per-SSID address must fire");
+        assert_eq!(
+            fire.detail,
+            format!(
+                "roam: BSSID {AP_A} -> {AP_B}, SSID Office-5G -> Office-6G; \
+link address {MAC_A} -> {MAC_B} (new DHCP identity)"
+            )
+        );
+    }
+
+    /// The same sample with a DHCP router set — what `Roam` appends when the
+    /// router moved in the same comparison.
+    fn with_router(sample: Sample, router: Option<&str>) -> Sample {
+        match sample {
+            Sample::Link(mut l) => {
+                l.dhcp_router = router.map(str::to_string);
+                Sample::Link(l)
+            }
+            other => other,
+        }
+    }
+
+    /// A router that changed in the same comparison is appended, not
+    /// suppressed: the record says what happened, and whether the hop was a
+    /// move to another segment is the reader's call.
+    #[test]
+    fn roam_names_a_router_change_in_the_same_comparison() {
+        let mut w = RecentWindow::new(8);
+        w.push(with_router(
+            link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)),
+            Some("10.0.0.1"),
+        ));
+        w.push(with_router(
+            link_identity(2, Some("Office"), Some(AP_B), Some(MAC_A)),
+            Some("192.168.0.1"),
+        ));
+        let fire = Roam.eval(&w).expect("a BSSID hop fires");
+        assert_eq!(
+            fire.detail,
+            format!(
+                "roam: BSSID {AP_A} -> {AP_B}; link address kept; router 10.0.0.1 -> 192.168.0.1"
+            )
+        );
+    }
+
+    /// `if_mac` is the default-route interface's MAC and the sample carries
+    /// no interface name, so a dock or undock moves it between the wired and
+    /// the Wi-Fi adapter. A tick whose medium was measured as wired is
+    /// transparent: a wired hop is no roam, and the Wi-Fi identity on either
+    /// side of it compares against itself. Dies under an `if_mac` comparison
+    /// that ignores the medium.
+    #[test]
+    fn roam_ignores_a_wired_hop() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_wired(1, MAC_A));
+        w.push(link_wired(2, MAC_B));
+        assert!(
+            Roam.eval(&w).is_none(),
+            "a new address on a wired link is not a roam"
+        );
+        // Undock onto Wi-Fi, dock back, undock again: the Wi-Fi identity is
+        // unchanged across the wired tick, so nothing fires at any step.
+        w.push(link_identity(3, Some("Office"), Some(AP_A), Some(MAC_A)));
+        assert!(
+            Roam.eval(&w).is_none(),
+            "the first Wi-Fi tick has no Wi-Fi predecessor and is no roam"
+        );
+        w.push(link_wired(4, MAC_B));
+        assert!(Roam.eval(&w).is_none(), "docking is not a roam");
+        w.push(link_identity(5, Some("Office"), Some(AP_A), Some(MAC_A)));
+        assert!(
+            Roam.eval(&w).is_none(),
+            "undocking onto the same Wi-Fi identity is not a roam"
+        );
+    }
+
+    /// The medium is judged from the measurement, never from whether a Wi-Fi
+    /// name was readable: a Wi-Fi tick whose SSID and BSSID are both
+    /// unreadable — the root reader's view (nodes #93, #108) — still
+    /// compares its address, so a per-SSID address rotation fires as a roam
+    /// with nothing else observable. Dies under a medium inferred from
+    /// `bssid`/`ssid`, which made the rule inert on the deployed daemon.
+    #[test]
+    fn roam_fires_on_a_root_shaped_address_hop() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, None, None, Some(MAC_A)));
+        w.push(link_identity(2, None, None, Some(MAC_B)));
+        let fire = Roam
+            .eval(&w)
+            .expect("an address hop on a measured Wi-Fi link fires without names");
+        assert_eq!(
+            fire.detail,
+            format!("roam: link address {MAC_A} -> {MAC_B} (new DHCP identity)")
+        );
+    }
+
+    /// `medium = None` is the absence of a measurement on the medium itself
+    /// — #25's second obligation: the field's absence is not the medium's
+    /// absence, and an address whose medium is unknown on either side is
+    /// neither compared nor a comparison basis. The BSSID branch, which
+    /// carries its medium in the reading itself, is unaffected.
+    #[test]
+    fn roam_does_not_compare_the_address_across_an_unmeasured_medium() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_on(1, None, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), Some(AP_A), Some(MAC_B)));
+        assert!(
+            Roam.eval(&w).is_none(),
+            "a predecessor of unknown medium is no basis for the address"
+        );
+        w.push(link_on(3, None, Some("Office"), Some(AP_A), Some(MAC_A)));
+        assert!(
+            Roam.eval(&w).is_none(),
+            "a newest tick of unknown medium does not compare its address"
+        );
+        w.push(link_on(4, None, Some("Office"), Some(AP_B), Some(MAC_A)));
+        let fire = Roam
+            .eval(&w)
+            .expect("the BSSID branch does not need the medium");
+        assert_eq!(
+            fire.detail,
+            format!("roam: BSSID {AP_A} -> {AP_B}; link address unmeasured")
+        );
+    }
+
+    /// `None` on either side is the absence of a measurement (not associated,
+    /// or not determinable this tick), never one half of a change.
+    #[test]
+    fn roam_silent_when_either_side_is_unmeasured() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), None, None));
+        w.push(link_identity(2, Some("Office"), Some(AP_A), Some(MAC_A)));
+        assert!(
+            Roam.eval(&w).is_none(),
+            "an unmeasured predecessor is no basis"
+        );
+        w.push(link_identity(3, Some("Office"), None, None));
+        assert!(
+            Roam.eval(&w).is_none(),
+            "an unmeasured newest tick is nothing to compare"
+        );
+    }
+
+    /// A tick that could not read the identity sits between the two readings
+    /// and is transparent: the comparison reaches back past it to the newest
+    /// measured predecessor, so the roam is not lost.
+    #[test]
+    fn roam_reaches_back_past_an_unmeasured_tick() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), None, None));
+        w.push(link_identity(3, Some("Office"), Some(AP_B), Some(MAC_A)));
+        let fire = Roam
+            .eval(&w)
+            .expect("a roam straddling an unmeasured tick must still fire");
+        assert!(fire.detail.contains(AP_A), "{}", fire.detail);
+        assert!(fire.detail.contains(AP_B), "{}", fire.detail);
+    }
+
+    /// The condition asserts only on the tick where the identity moved: the
+    /// next tick agrees with its predecessor, so the engine's clear edge can
+    /// close the incident.
+    #[test]
+    fn roam_clears_on_the_next_unchanged_tick() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), Some(AP_B), Some(MAC_B)));
+        assert!(Roam.eval(&w).is_some());
+        w.push(link_identity(3, Some("Office"), Some(AP_B), Some(MAC_B)));
+        assert!(Roam.eval(&w).is_none());
+    }
+
+    /// A roam during an operator pause is still a roam at resume: like
+    /// `gw-change`, the comparison falls back to the basis carried across the
+    /// clear, and the detail says the two readings are not consecutive ticks.
+    #[test]
+    fn roam_fires_across_a_resume_and_is_labelled() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.clear_for_resume();
+        w.push(link_identity(10, Some("Office"), Some(AP_B), Some(MAC_A)));
+        let fire = Roam
+            .eval(&w)
+            .expect("a roam during a pause must fire at resume");
+        assert!(
+            fire.detail.contains("across an observation gap"),
+            "a comparison across a pause must be attributable: {}",
+            fire.detail
+        );
+    }
+
+    /// One Wi-Fi identity reading at 15 s tick `tick` on the `Office` SSID.
+    fn push_identity(w: &mut RecentWindow, tick: i64, bssid: Option<&str>, if_mac: Option<&str>) {
+        w.push(link_identity(tick * TICK_US, Some("Office"), bssid, if_mac));
+    }
+
+    /// The field pattern: macOS hopping between the twin SSIDs of one access
+    /// point every ~3 min. Four identity changes inside 15 min read as churn,
+    /// the detail carries the per-field counts, and the condition stays
+    /// asserted while the pattern is in the window (node #109). Dies under
+    /// three hops counted as four, and under a per-field sum in place of a
+    /// per-tick count (the tick where both moved would then be two changes).
+    #[test]
+    fn wifi_churn_fires_on_four_changes_in_fifteen_minutes() {
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        // The identity held between hops, one reading per tick: a BSSID hop,
+        // both moving at once, a link-address rotation alone, a BSSID hop.
+        let hops = [
+            (0, AP_A, MAC_A),
+            (12, AP_B, MAC_A),
+            (24, AP_A, MAC_B),
+            (36, AP_A, MAC_A),
+            (48, AP_B, MAC_A),
+        ];
+        let at = |tick: i64| hops.iter().rev().find(|(t, _, _)| *t <= tick).unwrap();
+        for tick in 0..48 {
+            let (_, ap, mac) = at(tick);
+            push_identity(&mut w, tick, Some(ap), Some(mac));
+        }
+        assert!(WifiChurn.eval(&w).is_none(), "three hops are not churn");
+        let (_, ap, mac) = at(48);
+        push_identity(&mut w, 48, Some(ap), Some(mac));
+        let fire = WifiChurn
+            .eval(&w)
+            .expect("four identity changes in 15 min must fire");
+        assert_eq!(
+            fire.detail,
+            "wifi identity churn: 4 changes in ~540s (bssid: 3, link address: 2)"
+        );
+        push_identity(&mut w, 49, Some(ap), Some(mac));
+        assert!(
+            WifiChurn.eval(&w).is_some(),
+            "the condition asserts while the pattern is in the window"
+        );
+    }
+
+    /// Three changes are three roams, not churn. Dies under `>=` slack on
+    /// `WIFI_CHURN_MIN_CHANGES`.
+    #[test]
+    fn wifi_churn_silent_on_three_changes() {
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        for (tick, ap) in [(0, AP_A), (12, AP_B), (24, AP_A), (36, AP_B)] {
+            push_identity(&mut w, tick, Some(ap), Some(MAC_A));
+        }
+        assert!(WifiChurn.eval(&w).is_none());
+    }
+
+    /// A tick that could not read the identity is unmeasured: it is skipped
+    /// in the comparison and never counted as a change. Dies under `None`
+    /// read as a value (every gap then becomes two changes).
+    #[test]
+    fn wifi_churn_does_not_count_unmeasured_gaps() {
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        for tick in 0..12 {
+            if tick % 2 == 0 {
+                push_identity(&mut w, tick, Some(AP_A), Some(MAC_A));
+            } else {
+                push_identity(&mut w, tick, None, None);
+            }
+        }
+        push_identity(&mut w, 12, Some(AP_B), Some(MAC_A));
+        assert!(
+            WifiChurn.eval(&w).is_none(),
+            "six gaps around one identity and one hop are one change, not churn"
+        );
+    }
+
+    /// A tick whose medium was measured as wired carries the wired adapter's
+    /// `if_mac`, and docking and undocking must not count as identity changes.
+    /// Six dock/undock cycles in a quarter hour are no churn. Dies under an
+    /// `if_mac` count that ignores the medium.
+    #[test]
+    fn wifi_churn_ignores_wired_ticks() {
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        for tick in 0..12 {
+            if tick % 2 == 0 {
+                push_identity(&mut w, tick, Some(AP_A), Some(MAC_A));
+            } else {
+                push_identity_wired(&mut w, tick, MAC_B);
+            }
+        }
+        assert!(WifiChurn.eval(&w).is_none());
+    }
+
+    /// One reading at 15 s tick `tick` on a link measured as wired: no Wi-Fi
+    /// identity, the wired adapter's own address as `if_mac`.
+    fn push_identity_wired(w: &mut RecentWindow, tick: i64, if_mac: &str) {
+        w.push(link_wired(tick * TICK_US, if_mac));
+    }
+
+    /// Four changes spread over 20 min are not the pattern: only the changes
+    /// within `WIFI_CHURN_WINDOW_S` of the newest sample count, and the
+    /// oldest of the four falls outside it. Dies under an unbounded horizon.
+    #[test]
+    fn wifi_churn_silent_when_the_changes_span_twenty_minutes() {
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        // A hop every 27 ticks (405 s): the four hops span 1215 s, and the
+        // 15 min horizon behind the newest reading holds only three.
+        for (tick, ap) in [(0, AP_A), (27, AP_B), (54, AP_A), (81, AP_B), (108, AP_A)] {
+            push_identity(&mut w, tick, Some(ap), Some(MAC_A));
+        }
+        assert!(WifiChurn.eval(&w).is_none());
+    }
+
+    /// The #57 episode replayed: macOS hopping between the twin SSIDs of one
+    /// access point (different names, 5 GHz / 6 GHz) every 12 ticks — 3 min
+    /// at 15 s — first with a per-SSID private address (regime A: every hop
+    /// is DHCP from scratch), then with the address aligned across the twins
+    /// (regime B: every hop keeps it). Each hop fires `roam` in its class,
+    /// naming the SSID move, and nothing fires between hops; `wifi-churn` —
+    /// the observe-only aggregate the oracle raised — fires in both regimes
+    /// once four BSSID changes sit inside a quarter hour, and its detail
+    /// says how the identity moved.
+    #[test]
+    fn twin_ssid_episode_replays_as_roams_and_churn() {
+        const HOP_TICKS: i64 = 12;
+        const REGIME_B_FROM: i64 = 60;
+        let identity = |tick: i64| -> (&str, &str, &str) {
+            let on_6g = (tick / HOP_TICKS) % 2 == 1;
+            let (ssid, ap) = if on_6g {
+                ("cowork-6g", AP_B)
+            } else {
+                ("cowork-5g", AP_A)
+            };
+            let mac = if tick < REGIME_B_FROM && on_6g {
+                MAC_B
+            } else {
+                MAC_A
+            };
+            (ssid, ap, mac)
+        };
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        for tick in 0..=96 {
+            let (ssid, ap, mac) = identity(tick);
+            w.push(link_identity(
+                tick * TICK_US,
+                Some(ssid),
+                Some(ap),
+                Some(mac),
+            ));
+            let churn = WifiChurn.eval(&w);
+            match tick {
+                47 => assert!(churn.is_none(), "three hops are not churn"),
+                48 => assert_eq!(
+                    churn
+                        .expect("the fourth hop of regime A completes the churn")
+                        .detail,
+                    "wifi identity churn: 4 changes in ~540s (bssid: 4, link address: 4)"
+                ),
+                96 => assert_eq!(
+                    churn
+                        .expect("regime B churns too, with the address kept")
+                        .detail,
+                    "wifi identity churn: 6 changes in ~900s (bssid: 6, link address: 2)"
+                ),
+                _ => {}
+            }
+            let roam = Roam.eval(&w);
+            if tick == 0 || tick % HOP_TICKS != 0 {
+                assert!(roam.is_none(), "tick {tick}: nothing moved");
+                continue;
+            }
+            let (old_ssid, old_ap, old_mac) = identity(tick - 1);
+            let fire = roam.unwrap_or_else(|| panic!("tick {tick}: a hop must fire roam"));
+            let address = if tick < REGIME_B_FROM {
+                format!("link address {old_mac} -> {mac} (new DHCP identity)")
+            } else {
+                "link address kept".to_string()
+            };
+            assert_eq!(
+                fire.detail,
+                format!("roam: BSSID {old_ap} -> {ap}, SSID {old_ssid} -> {ssid}; {address}"),
+                "tick {tick}"
+            );
+        }
+    }
+
+    /// The same episode as the deployed root daemon sees it (nodes #93,
+    /// #108): the SSID reads `<redacted>` and is recorded as `None`, the
+    /// BSSID line is unproven and `None`, and only the measured medium says
+    /// the link is Wi-Fi. Regime A's per-SSID address rotation is then the
+    /// whole observable signal: every hop fires `roam` in the harmful class
+    /// and `wifi-churn` counts the four address changes; regime B's aligned
+    /// address leaves nothing observable, and the churn ages out. Dies under
+    /// a medium inferred from readable names, which made both rules inert
+    /// exactly here.
+    #[test]
+    fn twin_ssid_episode_as_root_replays_the_address_hops() {
+        const HOP_TICKS: i64 = 12;
+        const REGIME_B_FROM: i64 = 60;
+        let mac_at = |tick: i64| {
+            let on_6g = (tick / HOP_TICKS) % 2 == 1;
+            if tick < REGIME_B_FROM && on_6g {
+                MAC_B
+            } else {
+                MAC_A
+            }
+        };
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        for tick in 0..=96 {
+            let mac = mac_at(tick);
+            w.push(link_identity(tick * TICK_US, None, None, Some(mac)));
+            let churn = WifiChurn.eval(&w);
+            match tick {
+                47 => assert!(churn.is_none(), "three address hops are not churn"),
+                48 => assert_eq!(
+                    churn
+                        .expect("the fourth address hop completes the churn")
+                        .detail,
+                    "wifi identity churn: 4 changes in ~540s (bssid: 0, link address: 4)"
+                ),
+                96 => assert!(
+                    churn.is_none(),
+                    "with the address aligned, the changes age out of the horizon"
+                ),
+                _ => {}
+            }
+            let roam = Roam.eval(&w);
+            if tick == 0 || tick % HOP_TICKS != 0 || tick >= REGIME_B_FROM {
+                assert!(
+                    roam.is_none(),
+                    "tick {tick}: nothing observable moved for a root reader"
+                );
+                continue;
+            }
+            let fire = roam.unwrap_or_else(|| panic!("tick {tick}: an address hop must fire"));
+            assert_eq!(
+                fire.detail,
+                format!(
+                    "roam: link address {} -> {mac} (new DHCP identity)",
+                    mac_at(tick - 1)
+                ),
+                "tick {tick}"
+            );
+        }
+    }
+
     #[test]
     fn neighbor_mac_collision_fires_on_two_macs_for_one_ip() {
         let mut w = RecentWindow::new(8);
@@ -1779,6 +2720,7 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: probed,
             lan_alive: alive,
@@ -1856,6 +2798,7 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -2265,6 +3208,34 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             fire.detail,
             "gateway ban cycle: 3 bans in ~300s, period ~150s (min 150s, max 150s)"
         );
+    }
+
+    /// A run of `NoGw` alone is no route — the interface was down, or the
+    /// roam was still in progress — not a gateway that answered and then
+    /// went silent toward this client. Three Wi-Fi toggles must not read as
+    /// a ban cycle: a run is a ban only if it holds a `Fail`. Dies under the
+    /// one-run-class fold that counted `NoGw`-only runs (node #97).
+    #[test]
+    fn ban_cycle_ignores_runs_of_no_gateway_alone() {
+        let c = BanCycle { min_bans: 3 };
+        let mut w = RecentWindow::new(64);
+        let round = [
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::NoGw,
+            GwVerdict::NoGw,
+            GwVerdict::NoGw,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+        ];
+        let mut next = 0;
+        for _ in 0..3 {
+            next = push_gw_ticks(&mut w, next, &round);
+        }
+        assert!(c.eval(&w).is_none());
     }
 
     /// Wi-Fi jitter loses single echoes: a one-tick `Fail` or `NoGw` between

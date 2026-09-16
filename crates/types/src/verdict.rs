@@ -2,8 +2,9 @@ use std::fmt;
 use std::str::FromStr;
 
 macro_rules! token_enum {
-    ($name:ident { $($variant:ident => $token:literal),+ $(,)? }) => {
+    ($(#[$attr:meta])* $name:ident { $($variant:ident => $token:literal),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        $(#[$attr])*
         pub enum $name { $($variant),+ }
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -58,6 +59,15 @@ token_enum!(DnsVerdict {
     Ok => "OK", FakeIp => "FAKEIP", Empty => "EMPTY", ServFail => "SERVFAIL",
     NxDomain => "NXDOMAIN", Timeout => "TIMEOUT", Skip => "SKIP",
 });
+// The medium of the default-route interface a link sample describes, MEASURED
+// from the hardware-port table (`networksetup -listallhardwareports`, readable
+// by root without Location Services) — never inferred from whether a Wi-Fi
+// name could be read: under root the SSID is `<redacted>` and the BSSID line
+// is unproven (realm net-observer, nodes #93, #108), so readable names would
+// make a Wi-Fi link look wired. Lowercase on the wire and in DuckDB, unlike
+// the verdicts, which travel as their variant names. Not a verdict: it is a
+// fact about the link, and `None` on the sample is "not determinable".
+token_enum!(#[serde(rename_all = "lowercase")] LinkMedium { Wifi => "wifi", Wired => "wired" });
 
 #[cfg(test)]
 mod tests {
@@ -109,6 +119,21 @@ mod tests {
         for (v, s) in [(WifiVerdict::Ok, "OK"), (WifiVerdict::Skip, "SKIP")] {
             assert_eq!(v.to_string(), s);
             assert_eq!(WifiVerdict::from_str(s).unwrap(), v);
+        }
+    }
+
+    /// The medium is lowercase both as a DuckDB token and on the wire — the
+    /// one token enum whose serde form is not the variant name.
+    #[test]
+    fn medium_roundtrip_is_lowercase_in_both_forms() {
+        for (v, s) in [(LinkMedium::Wifi, "wifi"), (LinkMedium::Wired, "wired")] {
+            assert_eq!(v.to_string(), s);
+            assert_eq!(LinkMedium::from_str(s).unwrap(), v);
+            assert_eq!(serde_json::to_string(&v).unwrap(), format!("\"{s}\""));
+            assert_eq!(
+                serde_json::from_str::<LinkMedium>(&format!("\"{s}\"")).unwrap(),
+                v
+            );
         }
     }
 

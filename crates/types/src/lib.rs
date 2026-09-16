@@ -24,6 +24,6 @@ pub use topology::{
     LearnedVia, TopologyLifetime, TopologyLink, link_from_cdp, link_from_frame, link_from_lldp,
 };
 pub use verdict::{
-    AirVerdict, DnsVerdict, GwVerdict, NeighborSource, NeighborsVerdict, ParseVerdictError,
-    TcpVerdict, WifiVerdict,
+    AirVerdict, DnsVerdict, GwVerdict, LinkMedium, NeighborSource, NeighborsVerdict,
+    ParseVerdictError, TcpVerdict, WifiVerdict,
 };
