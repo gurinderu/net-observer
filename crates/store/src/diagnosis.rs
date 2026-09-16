@@ -8,12 +8,14 @@
 //! The rules, verbatim from the docs:
 //!
 //! - `gw=FAIL` ⇒ the local network or Wi-Fi died: infrastructure, not us.
-//! - `gw=OK`, `direct=OK`, `vless=OK`, `tun=000` ⇒ the proxy is wedged; a
-//!   restart cures it.
+//! - `gw=OK`, `direct=OK`, `vless=OK`, tun answered anything but 204 (`000` =
+//!   no status at all, a captive portal's 200, a 5xx) ⇒ the proxy is wedged; a
+//!   restart cures it (realm net-observer, node #122).
 //! - `vless=FAIL` with the rest OK ⇒ that proxy server is dead or blocked from
 //!   this path.
 //! - `tun=000` **with `load1` in the tens** ⇒ host starvation, NOT a wedge: a
-//!   restart does not cure it and tears down live flows.
+//!   restart does not cure it and tears down live flows. Only a silent probe
+//!   reads as starvation — an answered non-204 under load is still the proxy's.
 //! - A `.ru` name answered from the fakeip range is ALWAYS a bug.
 //! - `SKIP` means the probe did not run — neither health nor fault.
 //!
@@ -70,6 +72,17 @@
 //!   else, so the inference stays; `gap_closed_by` says which case was taken.
 //!   Only when nothing at all follows the pause does the gap stay open-ended,
 //!   which is the truth: the record ends there.
+//!
+//! ## Passive stretches
+//!
+//! The second bracket, and a different one: while the probing tier is
+//! `passive` the daemon puts nothing on the wire but keeps writing a row per
+//! tick, every probe verdict `SKIP` (realm net-observer, node #88). The
+//! per-moment queries need no special case for it — a `SKIP` already reads as
+//! `unknown` — but a reader of a long run of `SKIP`s must be able to tell
+//! "withheld" from "could not run", so `gaps` lists each stretch from the
+//! `probing_edge` rows next to the pauses, marked `kind = 'passive'`. Samples
+//! never close a stretch (they land throughout); only an `active` edge does.
 //!
 //! ## Correlation
 //!
@@ -206,16 +219,90 @@ gap_at AS (
   LIMIT 1
 )";
 
+/// One row per stretch in which the daemon withheld every probe — the second
+/// kind of bracket, read from `probing_edge` (realm net-observer, node #88).
+///
+/// NOT an observation gap, and deliberately not folded into
+/// [`OBSERVATION_GAP_CTE`]: a passive daemon keeps writing a row per tick, so
+/// the per-moment queries already answer `unknown` from the `SKIP`s they find
+/// there, and a moment inside a passive stretch must not read as `gap` — the
+/// record does exist, it just carries no measurement. This CTE only names the
+/// stretches so a reader knows the `SKIP`s were withheld, not failed.
+///
+/// A stretch opens at a `passive` edge whose predecessor is not `passive` (a
+/// startup edge re-declaring passive after a crash continues the stretch
+/// rather than opening a second one) and is half-open
+/// `[gap_opened_us, gap_closed_us)`. It closes at the first later `active`
+/// edge, and `gap_closed_by` says which kind:
+///
+/// | `gap_closed_by` | what closed the stretch |
+/// | --- | --- |
+/// | `active` | an operator `SetProbing(active)` (a peer asked) |
+/// | `startup` | a startup edge whose configured default is `active` |
+///
+/// Samples never close it — they keep landing throughout — so `gap_closed_us`
+/// is `NULL` exactly when the record ends still passive.
+const PROBING_STRETCH_CTE: &str = "\
+probing_stretch AS (
+  SELECT gap_opened_us, gap_closed_us, gap_closed_by
+  FROM (
+    SELECT p.ts_us AS gap_opened_us,
+           e.ts_us AS gap_closed_us,
+           e.closed_by AS gap_closed_by,
+           row_number() OVER (PARTITION BY p.ts_us ORDER BY e.ts_us) AS rn
+    FROM (
+      SELECT ts_us
+      FROM (SELECT ts_us, tier, lag(tier) OVER (ORDER BY ts_us) AS prev_tier
+            FROM probing_edge)
+      WHERE tier = 'passive' AND (prev_tier IS NULL OR prev_tier <> 'passive')
+    ) p
+    LEFT JOIN (
+      SELECT ts_us,
+             CASE WHEN peer_uid IS NULL THEN 'startup' ELSE 'active' END AS closed_by
+      FROM probing_edge WHERE tier = 'active'
+    ) e ON e.ts_us > p.ts_us
+  )
+  WHERE rn = 1
+)";
+
 /// **Observation gaps** — every interval the operator paused collection for.
 ///
 /// The read side of the bracketed silence: one row per gap, open-ended
 /// (`gap_closed_us` `NULL`) only when the record ends inside the pause.
+///
+/// Pauses ONLY, in the shape it has had since it shipped: this is what a
+/// reader built before the probing tier asks for as `DiagnosticQuery::Gaps`,
+/// and a passive stretch listed here would be printed by that reader as a
+/// pause. The passive stretches ride alongside in [`silences_sql`], under a
+/// query id that reader has never heard of.
 pub fn observation_gaps_sql() -> String {
     format!(
         "WITH {SAMPLE_TS_CTE},
 {OBSERVATION_GAP_CTE}
 SELECT gap_opened_us, gap_closed_us, gap_closed_by
 FROM observation_gap ORDER BY gap_opened_us"
+    )
+}
+
+/// **Silences** — every bracketed silence the record contains: each interval
+/// the operator paused collection for, and each stretch the daemon spent
+/// withholding its probes.
+///
+/// The read side of both brackets, told apart by `kind`: `pause` rows are the
+/// silence of [`OBSERVATION_GAP_CTE`] (no samples at all — exactly the rows of
+/// [`observation_gaps_sql`]), `passive` rows the withheld probes of
+/// [`PROBING_STRETCH_CTE`] (samples every tick, verdicts `SKIP`). Each is
+/// open-ended (`gap_closed_us` `NULL`) only when the record ends inside it.
+/// (realm net-observer, node #88)
+pub fn silences_sql() -> String {
+    format!(
+        "WITH {SAMPLE_TS_CTE},
+{OBSERVATION_GAP_CTE},
+{PROBING_STRETCH_CTE}
+SELECT 'pause' AS kind, gap_opened_us, gap_closed_us, gap_closed_by FROM observation_gap
+UNION ALL
+SELECT 'passive' AS kind, gap_opened_us, gap_closed_us, gap_closed_by FROM probing_stretch
+ORDER BY gap_opened_us, kind"
     )
 }
 
@@ -246,7 +333,10 @@ layer_state AS (
            -- tun=000, but without load there is no telling wedge from starvation.
            WHEN p.tun_code = 0 AND h.load1 IS NULL THEN 'unknown'
            WHEN p.tun_code = 0 AND h.load1 > ? THEN 'host'
-           WHEN p.tun_code = 0 THEN 'proxy'
+           -- Any answer but 204 means the tunnel did not reach its far end
+           -- (a captive portal answers 200) — the shell oracle's `tun != 204`
+           -- vocabulary (realm net-observer, node #122).
+           WHEN p.tun_code <> 204 THEN 'proxy'
            WHEN l.gw <> 'OK' OR l.direct <> 'OK' THEN 'unknown'
            ELSE 'healthy'
          END AS layer
@@ -360,14 +450,19 @@ ORDER BY c.opened_us",
 /// **Wedge vs starvation** — the discriminator the project paid nine hours to
 /// learn, on 2026-07-27.
 ///
-/// Groups contiguous `tun=000` proxy ticks (gap ≤ `gap_us`) into episodes and
-/// names each one:
+/// Groups contiguous dead proxy ticks — `tun_code IS NOT NULL AND tun_code <>
+/// 204`, the oracle's dead-tun vocabulary (realm net-observer, node #122) —
+/// (gap ≤ `gap_us`) into episodes and names each one:
 ///
 /// - `link` — the gateway was down through it: not a proxy fault at all;
 /// - `vless` — the proxy server was unreachable: a restart is not the cure;
-/// - `starvation` — `load1 > load_threshold`: a restart does NOT cure it and
-///   tears down live flows;
-/// - `wedge` — every layer under the tun was healthy and the host was idle: a
+/// - `starvation` — `load1 > load_threshold` AND every tick in the episode
+///   went unanswered (`tun_code = 0` throughout, i.e. the probe timed out): a
+///   restart does NOT cure it and tears down live flows;
+/// - `wedge` — either the host was idle while the tun was dead, or the tun
+///   answered with something other than 204 (a captive portal's 200
+///   included) at any point in the episode even under load: the tunnel
+///   answered, wrongly, and load does not explain a wrong answer — a
 ///   restart cures it;
 /// - `unknown` — no `load1` (or no link sample) covering the episode, so the
 ///   record cannot tell the two apart.
@@ -377,22 +472,24 @@ pub fn wedge_vs_starvation_sql(load_threshold: f64, gap_us: i64) -> PreparedSql 
     let sql = format!(
         "WITH {PROXY_TICK_CTE},
 dead AS (
-  SELECT ts_us, vless FROM proxy_tick WHERE tun_code = 0
+  SELECT ts_us, vless, tun_code FROM proxy_tick
+  WHERE tun_code IS NOT NULL AND tun_code <> 204
 ),
 marked AS (
   SELECT ts_us,
          vless,
+         tun_code,
          CASE WHEN lag(ts_us) OVER (ORDER BY ts_us) IS NULL
                 OR ts_us - lag(ts_us) OVER (ORDER BY ts_us) > ?
               THEN 1 ELSE 0 END AS starts_episode
   FROM dead
 ),
 grouped AS (
-  SELECT ts_us, vless, sum(starts_episode) OVER (ORDER BY ts_us) AS episode
+  SELECT ts_us, vless, tun_code, sum(starts_episode) OVER (ORDER BY ts_us) AS episode
   FROM marked
 ),
 ctx AS (
-  SELECT g.episode, g.ts_us, g.vless, h.load1, l.gw, l.direct
+  SELECT g.episode, g.ts_us, g.vless, g.tun_code, h.load1, l.gw, l.direct
   FROM grouped g
   ASOF LEFT JOIN host_sample h ON g.ts_us >= h.ts_us
   ASOF LEFT JOIN link_sample l ON g.ts_us >= l.ts_us
@@ -409,7 +506,9 @@ SELECT episode,
                          OR coalesce(direct, 'MISSING') <> 'OK'
                        THEN 1 ELSE 0 END) = 1 THEN 'unknown'
          WHEN count(load1) = 0 THEN 'unknown'
-         WHEN max(load1) > ? THEN 'starvation'
+         -- Starvation is a silent probe: any answered (non-204) code under
+         -- load is a wedge instead — the tunnel answered, wrongly.
+         WHEN max(load1) > ? AND max(tun_code) = 0 THEN 'starvation'
          ELSE 'wedge'
        END AS verdict
 FROM ctx
@@ -860,6 +959,11 @@ impl DuckdbStore {
         self.query_table(&observation_gaps_sql())
     }
 
+    /// Run [`silences_sql`].
+    pub fn silences(&self) -> Result<QueryTable, StoreError> {
+        self.query_table(&silences_sql())
+    }
+
     /// Run [`segments_sql`].
     pub fn segments(&self) -> Result<QueryTable, StoreError> {
         self.query_table(&segments_sql())
@@ -979,7 +1083,7 @@ mod tests {
     use types::{
         DnsSample, DnsVerdict, GwVerdict, HostSample, Incident, LinkSample, NeighborObs,
         NeighborRole, NeighborSource, NeighborsSample, NeighborsVerdict, ObservingEdge,
-        ProxySample, Sample, TcpVerdict,
+        ProbingEdge, ProbingTier, ProxySample, Sample, TcpVerdict,
     };
 
     const SEC: i64 = 1_000_000;
@@ -1079,6 +1183,25 @@ mod tests {
         .unwrap();
     }
 
+    /// One switch of the probing tier. `peer` is `None` for the startup edge
+    /// that applies the configured default, `Some(uid)` for an operator's.
+    fn probing_edge(s: &DuckdbStore, ts_us: i64, tier: ProbingTier, peer: Option<u32>) {
+        s.write_probing_edge(&ProbingEdge {
+            ts_us,
+            tier,
+            peer_uid: peer,
+        })
+        .unwrap();
+    }
+
+    /// A tick every stream writes while the tier is passive: the probes are
+    /// withheld, so their verdicts are `SKIP`, and the row still lands.
+    fn passive_tick(s: &DuckdbStore, ts_us: i64) {
+        link(s, ts_us, GwVerdict::Skip, None, TcpVerdict::Skip);
+        proxy(s, ts_us, TcpVerdict::Skip, None);
+        host(s, ts_us, 1.5);
+    }
+
     fn cell(t: &QueryTable, row: usize, column: &str) -> String {
         let i = t
             .columns
@@ -1130,6 +1253,49 @@ mod tests {
         let t = s.verdict_at(20 * SEC).unwrap();
         assert_eq!(cell(&t, 0, "layer"), "host");
         assert_ne!(cell(&t, 0, "layer"), "proxy");
+    }
+
+    /// A captive portal's 200 is an answer, not a health check pass: the tun
+    /// reached something, but not its far end (realm net-observer, node
+    /// #122). It must read as `proxy`, not `healthy`.
+    #[test]
+    fn verdict_at_blames_the_proxy_on_a_captive_portal_answer() {
+        let s = DuckdbStore::in_memory().unwrap();
+        link(&s, 20 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy(&s, 20 * SEC, TcpVerdict::Ok, Some(200));
+        host(&s, 20 * SEC, 1.2);
+
+        let t = s.verdict_at(20 * SEC).unwrap();
+        assert_eq!(cell(&t, 0, "layer"), "proxy");
+    }
+
+    /// The same captive-portal answer under load is still the proxy's fault,
+    /// not starvation: the tunnel answered, wrongly, and load does not
+    /// explain a wrong answer. Only a silent probe (`tun_code = 0`) reads as
+    /// `host`.
+    #[test]
+    fn verdict_at_blames_the_proxy_not_the_host_for_a_captive_portal_under_load() {
+        let s = DuckdbStore::in_memory().unwrap();
+        link(&s, 20 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy(&s, 20 * SEC, TcpVerdict::Ok, Some(200));
+        host(&s, 20 * SEC, 31.0);
+
+        let t = s.verdict_at(20 * SEC).unwrap();
+        assert_eq!(cell(&t, 0, "layer"), "proxy");
+        assert_ne!(cell(&t, 0, "layer"), "host");
+    }
+
+    /// A tun code that never arrived (not `SKIP`, just absent) is unknown,
+    /// the same as a probe that did not run at all.
+    #[test]
+    fn verdict_at_reports_unknown_when_tun_code_is_null() {
+        let s = DuckdbStore::in_memory().unwrap();
+        link(&s, 20 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy(&s, 20 * SEC, TcpVerdict::Ok, None);
+        host(&s, 20 * SEC, 1.0);
+
+        let t = s.verdict_at(20 * SEC).unwrap();
+        assert_eq!(cell(&t, 0, "layer"), "unknown");
     }
 
     #[test]
@@ -1272,12 +1438,13 @@ mod tests {
 
     // ---- 3. wedge vs starvation --------------------------------------------
 
-    /// Push `n` ticks of a dead tun over a healthy link, at `load1`.
-    fn tun_dead_episode(s: &DuckdbStore, from_us: i64, n: i64, load1: f64) {
+    /// Push `n` ticks of a dead tun (answering `code`, anything but 204) over
+    /// a healthy link, at `load1`.
+    fn tun_dead_episode(s: &DuckdbStore, from_us: i64, n: i64, code: u16, load1: f64) {
         for i in 0..n {
             let ts = from_us + i * SEC;
             link(s, ts, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
-            proxy(s, ts, TcpVerdict::Ok, Some(0));
+            proxy(s, ts, TcpVerdict::Ok, Some(code));
             host(s, ts, load1);
         }
     }
@@ -1285,7 +1452,7 @@ mod tests {
     #[test]
     fn a_dead_tun_on_an_idle_host_is_a_wedge() {
         let s = DuckdbStore::in_memory().unwrap();
-        tun_dead_episode(&s, 10 * SEC, 4, 1.3);
+        tun_dead_episode(&s, 10 * SEC, 4, 0, 1.3);
         let t = s.wedge_vs_starvation().unwrap();
         assert_eq!(t.rows.len(), 1);
         assert_eq!(cell(&t, 0, "verdict"), "wedge");
@@ -1299,7 +1466,7 @@ mod tests {
     #[test]
     fn the_same_dead_tun_under_load_is_starvation_not_a_wedge() {
         let s = DuckdbStore::in_memory().unwrap();
-        tun_dead_episode(&s, 10 * SEC, 4, 31.0);
+        tun_dead_episode(&s, 10 * SEC, 4, 0, 31.0);
         let t = s.wedge_vs_starvation().unwrap();
         assert_eq!(t.rows.len(), 1);
         assert_eq!(cell(&t, 0, "verdict"), "starvation");
@@ -1307,13 +1474,45 @@ mod tests {
         assert_eq!(cell(&t, 0, "max_load1"), "31");
     }
 
+    /// A captive portal's 200 under load is still a wedge, not starvation:
+    /// the tunnel answered, wrongly, and load does not explain a wrong
+    /// answer — only an episode of silent probes (`tun_code = 0` throughout)
+    /// reads as starvation (realm net-observer, node #122).
+    #[test]
+    fn a_captive_portal_answer_under_load_is_a_wedge_not_starvation() {
+        let s = DuckdbStore::in_memory().unwrap();
+        tun_dead_episode(&s, 10 * SEC, 4, 200, 31.0);
+        let t = s.wedge_vs_starvation().unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "verdict"), "wedge");
+        assert_ne!(cell(&t, 0, "verdict"), "starvation");
+    }
+
+    /// A single answered tick breaks silence for the whole episode: `max(tun_code)`
+    /// is taken over a `USMALLINT` column, so one `200` among three `0`s is
+    /// enough to read the episode as a wedge, not starvation, even under load.
+    #[test]
+    fn one_answered_tick_in_a_silent_episode_makes_it_a_wedge() {
+        let s = DuckdbStore::in_memory().unwrap();
+        for (i, code) in [0u16, 0, 200, 0].into_iter().enumerate() {
+            let ts = 10 * SEC + i as i64 * SEC;
+            link(&s, ts, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+            proxy(&s, ts, TcpVerdict::Ok, Some(code));
+            host(&s, ts, 31.0);
+        }
+        let t = s.wedge_vs_starvation().unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "verdict"), "wedge");
+        assert_ne!(cell(&t, 0, "verdict"), "starvation");
+    }
+
     /// Both episodes in one record, told apart by `load1` alone.
     #[test]
     fn the_two_episodes_are_separated_and_named_individually() {
         let s = DuckdbStore::in_memory().unwrap();
-        tun_dead_episode(&s, 10 * SEC, 3, 1.0);
+        tun_dead_episode(&s, 10 * SEC, 3, 0, 1.0);
         healthy_tick(&s, 60 * SEC);
-        tun_dead_episode(&s, 120 * SEC, 3, 25.0);
+        tun_dead_episode(&s, 120 * SEC, 3, 0, 25.0);
         let t = s.wedge_vs_starvation().unwrap();
         assert_eq!(t.rows.len(), 2);
         assert_eq!(cell(&t, 0, "verdict"), "wedge");
@@ -1373,6 +1572,25 @@ mod tests {
         }
         let t = s.wedge_vs_starvation().unwrap();
         assert!(t.rows.is_empty(), "SKIP became an episode: {:?}", t.rows);
+    }
+
+    /// A tick with no tun code at all (not `SKIP`, just absent) is not an
+    /// episode either — the same NULL-is-unknown rule as `verdict_at`.
+    #[test]
+    fn a_null_tun_code_is_not_an_episode() {
+        let s = DuckdbStore::in_memory().unwrap();
+        for i in 0..4 {
+            let ts = 10 * SEC + i * SEC;
+            link(&s, ts, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+            proxy(&s, ts, TcpVerdict::Ok, None);
+            host(&s, ts, 30.0);
+        }
+        let t = s.wedge_vs_starvation().unwrap();
+        assert!(
+            t.rows.is_empty(),
+            "NULL tun_code became an episode: {:?}",
+            t.rows
+        );
     }
 
     #[test]
@@ -1815,6 +2033,141 @@ mod tests {
         assert_eq!(cell(&g, 0, "gap_closed_us"), (30 * SEC).to_string());
         assert_eq!(cell(&g, 1, "gap_opened_us"), (40 * SEC).to_string());
         assert_eq!(cell(&g, 1, "gap_closed_us"), (55 * SEC).to_string());
+        // The same rows, as `silences` lists them: every one a pause.
+        let all = s.silences().unwrap();
+        assert_eq!(all.rows.len(), 2);
+        assert!(
+            all.rows.iter().all(|r| r[0] == "pause"),
+            "with no probing edge, every silence is a pause: {:?}",
+            all.rows
+        );
+    }
+
+    // ---- 6b. passive stretches: the second bracket ---------------------------
+
+    /// A daemon that boots passive (the configured default, written as a
+    /// peerless edge) and is switched to active by an operator: one `passive`
+    /// row, closed by `active`, listed by `silences` next to the pauses. The
+    /// `SKIP` ticks in between do NOT close it — samples keep landing under
+    /// passive — and a moment inside it reads `unknown` from those `SKIP`s,
+    /// never `gap`.
+    ///
+    /// `observation_gaps` (the `Gaps` query a pre-tier reader still asks for)
+    /// keeps its pauses-only shape: no `kind` column, and the stretch is NOT
+    /// among its rows — that reader would print it as a pause.
+    #[test]
+    fn a_passive_stretch_is_a_silence_of_its_own_kind_and_is_not_a_gap() {
+        let s = DuckdbStore::in_memory().unwrap();
+        probing_edge(&s, 5 * SEC, ProbingTier::Passive, None);
+        passive_tick(&s, 10 * SEC);
+        passive_tick(&s, 25 * SEC);
+        probing_edge(&s, 30 * SEC, ProbingTier::Active, Some(501));
+        healthy_tick(&s, 40 * SEC);
+
+        let g = s.silences().unwrap();
+        assert_eq!(g.rows.len(), 1, "{:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "passive");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (5 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (30 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "active");
+
+        let gaps = s.observation_gaps().unwrap();
+        assert_eq!(
+            gaps.columns,
+            vec!["gap_opened_us", "gap_closed_us", "gap_closed_by"],
+            "`Gaps` keeps the shape it shipped with"
+        );
+        assert!(
+            gaps.rows.is_empty(),
+            "a passive stretch is not a pause and must not reach a pre-tier reader as one: {:?}",
+            gaps.rows
+        );
+
+        // Not a gap: the record exists and says "no measurement".
+        let t = s.verdict_at(25 * SEC).unwrap();
+        assert_eq!(cell(&t, 0, "layer"), "unknown");
+        assert_eq!(cell(&t, 0, "gw"), "SKIP");
+        assert_eq!(
+            cell(&s.verdict_at(40 * SEC).unwrap(), 0, "layer"),
+            "healthy"
+        );
+    }
+
+    /// The record ends passive: the stretch is open-ended, and the ticks after
+    /// the edge are exactly what must not be read as closing it.
+    #[test]
+    fn a_stretch_the_record_ends_inside_stays_open_ended() {
+        let s = DuckdbStore::in_memory().unwrap();
+        probing_edge(&s, 5 * SEC, ProbingTier::Passive, None);
+        passive_tick(&s, 10 * SEC);
+        passive_tick(&s, 25 * SEC);
+
+        let g = s.silences().unwrap();
+        assert_eq!(g.rows.len(), 1);
+        assert_eq!(cell(&g, 0, "kind"), "passive");
+        assert_eq!(cell(&g, 0, "gap_closed_us"), "");
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "");
+    }
+
+    /// A crash while passive: the next boot writes its passive default as a
+    /// second `passive` edge, which CONTINUES the stretch rather than opening
+    /// another — until a boot whose default is active (a peerless `active`
+    /// edge) closes it, named as `startup`.
+    #[test]
+    fn a_restart_that_stays_passive_continues_the_stretch_and_an_active_boot_closes_it() {
+        let s = DuckdbStore::in_memory().unwrap();
+        probing_edge(&s, 5 * SEC, ProbingTier::Passive, None);
+        passive_tick(&s, 10 * SEC);
+        // Died, came back with the same default.
+        probing_edge(&s, 30 * SEC, ProbingTier::Passive, None);
+        passive_tick(&s, 35 * SEC);
+        // Reconfigured to active, restarted.
+        probing_edge(&s, 60 * SEC, ProbingTier::Active, None);
+        healthy_tick(&s, 65 * SEC);
+
+        let g = s.silences().unwrap();
+        assert_eq!(g.rows.len(), 1, "one stretch, not two: {:?}", g.rows);
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (5 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (60 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "startup");
+    }
+
+    /// Both brackets in one record, interleaved: a pause inside a passive
+    /// stretch is listed as its own `pause` row, the stretch as `passive`, in
+    /// time order. Neither swallows the other.
+    #[test]
+    fn a_pause_inside_a_passive_stretch_is_listed_as_both() {
+        let s = DuckdbStore::in_memory().unwrap();
+        probing_edge(&s, 5 * SEC, ProbingTier::Passive, None);
+        passive_tick(&s, 10 * SEC);
+        edge(&s, 20 * SEC, false);
+        edge(&s, 30 * SEC, true);
+        passive_tick(&s, 30 * SEC);
+        probing_edge(&s, 45 * SEC, ProbingTier::Active, Some(501));
+        healthy_tick(&s, 50 * SEC);
+
+        let g = s.silences().unwrap();
+        assert_eq!(g.rows.len(), 2, "{:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "passive");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (5 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (45 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "kind"), "pause");
+        assert_eq!(cell(&g, 1, "gap_opened_us"), (20 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "gap_closed_us"), (30 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "gap_closed_by"), "resume");
+        // The pause is still a gap for the per-moment reader.
+        assert_eq!(cell(&s.verdict_at(25 * SEC).unwrap(), 0, "layer"), "gap");
+    }
+
+    /// An active daemon opens no stretch: only a `passive` edge does, and a
+    /// record that begins with an active startup edge lists nothing.
+    #[test]
+    fn an_active_default_opens_no_stretch() {
+        let s = DuckdbStore::in_memory().unwrap();
+        probing_edge(&s, 5 * SEC, ProbingTier::Active, None);
+        healthy_tick(&s, 10 * SEC);
+        assert!(s.silences().unwrap().rows.is_empty());
+        assert!(s.observation_gaps().unwrap().rows.is_empty());
     }
 
     // ---- 7. segments (where have I been) and one segment's history ----------

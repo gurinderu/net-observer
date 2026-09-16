@@ -21,9 +21,10 @@ pub const META: CollectorMeta = CollectorMeta {
 /// interval and folded per destination.
 ///
 /// Passive by construction: it reads a local HTTP API on the loopback and puts
-/// nothing on the wire of its own accord, so it belongs with the collectors
-/// that read what the system already knows — nothing here is a probe an
-/// operator can withhold, and the quiet switch does not reach it.
+/// nothing on the wire of its own accord, so it is not an
+/// `types::EmissionClass` and takes no `ProbingState` — like `host`, `wifi`
+/// and `neighbors` it keeps reading in the passive tier, and neither the tier
+/// nor the quiet switch reaches it (realm net-observer, node #88).
 ///
 /// Generic over its [`ConnectionFacts`] port for static dispatch — native
 /// `async fn` in the port trait rules out `dyn`, and the daemon enumerates the

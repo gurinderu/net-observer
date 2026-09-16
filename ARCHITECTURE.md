@@ -459,8 +459,30 @@ graph TD
   gpui-drawn pill (green track + knob-right when `snapshot.observing`, grey +
   knob-left when paused); clicking it sends `Control(SetObserving(!observing))`
   over the socket (`send_set_observing`) and refreshes, and the header
-  shows a muted "paused" state (grey dot) while collection is off. gpui's
-  build script runs **bindgen over `dispatch.h`** (libclang plus the SDK
+  shows a muted "paused" state (grey dot) while collection is off.
+  **The map window runs the audit ladder by rung and shows its findings.**
+  The network-map window's control row is four rungs — `Scan · Ports ·
+  Banners · CVE` — each a `Control(ScanNeighbors(ScanOptions))` carrying the
+  ladder up to itself (`Scan` = the base sweep + mDNS; `Ports` adds the port
+  scan; `Banners` = ports + banner grab; `CVE` = ports + banners + the match
+  against the daemon's local CVE snapshot), sent through the same
+  background-executor wiring as every other control button, so the daemon's
+  answer — a refusal, or a rung it dropped for a missing dependency, named —
+  lands verbatim in the line under the rungs. The bar only asks: which rungs
+  actually run is the daemon's decision (see [Control path](#control-path)).
+  While one is in flight all four are inert and `scanning…` stands beside
+  them. A **Findings** reading, beside Graph and List, lists every CVE the
+  record hypothesises for an open port — a read-only
+  `Query(Vulns { network: None })` over the socket on the background executor,
+  fetched when the window opens and again after each rung completes, never on
+  a timer — one line per finding grouped by host (`ip:port  cve_id ·
+  confidence · cvss · KEV`, `KEV` only when the daemon flagged it as
+  known-exploited), `no findings` for an empty table, and the daemon's own
+  words when it could not answer (a query it read but could not run, or a
+  daemon built before `Request::Query` existed). Each finding is a hypothesis
+  carrying its confidence, and the caption says so. (realm net-observer, node
+  #90)
+  gpui's build script runs **bindgen over `dispatch.h`** (libclang plus the SDK
   headers), so the crate is a full workspace member but is excluded from
   `default-members` — a bare `cargo build` needs no GUI toolchain. Build the bar
   with `--all` / `-p net-observer-bar` **from inside `nix develop`**. The
@@ -478,7 +500,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | Table | Columns | Notes |
 | --- | --- | --- |
 | `link_sample` | `ts_us, gw, gw_rtt_ms, direct, direct_rtt_ms, dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present, lan_probed, lan_alive, fakeip_route_if, singbox_tun_if, bssid, if_mac, medium` | Local path: gateway ping, direct TCP (bound to phys iface), DHCP/ARP facts, Wi-Fi SSID + CoreCapture presence. `lan_probed`/`lan_alive` are the probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL tick (NULL = not probed). `fakeip_route_if` is the egress interface the route table resolves for a fakeip-pool address; `singbox_tun_if` is the interface carrying sing-box's own TUN address (present only while sing-box runs — the sing-box-alive fact, not "any utun", so a foreign VPN's utun does not read as sing-box being up). Both NULL = could not be determined. `bssid` is the BSSID of the access point associated with and `if_mac` the interface's own MAC as currently assigned (Private Wi-Fi Address rotates it per SSID), both lowercase; a BSSID change at the same SSID is a roam the SSID alone cannot show, an `if_mac` change a new DHCP identity toward the network. NULL = not associated / not determinable. `medium` is the medium of the default-route interface (`wifi` or `wired`), measured from the hardware-port table so an `if_mac` change can be judged as a Wi-Fi roam or a dock/undock without a readable SSID or BSSID; NULL = not determinable. |
-| `proxy_sample` | `ts_us, server_ip, tcp, rtt_ms, tun_code, selector, est_direct_alive, est_direct_age_s, est_tun_alive, est_tun_age_s` | Per-VLESS TCP reachability, tun HTTP 204 (`tun_code`), Clash selector. The `est_*` columns are the established-flow discriminator (held reference streams: direct underlay / through the tunnel), per-tick facts replicated across the tick's rows like `tun_code`; NULL = no measurement. |
+| `proxy_sample` | `ts_us, server_ip, tcp, rtt_ms, tun_code, selector, est_direct_alive, est_direct_age_s, est_tun_alive, est_tun_age_s` | Per-VLESS TCP reachability, tun HTTP 204 (`tun_code`), Clash selector. `tun_code` is the HTTP status the probe got; `0` = probed, no HTTP status (connect refused, timeout, transport error — the shell oracle's curl `000`), the value every reading, live (`starvation`) and offline (`why`, `wedge-or-starvation`), takes as the dead tun; `NULL` = not probed (the passive tier, a preflight skip), neither health nor fault. The `est_*` columns are the established-flow discriminator (held reference streams: direct underlay / through the tunnel), per-tick facts replicated across the tick's rows like `tun_code`; NULL = no measurement. |
 | `dns_sample` | `ts_us, probe, server, verdict, ip, rtt_ms` | One row per resolver probe (name label × resolver path); `verdict` drives the `fakeip` trigger. |
 | `route_event` | `ts_us, kind, iface, detail` | PF_ROUTE event stream (`kind` = `iface` / `addr` / `route`): iface up/down, addr add/loss, default-route change. |
 | `host_sample` | `ts_us, load1, load5, load15, disk_used_pct, disk_free_mb, swap_used_mb` | Host load averages — the `starvation` discriminator — plus the usage of the volume holding the record (`disk_used_pct` as `df` computes capacity, `disk_free_mb` what a writer can still take, in MiB) and the swap in use in MiB: the ENOSPC and memory-pressure discriminators the shell oracle carried. A store write that fails for want of space is logged as a gap; these columns let the record name the cause. NULL = not measured, never a zero. |
@@ -488,6 +510,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `blob_ref` | `id, incident_id, ts_us, kind, path` | On-disk forensics blobs (pcap freeze, dumps) referenced by path. |
 | `trigger_fired` | `ts_us, trigger_id, incident_id, detail` | One row per trigger fire. |
 | `observing_edge` | `ts_us, observing, peer_uid, cause` | One row per collection boundary — the one sanctioned gap in "SKIP, never silence"; `observing` is the state entered, so `false` opens a gap and `true` closes one. `peer_uid` attributes it to the control-socket peer that asked (SQL `NULL` when nobody did), and `cause` (`control` / `startup`) says what produced it. |
+| `probing_edge` | `ts_us, tier, peer_uid` | One row per switch of the probing tier (`tier` is the tier entered, `passive` / `active`). Not a gap — a passive daemon keeps writing a row per tick with every probe verdict `SKIP` — but the bracket that says those `SKIP`s were *withheld*, not failed, and by whom. `peer_uid` is `NULL` for the startup edge, which records the configured default so a record that begins passive says so. (realm net-observer, node #88) |
 
 `dns_sample`, `route_event`, and `host_sample` are created by the v1.1 `dns`,
 `route-events`, and `host-metrics` collectors respectively.
@@ -528,7 +551,7 @@ carries, lives in `types` for the same reason.
 | --- | --- |
 | `verdict_at(ts_us)` | every layer's state at a moment, plus the `layer` the record blames |
 | `incident_context()` | for each incident, the layer state at or just before it opened |
-| `wedge_vs_starvation()` | contiguous `tun=000` episodes, each named `link` / `vless` / `starvation` / `wedge` / `unknown` |
+| `wedge_vs_starvation()` | episodes of ticks whose tun answered anything but 204 (`0` = a silent probe, a captive portal's 200, a 5xx), each named `link` / `vless` / `starvation` / `wedge` / `unknown` |
 | `gw_drops()` | the first link sample of each run of `FAIL`/`NOGW` (`SKIP` ticks removed first, so a quiet run cannot manufacture an edge) |
 | `gateway_ramp(drop_ts_us)` | gateway RTT over the window before a drop, with a least-squares `slope_ms_per_s` over the answered ticks — the ~40 s coworking climb as data |
 | `fakeip_bugs()` | `FAKEIP` on a `.ru` name, which is always a bug |
@@ -540,11 +563,17 @@ The `layer` vocabulary is `link` / `vless` / `proxy` / `host` / `healthy` /
 health or as fault, and two situations make a query decline outright rather than
 answer:
 
-- **A dead tun with no `load1`.** `tun_code = 0` is a wedge if the host was idle
-  and starvation if it was not, and without a host sample the record cannot tell
-  them apart — so the layer is `unknown`, never a guess at `proxy`. The
-  distinction is the one the project paid nine hours to learn on 2026-07-27: a
-  restart cures a wedge and *tears down live flows* under starvation.
+- **A dead-tun episode with no `load1`.** An episode is a run of ticks whose
+  tun answered anything but 204 (`0` — the probe got no status at all; a
+  captive portal's 200; a 5xx). It is `starvation` only when the host was
+  loaded *and* every tick in the episode was silent (`tun_code = 0`
+  throughout); it is `wedge` otherwise — an episode with even one
+  answered-but-wrong tick is a wedge no matter the load, because the tunnel
+  answered and load does not explain a wrong answer. Without a host sample
+  the record cannot tell wedge from starvation at all, so it declines
+  outright: `unknown`, never a guess. The distinction is the one the project
+  paid nine hours to learn on 2026-07-27: a restart cures a wedge and *tears
+  down live flows* under starvation.
 - **A moment inside an observation gap.** An `ASOF JOIN` would honestly hand back
   the newest sample from *before* a pause as though it were a reading taken at
   the moment asked about, with nothing in the row saying otherwise — a gap that
@@ -578,6 +607,17 @@ sequence is not assumed to be well-formed pairs: a resume with no preceding paus
 opens no gap, and databases written before the startup edge existed still close
 their gaps by the `sample` inference.
 
+**Passive stretches are the second bracket, derived the same way but kept
+apart.** `probing_stretch` opens at a `passive` edge whose predecessor is not
+`passive` (a passive startup edge after a crash continues a stretch rather than
+opening a second one) and closes at the first later `active` edge —
+`gap_closed_by` = `active` (a peer asked) or `startup` (a boot whose default is
+active) — never at a sample, because samples keep landing under passive. It is
+deliberately not folded into `observation_gap`: a moment inside a stretch has a
+row and reads `unknown` from its `SKIP`s, never `gap`. `silences_sql` lists
+both brackets under a `kind` column (`pause` | `passive`); `observation_gaps_sql`
+stays pauses-only. (realm net-observer, node #88)
+
 ### Verdict vocabulary
 
 Ported from the oracle and cross-checked against recorded log excerpts:
@@ -594,7 +634,12 @@ collector whose per-tick `preflight()` is `Unavailable` (see
 (`ControlCmd::SetQuiet(true)`), where the link collector withholds the gateway
 echo but still emits one sample per tick carrying `gw = SKIP` — quiet silences
 the wire, never the record, and the triggers read that as *no measurement*, never
-as a healthy gateway and never as a drop.
+as a healthy gateway and never as a drop. The **passive probing tier**
+(`ControlCmd::SetProbing`, the daemon's default) is the same rule applied to
+every emission class at once: every probe of the link, proxy and dns collectors
+lands as `SKIP`, and the switch itself is bracketed by a `probing_edge` row so
+the record can tell "withheld" from "could not run" (realm net-observer, node
+#88).
 
 **The one sanctioned exception: an operator pause.** When collection is paused
 (`ControlCmd::SetObserving(false)`) the collectors stop probing entirely rather
@@ -624,8 +669,12 @@ the durable record; the socket is the live, low-latency read path.
   - `Request::Query(DiagnosticQuery)` → `Response::Table(Table)` — one of the
     named diagnoses of [Diagnosis queries](#diagnosis-queries) (`why`,
     `incident-context`, `wedge-or-starvation`, `gateway-ramp` and the drop list
-    it defaults from, `gaps`, `neighbors`, `vulns`, `segments`, `history`,
-    `topology`, `connections`), run by the daemon against its **own** store while it keeps
+    it defaults from, `gaps` and `silences` — the latter every bracketed
+    silence with a `kind` column, pauses and passive stretches; `Gaps` keeps
+    its pauses-only shape because a reader built before the tier asks for it
+    by that id and would print a stretch as a pause — `neighbors`, `vulns`,
+    `segments`, `history`, `topology`, `connections`), run by the daemon
+    against its **own** store while it keeps
     collecting — the only reader that can, since the daemon's per-process lock
     keeps every other opener out, and the moment of an incident is exactly when
     these are wanted. Read-only, in the same class as `Status`: no peer gate.
@@ -668,24 +717,30 @@ the durable record; the socket is the live, low-latency read path.
     (realm net-observer, node #58)
   - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
     write/control path (see [Control path](#control-path) below); the only
-    non-read request. Six commands today — `ControlCmd::KickstartProxy`,
-    `SetObserving(bool)`, `SetQuiet(bool)`, `FreezePcap`,
-    `ScanNeighbors(ScanOptions)`, `ScanAir` — every one behind the same
-    peer-credential check and none behind a config switch.
+    non-read request. Seven commands today — `ControlCmd::KickstartProxy`,
+    `SetObserving(bool)`, `SetQuiet(bool)`, `SetProbing(ProbingTier)`,
+    `FreezePcap`, `ScanNeighbors(ScanOptions)`, `ScanAir` — every one behind
+    the same peer-credential check and none behind a config switch.
   - `Request::Subscribe { kinds }` → a **held-open stream** of newline-JSON
     `StreamFrame`s (not a single `Response`, and not bare `Event`s) — the
     realtime pub/sub path (see [Event bus and live
     subscriptions](#event-bus-and-live-subscriptions) below). The stream opens
     with a **mandatory** `StreamFrame::Ready` ack carrying the `kinds` the daemon
-    actually accepted and its current `observing` state, so a fresh subscriber
-    learns whether collection is live immediately instead of inferring it from
-    silence. Four other frame kinds follow: `Event` (a live sample or incident),
+    actually accepted, its current `observing` state and its current `probing`
+    tier, so a fresh subscriber learns whether collection is live — and whether
+    the `SKIP`s it is about to see are withheld probes — immediately instead of
+    inferring either from silence (`probing` defaults to `active` on decode, as
+    `StatusSnapshot::probing` does: a pre-tier daemon probed). Five other frame
+    kinds follow: `Event` (a live sample or incident),
     `Gap` (this subscriber fell behind the bus and lost `skipped` events),
     `Observing` (a real pause/resume transition — the state at subscribe time
     rides on `Ready` instead, so a state report can never be mistaken for an edge
-    that never happened), and `Error` (a daemon-side refusal or failure, reported
-    **in band** instead of as a bare close). Only `Event` frames are subject to
-    the `kinds` filter (`None` = every `EventKind`, `Some(list)` = server-side);
+    that never happened), `Probing` (a real switch of the probing tier, the same
+    `types::ProbingEdge` the daemon writes to `probing_edge`; the tier in force
+    is read from `StatusSnapshot::probing`), and `Error` (a daemon-side refusal
+    or failure, reported **in band** instead of as a bare close). Only `Event`
+    frames are subject to the `kinds` filter (`None` = every `EventKind`,
+    `Some(list)` = server-side);
     the stream-integrity frames are **always** delivered, because a filtered
     subscriber has more need to know about a hole or a pause, not less. That rule
     lives in exactly one place, `EncodedFrame::passes`. The daemon holds at most
@@ -1024,6 +1079,47 @@ already-authorised command:
    `observing` it is a shared `AtomicBool` mirrored into `snapshot.quiet`, is
    process-scoped, and is never persisted. Client: the bar footer's
    **Quiet**/**Unquiet** action.
+
+   **Self-control — `ControlCmd::SetProbing(tier)`.** The probing tier (realm
+   net-observer, node #88): `passive` puts **nothing on the wire** — every
+   emission class of the link, proxy and dns collectors (gateway echo, direct
+   probe, neighbour pings, TUN 204, endpoint connects, the held reference
+   streams, resolver queries; `types::EmissionClass`) is withheld, each tick
+   still lands with its probe verdicts `SKIP`, and the held streams are closed —
+   while `active` runs every class (quiet still withholds the echo inside it).
+   The daemon boots into the tier `[probing] default` names, `passive` when
+   absent, and never changes tier by itself. The three collectors read one
+   shared `collector_core::ProbingState` per tick, mirrored into
+   `snapshot.probing`; process-scoped and never persisted like quiet — but
+   unlike quiet every real switch is **bracketed**: one `types::ProbingEdge`
+   goes to two sinks, a `probing_edge` row via the `Store` and a
+   `StreamFrame::Probing` on the bus, and the startup default is written as a
+   peerless edge too. A no-op switch writes nothing. A real switch, in either
+   direction, closes and re-opens detection exactly as a resume does — it
+   publishes the same `resume_at_us` epoch, so `pipeline::run` clears the
+   recent-sample window and re-arms every trigger, and the interval collectors
+   drop a tick that straddled the edge at the source — so the cleared window
+   makes the first post-edge sample judge afresh, exactly as after a resume: a
+   condition that no longer holds closes its open incident at that sample's
+   `ts_us`, one that still holds (a `NoGw` gw-drop, a fakeip hijack — both
+   readable under passive) keeps it open, and the `probing_edge` row at the
+   switch's own `ts_us` is the bracket either way; the first passive `SKIP`s
+   never read as a recovery, and dead ticks from before a stretch stay out of
+   the count after it. Clients: the bar menu's **Probe network**/**Stop probing**
+   row and `net-observer-cli probe passive|active`; `gaps` asks the `Silences`
+   diagnosis, which lists passive stretches as `kind = passive` next to the
+   pauses (`Gaps` itself stays pauses-only for readers built before the tier;
+   when an older daemon answers `Gaps` the CLI says so on stderr, and when it
+   reads the file it runs `silences_sql` and prints only its usual source line).
+
+   Passive and quiet are two different promises, which is why only one of them
+   refuses a manual scan. Passive promises **no emission the daemon makes on
+   its own** — nothing on a timer; an operator's `ScanNeighbors` is not the
+   daemon's emission, the command is the sanction (realm net-observer, node
+   #91) and the scan writes its own `neighbor_scan` row, so passive lets it
+   through. Quiet is the **evidence protocol** (realm net-observer, node #26):
+   a capture taken under quiet must contain none of our packets, so quiet
+   keeps refusing the sweep.
 
 4. **Self-control — `ControlCmd::FreezePcap`.** Copy the pcap ring out now, into
    a fresh freeze directory — the same passive artifact the `gw-change` trigger

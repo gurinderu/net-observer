@@ -4,6 +4,7 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use types::ProbingTier;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -26,8 +27,36 @@ pub struct Config {
     /// nobody. See `net-observerd::api::ControlPolicy`.
     pub control_uids: Vec<u32>,
     pub collectors: Collectors,
+    /// The probing tier the daemon boots into. Absent, `passive`: nothing on
+    /// the wire until the operator presses (realm net-observer, node #88).
+    #[serde(default)]
+    pub probing: ProbingCfg,
     /// Parameters of the manual actions the control path can run. Gates nothing.
     pub acting: ActingCfg,
+}
+
+/// The probing tier at startup. Applied once, when the daemon boots, and
+/// written as the first `probing_edge` row; the tier is then process-scoped
+/// like `observing` and `quiet` — never persisted, moved only by
+/// `ControlCmd::SetProbing`, and back to this value on the next start.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbingCfg {
+    /// `"passive"` (the default when the key is absent — the owner's decision:
+    /// a daemon nobody has pressed puts nothing on the wire) or `"active"`.
+    #[serde(default = "default_probing_tier")]
+    pub default: ProbingTier,
+}
+
+impl Default for ProbingCfg {
+    fn default() -> Self {
+        ProbingCfg {
+            default: default_probing_tier(),
+        }
+    }
+}
+
+fn default_probing_tier() -> ProbingTier {
+    ProbingTier::Passive
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +323,7 @@ impl Default for Config {
                     filter: "arp or icmp or udp port 67 or udp port 68 or ether broadcast".into(),
                 },
             },
+            probing: ProbingCfg::default(),
             acting: ActingCfg {
                 singbox_service: "system/sing-box".into(),
             },
@@ -624,6 +654,35 @@ mod tests {
     #[test]
     fn control_uids_default_empty() {
         assert!(Config::load(None).unwrap().control_uids.is_empty());
+    }
+    /// Passive when the key is absent — the owner's decision — and the tier
+    /// reads from `[probing] default` in the same lowercase vocabulary the
+    /// socket and the DB column use. A config from before the section keeps
+    /// loading and lands on passive.
+    #[test]
+    fn probing_defaults_to_passive_and_reads_from_toml() {
+        assert_eq!(
+            Config::load(None).unwrap().probing.default,
+            ProbingTier::Passive
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        std::fs::write(&p, "[probing]\ndefault = \"active\"\n").unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert_eq!(c.probing.default, ProbingTier::Active);
+
+        let p = dir.path().join("legacy.toml");
+        std::fs::write(&p, "[collectors.link]\ninterval = \"5s\"\n").unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert_eq!(c.probing.default, ProbingTier::Passive);
+
+        let p = dir.path().join("bad.toml");
+        std::fs::write(&p, "[probing]\ndefault = \"loud\"\n").unwrap();
+        assert!(
+            Config::load(Some(p.to_str().unwrap())).is_err(),
+            "an unknown tier is an error, never a silent fall-back"
+        );
     }
     #[test]
     fn control_uids_can_be_set_via_toml() {

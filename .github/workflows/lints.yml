@@ -23,7 +23,11 @@ jobs:
       - name: Install toolchain
         run: rustup show
 
+      # PRs restore `main`'s cache; only `main` writes, or per-PR copies
+      # evict it under the 10 GB cap (#125).
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: rustfmt
         run: cargo fmt --all --check
