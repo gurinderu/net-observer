@@ -346,12 +346,20 @@ fn measured_predecessor<'w>(
 /// Fires when the link's own Wi-Fi identity moved between the newest link
 /// sample and its newest measured predecessor: the associated access point
 /// (`bssid`) changed while the SSID stayed the same — band steering, twin
-/// access points — or the interface's own MAC (`if_mac`) changed, which under
+/// access points — or the link's own address (`if_mac`) changed, which under
 /// Private Wi-Fi Address is a new DHCP identity toward the network. Either
 /// is a roam, and both on one tick are one roam whose detail names both. The
 /// masquerade this unmasks: a roam otherwise lands as `gw-drop` or
 /// `per-client-block` with the move itself readable nowhere. (realm
 /// net-observer, node #59)
+///
+/// The detail classifies the roam by its link address, because that is what
+/// separates the harmless hop from the harmful one (node #109): with the
+/// address kept, each hop is a sub-second DHCP INIT-REBOOT on the same IP —
+/// `link address kept`; with a per-SSID private address rotating, DHCP
+/// starts from scratch and the link has a 10–20 s hole — `link address
+/// <old> -> <new> (new DHCP identity)`. A BSSID hop whose address could not
+/// be read on either side is `link address unmeasured`, never claimed kept.
 ///
 /// Each field is compared against the newest OLDER sample in which that
 /// field is measured, so a tick that could not read the identity is
@@ -373,9 +381,8 @@ impl Condition for Roam {
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let last = w.last_link()?;
         let recent = w.recent_link(GW_CHANGE_SCAN);
-        let mut moves: Vec<String> = Vec::new();
         let mut across_gap = false;
-        if let Some(new_ap) = last.bssid.as_deref()
+        let bssid_move = if let Some(new_ap) = last.bssid.as_deref()
             && let Some(ssid) = last.ssid.as_deref()
             && let Some((prev, provenance)) =
                 measured_predecessor(w, &recent, |l| l.bssid.is_some())
@@ -383,30 +390,143 @@ impl Condition for Roam {
             && old_ap != new_ap
             && prev.ssid.as_deref() == Some(ssid)
         {
-            moves.push(format!("BSSID {old_ap} -> {new_ap} at SSID {ssid}"));
             across_gap |= provenance == LinkProvenance::AcrossGap;
+            Some(format!("BSSID {old_ap} -> {new_ap} at SSID {ssid}"))
+        } else {
+            None
+        };
+        // The link address, compared the same way.
+        enum Address {
+            Moved(String),
+            Kept,
+            Unmeasured,
         }
-        if let Some(new_mac) = last.if_mac.as_deref()
+        let address = if let Some(new_mac) = last.if_mac.as_deref()
             && let Some((prev, provenance)) =
                 measured_predecessor(w, &recent, |l| l.if_mac.is_some())
             && let Some(old_mac) = prev.if_mac.as_deref()
-            && old_mac != new_mac
         {
-            moves.push(format!(
-                "interface MAC {old_mac} -> {new_mac} (new DHCP identity)"
-            ));
-            across_gap |= provenance == LinkProvenance::AcrossGap;
-        }
-        if moves.is_empty() {
-            return None;
-        }
+            if old_mac == new_mac {
+                Address::Kept
+            } else {
+                across_gap |= provenance == LinkProvenance::AcrossGap;
+                Address::Moved(format!(
+                    "link address {old_mac} -> {new_mac} (new DHCP identity)"
+                ))
+            }
+        } else {
+            Address::Unmeasured
+        };
+        let address = match (&bssid_move, address) {
+            (_, Address::Moved(moved)) => moved,
+            (None, _) => return None,
+            (Some(_), Address::Kept) => "link address kept".to_string(),
+            (Some(_), Address::Unmeasured) => "link address unmeasured".to_string(),
+        };
         let across = if across_gap {
             " (across an observation gap)"
         } else {
             ""
         };
+        let detail = match bssid_move {
+            Some(ap) => format!("roam: {ap}; {address}{across}"),
+            None => format!("roam: {address}{across}"),
+        };
+        Some(Fire { detail })
+    }
+}
+
+/// The fewest identity changes inside [`WIFI_CHURN_WINDOW_S`] that read as
+/// churn: the field pattern is a hop every ~2.5–3 min, so four is a quarter
+/// hour of it. Tunable by the owner.
+const WIFI_CHURN_MIN_CHANGES: usize = 4;
+
+/// How far behind the newest link sample `wifi-churn` counts identity
+/// changes, in seconds. Tunable by the owner.
+const WIFI_CHURN_WINDOW_S: i64 = 900;
+
+/// How many recent link samples `wifi-churn` walks: the same reach as
+/// `ban-cycle`, the engine window itself, because the reading an in-horizon
+/// change is measured against may sit any number of unmeasured ticks behind
+/// the horizon.
+const WIFI_CHURN_SCAN: usize = BAN_CYCLE_SCAN;
+
+/// The ticks at which `field` changed, newest first: a tick whose measured
+/// reading differs from the previous MEASURED reading of the same field, and
+/// whose `ts_us` is at or after `horizon`. A tick with the field unmeasured
+/// is skipped in the comparison and is never a change. Walked newest-first,
+/// so the reading each change is measured against may lie behind the
+/// horizon.
+fn identity_changes(
+    links: &[&LinkSample],
+    horizon: i64,
+    field: fn(&LinkSample) -> Option<&str>,
+) -> Vec<i64> {
+    let mut changes = Vec::new();
+    // The newest measured reading walked so far and the tick it was read on.
+    let mut newer: Option<(&str, i64)> = None;
+    for l in links {
+        let Some(value) = field(l) else {
+            continue;
+        };
+        if let Some((newer_value, newer_ts)) = newer
+            && newer_value != value
+            && newer_ts >= horizon
+        {
+            changes.push(newer_ts);
+        }
+        newer = Some((value, l.ts_us));
+    }
+    changes
+}
+
+/// Fires when the window holds at least [`WIFI_CHURN_MIN_CHANGES`] Wi-Fi
+/// identity changes within [`WIFI_CHURN_WINDOW_S`] of the newest link sample
+/// — an identity change being a tick whose measured `bssid` or `if_mac`
+/// differs from the previous measured reading of the same field. The field
+/// pattern: macOS hopping between the twin SSIDs of one access point every
+/// ~2.5–3 min, each hop otherwise its own `roam` incident with the churn
+/// itself readable nowhere. This one names the churn, its span and how the
+/// identity moved (per-field counts), and stays asserted while the pattern
+/// is in the window so the engine's clear edge closes the one incident when
+/// it ages out. The daemon's firing backoff (5 min) is the rate limit the
+/// field asked for. (realm net-observer, node #109)
+///
+/// A tick with a field unmeasured (`None`) is skipped in that field's
+/// comparison and never counted as a change (node #25). A tick where both
+/// fields moved is one change; the per-field counts in the detail say which
+/// moved. The detail is written when the incident opens, so its counts and
+/// span are those of the first firing.
+pub struct WifiChurn;
+impl Condition for WifiChurn {
+    fn id(&self) -> &'static str {
+        "wifi-churn"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_link()?;
+        let horizon = last.ts_us.saturating_sub(WIFI_CHURN_WINDOW_S * 1_000_000);
+        let links = w.recent_link(WIFI_CHURN_SCAN);
+        let bssid_changes = identity_changes(&links, horizon, |l| l.bssid.as_deref());
+        let mac_changes = identity_changes(&links, horizon, |l| l.if_mac.as_deref());
+        // One change per tick, however many fields moved on it.
+        let mut ticks: Vec<i64> = bssid_changes
+            .iter()
+            .chain(mac_changes.iter())
+            .copied()
+            .collect();
+        ticks.sort_unstable();
+        ticks.dedup();
+        let n = ticks.len();
+        if n < WIFI_CHURN_MIN_CHANGES {
+            return None;
+        }
+        let span_s = (ticks.last()? - ticks.first()?) / 1_000_000;
         Some(Fire {
-            detail: format!("roam: {}{across}", moves.join("; ")),
+            detail: format!(
+                "wifi identity churn: {n} changes in ~{span_s}s (bssid: {b}, link address: {m})",
+                b = bssid_changes.len(),
+                m = mac_changes.len(),
+            ),
         })
     }
 }
@@ -1638,6 +1758,9 @@ mod tests {
 
     /// Band steering / twin access points: the same SSID answered by a new
     /// BSSID is a roam, and the detail names both access points and the SSID.
+    /// The harmless class: the link address survived the hop, so the DHCP
+    /// exchange was a sub-second INIT-REBOOT on the same IP — and the detail
+    /// says so (node #109).
     #[test]
     fn roam_fires_when_the_bssid_moves_at_the_same_ssid() {
         let mut w = RecentWindow::new(8);
@@ -1649,26 +1772,27 @@ mod tests {
             .expect("a new BSSID at the same SSID must fire");
         assert_eq!(
             fire.detail,
-            format!("roam: BSSID {AP_A} -> {AP_B} at SSID Office")
+            format!("roam: BSSID {AP_A} -> {AP_B} at SSID Office; link address kept")
         );
     }
 
-    /// Private Wi-Fi Address rotating the interface's own MAC is a new DHCP
-    /// identity toward the network: a roam even with the access point unchanged.
+    /// Private Wi-Fi Address rotating the link's own address is a new DHCP
+    /// identity toward the network — DHCP from scratch, the harmful class — a
+    /// roam even with the access point unchanged (node #109).
     #[test]
-    fn roam_fires_when_the_interface_mac_moves() {
+    fn roam_fires_when_the_link_address_moves() {
         let mut w = RecentWindow::new(8);
         w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
         w.push(link_identity(2, Some("Office"), Some(AP_A), Some(MAC_B)));
-        let fire = Roam.eval(&w).expect("a new interface MAC must fire");
+        let fire = Roam.eval(&w).expect("a new link address must fire");
         assert_eq!(
             fire.detail,
-            format!("roam: interface MAC {MAC_A} -> {MAC_B} (new DHCP identity)")
+            format!("roam: link address {MAC_A} -> {MAC_B} (new DHCP identity)")
         );
     }
 
-    /// Both identities moving on one tick is one roam, and the one detail
-    /// names both moves.
+    /// Both identities moving on one tick is one roam of the harmful class,
+    /// and the one detail names both moves.
     #[test]
     fn roam_names_both_moves_in_one_detail() {
         let mut w = RecentWindow::new(8);
@@ -1679,8 +1803,25 @@ mod tests {
             fire.detail,
             format!(
                 "roam: BSSID {AP_A} -> {AP_B} at SSID Office; \
-interface MAC {MAC_A} -> {MAC_B} (new DHCP identity)"
+link address {MAC_A} -> {MAC_B} (new DHCP identity)"
             )
+        );
+    }
+
+    /// A BSSID hop whose link address could not be read on either side
+    /// cannot be classified: the detail says the address is unmeasured
+    /// rather than claiming it was kept.
+    #[test]
+    fn roam_says_when_the_link_address_is_unmeasured() {
+        let mut w = RecentWindow::new(8);
+        w.push(link_identity(1, Some("Office"), Some(AP_A), Some(MAC_A)));
+        w.push(link_identity(2, Some("Office"), Some(AP_B), None));
+        let fire = Roam
+            .eval(&w)
+            .expect("a BSSID hop fires whatever the link address reading");
+        assert_eq!(
+            fire.detail,
+            format!("roam: BSSID {AP_A} -> {AP_B} at SSID Office; link address unmeasured")
         );
     }
 
@@ -1759,6 +1900,96 @@ interface MAC {MAC_A} -> {MAC_B} (new DHCP identity)"
             "a comparison across a pause must be attributable: {}",
             fire.detail
         );
+    }
+
+    /// One Wi-Fi identity reading at 15 s tick `tick` on the `Office` SSID.
+    fn push_identity(w: &mut RecentWindow, tick: i64, bssid: Option<&str>, if_mac: Option<&str>) {
+        w.push(link_identity(tick * TICK_US, Some("Office"), bssid, if_mac));
+    }
+
+    /// The field pattern: macOS hopping between the twin SSIDs of one access
+    /// point every ~3 min. Four identity changes inside 15 min read as churn,
+    /// the detail carries the per-field counts, and the condition stays
+    /// asserted while the pattern is in the window (node #109). Dies under
+    /// three hops counted as four, and under a per-field sum in place of a
+    /// per-tick count (the tick where both moved would then be two changes).
+    #[test]
+    fn wifi_churn_fires_on_four_changes_in_fifteen_minutes() {
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        // The identity held between hops, one reading per tick: a BSSID hop,
+        // both moving at once, a link-address rotation alone, a BSSID hop.
+        let hops = [
+            (0, AP_A, MAC_A),
+            (12, AP_B, MAC_A),
+            (24, AP_A, MAC_B),
+            (36, AP_A, MAC_A),
+            (48, AP_B, MAC_A),
+        ];
+        let at = |tick: i64| hops.iter().rev().find(|(t, _, _)| *t <= tick).unwrap();
+        for tick in 0..48 {
+            let (_, ap, mac) = at(tick);
+            push_identity(&mut w, tick, Some(ap), Some(mac));
+        }
+        assert!(WifiChurn.eval(&w).is_none(), "three hops are not churn");
+        let (_, ap, mac) = at(48);
+        push_identity(&mut w, 48, Some(ap), Some(mac));
+        let fire = WifiChurn
+            .eval(&w)
+            .expect("four identity changes in 15 min must fire");
+        assert_eq!(
+            fire.detail,
+            "wifi identity churn: 4 changes in ~540s (bssid: 3, link address: 2)"
+        );
+        push_identity(&mut w, 49, Some(ap), Some(mac));
+        assert!(
+            WifiChurn.eval(&w).is_some(),
+            "the condition asserts while the pattern is in the window"
+        );
+    }
+
+    /// Three changes are three roams, not churn. Dies under `>=` slack on
+    /// `WIFI_CHURN_MIN_CHANGES`.
+    #[test]
+    fn wifi_churn_silent_on_three_changes() {
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        for (tick, ap) in [(0, AP_A), (12, AP_B), (24, AP_A), (36, AP_B)] {
+            push_identity(&mut w, tick, Some(ap), Some(MAC_A));
+        }
+        assert!(WifiChurn.eval(&w).is_none());
+    }
+
+    /// A tick that could not read the identity is unmeasured: it is skipped
+    /// in the comparison and never counted as a change. Dies under `None`
+    /// read as a value (every gap then becomes two changes).
+    #[test]
+    fn wifi_churn_does_not_count_unmeasured_gaps() {
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        for tick in 0..12 {
+            if tick % 2 == 0 {
+                push_identity(&mut w, tick, Some(AP_A), Some(MAC_A));
+            } else {
+                push_identity(&mut w, tick, None, None);
+            }
+        }
+        push_identity(&mut w, 12, Some(AP_B), Some(MAC_A));
+        assert!(
+            WifiChurn.eval(&w).is_none(),
+            "six gaps around one identity and one hop are one change, not churn"
+        );
+    }
+
+    /// Four changes spread over 20 min are not the pattern: only the changes
+    /// within `WIFI_CHURN_WINDOW_S` of the newest sample count, and the
+    /// oldest of the four falls outside it. Dies under an unbounded horizon.
+    #[test]
+    fn wifi_churn_silent_when_the_changes_span_twenty_minutes() {
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        // A hop every 27 ticks (405 s): the four hops span 1215 s, and the
+        // 15 min horizon behind the newest reading holds only three.
+        for (tick, ap) in [(0, AP_A), (27, AP_B), (54, AP_A), (81, AP_B), (108, AP_A)] {
+            push_identity(&mut w, tick, Some(ap), Some(MAC_A));
+        }
+        assert!(WifiChurn.eval(&w).is_none());
     }
 
     #[test]

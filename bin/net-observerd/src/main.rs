@@ -42,7 +42,7 @@ use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
     BanCycle, EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, Gated, GwChange, GwDrop,
-    GwMacChange, NeighborMacCollision, PerClientBlock, Roam, Starvation, Wedge,
+    GwMacChange, NeighborMacCollision, PerClientBlock, Roam, Starvation, Wedge, WifiChurn,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -1482,6 +1482,16 @@ fn build_engine(
         // the record. (realm net-observer, node #59)
         Trigger::new(
             Box::new(Roam),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        // Four or more identity changes in a quarter hour are one churn
+        // incident, not a string of roams. A change signature, so not gated;
+        // no pcap freeze, the evidence is the recorded identities; and
+        // `BACKOFF_US` (5 min) is the rate limit the field asked for.
+        // (realm net-observer, node #109)
+        Trigger::new(
+            Box::new(WifiChurn),
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
