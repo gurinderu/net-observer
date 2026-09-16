@@ -1044,14 +1044,18 @@ already-authorised command:
    peerless edge too. A no-op switch writes nothing. A real switch, in either
    direction, closes and re-opens detection exactly as a resume does — it
    publishes the same `resume_at_us` epoch, so `pipeline::run` clears the
-   recent-sample window and re-arms every trigger — which is what closes an
-   open incident *at* the switch (the `probing_edge` row at that `ts_us` is its
-   bracket) rather than letting the first passive `SKIP`s read as a recovery,
-   and keeps dead ticks from before a stretch out of the count after it.
-   Clients: the bar menu's **Probe network**/**Stop probing** row and
-   `net-observer-cli probe passive|active`; `gaps` asks the `Silences`
+   recent-sample window and re-arms every trigger, and the interval collectors
+   drop a tick that straddled the edge at the source — so an open incident
+   closes at the first sample after the switch, exactly as after a resume
+   (its `closed_us` is that sample's `ts_us`; the `probing_edge` row at the
+   switch's own `ts_us` is the bracket), rather than the first passive `SKIP`s
+   reading as a recovery, and dead ticks from before a stretch stay out of the
+   count after it. Clients: the bar menu's **Probe network**/**Stop probing**
+   row and `net-observer-cli probe passive|active`; `gaps` asks the `Silences`
    diagnosis, which lists passive stretches as `kind = passive` next to the
-   pauses (`Gaps` itself stays pauses-only for readers built before the tier).
+   pauses (`Gaps` itself stays pauses-only for readers built before the tier;
+   when an older daemon answers `Gaps` the CLI says so on stderr, and when it
+   reads the file it runs `silences_sql` and prints only its usual source line).
 
    Passive and quiet are two different promises, which is why only one of them
    refuses a manual scan. Passive promises **no emission the daemon makes on

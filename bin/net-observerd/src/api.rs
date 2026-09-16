@@ -1128,13 +1128,15 @@ fn control_response(
 /// resume publishes, and `pipeline::run` then clears the recent-sample window
 /// (`RecentWindow::clear_for_resume`, gateway-change basis kept), re-arms every
 /// trigger (`TriggerEngine::rearm_all`) and keeps the bounded pre-edge drain out
-/// of the window. So an incident open at the switch closes at the switch — by
-/// the mechanism the record already explains, the `probing_edge` row at the
-/// same `ts_us` being its bracket — the probe-fed conditions do not read the
-/// first passive `SKIP`s as a recovery, and after a switch back no dead tick
-/// from before the stretch can join the ticks after it. Without this, the
-/// switch to passive turned every probe-fed condition to `None` at once and
-/// the engine closed open incidents as "recovered" at that instant.
+/// of the window; the interval collectors drop a tick that straddled the edge
+/// at the source as well. So an incident open at the switch closes at the
+/// first sample after the switch, exactly as after a resume — its `closed_us`
+/// is that sample's `ts_us`, and the `probing_edge` row at the switch's own
+/// `ts_us` is the bracket that explains it. The probe-fed conditions do not
+/// read the first passive `SKIP`s as a recovery, and after a switch back no
+/// dead tick from before the stretch can join the ticks after it. Without
+/// this, the switch to passive turned every probe-fed condition to `None` at
+/// once and the engine closed open incidents as "recovered" at that instant.
 fn set_probing(
     tier: ProbingTier,
     authorized: PeerAuthorized,
@@ -2487,6 +2489,42 @@ mod tests {
                 .query_scalar_i64("SELECT count(*) FROM neighbor")
                 .unwrap(),
             0
+        );
+    }
+
+    /// The sibling of the quiet refusal, in the other direction: the passive
+    /// tier promises no emission the daemon makes on its own, and an operator's
+    /// scan is not the daemon's — the command is the sanction (realm
+    /// net-observer, node #91) and the scan writes its own `neighbor_scan`
+    /// row, so passive lets it through and the record shows what was sent
+    /// inside the stretch. (realm net-observer, node #88)
+    #[test]
+    fn a_neighbour_scan_runs_under_the_passive_tier() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
+        srv.probing.set(ProbingTier::Passive);
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions::default()),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(
+            res.ok,
+            "passive must not refuse a manual scan: {}",
+            res.message
+        );
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM neighbor_scan WHERE method = 'sweep'")
+                .unwrap(),
+            1,
+            "the scan's own row is what shows the packets were sent inside the stretch"
+        );
+        assert_eq!(
+            srv.probing.tier(),
+            ProbingTier::Passive,
+            "a scan does not move the tier"
         );
     }
 

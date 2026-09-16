@@ -567,11 +567,19 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             // Every bracketed silence — pauses AND passive stretches — is
             // `Silences`. A daemon built before it cannot read that request;
             // it is then asked `Gaps`, the pauses-only shape it has, and the
-            // reader is told what the answer will lack. The offline record is
-            // read with the full query. (realm net-observer, node #88)
+            // reader is told what THAT answer lacks — only when it is the
+            // answer: the offline record is read with the full query and
+            // lists the stretches, so the file path prints its usual source
+            // line alone. (realm net-observer, node #88)
             let table = diagnose_table_by(
                 cli,
-                |socket| ask_silences_or_gaps(socket, net_observer_ipc::diagnose),
+                |socket| {
+                    let (outcome, note) = ask_silences_or_gaps(socket, net_observer_ipc::diagnose)?;
+                    if let Some(note) = note {
+                        eprintln!("{note}");
+                    }
+                    Ok(outcome)
+                },
                 |off| run_query(off, &diagnosis::silences_sql()),
             )?;
             print!("{}", diagnose::format_observation_gaps(&table)?);
@@ -715,26 +723,33 @@ fn diagnose_table(
     diagnose_table_by(cli, |s| net_observer_ipc::diagnose(s, q), offline)
 }
 
-/// Ask `Silences` and, on a daemon that cannot read it, `Gaps` instead —
-/// saying so on stderr, because the fallback answer lists the pauses only and
-/// a reader must not take "no passive stretch listed" for "there was none".
-/// `ask` is the socket round-trip, injected so the fallback rule is testable
-/// without a daemon; a daemon that reads `Silences` and fails it is NOT
-/// retried (the file would only meet the lock), and one older than `Gaps` too
-/// answers `Unsupported` twice, which [`route`] then sends to the file.
+/// Ask `Silences` and, on a daemon that cannot read it, `Gaps` instead.
+///
+/// The second value is the one-line note for stderr, and it is `Some` ONLY
+/// when a daemon actually answered `Gaps`: that answer lists the pauses only,
+/// and a reader must not take "no passive stretch listed" for "there was
+/// none". A daemon too old for `Query` at all answers `Unsupported` twice;
+/// [`route`] then reads the file with the full `silences_sql`, which DOES list
+/// the stretches — so no note, or it would contradict the table under it.
+/// `ask` is the socket round-trip, injected so the rule is testable without a
+/// daemon; a daemon that reads `Silences` and fails it is NOT retried (the
+/// file would only meet the lock).
 fn ask_silences_or_gaps(
     socket: &str,
     ask: impl Fn(&str, DiagnosticQuery) -> std::io::Result<QueryOutcome>,
-) -> std::io::Result<QueryOutcome> {
+) -> std::io::Result<(QueryOutcome, Option<String>)> {
     match ask(socket, DiagnosticQuery::Silences)? {
         QueryOutcome::Unsupported(m) => {
-            eprintln!(
-                "net-observerd at {socket} predates the `Silences` diagnosis ({m}); \
-                 asking `Gaps` instead — pauses only, passive stretches not listed"
-            );
-            ask(socket, DiagnosticQuery::Gaps)
+            let fallback = ask(socket, DiagnosticQuery::Gaps)?;
+            let note = matches!(fallback, QueryOutcome::Table(_)).then(|| {
+                format!(
+                    "net-observerd at {socket} predates the `Silences` diagnosis ({m}); \
+                     it answered `Gaps` instead — pauses only, passive stretches not listed"
+                )
+            });
+            Ok((fallback, note))
         }
-        answered => Ok(answered),
+        answered => Ok((answered, None)),
     }
 }
 
@@ -1525,8 +1540,9 @@ mod tests {
         use std::cell::RefCell;
         let asked: RefCell<Vec<DiagnosticQuery>> = RefCell::new(Vec::new());
 
-        // An old daemon: `Silences` is undecodable, `Gaps` answers.
-        let out = ask_silences_or_gaps("/run/observer.sock", |_, q| {
+        // An old daemon: `Silences` is undecodable, `Gaps` answers — and the
+        // note says what that answer lacks.
+        let (out, note) = ask_silences_or_gaps("/run/observer.sock", |_, q| {
             asked.borrow_mut().push(q.clone());
             Ok(match q {
                 DiagnosticQuery::Silences => {
@@ -1541,26 +1557,51 @@ mod tests {
             *asked.borrow(),
             vec![DiagnosticQuery::Silences, DiagnosticQuery::Gaps]
         );
+        let note = note.expect("a daemon that answered `Gaps` earns the note");
+        assert!(note.contains("passive stretches not listed"), "{note}");
 
-        // A current daemon: one question.
+        // A daemon too old for `Query` at all: `Unsupported` twice, NO note —
+        // `route` then reads the file with the full query, which does list
+        // the stretches, and a note here would contradict the table under it.
         asked.borrow_mut().clear();
-        let out = ask_silences_or_gaps("/run/observer.sock", |_, q| {
+        let (out, note) = ask_silences_or_gaps("/run/observer.sock", |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(QueryOutcome::Unsupported(
+                "bad request: unknown variant `Query`".into(),
+            ))
+        })
+        .unwrap();
+        assert!(matches!(out, QueryOutcome::Unsupported(_)));
+        assert_eq!(
+            *asked.borrow(),
+            vec![DiagnosticQuery::Silences, DiagnosticQuery::Gaps]
+        );
+        assert_eq!(
+            note, None,
+            "no daemon answered `Gaps`, so nothing to warn about"
+        );
+
+        // A current daemon: one question, no note.
+        asked.borrow_mut().clear();
+        let (out, note) = ask_silences_or_gaps("/run/observer.sock", |_, q| {
             asked.borrow_mut().push(q.clone());
             Ok(QueryOutcome::Table(Table::default()))
         })
         .unwrap();
         assert_eq!(out, QueryOutcome::Table(Table::default()));
         assert_eq!(*asked.borrow(), vec![DiagnosticQuery::Silences]);
+        assert_eq!(note, None);
 
         // A daemon that read `Silences` and failed it: reported, not retried.
         asked.borrow_mut().clear();
-        let out = ask_silences_or_gaps("/run/observer.sock", |_, q| {
+        let (out, note) = ask_silences_or_gaps("/run/observer.sock", |_, q| {
             asked.borrow_mut().push(q.clone());
             Ok(QueryOutcome::Failed("boom".into()))
         })
         .unwrap();
         assert_eq!(out, QueryOutcome::Failed("boom".into()));
         assert_eq!(*asked.borrow(), vec![DiagnosticQuery::Silences]);
+        assert_eq!(note, None);
     }
 
     /// A daemon that read the request and could not run it, and a socket that
