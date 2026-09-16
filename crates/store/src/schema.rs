@@ -18,8 +18,9 @@ ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS singbox_tun_if VARCHAR;
 -- The link's identity pair: the BSSID of the access point associated with and
 -- the interface's own (Private Wi-Fi Address, per-SSID) MAC, both lowercase.
 -- A BSSID change at the same SSID is a roam the SSID column cannot show; an
--- if_mac change is a new DHCP identity toward the network. NULL = not
--- associated / not determinable. Same migration treatment.
+-- if_mac change is a new DHCP identity toward the network (realm net-observer,
+-- node #59). NULL = not associated / not determinable. Same migration
+-- treatment.
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS bssid VARCHAR;
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS if_mac VARCHAR;
 CREATE TABLE IF NOT EXISTS proxy_sample (

@@ -131,7 +131,8 @@ where
         // The link's identity pair: the AP associated with and the interface's
         // own MAC. Two local reads (no packet on the wire), so they keep
         // running under quiet mode. Recorded every tick because a roam between
-        // twin SSIDs shows up here and nowhere else.
+        // twin SSIDs shows up here and nowhere else (realm net-observer,
+        // node #59).
         let bssid = self.facts.bssid().await;
         let if_mac = self.facts.if_mac().await;
         let wifi_present = self.facts.wifi_capture_present().await;

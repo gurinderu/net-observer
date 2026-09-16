@@ -28,7 +28,8 @@
 //! Services, which a LaunchDaemon cannot obtain — root `wdutil` returns
 //! `SSID : <redacted>` on this machine while RSSI comes through fine. The SSID
 //! and BSSID are collected by the `link` collector instead, from the
-//! command-line tools (`LinkSample::ssid`, `LinkSample::bssid`).
+//! command-line tools (`LinkSample::ssid`, `LinkSample::bssid`) (root
+//! visibility unobserved, node #93).
 
 use collector_core::Readiness;
 use collector_wifi::{WifiFacts, WifiRead, WifiReading};
