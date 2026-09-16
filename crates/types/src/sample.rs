@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::air::AirSample;
 use crate::neighbor::NeighborsSample;
-use crate::verdict::{DnsVerdict, GwVerdict, TcpVerdict, WifiVerdict};
+use crate::verdict::{DnsVerdict, GwVerdict, LinkMedium, TcpVerdict, WifiVerdict};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkSample {
@@ -29,6 +29,16 @@ pub struct LinkSample {
     /// net-observer, node #59). `serde(default)` as above.
     #[serde(default)]
     pub if_mac: Option<String>,
+    /// The medium of the default-route interface this sample describes —
+    /// the interface `if_mac` belongs to — measured from the hardware-port
+    /// table each tick ([`LinkMedium`]). `None` = not determinable (the port
+    /// table could not be read, or does not list the interface); the sample
+    /// still lacks the interface name itself. The identity rules judge the
+    /// `if_mac` comparison by this, never by whether an SSID or BSSID was
+    /// readable: under root neither is (realm net-observer, nodes #93,
+    /// #108). `serde(default)` so a pre-field daemon's samples still decode.
+    #[serde(default)]
+    pub medium: Option<LinkMedium>,
     pub wifi_capture_present: bool,
     /// Probe-on-suspicion: how many LAN neighbors were pinged on this tick.
     /// Measured only when the gateway verdict is `Fail`; `None` = not probed
@@ -236,6 +246,7 @@ mod tests {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

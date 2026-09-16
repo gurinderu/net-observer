@@ -292,6 +292,7 @@ mod tests {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

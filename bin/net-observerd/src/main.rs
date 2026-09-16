@@ -42,7 +42,7 @@ use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
     BanCycle, EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, Gated, GwChange, GwDrop,
-    GwMacChange, NeighborMacCollision, PerClientBlock, Starvation, Wedge,
+    GwMacChange, NeighborMacCollision, PerClientBlock, Roam, Starvation, Wedge, WifiChurn,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -1155,6 +1155,7 @@ impl Collector for FakeCollector {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1175,6 +1176,7 @@ impl Collector for FakeCollector {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1425,11 +1427,11 @@ fn build_api_server(
 }
 
 /// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
-/// gw-mac-change, neighbor-mac-collision, per-client-block, ban-cycle, fakeip,
-/// fakeip-hijack, endpoint-block, established-stall, starvation). Every rule
-/// records an incident (durable, in DuckDB) and mirrors it into the live
-/// snapshot's ring for the socket API; gw-change and gw-mac-change
-/// additionally freeze the pcap ring when one is available.
+/// roam, wifi-churn, gw-mac-change, neighbor-mac-collision, per-client-block,
+/// ban-cycle, fakeip, fakeip-hijack, endpoint-block, established-stall,
+/// starvation). Every rule records an incident (durable, in DuckDB) and
+/// mirrors it into the live snapshot's ring for the socket API; gw-change and
+/// gw-mac-change additionally freeze the pcap ring when one is available.
 fn build_engine(
     store: Arc<DuckdbStore>,
     cfg: &Config,
@@ -1482,6 +1484,27 @@ fn build_engine(
             BACKOFF_US,
         ),
         Trigger::new(Box::new(GwChange), gw_change_handlers, BACKOFF_US),
+        // A roam — a BSSID hop, or a new link address on Wi-Fi — is its own
+        // incident, not the `gw-drop`/`per-client-block` it used to
+        // masquerade as. Not gated: the settle window would suppress exactly
+        // this event. No pcap freeze: the evidence is the two identities in
+        // the record. NO backoff: the field cadence is a hop every 2.5–3 min
+        // and each hop at that cadence is its own incident — under
+        // `BACKOFF_US` most would be silently dropped. Hops on consecutive
+        // ticks merge into one under the engine's latch; the rows still
+        // record both. `wifi-churn` below carries the aggregate's rate
+        // limit. (realm net-observer, node #59)
+        Trigger::new(Box::new(Roam), vec![record.clone(), snap.clone()], 0),
+        // Four or more identity changes in a quarter hour are one churn
+        // incident, not a string of roams. A change signature, so not gated;
+        // no pcap freeze, the evidence is the recorded identities; and
+        // `BACKOFF_US` (5 min) is the rate limit the field asked for.
+        // (realm net-observer, node #109)
+        Trigger::new(
+            Box::new(WifiChurn),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
         // The same gateway address answered by a new MAC freezes the ring like
         // any other gateway change: the frames around the swap are the evidence
         // that separates an ARP spoof from a silent move to another network.
@@ -1849,6 +1872,7 @@ mod tests {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

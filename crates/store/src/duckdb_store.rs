@@ -314,7 +314,7 @@ impl Store for DuckdbStore {
         let c = self.conn.lock().unwrap();
         match s {
             Sample::Link(l) => c.execute(
-                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     l.ts_us,
                     l.gw.to_string(),
@@ -331,7 +331,8 @@ impl Store for DuckdbStore {
                     l.fakeip_route_if,
                     l.singbox_tun_if,
                     l.bssid,
-                    l.if_mac
+                    l.if_mac,
+                    l.medium.map(|m| m.to_string())
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
@@ -690,8 +691,8 @@ mod tests {
     use super::*;
     use crate::Store;
     use types::{
-        GwVerdict, LinkSample, NeighborObs, NeighborRole, NeighborSource, NeighborsSample,
-        NeighborsVerdict, ProxySample, Sample, TcpVerdict,
+        GwVerdict, LinkMedium, LinkSample, NeighborObs, NeighborRole, NeighborSource,
+        NeighborsSample, NeighborsVerdict, ProxySample, Sample, TcpVerdict,
     };
 
     /// A neighbours tick for one device, so the upsert rules can be driven.
@@ -1109,6 +1110,7 @@ mod tests {
             ssid: Some("cowork".into()),
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1141,6 +1143,7 @@ mod tests {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: Some(3),
             lan_alive: Some(1),
@@ -1191,6 +1194,7 @@ mod tests {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1227,6 +1231,7 @@ mod tests {
             ssid: Some("cowork".into()),
             bssid: Some("3c:22:fb:12:34:56".into()),
             if_mac: Some("f0:18:98:0a:0b:0c".into()),
+            medium: Some(LinkMedium::Wifi),
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1238,23 +1243,48 @@ mod tests {
             ts_us: 2000,
             bssid: None,
             if_mac: None,
+            medium: None,
+            ..base.clone()
+        }))
+        .unwrap();
+        // The medium as a lowercase token, and a wired reading — the root
+        // reader's dock/undock — distinguishable from a Wi-Fi one and from
+        // "not determinable".
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 3000,
+            medium: Some(LinkMedium::Wired),
             ..base
         }))
         .unwrap();
         let t = s
-            .query_table("SELECT ts_us, ssid, bssid, if_mac FROM link_sample ORDER BY ts_us")
+            .query_table(
+                "SELECT ts_us, ssid, bssid, if_mac, medium FROM link_sample ORDER BY ts_us",
+            )
             .unwrap();
         assert_eq!(
             t.rows,
             vec![
-                vec!["1000", "cowork", "3c:22:fb:12:34:56", "f0:18:98:0a:0b:0c"],
-                vec!["2000", "cowork", "", ""],
+                vec![
+                    "1000",
+                    "cowork",
+                    "3c:22:fb:12:34:56",
+                    "f0:18:98:0a:0b:0c",
+                    "wifi"
+                ],
+                vec!["2000", "cowork", "", "", ""],
+                vec![
+                    "3000",
+                    "cowork",
+                    "3c:22:fb:12:34:56",
+                    "f0:18:98:0a:0b:0c",
+                    "wired"
+                ],
             ]
         );
         assert_eq!(
             s.query_scalar_i64(
                 "SELECT count(*) FROM link_sample \
-                 WHERE ts_us = 2000 AND bssid IS NULL AND if_mac IS NULL"
+                 WHERE ts_us = 2000 AND bssid IS NULL AND if_mac IS NULL AND medium IS NULL"
             )
             .unwrap(),
             1
@@ -1575,6 +1605,7 @@ mod tests {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1807,6 +1838,7 @@ mod tests {
             ssid: None,
             bssid: None,
             if_mac: None,
+            medium: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

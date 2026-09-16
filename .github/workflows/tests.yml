@@ -39,12 +39,15 @@ jobs:
       - name: test
         run: cargo test --all
 
-      # The gpui menu bar is outside `default-members` because its build script
-      # needs Apple's Metal shader compiler, so a plain `cargo build`/`test`
-      # skips it and a break there is invisible until someone runs the GUI.
-      # Kept as its own step so the daemon's verdict stays readable when the GUI
-      # is the thing that failed. A macos-latest runner does carry the Metal
-      # Toolchain — confirmed by this step passing on 2026-09-01; locally it
-      # needs the xcrun shim in flake.nix instead.
+      # The gpui menu bar is outside `default-members`, so a plain `cargo
+      # build`/`test` skips it and a break there is invisible until someone
+      # asks for it by name. Kept as its own step so the daemon's verdict stays
+      # readable when the GUI is the thing that failed. The bar needs no Metal
+      # toolchain at build time: the workspace pins gpui's `runtime_shaders`
+      # feature (Cargo.toml), so the shaders compile at app launch. What its
+      # build script still runs is bindgen over dispatch.h, which takes
+      # libclang and the SDK headers from the runner's Command Line Tools.
+      # (This step first passed on 2026-09-01, when it still needed the Metal
+      # Toolchain the runner happens to carry.)
       - name: build the menu bar
         run: cargo build -p net-observer-bar
