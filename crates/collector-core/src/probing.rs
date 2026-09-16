@@ -6,10 +6,9 @@ use types::ProbingTier;
 
 /// The daemon's current [`ProbingTier`], shared between the control socket
 /// (its only writer) and the link, proxy and dns collectors, which read it once
-/// per tick before emitting — exactly the way the link collector's `quiet`
-/// `AtomicBool` is shared. Process-scoped and never persisted: the daemon
-/// constructs it from the configured default at startup. (realm net-observer,
-/// node #88)
+/// per tick before emitting — exactly the way the observing `AtomicBool` is
+/// shared. Process-scoped and never persisted: the daemon constructs it from
+/// the configured default at startup. (realm net-observer, node #88)
 ///
 /// A single atomic rather than a lock: the readers take one load per tick and
 /// must never wait on the control path.
