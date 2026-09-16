@@ -1,6 +1,9 @@
 use crate::{Store, diagnosis::PreparedSql, schema::SCHEMA_SQL};
-use duckdb::{Connection, params};
-use std::sync::Mutex;
+use duckdb::{Connection, InterruptHandle, params};
+use std::panic::AssertUnwindSafe;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use types::{
     BlobRef, Incident, NeighborLifetime, ObservingEdge, Sample, TopologyLifetime, TopologyLink,
     TriggerFired,
@@ -58,12 +61,38 @@ pub struct NeighborScan {
     pub detail: Option<String>,
 }
 
+/// What a store call can fail with.
+///
+/// Two variants exist because the connection is shared with the writer: a
+/// read that runs past its budget, or panics, must hand the connection back
+/// whole and say what happened, never take the pipeline's next write down
+/// with it (realm net-observer, node #58).
 #[derive(Debug, thiserror::Error)]
-#[error(transparent)]
-pub struct StoreError(#[from] pub duckdb::Error);
+pub enum StoreError {
+    /// The driver's own error, verbatim.
+    #[error(transparent)]
+    Duckdb(#[from] duckdb::Error),
+    /// The statement ran past the budget [`DuckdbStore::query_prepared_within`]
+    /// was given and was interrupted at the deadline. The connection is usable
+    /// again the moment this is returned.
+    #[error("query exceeded its budget of {budget:?} and was interrupted")]
+    Interrupted { budget: Duration },
+    /// The driver or a row conversion panicked under the connection lock. The
+    /// panic was caught so the lock was released normally — a poisoned mutex
+    /// would panic the writer's next `lock()` and with it the consumer loop.
+    /// The message is the panic's own payload.
+    #[error("store panicked under its connection lock: {0}")]
+    Panicked(String),
+}
 
 pub struct DuckdbStore {
     conn: Mutex<Connection>,
+    /// Taken from the connection ONCE, at open: obtaining it needs the
+    /// connection, and the moment a deadline fires the connection is exactly
+    /// what the running query holds. Interrupts only a statement in flight; a
+    /// flag left set with nothing running is cleared by DuckDB at the start of
+    /// the next statement (`ClientContext::InitialCleanup`).
+    interrupt: Arc<InterruptHandle>,
 }
 
 /// A generic query result: column names plus already-stringified rows.
@@ -85,8 +114,10 @@ impl DuckdbStore {
     }
     fn from_conn(conn: Connection) -> Result<Self, StoreError> {
         conn.execute_batch(SCHEMA_SQL)?;
+        let interrupt = conn.interrupt_handle();
         Ok(Self {
             conn: Mutex::new(conn),
+            interrupt,
         })
     }
 
@@ -138,24 +169,100 @@ impl DuckdbStore {
         sql: &str,
         params: &[&dyn duckdb::types::ToSql],
     ) -> Result<QueryTable, StoreError> {
+        self.with_conn(|conn| run_statement(conn, sql, params))
+    }
+
+    /// Run `f` on the connection under its lock, with a panic inside `f`
+    /// turned into [`StoreError::Panicked`] rather than left to poison the
+    /// mutex. The connection is shared with the pipeline's writer, whose next
+    /// `lock()` would otherwise panic the consumer loop over a read that blew
+    /// up — the panic is still reported through the panic hook, it simply does
+    /// not take the guard down with it.
+    pub(crate) fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query(params)?;
-        let columns = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
-        let ncols = columns.len();
-        let mut out_rows = Vec::new();
-        while let Some(row) = rows.next()? {
-            let mut cells = Vec::with_capacity(ncols);
-            for i in 0..ncols {
-                let value: duckdb::types::Value = row.get(i)?;
-                cells.push(value_to_string(&value));
-            }
-            out_rows.push(cells);
+        match std::panic::catch_unwind(AssertUnwindSafe(|| f(&conn))) {
+            Ok(result) => result,
+            Err(payload) => Err(StoreError::Panicked(panic_message(payload.as_ref()))),
         }
-        Ok(QueryTable {
-            columns,
-            rows: out_rows,
-        })
+    }
+}
+
+/// One prepared statement, executed and read out in full. Free of the lock so
+/// [`DuckdbStore::with_conn`] can wrap it.
+fn run_statement(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn duckdb::types::ToSql],
+) -> Result<QueryTable, StoreError> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params)?;
+    let columns = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
+    let ncols = columns.len();
+    let mut out_rows = Vec::new();
+    while let Some(row) = rows.next()? {
+        let mut cells = Vec::with_capacity(ncols);
+        for i in 0..ncols {
+            let value: duckdb::types::Value = row.get(i)?;
+            cells.push(value_to_string(&value));
+        }
+        out_rows.push(cells);
+    }
+    Ok(QueryTable {
+        columns,
+        rows: out_rows,
+    })
+}
+
+/// The text a panic payload carries, for [`StoreError::Panicked`]: `panic!`
+/// with a literal gives a `&str`, with a `format!` a `String`; anything else
+/// is named as such rather than lost.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// A deadline on one statement: a thread that interrupts the connection if it
+/// is not stood down within `budget`.
+///
+/// Armed and disarmed INSIDE the connection lock, and `disarm` joins the
+/// thread — so once the statement's caller holds its result, no interrupt can
+/// still be on its way to hit whatever the writer runs next. The remaining
+/// case, an interrupt that lands after the statement finished but before the
+/// join, leaves a flag with nothing running; DuckDB clears it at the start of
+/// the next statement (`ClientContext::InitialCleanup`, checked against the
+/// bundled sources), so that statement is unaffected.
+struct Watchdog {
+    stand_down: mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<bool>,
+}
+
+impl Watchdog {
+    fn arm(interrupt: Arc<InterruptHandle>, budget: Duration) -> Self {
+        let (stand_down, rx) = mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || match rx.recv_timeout(budget) {
+            // The deadline passed with the statement still running.
+            Err(RecvTimeoutError::Timeout) => {
+                interrupt.interrupt();
+                true
+            }
+            // Stood down: the sender was dropped before the deadline.
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
+        });
+        Self { stand_down, thread }
+    }
+
+    /// Stand the thread down and wait for it; `true` iff it fired.
+    fn disarm(self) -> bool {
+        drop(self.stand_down);
+        self.thread.join().unwrap_or(false)
     }
 }
 
@@ -524,6 +631,27 @@ impl Store for DuckdbStore {
 
     fn query_prepared(&self, p: &PreparedSql) -> Result<QueryTable, StoreError> {
         self.query_table_params(p.sql(), &p.params_as_dyn())
+    }
+
+    fn query_prepared_within(
+        &self,
+        p: &PreparedSql,
+        budget: Duration,
+    ) -> Result<QueryTable, StoreError> {
+        self.with_conn(|conn| {
+            let watchdog = Watchdog::arm(Arc::clone(&self.interrupt), budget);
+            let result = run_statement(conn, p.sql(), &p.params_as_dyn());
+            let fired = watchdog.disarm();
+            match result {
+                // The driver reports an interrupt as its own failure, spelled
+                // `INTERRUPT`; only that, and only when the watchdog fired, is
+                // ours to rename. Any other error at the deadline stays itself.
+                Err(StoreError::Duckdb(e)) if fired && e.to_string().contains("INTERRUPT") => {
+                    Err(StoreError::Interrupted { budget })
+                }
+                other => other,
+            }
+        })
     }
 }
 
@@ -1561,5 +1689,67 @@ mod tests {
         let t = s.query_table("SELECT ts_us, gw FROM link_sample").unwrap();
         assert_eq!(t.columns, vec!["ts_us".to_string(), "gw".to_string()]);
         assert_eq!(t.rows, vec![vec!["42".to_string(), "OK".to_string()]]);
+    }
+
+    /// A query past its budget is INTERRUPTED — the connection comes back, the
+    /// call returns the interruption as itself, and the store is whole
+    /// afterwards: the next statement runs, which is what the daemon's writer
+    /// needs the moment the diagnosis lets go of the lock. The cross join is
+    /// effectively unbounded (10^13 rows), so it can only end by interruption.
+    #[test]
+    fn a_query_past_its_budget_is_interrupted_and_the_store_survives() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let slow = PreparedSql::plain(
+            "SELECT count(*) FROM range(10000000) t1, range(1000000) t2".to_string(),
+        );
+        let budget = std::time::Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        match s.query_prepared_within(&slow, budget) {
+            Err(StoreError::Interrupted { budget: b }) => assert_eq!(b, budget),
+            other => panic!("expected Interrupted, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the interrupt must land near the deadline, not at the cross join's end"
+        );
+        // Whole afterwards: no poisoned mutex, no stale interrupt on the next statement.
+        let t = s.query_table("SELECT 1 AS one").unwrap();
+        assert_eq!(t.rows, vec![vec!["1".to_string()]]);
+    }
+
+    /// A query inside its budget answers normally and the watchdog stands down
+    /// without ever interrupting — the common case must cost nothing visible.
+    #[test]
+    fn a_query_inside_its_budget_answers_normally() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let quick = PreparedSql::plain("SELECT 2 AS two".to_string());
+        let t = s
+            .query_prepared_within(&quick, std::time::Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(t.columns, vec!["two".to_string()]);
+        assert_eq!(t.rows, vec![vec!["2".to_string()]]);
+        // And the flag the watchdog never set does not haunt the next statement.
+        assert_eq!(
+            s.query_table("SELECT 3").unwrap().rows,
+            vec![vec!["3".to_string()]]
+        );
+    }
+
+    /// A panic under the connection lock is caught and returned as an error, so
+    /// the guard is released UNPOISONED: the writer's next `lock().unwrap()`
+    /// must not panic the consumer loop because a read blew up.
+    #[test]
+    fn a_panic_under_the_lock_is_an_error_and_does_not_poison_the_mutex() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let r: Result<(), StoreError> = s.with_conn(|_| panic!("boom under the lock"));
+        match r {
+            Err(StoreError::Panicked(m)) => assert!(m.contains("boom"), "{m}"),
+            other => panic!("expected Panicked, got {other:?}"),
+        }
+        assert!(!s.conn.is_poisoned(), "the guard must be released normally");
+        assert_eq!(
+            s.query_table("SELECT 4").unwrap().rows,
+            vec![vec!["4".to_string()]]
+        );
     }
 }

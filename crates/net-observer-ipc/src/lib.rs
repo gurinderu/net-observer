@@ -914,7 +914,13 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// its caller is a terminal user who asked for it — so it gets a budget the
 /// bar's per-tick status poll must never have, rather than failing on a record
 /// long enough to make the question interesting.
-const DIAGNOSIS_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Deliberately LONGER than the daemon's own deadline on a diagnosis
+/// (`net-observerd`'s `QUERY_DEADLINE`, 30 s, after which it interrupts the
+/// statement and answers `Response::Error`): the daemon's "interrupted" must
+/// reach the operator, and a client that gives up first reads its own timeout
+/// instead — a worse report, and one that leaves the daemon's answer unread.
+const DIAGNOSIS_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Blocking client for the bar: connect, write one newline-JSON request, read one
 /// newline-JSON response. Framing = serde_json + `'\n'`. Connection-refused / no

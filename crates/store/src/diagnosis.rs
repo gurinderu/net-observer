@@ -93,6 +93,16 @@ pub struct PreparedSql {
 }
 
 impl PreparedSql {
+    /// A statement with no placeholders, so a plain query can go down the
+    /// same path as a parameterized one — the daemon runs every diagnosis
+    /// through one budgeted call.
+    pub fn plain(sql: String) -> Self {
+        Self {
+            sql,
+            params: Vec::new(),
+        }
+    }
+
     pub(crate) fn sql(&self) -> &str {
         &self.sql
     }
@@ -104,7 +114,9 @@ impl PreparedSql {
 
 /// Host `load1` above which a dead tun reads as starvation rather than a wedge.
 ///
-/// Mirrors the daemon's `STARVATION_LOAD`, and like the `starvation` trigger the
+/// The ONE source: the daemon's `STARVATION_LOAD` is this constant, so the
+/// trigger that records an incident and the diagnosis that reads it back use
+/// the same number by construction. Like the `starvation` trigger the
 /// comparison is strict (`load1 > threshold`).
 pub const DEFAULT_STARVATION_LOAD: f64 = 10.0;
 

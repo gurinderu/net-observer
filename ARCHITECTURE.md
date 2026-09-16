@@ -484,7 +484,7 @@ daemon read back with a `NULL` cause, which the gap derivation treats as
 `crates/store/src/diagnosis.rs` is the read side: the canned SQL that turns the
 record into *which layer failed*, so the reading of an outage is reproducible
 instead of re-derived by hand. Each is a `*_sql()` builder plus a `DuckdbStore`
-method that runs it with the defaults (`DEFAULT_STARVATION_LOAD` = 10.0, matching
+method that runs it with the defaults (`DEFAULT_STARVATION_LOAD` = 10.0, which IS
 the daemon's `STARVATION_LOAD`; `DEFAULT_EPISODE_GAP_US` = 30 s;
 `DEFAULT_RAMP_WINDOW_US` = 120 s). Correlation across cadences is by `ASOF JOIN`
 — the join the whole storage choice was made for. The two read primitives the
@@ -606,7 +606,17 @@ the durable record; the socket is the live, low-latency read path.
     any local process could inflict, so a second concurrent `Query` is refused
     at once with `Response::Error("a diagnosis is already running; retry")`
     (`api::QUERY_BUSY`) rather than queued. Not a per-peer rate limit — a
-    deliberate non-goal. The threshold a query needs but does not carry is the
+    deliberate non-goal. The one run is itself **bounded**: the daemon interrupts
+    the statement at `api::QUERY_DEADLINE` (30 s) through DuckDB's interrupt
+    handle (`Store::query_prepared_within`, a watchdog armed and stood down
+    inside the connection lock, so no late interrupt can reach the writer's next
+    statement) and answers `Response::Error("diagnosis exceeded 30 s and was
+    interrupted")`; a client that had already hung up cannot leave the mutex
+    held. The client's own read budget (`DIAGNOSIS_TIMEOUT`, 45 s) is longer on
+    purpose, so the daemon's report is what the operator reads. A panic under
+    the connection lock is caught (`StoreError::Panicked`) so the mutex is
+    released unpoisoned and the writer's next `lock()` does not panic the
+    consumer loop. The threshold a query needs but does not carry is the
     daemon's own `STARVATION_LOAD`, so a live reading agrees with the
     incidents the daemon recorded. `Table` is the
     stringified `columns` + `rows` shape the CLI renders on both paths (the
@@ -618,9 +628,13 @@ the durable record; the socket is the live, low-latency read path.
     (`QueryOutcome::Failed` vs `Unsupported`, on the pinned
     `UNDECODABLE_REQUEST_PREFIX`). The CLI asks the daemon first and opens the
     DB file only when nothing listens on the socket or the daemon is too old to
-    read the request (saying so on stderr) — never over a diagnosis that ran and
-    failed, where the file would only meet the lock and report the wrong
-    problem. (realm net-observer, node #58)
+    read the request (naming the socket it tried, on stderr) — never over a
+    diagnosis that ran and failed, where the file would only meet the lock and
+    report the wrong problem. An explicit `--db` names the record and means
+    the socket is not asked at all, and every diagnosis prints which record
+    answered (`source: net-observerd via <socket>` or `source: file <path>`)
+    on stderr, so a forensic reader never mistakes one record for the other.
+    (realm net-observer, node #58)
   - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
     write/control path (see [Control path](#control-path) below); the only
     non-read request. Six commands today — `ControlCmd::KickstartProxy`,
