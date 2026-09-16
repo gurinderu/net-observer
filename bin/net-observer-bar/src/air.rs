@@ -48,6 +48,10 @@
 //! coloured by severity: the geometry makes the claim, so no element can read as
 //! a measured quantity (realm net-observer, nodes #47 and #48).
 //!
+//! A different question — how the AP is *configured*, never how far it is or
+//! how much air it takes — IS graded and coloured, on a small badge in each
+//! row (see [`lane_row`]): the rubric decided at realm net-observer, node #89.
+//!
 //! Foreign APs also carry **no BSSID** in the system report, so two APs on one
 //! channel are indistinguishable between scans. Each scan is a slice; this window
 //! therefore draws the latest slice only and never a history of "that neighbour".
@@ -107,8 +111,8 @@ use net_observer_ipc::{
     SubscriptionHandle,
 };
 use types::{
-    AirObservation, AirSample, AirVerdict, Band, ChannelOverlapHypothesis, ChannelSpan,
-    OverlapConfidence, WifiSample, WifiVerdict, overlap_hypothesis,
+    AirObservation, AirSample, AirVerdict, ApGrade, Band, ChannelOverlapHypothesis, ChannelSpan,
+    Confidence, Grade, OverlapConfidence, WifiSample, WifiVerdict, overlap_hypothesis,
 };
 
 use crate::ui::{Glance, PROVENANCE_TEXT, Theme, clock, hint, moments_diverge, separator};
@@ -443,6 +447,10 @@ struct Lane {
     phy_mode: Option<String>,
     security: Option<String>,
     overlap: Overlap,
+    /// This AP's own configuration grade, computed once here from the same
+    /// [`AirObservation`] the rest of the lane is built from (realm
+    /// net-observer, node #89).
+    grade: ApGrade,
 }
 
 /// One band's worth of the map: the axis it is drawn on, our own band if we are
@@ -496,6 +504,7 @@ fn group(sample: &AirSample, own: Option<ChannelSpan>) -> Vec<BandGroup> {
             phy_mode: ap.phy_mode.clone(),
             security: ap.security.clone(),
             overlap,
+            grade: ap.grade(),
         };
         match groups.iter_mut().find(|g| g.band == span.band) {
             Some(g) => g.lanes.push(lane),
@@ -2072,11 +2081,14 @@ fn band_section(group: &BandGroup, theme: Theme) -> impl IntoElement + use<> {
 }
 
 /// One row of a band section's table: everything known about one foreign AP on a
-/// single line, with the overlap cell present only where an overlap is
-/// computable at all.
+/// single line, with a leading configuration-grade badge and the overlap cell
+/// present only where an overlap is computable at all.
 ///
-/// The ink is one neutral colour — deliberately not a severity palette, which
-/// would read as a measured verdict about interference.
+/// The label's ink is one neutral colour — deliberately not a severity
+/// palette, which would read as a measured verdict about interference. The
+/// grade badge is the one exception: it answers a different question, is
+/// never a claim about distance or airtime, and is coloured from the rubric
+/// decided at (realm net-observer, node #89).
 fn lane_row(band: Band, i: usize, lane: &Lane, theme: Theme) -> impl IntoElement + use<> {
     let sel = format!("air-row:{}:{i}", band_label(band));
     div()
@@ -2086,6 +2098,7 @@ fn lane_row(band: Band, i: usize, lane: &Lane, theme: Theme) -> impl IntoElement
         .gap_2()
         .w(px(AXIS_W))
         .overflow_hidden()
+        .child(grade_badge(band, i, &lane.grade, theme))
         .child(
             div()
                 .flex_1()
@@ -2105,6 +2118,46 @@ fn lane_row(band: Band, i: usize, lane: &Lane, theme: Theme) -> impl IntoElement
                 rgba(with_alpha(theme.fg, cell.alpha)),
             ))
         }))
+}
+
+/// The AP's configuration-grade badge: the letter, with a `?` suffix where one
+/// of the rubric's four inputs went unreported, coloured from the theme's own
+/// status palette (green-ish for A/B, amber for C/D, red for F — never a new
+/// palette). The reasons behind the letter are always reachable, never only on
+/// the screen: they are the badge's hover tip (realm net-observer, node #89).
+fn grade_badge(band: Band, i: usize, grade: &ApGrade, theme: Theme) -> impl IntoElement + use<> {
+    let sel = format!(
+        "air-grade:{}:{i}:grade-{}",
+        band_label(band),
+        grade.grade.as_str()
+    );
+    let marker = if grade.confidence == Confidence::Low {
+        format!("{}?", grade.grade.as_str())
+    } else {
+        grade.grade.as_str().to_string()
+    };
+    let tip = if grade.reasons.is_empty() {
+        "no penalties".to_string()
+    } else {
+        grade.reasons.join("; ")
+    };
+    div().debug_selector(move || sel).flex_none().child(hint(
+        // Unique per row, like the overlap hint above.
+        format!("air-grade-hint:{}:{i}", band_label(band)),
+        marker,
+        tip,
+        rgb(grade_color(grade.grade, theme)),
+    ))
+}
+
+/// The theme's own status colours, reused rather than invented: A/B green-ish,
+/// C/D amber, F red (realm net-observer, node #89).
+fn grade_color(grade: Grade, theme: Theme) -> u32 {
+    match grade {
+        Grade::A | Grade::B => theme.ok,
+        Grade::C | Grade::D => theme.warn,
+        Grade::F => theme.bad,
+    }
 }
 
 /// A stated state of the map: a headline in a semantic colour and the sentence
@@ -2753,6 +2806,7 @@ mod tests {
                 phy_mode: None,
                 security: None,
                 overlap: Overlap::OwnChannelUnknown,
+                grade: AirObservation::default().grade(),
             }],
             dropped: 0,
         };
@@ -2792,6 +2846,7 @@ mod tests {
                 &own(ch, "5ghz", 80),
                 Some(-60),
             )),
+            grade: AirObservation::default().grade(),
         };
         let on = overlap_label(&lane(36));
         assert!(on.starts_with("hypothesis:"), "{on}");
@@ -2809,6 +2864,7 @@ mod tests {
             phy_mode: Some("802.11ax".to_string()),
             security: Some("wpa2_personal".to_string()),
             overlap: Overlap::OwnChannelUnknown,
+            grade: AirObservation::default().grade(),
         };
         let s = lane_label(&l);
         assert!(s.contains("ch 36"));
@@ -3605,6 +3661,82 @@ mod headless_tests {
         assert!(
             bounds(&mut cx, &format!("air-axis:{here}")).is_some(),
             "the view that is only the axis drew no axis"
+        );
+    }
+
+    /// The configuration-grade badge (realm net-observer, node #89) is checked
+    /// the same way the overlap hint above is: by the selector [`lane_row`]
+    /// itself builds, with no daemon behind it at all — a WPA3/5 GHz/80 MHz/ax
+    /// AP draws `grade-A`, an open one draws `grade-F`.
+    #[gpui::test]
+    fn the_grade_badge_names_the_letter_it_drew(cx: &mut TestAppContext) {
+        let best = AirObservation {
+            channel: Some(36),
+            channel_band: Some("5ghz".to_string()),
+            channel_width_mhz: Some(80),
+            phy_mode: Some("802.11ax".to_string()),
+            security: Some("wpa3_personal".to_string()),
+            rssi_dbm: Some(-50),
+            noise_dbm: Some(-90),
+        };
+        let open = AirObservation {
+            channel: Some(6),
+            channel_band: Some("2ghz".to_string()),
+            channel_width_mhz: Some(20),
+            phy_mode: Some("802.11n".to_string()),
+            security: Some("open".to_string()),
+            rssi_dbm: Some(-60),
+            noise_dbm: Some(-90),
+        };
+        let to_lane = |ap: &AirObservation| Lane {
+            span: span_of(ap).expect("both fixtures carry a placeable channel and band"),
+            rssi_dbm: ap.rssi_dbm,
+            phy_mode: ap.phy_mode.clone(),
+            security: ap.security.clone(),
+            overlap: Overlap::OwnChannelUnknown,
+            grade: ap.grade(),
+        };
+
+        struct Host {
+            best: Lane,
+            open: Lane,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(lane_row(Band::FiveGhz, 0, &self.best, Theme::dark()))
+                    .child(lane_row(Band::TwoGhz, 0, &self.open, Theme::dark()))
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host {
+            best: to_lane(&best),
+            open: to_lane(&open),
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(size(px(400.0), px(400.0)));
+        cx.run_until_parked();
+
+        assert!(
+            bounds(
+                &mut cx,
+                &format!("air-grade:{}:0:grade-A", band_label(Band::FiveGhz))
+            )
+            .is_some(),
+            "WPA3/5 GHz/80 MHz/ax must draw a grade-A badge"
+        );
+        assert!(
+            bounds(
+                &mut cx,
+                &format!("air-grade:{}:0:grade-F", band_label(Band::TwoGhz))
+            )
+            .is_some(),
+            "open security must draw a grade-F badge"
         );
     }
 

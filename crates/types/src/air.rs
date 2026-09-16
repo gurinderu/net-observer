@@ -43,6 +43,225 @@ pub struct AirObservation {
     pub noise_dbm: Option<i32>,
 }
 
+/// Letter for an access point's **configuration** — never for how far away it
+/// is (see [`Signal`] for that, and [`AirObservation::grade`] for the rubric
+/// itself, decided at realm net-observer, node #89). `A` is zero penalties;
+/// `F` is four or more, or an open/legacy security mode outright — the one
+/// override, because a network open to anybody is not "one grade away" from
+/// anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Grade {
+    A,
+    B,
+    C,
+    D,
+    F,
+}
+
+impl Grade {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Grade::A => "A",
+            Grade::B => "B",
+            Grade::C => "C",
+            Grade::D => "D",
+            Grade::F => "F",
+        }
+    }
+}
+
+/// How much of the rubric's four inputs (`security`, `channel_band`,
+/// `channel_width_mhz`, `phy_mode`) the scan actually reported.
+///
+/// `Low` never means the AP was judged more harshly for what was missing — an
+/// unread input contributes no penalty — only that the letter may understate
+/// what full information would have shown, never overstate it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    High,
+    Low,
+}
+
+/// The grade rubric's verdict for one access point: the letter, how much of
+/// the rubric's inputs were actually present, and the penalties (or missing
+/// inputs) that produced the letter — see [`AirObservation::grade`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApGrade {
+    pub grade: Grade,
+    pub confidence: Confidence,
+    pub reasons: Vec<String>,
+}
+
+/// Signal-to-noise, bucketed. Deliberately not part of [`ApGrade`]: a
+/// wide-open network on a weak signal is still wide open, and a pristine WPA3
+/// network heard faintly is still pristine — configuration and distance are
+/// different questions (realm net-observer, node #89).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Signal {
+    Good,
+    Fair,
+    Poor,
+}
+
+impl Signal {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Signal::Good => "good",
+            Signal::Fair => "fair",
+            Signal::Poor => "poor",
+        }
+    }
+}
+
+impl AirObservation {
+    /// Grade this access point's **configuration** — never its distance from
+    /// us, which is [`AirObservation::signal`]'s question instead. Four
+    /// independently-optional inputs, each judged on its own axis and summed
+    /// as penalty points (the rubric decided at realm net-observer, node
+    /// #89):
+    ///
+    /// - **security**: WPA3 (any string starting with `wpa3`, so the
+    ///   transition mode counts too) costs nothing; `wpa2_personal` or
+    ///   `wpa2_enterprise` costs 1; `wpa2_personal_mixed` (TKIP still allowed)
+    ///   costs 2; anything else — WPA, WEP, no security, dynamic WEP, or a
+    ///   token this rubric does not recognise — grades `F` outright, because
+    ///   open or legacy security is not "one grade away" from anything;
+    /// - **band**: 5/6 GHz costs nothing, 2.4 GHz costs 1 (a crowded band);
+    /// - **width**: 40 MHz in 2.4 GHz costs 1 (squeezes neighbours), 20 MHz
+    ///   in 5/6 GHz costs 1 (capacity left unused), otherwise nothing;
+    /// - **generation**: a PHY mode naming `ax` or `be` costs nothing, `ac`
+    ///   without `ax` costs 1 ("Wi-Fi 5"), and anything else (b/g/n only)
+    ///   costs 2 ("Wi-Fi 4 or older").
+    ///
+    /// Total penalties map to A/B/C/D/F at 0/1/2/3/4-or-more. A `None` input
+    /// contributes no penalty — there is nothing in it to hold against the
+    /// AP — and drops [`Confidence`] to `Low`, naming the missing input in
+    /// the reasons: the grade is computed from whatever the scan actually
+    /// reported, never assumed from what it left out.
+    #[must_use]
+    pub fn grade(&self) -> ApGrade {
+        let mut penalties: u32 = 0;
+        let mut reasons = Vec::new();
+        let mut confidence = Confidence::High;
+        let mut forced_f = false;
+
+        match self.security.as_deref() {
+            Some(sec) => {
+                let sec = sec.to_ascii_lowercase();
+                if sec.starts_with("wpa3") {
+                    // No penalty.
+                } else if sec == "wpa2_personal" || sec == "wpa2_enterprise" {
+                    penalties += 1;
+                    reasons.push("WPA2".to_string());
+                } else if sec == "wpa2_personal_mixed" {
+                    penalties += 2;
+                    reasons.push("WPA2 with TKIP allowed".to_string());
+                } else {
+                    forced_f = true;
+                    reasons.push("open, legacy or unrecognised security".to_string());
+                }
+            }
+            None => {
+                confidence = Confidence::Low;
+                reasons.push("security: unmeasured".to_string());
+            }
+        }
+
+        let band = self.channel_band.as_deref().and_then(Band::parse);
+        match (self.channel_band.as_deref(), band) {
+            (Some(_), Some(Band::TwoGhz)) => {
+                penalties += 1;
+                reasons.push("2.4 GHz: crowded band".to_string());
+            }
+            (Some(_), Some(_)) => {}
+            // A label the rubric cannot parse is as good as no label: the
+            // band-dependent width rule cannot fire, so the grade is hedged.
+            (Some(_), None) => {
+                confidence = Confidence::Low;
+                reasons.push("channel_band: unrecognised".to_string());
+            }
+            (None, _) => {
+                confidence = Confidence::Low;
+                reasons.push("channel_band: unmeasured".to_string());
+            }
+        }
+
+        match self.channel_width_mhz {
+            Some(w) if band == Some(Band::TwoGhz) && w == 40 => {
+                penalties += 1;
+                reasons.push("40 MHz in 2.4 GHz squeezes neighbours".to_string());
+            }
+            Some(w) if matches!(band, Some(Band::FiveGhz | Band::SixGhz)) && w == 20 => {
+                penalties += 1;
+                reasons.push("20 MHz in 5 GHz leaves capacity unused".to_string());
+            }
+            Some(_) => {}
+            None => {
+                confidence = Confidence::Low;
+                reasons.push("channel_width_mhz: unmeasured".to_string());
+            }
+        }
+
+        match self.phy_mode.as_deref() {
+            Some(phy) => {
+                let phy = phy.to_ascii_lowercase();
+                if phy.contains("ax") || phy.contains("be") {
+                    // No penalty.
+                } else if phy.contains("ac") {
+                    penalties += 1;
+                    reasons.push("Wi-Fi 5".to_string());
+                } else {
+                    penalties += 2;
+                    reasons.push("Wi-Fi 4 or older".to_string());
+                }
+            }
+            None => {
+                confidence = Confidence::Low;
+                reasons.push("phy_mode: unmeasured".to_string());
+            }
+        }
+
+        let grade = if forced_f {
+            Grade::F
+        } else {
+            match penalties {
+                0 => Grade::A,
+                1 => Grade::B,
+                2 => Grade::C,
+                3 => Grade::D,
+                _ => Grade::F,
+            }
+        };
+
+        ApGrade {
+            grade,
+            confidence,
+            reasons,
+        }
+    }
+
+    /// Signal-to-noise as a bucket, or `None` when either half was not
+    /// reported: `>= 30` dB is `Good`, `20..30` is `Fair`, below that is
+    /// `Poor`. Distance, not configuration — kept off [`ApGrade`] on purpose
+    /// (realm net-observer, node #89).
+    #[must_use]
+    pub fn signal(&self) -> Option<Signal> {
+        let snr = self.rssi_dbm? - self.noise_dbm?;
+        Some(if snr >= 30 {
+            Signal::Good
+        } else if snr >= 20 {
+            Signal::Fair
+        } else {
+            Signal::Poor
+        })
+    }
+}
+
 /// One scan of the radio environment.
 ///
 /// `air == Skip` means the scan could not run at all (radio off, the report
@@ -554,5 +773,205 @@ mod tests {
     #[test]
     fn frequency_extent_is_none_where_the_channel_cannot_be_placed() {
         assert!(span(99, Band::TwoGhz, 20).frequency_extent().is_none());
+    }
+
+    // ---- ApGrade: the config-grade rubric (realm net-observer, node #89) ----
+
+    /// The best case on every axis: nothing to hold against the AP at all.
+    fn best_ap() -> AirObservation {
+        AirObservation {
+            channel: Some(36),
+            channel_band: Some("5ghz".to_string()),
+            channel_width_mhz: Some(80),
+            phy_mode: Some("802.11a/n/ac/ax".to_string()),
+            security: Some("wpa3_personal".to_string()),
+            rssi_dbm: Some(-50),
+            noise_dbm: Some(-90),
+        }
+    }
+
+    #[test]
+    fn wpa3_including_the_transition_mode_costs_nothing() {
+        let mut ap = best_ap();
+        ap.security = Some("wpa3_transition".to_string());
+        let g = ap.grade();
+        assert_eq!(g.grade, Grade::A);
+        assert!(g.reasons.is_empty(), "{g:?}");
+    }
+
+    #[test]
+    fn wpa2_personal_or_enterprise_costs_one() {
+        for sec in ["wpa2_personal", "wpa2_enterprise"] {
+            let mut ap = best_ap();
+            ap.security = Some(sec.to_string());
+            let g = ap.grade();
+            assert_eq!(g.grade, Grade::B, "{sec}: {g:?}");
+            assert!(g.reasons.contains(&"WPA2".to_string()), "{sec}: {g:?}");
+        }
+    }
+
+    #[test]
+    fn wpa2_mixed_tkip_costs_two() {
+        let mut ap = best_ap();
+        ap.security = Some("wpa2_personal_mixed".to_string());
+        let g = ap.grade();
+        assert_eq!(g.grade, Grade::C);
+        assert!(
+            g.reasons.contains(&"WPA2 with TKIP allowed".to_string()),
+            "{g:?}"
+        );
+    }
+
+    #[test]
+    fn open_or_legacy_security_grades_f_outright() {
+        for sec in ["wpa_personal", "wep", "none", "open", "dynamic_wep"] {
+            let mut ap = best_ap();
+            ap.security = Some(sec.to_string());
+            let g = ap.grade();
+            assert_eq!(g.grade, Grade::F, "{sec}: {g:?}");
+            assert!(
+                g.reasons
+                    .contains(&"open, legacy or unrecognised security".to_string()),
+                "{sec}: {g:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_point_four_ghz_band_costs_one() {
+        let mut ap = best_ap();
+        ap.channel_band = Some("2ghz".to_string());
+        ap.channel_width_mhz = Some(20); // not 40, so only the band rule fires.
+        let g = ap.grade();
+        assert_eq!(g.grade, Grade::B);
+        assert!(
+            g.reasons.contains(&"2.4 GHz: crowded band".to_string()),
+            "{g:?}"
+        );
+    }
+
+    #[test]
+    fn forty_mhz_in_two_point_four_ghz_costs_one_on_top_of_the_band_penalty() {
+        let mut ap = best_ap();
+        ap.channel_band = Some("2ghz".to_string());
+        ap.channel_width_mhz = Some(40);
+        let g = ap.grade();
+        assert_eq!(g.grade, Grade::C, "band -1, width -1: {g:?}");
+        assert!(
+            g.reasons
+                .contains(&"40 MHz in 2.4 GHz squeezes neighbours".to_string()),
+            "{g:?}"
+        );
+    }
+
+    #[test]
+    fn twenty_mhz_in_five_ghz_costs_one() {
+        let mut ap = best_ap();
+        ap.channel_width_mhz = Some(20);
+        let g = ap.grade();
+        assert_eq!(g.grade, Grade::B);
+        assert!(
+            g.reasons
+                .contains(&"20 MHz in 5 GHz leaves capacity unused".to_string()),
+            "{g:?}"
+        );
+    }
+
+    #[test]
+    fn ac_without_ax_costs_one() {
+        let mut ap = best_ap();
+        ap.phy_mode = Some("802.11ac".to_string());
+        let g = ap.grade();
+        assert_eq!(g.grade, Grade::B);
+        assert!(g.reasons.contains(&"Wi-Fi 5".to_string()), "{g:?}");
+    }
+
+    #[test]
+    fn b_g_n_only_costs_two() {
+        let mut ap = best_ap();
+        ap.phy_mode = Some("802.11b/g/n".to_string());
+        let g = ap.grade();
+        assert_eq!(g.grade, Grade::C);
+        assert!(g.reasons.contains(&"Wi-Fi 4 or older".to_string()), "{g:?}");
+    }
+
+    #[test]
+    fn wpa3_five_ghz_eighty_mhz_ax_grades_a_with_high_confidence() {
+        let g = best_ap().grade();
+        assert_eq!(g.grade, Grade::A);
+        assert_eq!(g.confidence, Confidence::High);
+        assert!(g.reasons.is_empty(), "{g:?}");
+    }
+
+    /// WPA2-mixed / 2.4 GHz / 40 MHz / b-g-n: -2 -1 -1 -2 = 6 penalties.
+    #[test]
+    fn wpa2_mixed_two_point_four_forty_mhz_b_g_n_grades_f() {
+        let ap = AirObservation {
+            channel: Some(6),
+            channel_band: Some("2ghz".to_string()),
+            channel_width_mhz: Some(40),
+            phy_mode: Some("802.11b/g/n".to_string()),
+            security: Some("wpa2_personal_mixed".to_string()),
+            rssi_dbm: Some(-60),
+            noise_dbm: Some(-90),
+        };
+        let g = ap.grade();
+        assert_eq!(g.grade, Grade::F, "{g:?}");
+        assert_eq!(g.reasons.len(), 4, "{g:?}");
+    }
+
+    #[test]
+    fn missing_security_is_low_confidence_and_names_the_gap() {
+        let mut ap = best_ap();
+        ap.security = None;
+        let g = ap.grade();
+        assert_eq!(g.confidence, Confidence::Low);
+        assert!(
+            g.reasons.contains(&"security: unmeasured".to_string()),
+            "{g:?}"
+        );
+        // Grade is computed from what remains — the missing input costs
+        // nothing against the AP.
+        assert_eq!(g.grade, Grade::A, "{g:?}");
+    }
+
+    /// A band label the rubric cannot parse disables the width rule exactly
+    /// as a missing band does, so it hedges the grade the same way.
+    #[test]
+    fn an_unrecognised_band_label_is_low_confidence_not_silently_high() {
+        let mut ap = best_ap();
+        ap.channel_band = Some("7GHz".to_string());
+        let g = ap.grade();
+        assert_eq!(g.confidence, Confidence::Low);
+        assert!(
+            g.reasons
+                .contains(&"channel_band: unrecognised".to_string()),
+            "{g:?}"
+        );
+        assert_eq!(g.grade, Grade::A, "{g:?}");
+    }
+
+    #[test]
+    fn snr_buckets_good_fair_poor_and_missing_noise() {
+        let signal_at = |rssi: i32, noise: i32| {
+            AirObservation {
+                rssi_dbm: Some(rssi),
+                noise_dbm: Some(noise),
+                ..Default::default()
+            }
+            .signal()
+        };
+        assert_eq!(signal_at(-44, -90), Some(Signal::Good), "snr 46");
+        assert_eq!(signal_at(-65, -90), Some(Signal::Fair), "snr 25");
+        assert_eq!(signal_at(-80, -90), Some(Signal::Poor), "snr 10");
+        assert_eq!(
+            AirObservation {
+                rssi_dbm: Some(-60),
+                noise_dbm: None,
+                ..Default::default()
+            }
+            .signal(),
+            None
+        );
     }
 }
