@@ -1387,6 +1387,7 @@ dependencies = [
  "humantime-serde",
  "serde",
  "tempfile",
+ "types",
 ]
 
 [[package]]

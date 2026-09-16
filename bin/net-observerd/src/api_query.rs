@@ -176,7 +176,10 @@ mod tests {
             },
             &["ts_us", "slope_ms_per_s", "observation_gap_us"],
         );
-        expect(DiagnosticQuery::Gaps, &["gap_opened_us", "gap_closed_by"]);
+        expect(
+            DiagnosticQuery::Gaps,
+            &["kind", "gap_opened_us", "gap_closed_by"],
+        );
         expect(
             DiagnosticQuery::Neighbors { network: None },
             &["mac", "source"],

@@ -4,6 +4,7 @@ edition.workspace = true
 
 [dependencies]
 serde.workspace = true
+types.workspace = true
 figment.workspace = true
 humantime-serde.workspace = true
 
