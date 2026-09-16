@@ -617,10 +617,13 @@ impl PcapFreezer for macos::PcapRing {
 /// real segment. The production impl is [`crate::SystemScanner`].
 pub trait NeighborScanner: Send + Sync {
     /// Run the scan, blocking for as long as its own budget allows. `opts` is the
-    /// EFFECTIVE option set (already intersected with config permission by the
-    /// caller), so the scanner runs exactly the rungs it is handed. `None` when
-    /// there is nothing to scan (no interface, no IPv4 subnet) — a refusal the
-    /// caller reports, not an error it swallows.
+    /// EFFECTIVE option set: the rungs the operator asked for, minus dependency
+    /// drops the caller already made (banners need ports; cve needs banners and
+    /// a provisioned snapshot). There is no permission ceiling — config never
+    /// gates an operator's command (realm net-observer, node #91) — so the
+    /// scanner runs exactly the rungs it is handed. `None` when there is nothing
+    /// to scan (no interface, no IPv4 subnet) — a refusal the caller reports,
+    /// not an error it swallows.
     fn scan(&self, opts: &net_observer_ipc::ScanOptions) -> Option<ScanReport>;
 }
 

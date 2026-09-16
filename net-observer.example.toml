@@ -24,8 +24,8 @@ socket_mode = 0o666
 # Optional: chown the socket to this uid (control-path hardening). Unset by
 # default, so the socket keeps the daemon's ownership. It has a SECOND role: this
 # uid is also authorised to send control requests (Control(..)) — it is the
-# operator's explicit statement about who owns the control endpoint. When you
-# enable acting below, set this to the logged-in user's uid AND set
+# operator's explicit statement about who owns the control endpoint. To harden
+# the control path, set this to the logged-in user's uid AND set
 # socket_mode = 0o600 so only that owner can even connect — a world-connectable
 # read socket should not also invite action attempts.
 # socket_owner_uid = 501
@@ -106,19 +106,16 @@ ring_mb = 8
 # BPF filter — keep it cheap: link-layer control traffic only.
 filter = "arp or icmp or udp port 67 or udp port 68 or ether broadcast"
 
-# The control (acting) path: manual recovery actions net-observerd runs as root
-# (currently `launchctl kickstart -k` on the sing-box service). DISABLED by
-# default — with acting off, every ACTING-CLASS control request (KickstartProxy)
-# is refused WITHOUT running anything, and acting NEVER happens automatically
-# (only on an explicit request from the cli `kickstart` subcommand). This switch
-# does not gate benign self-control: SetObserving, which only pauses/resumes this
-# daemon's own collection, works regardless — though it, like every control
-# request, still requires an authorised peer (see socket_owner_uid /
-# control_uids above).
+# Parameters of the manual actions net-observerd runs as root on an explicit
+# control request (currently `launchctl kickstart -k` on the sing-box service,
+# from the cli `kickstart` subcommand). This section gates nothing: config may
+# switch off what the daemon does by itself, never a command the operator sends
+# by hand — the invocation is the sanction. What every control request does
+# need is an authorised peer (see socket_owner_uid / control_uids above), and
+# acting NEVER happens automatically. A legacy `enabled` key here is ignored.
 #
-# Before enabling, harden the socket: set socket_mode = 0o600 and socket_owner_uid
-# above so only the owner can even connect to the control endpoint.
+# Harden the socket: set socket_mode = 0o600 and socket_owner_uid above so only
+# the owner can even connect to the control endpoint.
 # [acting]
-# enabled = false
 # launchctl service target restarted by KickstartProxy.
 # singbox_service = "system/sing-box"

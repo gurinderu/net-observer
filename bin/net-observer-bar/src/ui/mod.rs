@@ -30,9 +30,10 @@
 //! the outcome with [`Glance::apply_toggle_result`]. The socket round-trips never
 //! run on the gpui main thread, so a daemon that accepts but does not answer cannot
 //! park the bar. This is benign **self-control** — it pauses/resumes the observer's
-//! OWN collection only; it never touches the proxy or the network and is not gated
-//! by `acting.enabled`. While paused the header shows a muted "paused" state and the
-//! daemon stays alive so the switch can turn collection back on.
+//! OWN collection only; it never touches the proxy or the network, and like every
+//! control command the daemon checks only the peer uid before running it. While
+//! paused the header shows a muted "paused" state and the daemon stays alive so
+//! the switch can turn collection back on.
 
 mod control;
 mod model;

@@ -374,10 +374,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     // The observer's OWN collection on/off flag (self-control). `true` (default)
     // = collecting; `false` = paused. The interval + event collectors check it
     // each cycle (skip the probe / drop the batch while paused); the
-    // `SetObserving` control command flips it. Benign self-control — NOT gated by
-    // `acting.enabled` and it never touches sing-box or the network. While paused
-    // the daemon stays alive and the socket keeps serving, so the switch can turn
-    // collection back on. `StatusSnapshot::default()` already reports
+    // `SetObserving` control command flips it. Benign self-control — it never
+    // touches sing-box or the network. While paused the daemon stays alive and
+    // the socket keeps serving, so the switch can turn collection back on.
+    // `StatusSnapshot::default()` already reports
     // `observing: true`; the control handler mirrors every change into it.
     //
     // It always starts `true`, and is deliberately never loaded from disk (see
@@ -1333,12 +1333,10 @@ fn build_api_server(
     let socket_path = cfg.socket_path.clone();
     let socket_mode = cfg.socket_mode;
     let socket_owner_uid = cfg.socket_owner_uid;
-    // Thread the acting config through so the control path is gated by
-    // `acting.enabled` (off by default) in one place: `api::control_response`.
-    // The `observing` flag is threaded separately: `SetObserving` is benign
-    // self-control and must NOT be gated by that switch.
+    // Parameters of the manual actions, not a gate: config never stands between
+    // an authorised operator's command and its execution (realm net-observer,
+    // node #91).
     let acting = api::ActingConfig {
-        enabled: cfg.acting.enabled,
         singbox_service: cfg.acting.singbox_service.clone(),
     };
     api::ApiServer {
@@ -1355,8 +1353,8 @@ fn build_api_server(
         control_refusals: api::RateLimitedLog::new(api::REFUSAL_LOG_INTERVAL),
         sub_refusals: api::RateLimitedLog::new(api::REFUSAL_LOG_INTERVAL),
         acting,
-        // Who may send a `Request::Control` at all — orthogonal to
-        // `acting.enabled`, which only gates the acting *class* of commands.
+        // Who may send a `Request::Control` at all — the one gate on the
+        // control path.
         policy: api::ControlPolicy::from_config(cfg.socket_owner_uid, cfg.control_uids.clone()),
         observing: observing.clone(),
         // Shared, never fresh — for `quiet` the same reason as `observing`, and
@@ -1391,12 +1389,6 @@ fn build_api_server(
             // read: a pause landing mid-scan must reach the in-flight read.
             observing.clone(),
         )) as Arc<dyn AirScanner>),
-        // The config permission ceiling for the active scan.
-        scan_permission: net_observer_ipc::ScanOptions {
-            ports: cfg.collectors.neighbors.scan.ports,
-            banners: cfg.collectors.neighbors.scan.banners,
-            cve: cfg.collectors.neighbors.scan.cve,
-        },
         // Where the `cve` rung loads its snapshot; the availability check in
         // `scan_now` decides whether the rung is effective this run.
         scan_cve_snapshot: cfg
@@ -1822,8 +1814,6 @@ mod tests {
             control_uids: vec![7, 9],
             blob_dir: "/tmp/net-observerd-wiring-test-blobs".into(),
             acting: config::ActingCfg {
-                // Also NOT the shipped default (`false`), for the same reason.
-                enabled: true,
                 singbox_service: "system/wiring-test".into(),
             },
             ..Config::default()
@@ -1999,10 +1989,6 @@ mod tests {
         assert_eq!(
             srv.socket_owner_uid, cfg.socket_owner_uid,
             "the socket must be chowned to the configured owner"
-        );
-        assert_eq!(
-            srv.acting.enabled, cfg.acting.enabled,
-            "the acting gate must come from config, not from a literal"
         );
         assert_eq!(
             srv.acting.singbox_service, cfg.acting.singbox_service,

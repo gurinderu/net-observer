@@ -285,8 +285,9 @@ impl Render for MenuView {
                 spawn_control_on(&model, cx, quiet_round_trip);
             },
         );
-        // Scan is the only entry here that addresses other machines: acting-class,
-        // refused by default, and warn-coloured for the same reason as quiet.
+        // Scan is the only entry here that addresses other machines — it runs
+        // when asked, no config switch gates it — and is warn-coloured for the
+        // same reason as quiet.
         let scan = self.entry("scan", "Scan", theme.warn, theme, cx, |this, cx| {
             let model = this.model.clone();
             spawn_control_on(&model, cx, scan_round_trip_base);
