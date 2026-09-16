@@ -6,10 +6,10 @@
 //! (and Linux). It reads the kernel's exponentially-weighted run-queue average,
 //! the starvation discriminator (`load` in the tens while `tun=000`). Disk and
 //! swap are the two resource columns the retired shell oracle carried and the
-//! daemon lacked (realm net-observer, node #114): a store write that fails for
-//! want of space is logged as a gap, and the volume's usage is what lets the
-//! record name that cause. Every unobtainable value degrades to `None`, never a
-//! panic — "absence is a signal".
+//! daemon lacked, read the way decided at (realm net-observer, node #123): a
+//! store write that fails for want of space is logged as a gap, and the
+//! volume's usage is what lets the record name that cause. Every unobtainable
+//! value degrades to `None`, never a panic — "absence is a signal".
 
 use std::ffi::CString;
 use std::mem::{MaybeUninit, size_of};
@@ -107,9 +107,10 @@ fn volume_usage(path: &Path) -> Option<(f64, u64)> {
 /// Pure: a filesystem's block counts → `(used fraction 0–100, free MiB)`.
 ///
 /// Both figures are `df`'s: used is `f_blocks - f_bfree`, the denominator is
-/// `used + f_bavail` (the blocks a writer can actually take, not the raw
-/// total), so 100 means the next write fails even where `f_bfree` still shows
-/// a reserve; free is `f_bavail` in whole MiB, what `df -m` prints as
+/// `used + f_bavail` (the blocks an unprivileged writer can take, not the raw
+/// total), so 100 means an unprivileged writer gets ENOSPC; root — this
+/// daemon — still has the `f_bfree - f_bavail` reserve, so rows can keep
+/// landing past 100. Free is `f_bavail` in whole MiB, what `df -m` prints as
 /// `Avail`. `None` for a filesystem reporting no usable blocks at all, or
 /// inconsistent counts (more free than total) — never a made-up figure.
 fn usage_from_blocks(bsize: u64, blocks: u64, bfree: u64, bavail: u64) -> Option<(f64, u64)> {
@@ -144,8 +145,19 @@ fn swap_usage() -> Option<libc::xsw_usage> {
             0,
         )
     };
-    if rc != 0 || size != size_of::<libc::xsw_usage>() {
-        tracing::debug!(rc, size, errno = ?std::io::Error::last_os_error(), "sysctlbyname vm.swapusage failed");
+    if rc != 0 {
+        tracing::debug!(errno = ?std::io::Error::last_os_error(), "sysctlbyname vm.swapusage failed");
+        return None;
+    }
+    let expected = size_of::<libc::xsw_usage>();
+    if size != expected {
+        // The call succeeded, so errno says nothing here: the two sizes are
+        // the whole finding.
+        tracing::debug!(
+            written = size,
+            expected,
+            "sysctlbyname vm.swapusage filled a different size than libc's xsw_usage"
+        );
         return None;
     }
     // SAFETY: `rc == 0` and the kernel reported writing exactly the struct's

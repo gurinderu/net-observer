@@ -9,7 +9,8 @@ use collector_core::Readiness;
 /// Host resource facts gathered from the OS: the 1/5/15-minute load averages
 /// (the sample's anchor) plus the two discriminators the retired shell oracle
 /// carried and the daemon lacked — disk usage of the volume holding the
-/// record and swap in use (realm net-observer, node #114).
+/// record and swap in use — measured as decided at (realm net-observer,
+/// node #123).
 ///
 /// The methods are native `async fn` (no `async-trait` macro) so real adapters
 /// can use async-native I/O; the macOS `getloadavg` reader awaits an instant

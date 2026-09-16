@@ -122,9 +122,10 @@ pub struct RouteEvent {
 /// Host resource sample: load averages (1/5/15-min) — the starvation
 /// discriminator — plus the usage of the volume holding the record and the
 /// swap in use, the ENOSPC and memory-pressure discriminators the retired
-/// shell oracle carried (realm net-observer, node #114). A store write that
-/// fails for want of space is logged as a gap; this is the row that lets the
-/// record name the cause.
+/// shell oracle carried (the oracle backlog: realm net-observer, node #114),
+/// measured as decided at node #123. A store write that fails for want of
+/// space is logged as a gap; this is the row that lets the record name the
+/// cause.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostSample {
     pub ts_us: i64,
@@ -133,16 +134,16 @@ pub struct HostSample {
     pub load15: f64,
     /// Used fraction of the filesystem holding the record (the DB file's
     /// volume), 0–100, as `df` computes capacity. `None` = not measured —
-    /// never a fabricated value (realm net-observer, node #114).
+    /// never a fabricated value (realm net-observer, node #123).
     /// `serde(default)` so a pre-field daemon's samples still decode.
     #[serde(default)]
     pub disk_used_pct: Option<f64>,
-    /// Free megabytes on that same filesystem, available to a writer. `None`
+    /// Free MiB on that same filesystem, available to a writer. `None`
     /// = not measured; `Some` exactly when `disk_used_pct` is.
     #[serde(default)]
     pub disk_free_mb: Option<u64>,
-    /// Swap in use, megabytes. `None` = not measured (realm net-observer,
-    /// node #114). `serde(default)` as above.
+    /// Swap in use, MiB. `None` = not measured (realm net-observer,
+    /// node #123). `serde(default)` as above.
     #[serde(default)]
     pub swap_used_mb: Option<u64>,
 }

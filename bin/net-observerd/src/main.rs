@@ -507,7 +507,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     if cfg.collectors.host.enabled {
         // The record's volume is the filesystem holding the DB file: its
         // directory, created above before the store was opened, so it exists
-        // from the first tick (realm net-observer, node #114).
+        // from the first tick (realm net-observer, node #123).
         let record_volume = Path::new(&cfg.db_path)
             .parent()
             .filter(|p| !p.as_os_str().is_empty())

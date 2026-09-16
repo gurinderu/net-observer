@@ -54,11 +54,11 @@ CREATE TABLE IF NOT EXISTS host_sample (
   ts_us BIGINT, load1 DOUBLE, load5 DOUBLE, load15 DOUBLE);
 -- The usage of the volume holding this very file (used fraction 0-100 and
 -- free MiB, as `df` computes them) and the swap in use, MiB: the ENOSPC and
--- memory-pressure discriminators the retired shell oracle carried (realm
--- net-observer, node #114). A store write that fails for want of space is
--- logged as a gap; these columns let the record name the cause. NULL = not
--- measured, never a zero. Added after the host table first shipped — same
--- migration treatment as link_sample above.
+-- memory-pressure discriminators the retired shell oracle carried, measured
+-- as decided at (realm net-observer, node #123). A store write that fails for
+-- want of space is logged as a gap; these columns let the record name the
+-- cause. NULL = not measured, never a zero. Added after the host table first
+-- shipped — same migration treatment as link_sample above.
 ALTER TABLE host_sample ADD COLUMN IF NOT EXISTS disk_used_pct DOUBLE;
 ALTER TABLE host_sample ADD COLUMN IF NOT EXISTS disk_free_mb UBIGINT;
 ALTER TABLE host_sample ADD COLUMN IF NOT EXISTS swap_used_mb UBIGINT;
