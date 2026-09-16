@@ -244,15 +244,7 @@ impl Condition for GwChange {
             .skip(1)
             .take_while(|l| l.gw == GwVerdict::Skip)
             .count();
-        let (prev, provenance) = match recent.iter().skip(1).find(|l| l.gw != GwVerdict::Skip) {
-            Some(prev) => (*prev, LinkProvenance::Contiguous),
-            // Nothing comparable in the window: fall back to the basis carried
-            // across a pause, which must itself be a measurement.
-            None => match w.prev_link_with_provenance()? {
-                (prev, _) if prev.gw == GwVerdict::Skip => return None,
-                (prev, provenance) => (prev, provenance),
-            },
-        };
+        let (prev, provenance) = measured_predecessor(w, &recent, |l| l.gw != GwVerdict::Skip)?;
         // A change measured against the basis carried across a pause is real —
         // the oracle freezes on ANY gateway change — but it is not two
         // consecutive ticks, and the incident must not read as though it were.
@@ -292,15 +284,7 @@ impl Condition for GwMacChange {
         let comparable = |l: &LinkSample| l.dhcp_router.is_some() && l.gw_arp_mac.is_some();
         let recent = w.recent_link(GW_CHANGE_SCAN);
         let unreadable = recent.iter().skip(1).take_while(|l| !comparable(l)).count();
-        let (prev, provenance) = match recent.iter().skip(1).find(|l| comparable(l)) {
-            Some(prev) => (*prev, LinkProvenance::Contiguous),
-            // Nothing comparable in the window: fall back to the basis carried
-            // across a pause, which must itself carry both values.
-            None => match w.prev_link_with_provenance()? {
-                (prev, _) if !comparable(prev) => return None,
-                (prev, provenance) => (prev, provenance),
-            },
-        };
+        let (prev, provenance) = measured_predecessor(w, &recent, comparable)?;
         let prev_router = prev.dhcp_router.as_deref()?;
         let prev_mac = prev.gw_arp_mac.as_deref()?;
         if last_router != prev_router {
@@ -326,9 +310,11 @@ impl Condition for GwMacChange {
 /// holds, with the provenance of the answer: found inside `recent` (newest
 /// first, the newest itself at index 0) as a contiguous predecessor, else the
 /// basis carried across a pause — which must itself be measured. `None` when
-/// nothing measured precedes the newest sample. The predecessor scan
-/// `gw-change` and `gw-mac-change` each spell out inline, for a signature
-/// that needs it twice.
+/// nothing measured precedes the newest sample. The one predecessor scan of
+/// the change signatures (`gw-change`, `gw-mac-change`, `roam`): reaching
+/// back past unmeasured ticks is how a change that quiet mode, an empty ARP
+/// cache or an unreadable identity straddled is still seen, and falling back
+/// to the carried basis is how a change DURING a pause is seen at resume.
 fn measured_predecessor<'w>(
     w: &'w RecentWindow,
     recent: &[&'w LinkSample],
