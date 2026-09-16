@@ -524,8 +524,8 @@ mod tests {
 
     /// Quiet must suppress the neighbor pings too: they are addressed packets,
     /// and pinging the segment during an incident is exactly what a network
-    /// admin sees. Dies under gating on the placeholder ping outcome (which
-    /// reads unreachable under quiet) instead of on the quiet flag.
+    /// admin sees. Dies under gating the neighbour probe on anything but a
+    /// SENT echo that failed — a withheld echo is `None`, never "unreachable".
     #[tokio::test]
     async fn quiet_suppresses_the_neighbor_probes_too() {
         let ping = CountingPing {
