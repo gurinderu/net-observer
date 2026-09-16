@@ -1519,9 +1519,11 @@ fn offline_note(reason: &str, theme: Theme) -> impl IntoElement + use<> {
 /// The root view of the **network-map window**. Holds a handle to the shared
 /// [`Glance`] and re-renders whenever it changes — the same live-update path the
 /// panel uses (the menu-bar refresh timer writes the snapshot every ~3s; see
-/// [`crate::menubar`]), so this window carries no socket and no subscription of its
-/// own. It only reshapes `snapshot.neighbors` into the star (see
-/// [`network_map_section`]).
+/// [`crate::menubar`]). The star and the list are reshaped from
+/// `snapshot.neighbors` on that model (see [`network_map_section`]); the
+/// findings are the one thing this window asks the daemon for itself — once
+/// per open and once per completed rung ([`MapView::spawn_findings_fetch`]),
+/// never on a timer. It still holds no subscription of its own.
 pub(crate) struct MapView {
     model: Entity<Glance>,
     /// Which reading is on screen. The star is the shape of the segment; the
@@ -1532,7 +1534,10 @@ pub(crate) struct MapView {
     /// completion hook ([`MapView::scan_finished`]). While raised the rungs are
     /// inert and the control line says `scanning…`: a scan takes seconds by
     /// design, and a second click in that window would queue a second sweep
-    /// behind the first.
+    /// behind the first. View-local, so it knows only this window's rungs: a
+    /// base scan started from the menu's Scan neither greys them nor refreshes
+    /// the findings, and a rung pressed during it queues a second sweep at the
+    /// daemon.
     scan_in_flight: bool,
     /// The daemon's last answer to `DiagnosticQuery::Vulns`: `None` until the
     /// first read returns, then the table or the daemon's words for why there is

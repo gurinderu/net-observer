@@ -292,6 +292,12 @@ const RUNG_CVE: ScanOptions = ScanOptions {
     banners: true,
     cve: true,
 };
+// The ladder's shape is pinned where it is declared: a rung that dropped a
+// lower one would ask for what the daemon cannot give, and that is a build
+// error here rather than a dropped rung at the daemon.
+const _: () = assert!(RUNG_PORTS.ports && !RUNG_PORTS.banners && !RUNG_PORTS.cve);
+const _: () = assert!(RUNG_BANNERS.ports && RUNG_BANNERS.banners && !RUNG_BANNERS.cve);
+const _: () = assert!(RUNG_CVE.ports && RUNG_CVE.banners && RUNG_CVE.cve);
 
 /// The Ports rung: the base scan plus a TCP port scan of the neighbours it found.
 /// Same shape as [`scan_round_trip_base`], for the same reason.
@@ -526,16 +532,13 @@ mod tests {
         );
     }
 
-    /// Each rung carries every rung beneath it — the daemon drops `banners`
-    /// without `ports` and `cve` without `banners`, so a rung missing a lower
-    /// one would ask for what it cannot get.
+    /// The bottom rung is the base scan and nothing more: `ScanOptions::default()`
+    /// names no rung. The shape of the three rungs above it is pinned at compile
+    /// time beside their declaration.
     #[test]
-    fn each_rung_carries_the_rungs_beneath_it() {
+    fn the_base_rung_names_no_rung() {
         let base = ScanOptions::default();
         assert!(!base.ports && !base.banners && !base.cve);
-        assert!(RUNG_PORTS.ports && !RUNG_PORTS.banners && !RUNG_PORTS.cve);
-        assert!(RUNG_BANNERS.ports && RUNG_BANNERS.banners && !RUNG_BANNERS.cve);
-        assert!(RUNG_CVE.ports && RUNG_CVE.banners && RUNG_CVE.cve);
     }
 
     /// Every non-table outcome becomes a readable line carrying the daemon's own
