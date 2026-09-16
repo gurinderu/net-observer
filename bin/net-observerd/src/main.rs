@@ -2376,15 +2376,20 @@ mod tests {
 
     /// The `established-stall` rule is installed with the production handlers:
     /// a tick whose held tunnel stream still carries records nothing, one
-    /// whose stream died (fresh probes fine) records the incident. Nothing
-    /// else in the rule set can fire on this stream: the tun code is healthy
-    /// (no wedge/starvation), the underlay TCP is Ok (no endpoint-block), and
-    /// there is no link, DNS or neighbors sample.
+    /// whose stream died (fresh probes fine) records the incident. The rule
+    /// rides inside `Gated { require_direct: true, .. }`, so the stream leads
+    /// with a healthy link sample — a destination-fault verdict without a
+    /// measured live uplink is exactly the no-uplink false positive the gate
+    /// exists to stop. Nothing else in the rule set can fire on this stream:
+    /// the gateway is steadily OK with no predecessor to differ from, the tun
+    /// code is healthy (no wedge/starvation), the underlay TCP is Ok (no
+    /// endpoint-block), and there is no DNS or neighbors sample.
     #[test]
     fn build_engine_registers_the_established_stall_rule() {
         let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
         let mut w = RecentWindow::new(8);
 
+        feed(&mut fx.engine, &mut w, link(0, GwVerdict::Ok));
         feed(&mut fx.engine, &mut w, proxy_with_streams(1, true));
         assert_eq!(
             incidents_for(&fx.store, "established-stall"),

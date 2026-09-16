@@ -911,7 +911,10 @@ mod tests {
             "no host sample = no starvation evidence, the gate stays open"
         );
         w.push(host(1, 42.0));
-        assert!(c.eval(&w).is_none(), "probes under load measure the run queue");
+        assert!(
+            c.eval(&w).is_none(),
+            "probes under load measure the run queue"
+        );
         w.push(host(2, 3.0));
         assert!(c.eval(&w).is_some());
     }
