@@ -1,5 +1,5 @@
 use collector_core::PingOutcome;
-use types::{GwVerdict, LinkMedium, LinkSample, TcpVerdict};
+use types::{GwVerdict, LinkMedium, LinkSample, TcpVerdict, mac_is_private};
 
 use crate::facts::LinkSummary;
 
@@ -26,7 +26,9 @@ use crate::facts::LinkSummary;
 /// equally untouched. `summary` is the one `ipconfig getsummary` parse for
 /// this tick — the AP's BSSID and the current DHCP lease's start/length — and
 /// `if_mac` the interface's own (rotating) MAC, passed through as read,
-/// `None` meaning not determinable, never a fabricated value (realm
+/// `None` meaning not determinable, never a fabricated value. `if_mac_private`
+/// is derived here, from `if_mac`'s U/L bit ([`mac_is_private`]), rather than
+/// carried through a probe: it is a pure fold of an already-read fact (realm
 /// net-observer, node #93 item 1; node #109 item 1).
 #[allow(clippy::too_many_arguments)]
 pub fn build_link_sample(
@@ -75,8 +77,7 @@ pub fn build_link_sample(
         lease_start_us,
         lease_secs,
     } = summary;
-    // Not yet classified: the U/L-bit fold lands in a follow-up commit.
-    let if_mac_private = None;
+    let if_mac_private = if_mac.as_deref().and_then(mac_is_private);
     LinkSample {
         ts_us,
         gw,
@@ -272,6 +273,8 @@ mod tests {
         assert_eq!(s.medium, Some(LinkMedium::Wifi));
         assert_eq!(s.lease_start_us, Some(1_758_066_844_000_000));
         assert_eq!(s.lease_secs, Some(86400));
+        // f0:.. has the U/L bit clear: the hardware-burned address.
+        assert_eq!(s.if_mac_private, Some(false));
         assert!(s.wifi_capture_present);
     }
 
@@ -334,5 +337,39 @@ mod tests {
         );
         assert_eq!(s.lease_start_us, Some(1_758_066_844_000_000));
         assert_eq!(s.lease_secs, Some(3600));
+    }
+
+    /// `if_mac_private` is folded from `if_mac`'s U/L bit: `ca:...` (a
+    /// Private Wi-Fi Address) reads private, `3c:...` (a real OUI) does not,
+    /// and no `if_mac` at all leaves it `None` — never a guess.
+    #[test]
+    fn if_mac_private_is_derived_from_the_ul_bit() {
+        for (mac, expected) in [
+            (Some("ca:8f:38:b3:12:d3"), Some(true)),
+            (Some("3c:22:fb:12:34:56"), Some(false)),
+            (None, None),
+        ] {
+            let s = build_link_sample(
+                10,
+                outcome(true),
+                outcome(true),
+                false,
+                Some("10.20.0.1".into()),
+                (None, None),
+                None,
+                (None, None),
+                None,
+                None,
+                None,
+                LinkSummary::default(),
+                mac.map(str::to_string),
+                None,
+                false,
+            );
+            assert_eq!(
+                s.if_mac_private, expected,
+                "if_mac {mac:?} must classify as {expected:?}"
+            );
+        }
     }
 }

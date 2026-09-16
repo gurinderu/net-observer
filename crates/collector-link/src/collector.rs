@@ -455,7 +455,8 @@ mod tests {
     }
 
     /// The identity pair the facts port reads — the AP's BSSID and the
-    /// interface's own MAC — lands in the sample every tick, untouched.
+    /// interface's own MAC — lands in the sample every tick, untouched, and
+    /// `if_mac_private` is folded from that MAC's own U/L bit.
     #[tokio::test]
     async fn the_link_identity_lands_in_the_sample() {
         let c = collector(true);
@@ -465,6 +466,8 @@ mod tests {
         };
         assert_eq!(l.bssid.as_deref(), Some("3c:22:fb:12:34:56"));
         assert_eq!(l.if_mac.as_deref(), Some("f0:18:98:0a:0b:0c"));
+        // f0:.. is a real OUI: the hardware-burned address, not private.
+        assert_eq!(l.if_mac_private, Some(false));
     }
 
     /// The lease pair the ONE `summary` call carries alongside the BSSID
