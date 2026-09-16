@@ -237,7 +237,12 @@ Collectors and their probe ports are **native `async fn`** (Rust ≥ 1.75), not 
   What a resume does **not** do is reset the firing budget: `last_fire_us` survives
   it, so each trigger still fires at most once per `backoff_us` and a toggled
   switch cannot storm the incident log. The `observing_edge` rows bound the gap
-  between the two records.
+  between the two records. Before either of those two steps, `TriggerEngine::close_all`
+  closes whatever incident the **previous** session left open, at the `ts_us` of
+  the edge that ended it — the pause's own, or the tier switch's, carried
+  forward in `session_end_us` — never at the first post-edge sample's, which
+  would misattribute the unobserved gap to it; so no `incident` row is ever
+  left open across the bracket.
 - **Exactly one thing survives that clear: the gateway-CHANGE BASIS.**
   `clear_for_resume` carries the newest `LinkSample` forward, reachable **only**
   through `RecentWindow::prev_link` / `prev_link_with_provenance` — never through
