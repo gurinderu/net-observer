@@ -74,9 +74,9 @@ pub enum Health {
 }
 
 /// Classify a [`StatusSnapshot`] into a [`Health`]: [`Health::NoData`] when there
-/// is no link *and* no proxy tick (and when the gateway verdict is `SKIP` — quiet
-/// mode — while the tun is healthy: nothing was measured at the gateway, so there
-/// is no verdict to give), [`Health::Ok`] when the gateway verdict is
+/// is no link *and* no proxy tick (and when the gateway verdict is `SKIP` — the
+/// passive tier — while the tun is healthy: nothing was measured at the gateway,
+/// so there is no verdict to give), [`Health::Ok`] when the gateway verdict is
 /// `OK` *and* the tun probe returned HTTP 204 (the healthy reachability code),
 /// and [`Health::Bad`] otherwise (gw or tun bad / degraded — e.g. tun `0` =
 /// wedge). Pure over its input, so it is unit-tested without a socket or a GUI.
@@ -84,7 +84,7 @@ pub fn health(snap: &StatusSnapshot) -> Health {
     if snap.link.is_none() && snap.proxy.is_none() {
         return Health::NoData;
     }
-    // A `SKIP` gateway is quiet mode: the echo was deliberately not sent, so
+    // A `SKIP` gateway is the passive tier: the echo was deliberately not sent, so
     // there is no gateway verdict to judge. Calling that red would be a false
     // alarm about the network and calling it green would be a claim we did not
     // measure — so unless the tun is independently bad, the dot goes to
@@ -210,23 +210,21 @@ mod tests {
         assert_eq!(status_glyph(&snap), "🟢 gw:OK tun:204");
     }
 
-    /// Quiet mode (`gw = SKIP`) is not a fault: with the tun healthy the dot is
-    /// the "no verdict" one, not red — and not green either, since nothing at the
-    /// gateway was measured.
+    /// The passive tier (`gw = SKIP`) is not a fault: with the tun healthy the
+    /// dot is the "no verdict" one, not red — and not green either, since
+    /// nothing at the gateway was measured.
     #[test]
     fn skip_gateway_is_no_verdict_not_a_fault() {
-        let quiet = StatusSnapshot {
+        let passive = StatusSnapshot {
             link: Some(link(GwVerdict::Skip)),
             proxy: Some(proxy(Some(204), Some("auto"))),
-            quiet: true,
             ..Default::default()
         };
-        assert_eq!(health(&quiet), Health::NoData);
-        // A wedged tun is still a fault while quiet.
+        assert_eq!(health(&passive), Health::NoData);
+        // A wedged tun is still a fault while the gateway is withheld.
         let wedged = StatusSnapshot {
             link: Some(link(GwVerdict::Skip)),
             proxy: Some(proxy(Some(0), None)),
-            quiet: true,
             ..Default::default()
         };
         assert_eq!(health(&wedged), Health::Bad);

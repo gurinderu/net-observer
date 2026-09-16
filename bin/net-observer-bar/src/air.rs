@@ -1423,8 +1423,8 @@ impl AirView {
             .spawn(move || {
                 let state = match net_observer_ipc::control(&sock, ControlCmd::ScanAir) {
                     // The daemon's own words, both ways. A refusal here is a
-                    // sentence it wrote — "quiet is on", "try again in 9s" — and
-                    // paraphrasing it would lose the reason.
+                    // sentence it wrote — "observation is paused", "try again in
+                    // 9s" — and paraphrasing it would lose the reason.
                     Ok(ControlOutcome::Ran(r)) if r.ok => ScanState::Scanning,
                     Ok(ControlOutcome::Ran(r)) => ScanState::Refused(r.message.into()),
                     Ok(ControlOutcome::Unsupported(m)) => ScanState::Unsupported(m.into()),
@@ -2618,7 +2618,9 @@ mod tests {
     #[test]
     fn a_settled_scan_state_is_never_expired() {
         let mut feed = AirFeed::default();
-        feed.apply(BridgeMsg::Scan(ScanState::Refused("quiet is on".into())));
+        feed.apply(BridgeMsg::Scan(ScanState::Refused(
+            "observation is paused".into(),
+        )));
         assert!(feed.scan_deadline.is_none());
         assert!(!feed.expire_scan(Instant::now() + SCAN_BUSY_TIMEOUT * 10));
         assert!(matches!(feed.scan, ScanState::Refused(_)));

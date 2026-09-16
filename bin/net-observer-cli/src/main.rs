@@ -165,8 +165,8 @@ enum Command {
     /// — it addresses every host of the subnet. Nothing in the daemon's config
     /// has to permit it: the command is the sanction, and every run leaves a
     /// `neighbor_scan` row saying what was probed. The daemon refuses it with a
-    /// reason when it cannot run (paused, quiet, no IPv4 subnet, no scanner on
-    /// this host) or when the peer is not authorised. Exits non-zero if the
+    /// reason when it cannot run (paused, no IPv4 subnet, no scanner on this
+    /// host) or when the peer is not authorised. Exits non-zero if the
     /// scan was refused/failed or the daemon is unreachable.
     ScanNeighbors {
         /// Also TCP-connect-scan discovered neighbours' common ports. Off unless
@@ -1383,7 +1383,6 @@ mod tests {
                 incident("i2", "gw-drop", 60, Some(70)),
             ],
             observing,
-            quiet: false,
             probing: ProbingTier::Active,
             capabilities: None,
         }

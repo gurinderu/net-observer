@@ -88,27 +88,15 @@ pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, GlanceError> {
 /// connection-refused (daemon down) or a protocol error maps to `Err(String)` so
 /// the panel can surface it as a transient line instead of crashing — never a
 /// panic.
-/// Ask `net-observerd` to enter (`true`) or leave (`false`) **quiet** mode over
-/// the local socket (`Control(SetQuiet(on))`).
-///
-/// Quiet is not a pause: the daemon keeps collecting and keeps emitting one link
-/// sample per tick — it just addresses no packet at the gateway, so the gateway
-/// verdict reads `SKIP`. Benign **self-control**; the daemon checks only the
-/// peer uid before running it.
-/// Transport failures map to `Err(String)` for the panel to surface, never a panic.
-pub fn send_set_quiet(socket_path: &str, on: bool) -> Result<ControlResult, String> {
-    control_query(socket_path, ControlCmd::SetQuiet(on))
-}
-
 /// Ask `net-observerd` to switch its probing tier over the local socket
 /// (`Control(SetProbing(tier))`).
 ///
 /// `Passive` puts nothing on the wire — every link, proxy and dns probe is
 /// withheld and lands as `SKIP`, the held reference streams are closed;
-/// `Active` runs every probe. Benign **self-control** like quiet, but unlike
-/// quiet every real switch is bracketed by a durable `probing_edge` row. The
-/// daemon checks only the peer uid before running it. Transport failures map to
-/// `Err(String)` for the panel to surface, never a panic.
+/// `Active` runs every probe. Benign **self-control**, and every real switch
+/// is bracketed by a durable `probing_edge` row. The daemon checks only the
+/// peer uid before running it. Transport failures map to `Err(String)` for
+/// the panel to surface, never a panic.
 pub fn send_set_probing(socket_path: &str, tier: ProbingTier) -> Result<ControlResult, String> {
     control_query(socket_path, ControlCmd::SetProbing(tier))
 }
@@ -128,7 +116,7 @@ pub fn send_freeze_pcap(socket_path: &str) -> Result<ControlResult, String> {
 /// The one control action in the panel that puts packets on the wire towards
 /// machines that are not this one. The daemon runs it when asked — the press is
 /// the sanction, no config switch gates it (realm net-observer, node #91) — and
-/// answers `ok: false` with a reason when it cannot (paused, quiet, no subnet)
+/// answers `ok: false` with a reason when it cannot (paused, no subnet)
 /// or when the peer uid is not authorised, shown like any other control outcome.
 pub fn send_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult, String> {
     control_query(socket_path, ControlCmd::ScanNeighbors(opts))
@@ -181,30 +169,12 @@ pub fn toggle_round_trip(
     (control, read_fresh(socket_path))
 }
 
-/// The blocking half of the quiet toggle, built exactly like
-/// [`toggle_round_trip`] and for the same reason: `SetQuiet(bool)` is absolute on
-/// the wire, so the target is derived from a freshly-read state rather than from a
-/// snapshot up to one refresh tick old. Never call it on the gpui main thread.
-pub fn quiet_round_trip(
-    socket_path: &str,
-) -> (
-    Result<ControlResult, String>,
-    Result<StatusSnapshot, GlanceError>,
-) {
-    let before = match read_fresh(socket_path) {
-        Ok(s) => s,
-        Err(e) => return (Err(e.to_string()), Err(e)),
-    };
-    let control = send_set_quiet(socket_path, !before.quiet);
-    (control, read_fresh(socket_path))
-}
-
 /// The blocking half of the probe toggle, built exactly like
-/// [`quiet_round_trip`] and for the same reason: `SetProbing(tier)` is absolute
-/// on the wire and a second controller exists (`net-observer-cli probe`), so
-/// the target tier is derived from a freshly-read state — the OTHER tier from
-/// the one the daemon holds now — rather than from a snapshot up to one
-/// refresh tick old. Never call it on the gpui main thread.
+/// [`toggle_round_trip`] and for the same reason: `SetProbing(tier)` is
+/// absolute on the wire and a second controller exists (`net-observer-cli
+/// probe`), so the target tier is derived from a freshly-read state — the
+/// OTHER tier from the one the daemon holds now — rather than from a
+/// snapshot up to one refresh tick old. Never call it on the gpui main thread.
 pub fn probing_round_trip(
     socket_path: &str,
 ) -> (

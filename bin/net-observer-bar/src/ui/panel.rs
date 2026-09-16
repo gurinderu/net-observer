@@ -180,15 +180,13 @@ fn header_row(
 
 /// The header's muted state label, or `None` while offline.
 ///
-/// Paused, passive and quiet are DIFFERENT states and must never be rendered
-/// as one: a paused daemon collects nothing; a passive daemon collects and
-/// records but puts nothing on the wire, every probe reading `SKIP`; a quiet
-/// daemon probes and withholds only the gateway echo. The stronger claim about
-/// what is being recorded wins the label — paused over the tier — and the
-/// tier is always named, because "passive" is the daemon's default and an
-/// operator reading the panel must see whether the wire is silent. Quiet is
-/// shown only inside the active tier, the one place it changes anything.
-/// Pure over its inputs, so the wording is a testable fact.
+/// Paused and passive are DIFFERENT states and must never be rendered as
+/// one: a paused daemon collects nothing; a passive daemon collects and
+/// records but puts nothing on the wire, every probe reading `SKIP`. The
+/// stronger claim about what is being recorded wins the label — paused over
+/// the tier — and the tier is always named, because "passive" is the
+/// daemon's default and an operator reading the panel must see whether the
+/// wire is silent. Pure over its inputs, so the wording is a testable fact.
 fn header_sub_label(online: bool, snapshot: &StatusSnapshot) -> Option<&'static str> {
     if !online {
         return None;
@@ -196,10 +194,9 @@ fn header_sub_label(online: bool, snapshot: &StatusSnapshot) -> Option<&'static 
     if !snapshot.observing {
         return Some("paused");
     }
-    Some(match (snapshot.probing, snapshot.quiet) {
-        (ProbingTier::Passive, _) => "passive",
-        (ProbingTier::Active, true) => "probing, quiet",
-        (ProbingTier::Active, false) => "probing",
+    Some(match snapshot.probing {
+        ProbingTier::Passive => "passive",
+        ProbingTier::Active => "probing",
     })
 }
 
@@ -753,8 +750,8 @@ fn tcp_verdict_color(v: types::TcpVerdict, theme: Theme) -> Rgba {
 }
 
 /// Semantic color for a [`types::GwVerdict`]. Exhaustive for the same reason as
-/// [`tcp_verdict_color`]: a probe that did not run (`SKIP`, quiet mode) reads as
-/// muted rather than as a failure.
+/// [`tcp_verdict_color`]: a probe that did not run (`SKIP`, the passive tier)
+/// reads as muted rather than as a failure.
 fn gw_verdict_color(v: types::GwVerdict, theme: Theme) -> Rgba {
     match v {
         types::GwVerdict::Ok => rgb(theme.ok),
@@ -781,41 +778,31 @@ fn freshness_line(snapshot: &StatusSnapshot, now_us: i64) -> String {
 mod tests {
     use super::*;
 
-    /// The four states the header can name, kept apart: offline says nothing,
-    /// paused outranks the tier, and the tier is named in both directions —
-    /// with quiet shown only where it changes anything (inside active).
+    /// The three states the header can name, kept apart: offline says
+    /// nothing, paused outranks the tier, and the tier is named in both
+    /// directions.
     #[test]
-    fn header_sub_label_keeps_paused_passive_and_quiet_apart() {
-        let snap = |observing: bool, probing: ProbingTier, quiet: bool| StatusSnapshot {
+    fn header_sub_label_keeps_paused_and_passive_apart() {
+        let snap = |observing: bool, probing: ProbingTier| StatusSnapshot {
             observing,
             probing,
-            quiet,
             ..StatusSnapshot::default()
         };
         assert_eq!(
-            header_sub_label(false, &snap(true, ProbingTier::Passive, false)),
+            header_sub_label(false, &snap(true, ProbingTier::Passive)),
             None
         );
         assert_eq!(
-            header_sub_label(true, &snap(false, ProbingTier::Active, true)),
+            header_sub_label(true, &snap(false, ProbingTier::Active)),
             Some("paused")
         );
         assert_eq!(
-            header_sub_label(true, &snap(true, ProbingTier::Passive, false)),
+            header_sub_label(true, &snap(true, ProbingTier::Passive)),
             Some("passive")
         );
         assert_eq!(
-            header_sub_label(true, &snap(true, ProbingTier::Passive, true)),
-            Some("passive"),
-            "quiet changes nothing under passive and must not be shown there"
-        );
-        assert_eq!(
-            header_sub_label(true, &snap(true, ProbingTier::Active, false)),
+            header_sub_label(true, &snap(true, ProbingTier::Active)),
             Some("probing")
-        );
-        assert_eq!(
-            header_sub_label(true, &snap(true, ProbingTier::Active, true)),
-            Some("probing, quiet")
         );
     }
 

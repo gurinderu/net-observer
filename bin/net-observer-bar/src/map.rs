@@ -271,8 +271,8 @@ fn ring_positions(n: usize, cx: f32, cy: f32, r: f32) -> Vec<(f32, f32)> {
 /// The gateway keeps the accent (it is also `NeighborRole::Gateway`, but the map
 /// decides the gateway from the raw key before a `MapNode` exists, so honour that
 /// flag first). Infra reads in `track_on` — a distinct active tint, deliberately
-/// NOT the `warn` amber (which means "something is wrong" on the quiet/offline
-/// chips), so network gear stands out as a role, not an alert; a host keeps the
+/// NOT the `warn` amber (which means "something is wrong" on the offline
+/// chip), so network gear stands out as a role, not an alert; a host keeps the
 /// primary ink; an unknown role (randomized MAC, or no OUI snapshot to reason
 /// from) is muted, reading as least load-bearing. The role is a HYPOTHESIS: a
 /// colour, never an asserted "SWITCH". (realm net-observer, nodes #33, #34, #36)
@@ -1415,7 +1415,7 @@ impl Render for MapView {
 /// ([`crate::ui::scan_round_trip_base`]) — a neighbour sweep addresses other
 /// machines, and the daemon runs it when asked: the click is the sanction, no
 /// config switch gates it (realm net-observer, node #91). When it cannot run
-/// (paused, quiet, no subnet) or the peer uid is not authorised it answers
+/// (paused, no subnet) or the peer uid is not authorised it answers
 /// `ok: false` with a reason, which lands in the line below the buttons as
 /// `failed: …`. There is no timer behind it: it fires on a click and only on a
 /// click. (v1 = observe, never act — that rule is about what the daemon does by
@@ -1482,8 +1482,8 @@ fn map_toolbar(
                 .child(rescan),
         )
         // The outcome of the last control action, shown verbatim: a refusal
-        // ("control refused: …", "quiet is on; …") must read as a refusal, never
-        // as a silent no-op.
+        // ("control refused: …", "observation is paused; …") must read as a
+        // refusal, never as a silent no-op.
         .when_some(control_msg, |d, msg| {
             let failed = msg.starts_with("failed");
             d.child(
