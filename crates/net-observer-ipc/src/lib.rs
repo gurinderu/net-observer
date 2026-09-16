@@ -235,8 +235,19 @@ pub enum DiagnosticQuery {
     /// live answer from silently plotting a different interval than the one
     /// asked for.
     GatewayRamp { drop_ts_us: i64, window_us: i64 },
-    /// Every observation gap the record contains (`observation_gaps_sql`).
+    /// Every observation gap the record contains (`observation_gaps_sql`) —
+    /// pauses only, in the shape this variant has had since it shipped. A
+    /// reader built before the probing tier asks for this and prints every
+    /// row as a pause, so the rows must stay pauses; the passive stretches
+    /// live under [`DiagnosticQuery::Silences`], a variant that reader has
+    /// never heard of.
     Gaps,
+    /// Every bracketed silence the record contains (`silences_sql`): the
+    /// pauses of `Gaps` plus the stretches the probing tier was passive for,
+    /// told apart by a `kind` column (`pause` | `passive`). A daemon built
+    /// before it answers `Unsupported`, and the CLI's `gaps` command then asks
+    /// `Gaps` instead, saying so. (realm net-observer, node #88)
+    Silences,
     /// The neighbours on every segment, or on `network` (`neighbors_sql`).
     Neighbors { network: Option<String> },
     /// The CVEs hypothesised for open ports, on every segment or on `network`
@@ -529,6 +540,16 @@ pub struct Ready {
     /// subscribe is also delivered as a `StreamFrame::Observing` (a redundant
     /// but consistent repeat) rather than lost.
     pub observing: bool,
+    /// The daemon's CURRENT probing tier — a state report, NOT a transition,
+    /// for the same reason as `observing`: a fresh subscriber must know at
+    /// once whether the `SKIP`s it is about to see are withheld probes, rather
+    /// than infer it from a run of them. Transitions arrive as
+    /// [`StreamFrame::Probing`].
+    ///
+    /// `serde(default)` = `Active`, matching a pre-tier daemon, which always
+    /// probed — the rationale [`StatusSnapshot::probing`] gives.
+    #[serde(default = "probing_default")]
+    pub probing: ProbingTier,
 }
 
 /// A hole in ONE subscriber's stream: `skipped` events were dropped because it
@@ -1438,6 +1459,7 @@ mod tests {
             ts_us: 1,
             kinds: Some(vec![EventKind::Air, EventKind::Wifi]),
             observing: true,
+            probing: ProbingTier::Active,
         }))
         .unwrap();
         match decode_handshake(&line) {
@@ -1640,6 +1662,7 @@ mod tests {
                 window_us: 120_000_000,
             },
             DiagnosticQuery::Gaps,
+            DiagnosticQuery::Silences,
             DiagnosticQuery::Neighbors { network: None },
             DiagnosticQuery::Neighbors {
                 network: Some("a4:83:e7:1b:2c:3d".into()),
@@ -2165,10 +2188,28 @@ mod tests {
             ts_us: 11,
             kinds: Some(vec![EventKind::Route, EventKind::Dns]),
             observing: false,
+            // `Passive`, not the serde default: proves the tier travelled
+            // rather than being reconstructed by the default.
+            probing: ProbingTier::Passive,
         };
         match round_trip_frame(&StreamFrame::Ready(ready.clone())) {
             StreamFrame::Ready(back) => assert_eq!(back, ready),
             other => panic!("unexpected frame variant: {other:?}"),
+        }
+    }
+
+    /// A pre-tier daemon's ack carries no `probing`; it decodes, and reads as
+    /// `Active` — that daemon probed — for the same reason a pre-tier
+    /// `StatusSnapshot` does.
+    #[test]
+    fn a_pre_tier_ready_ack_decodes_as_probing_active() {
+        let old = r#"{"Ready":{"ts_us":1,"kinds":null,"observing":true}}"#;
+        match serde_json::from_str::<StreamFrame>(old).unwrap() {
+            StreamFrame::Ready(r) => {
+                assert!(r.observing);
+                assert_eq!(r.probing, ProbingTier::Active);
+            }
+            other => panic!("expected Ready, got {other:?}"),
         }
     }
 
@@ -2338,6 +2379,7 @@ mod tests {
                 ts_us: 0,
                 kinds: None,
                 observing: true,
+                probing: ProbingTier::Active,
             }),
             StreamFrame::Gap(Gap {
                 ts_us: 0,
@@ -2394,6 +2436,7 @@ mod tests {
                 ts_us: 0,
                 kinds: Some(vec![EventKind::Route]),
                 observing: true,
+                probing: ProbingTier::Active,
             }),
             StreamFrame::Gap(Gap {
                 ts_us: 0,
@@ -2435,6 +2478,7 @@ mod tests {
             ts_us: 7,
             kinds: None,
             observing: false,
+            probing: ProbingTier::Active,
         });
         assert_eq!(ready.label(), "subscribed");
         assert_eq!(ready.detail(), "collection off; kinds: all");
@@ -2444,6 +2488,7 @@ mod tests {
             ts_us: 8,
             kinds: Some(vec![EventKind::Route, EventKind::Dns]),
             observing: true,
+            probing: ProbingTier::Active,
         });
         assert_eq!(ready_filtered.detail(), "collection on; kinds: route,dns");
 
@@ -2520,6 +2565,7 @@ mod tests {
                 ts_us: 0,
                 kinds: None,
                 observing: true,
+                probing: ProbingTier::Active,
             }
             .kinds_label(),
             "all"
@@ -2529,6 +2575,7 @@ mod tests {
                 ts_us: 0,
                 kinds: Some(vec![EventKind::Route, EventKind::Dns]),
                 observing: true,
+                probing: ProbingTier::Active,
             }
             .kinds_label(),
             "route,dns"

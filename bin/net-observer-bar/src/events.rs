@@ -948,6 +948,7 @@ mod tests {
             ts_us: 2,
             kinds: None,
             observing: true,
+            probing: types::ProbingTier::Active,
         }))));
         assert!(
             log.offline.is_none(),
@@ -993,6 +994,7 @@ mod tests {
             ts_us: 1,
             kinds: None,
             observing: false,
+            probing: types::ProbingTier::Active,
         }));
         assert_eq!(row.line, "subscribed  collection off; kinds: all");
         assert!(row.kind.is_none());

@@ -641,6 +641,7 @@ async fn handle_conn(
                 StreamCtx {
                     events_tx: &srv.events_tx,
                     observing: &srv.observing,
+                    probing: &srv.probing,
                     subscribers,
                     max_subscribers: srv.max_subscribers,
                     refusals: &srv.sub_refusals,
@@ -797,11 +798,12 @@ async fn write_stream_frame<W: AsyncWrite + Unpin>(
 /// because the read branch won loses no event; `AsyncReadExt::read` is cancel-safe
 /// too, so a lost race the other way reads nothing.
 /// The shared state one subscription needs, grouped so the signature stays
-/// readable: the bus it reads, the pause flag it reports, and the cap plus its
-/// rate-limited refusal log.
+/// readable: the bus it reads, the pause flag and the probing tier it reports,
+/// and the cap plus its rate-limited refusal log.
 struct StreamCtx<'a> {
     events_tx: &'a broadcast::Sender<EncodedFrame>,
     observing: &'a AtomicBool,
+    probing: &'a ProbingState,
     subscribers: &'a Arc<AtomicUsize>,
     max_subscribers: usize,
     refusals: &'a RateLimitedLog,
@@ -816,6 +818,7 @@ async fn stream_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let StreamCtx {
         events_tx,
         observing,
+        probing,
         subscribers,
         max_subscribers,
         refusals,
@@ -848,17 +851,19 @@ async fn stream_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     //    vanish into the old publish-before-subscribe window.
     let mut rx = events_tx.subscribe();
 
-    // 3. The mandatory ack, carrying the CURRENT collection state so a fresh
-    //    subscriber learns it immediately instead of inferring it from silence.
-    //    `observing` is read AFTER subscribing, deliberately: an edge landing in
-    //    between is then delivered twice (ack + bus frame) rather than lost, and
-    //    duplication is free because the frame carries an absolute state.
+    // 3. The mandatory ack, carrying the CURRENT collection state and probing
+    //    tier so a fresh subscriber learns them immediately instead of
+    //    inferring them from silence (or from a run of SKIPs). Both are read
+    //    AFTER subscribing, deliberately: an edge landing in between is then
+    //    delivered twice (ack + bus frame) rather than lost, and duplication is
+    //    free because the frame carries an absolute state.
     write_stream_frame(
         wr,
         &StreamFrame::Ready(Ready {
             ts_us: types::now_us(),
             kinds: kinds.clone(),
             observing: observing.load(Ordering::Acquire),
+            probing: probing.tier(),
         }),
     )
     .await?;
@@ -1852,15 +1857,13 @@ mod tests {
         .unwrap();
         match answer {
             Response::Table(t) => {
+                // The shape `Gaps` shipped with, and keeps: a pre-tier reader
+                // asks for it by this id and prints every row as a pause.
                 assert_eq!(
                     t.columns,
-                    ["kind", "gap_opened_us", "gap_closed_us", "gap_closed_by"]
+                    ["gap_opened_us", "gap_closed_us", "gap_closed_by"]
                 );
-                assert!(
-                    t.rows.is_empty(),
-                    "no pause and no passive edge, no bracket: {:?}",
-                    t.rows
-                );
+                assert!(t.rows.is_empty(), "no pause, no gap: {:?}", t.rows);
             }
             other => panic!("expected Table, got {other:?}"),
         }
@@ -2854,6 +2857,7 @@ mod tests {
     async fn subscriber_cap_refuses_with_a_decodable_error() {
         let (events_tx, _rx) = broadcast::channel::<EncodedFrame>(16);
         let observing = AtomicBool::new(true);
+        let probing = ProbingState::new(ProbingTier::Active);
         // Cap of 1, already taken.
         let subscribers = Arc::new(AtomicUsize::new(1));
 
@@ -2866,6 +2870,7 @@ mod tests {
             StreamCtx {
                 events_tx: &events_tx,
                 observing: &observing,
+                probing: &probing,
                 subscribers: &subscribers,
                 max_subscribers: 1,
                 refusals: &RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
@@ -2904,11 +2909,13 @@ mod tests {
         // retained for this one too.
         drop(rx);
         let observing = Arc::new(AtomicBool::new(true));
+        let probing = Arc::new(ProbingState::new(ProbingTier::Active));
         let subscribers = Arc::new(AtomicUsize::new(0));
 
         let (client, server) = tokio::io::duplex(64 * 1024);
         let tx = events_tx.clone();
         let obs = Arc::clone(&observing);
+        let tier = Arc::clone(&probing);
         let subs = Arc::clone(&subscribers);
         let task = tokio::spawn(async move {
             let (mut rd, mut wr) = tokio::io::split(server);
@@ -2919,6 +2926,7 @@ mod tests {
                 StreamCtx {
                     events_tx: &tx,
                     observing: &obs,
+                    probing: &tier,
                     subscribers: &subs,
                     max_subscribers: 8,
                     refusals: &RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
@@ -2969,11 +2977,15 @@ mod tests {
     async fn subscribe_ack_reports_the_current_observing_state() {
         let (events_tx, _rx) = broadcast::channel::<EncodedFrame>(16);
         let observing = Arc::new(AtomicBool::new(false));
+        // Passive, so the ack is seen to carry the tier the daemon holds
+        // rather than the wire default (`Active`).
+        let probing = Arc::new(ProbingState::new(ProbingTier::Passive));
         let subscribers = Arc::new(AtomicUsize::new(0));
 
         let (client, server) = tokio::io::duplex(4096);
         let tx = events_tx.clone();
         let obs = Arc::clone(&observing);
+        let tier = Arc::clone(&probing);
         let subs = Arc::clone(&subscribers);
         let task = tokio::spawn(async move {
             let (mut rd, mut wr) = tokio::io::split(server);
@@ -2984,6 +2996,7 @@ mod tests {
                 StreamCtx {
                     events_tx: &tx,
                     observing: &obs,
+                    probing: &tier,
                     subscribers: &subs,
                     max_subscribers: 8,
                     refusals: &RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
@@ -2998,6 +3011,11 @@ mod tests {
         match serde_json::from_str::<StreamFrame>(&line).unwrap() {
             StreamFrame::Ready(ready) => {
                 assert!(!ready.observing, "the ack must report the paused state");
+                assert_eq!(
+                    ready.probing,
+                    ProbingTier::Passive,
+                    "the ack must report the tier in force"
+                );
                 assert_eq!(ready.kinds, Some(vec![EventKind::Route]));
             }
             other => panic!("expected a Ready ack as the first frame, got {other:?}"),
@@ -3649,6 +3667,7 @@ mod tests {
 
         let (events_tx, _rx) = broadcast::channel::<EncodedFrame>(16);
         let observing = AtomicBool::new(true);
+        let probing = ProbingState::new(ProbingTier::Active);
         // Cap of 1, already taken, so every attempt below is refused.
         let subscribers = Arc::new(AtomicUsize::new(1));
         let refusals = RateLimitedLog::new(REFUSAL_LOG_INTERVAL);
@@ -3666,6 +3685,7 @@ mod tests {
                 StreamCtx {
                     events_tx: &events_tx,
                     observing: &observing,
+                    probing: &probing,
                     subscribers: &subscribers,
                     max_subscribers: 1,
                     refusals: &refusals,

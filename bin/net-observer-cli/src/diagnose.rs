@@ -486,10 +486,12 @@ pub(crate) fn format_gateway_ramp(
     Ok(out)
 }
 
-/// **The observation gaps the record contains** — renders
-/// [`store::diagnosis::observation_gaps_sql`]: every operator pause and every
-/// passive stretch, told apart by `KIND`. A `kind` column is absent from a
-/// daemon built before the probing tier; its rows are then all pauses.
+/// **The bracketed silences the record contains** — renders
+/// [`store::diagnosis::silences_sql`]: every operator pause and every passive
+/// stretch, told apart by `KIND`. Also renders the pauses-only
+/// [`store::diagnosis::observation_gaps_sql`] a daemon built before `Silences`
+/// answers instead: its table has no `kind` column, and its rows are all
+/// pauses.
 pub(crate) fn format_observation_gaps(table: &Table) -> Result<String> {
     let c = Cols(&table.columns);
     let (go, gc, by) = (

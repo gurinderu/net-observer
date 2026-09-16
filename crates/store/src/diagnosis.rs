@@ -263,15 +263,36 @@ probing_stretch AS (
   WHERE rn = 1
 )";
 
-/// **Observation gaps** — every interval the operator paused collection for,
-/// and every stretch the daemon spent withholding its probes.
+/// **Observation gaps** — every interval the operator paused collection for.
+///
+/// The read side of the bracketed silence: one row per gap, open-ended
+/// (`gap_closed_us` `NULL`) only when the record ends inside the pause.
+///
+/// Pauses ONLY, in the shape it has had since it shipped: this is what a
+/// reader built before the probing tier asks for as `DiagnosticQuery::Gaps`,
+/// and a passive stretch listed here would be printed by that reader as a
+/// pause. The passive stretches ride alongside in [`silences_sql`], under a
+/// query id that reader has never heard of.
+pub fn observation_gaps_sql() -> String {
+    format!(
+        "WITH {SAMPLE_TS_CTE},
+{OBSERVATION_GAP_CTE}
+SELECT gap_opened_us, gap_closed_us, gap_closed_by
+FROM observation_gap ORDER BY gap_opened_us"
+    )
+}
+
+/// **Silences** — every bracketed silence the record contains: each interval
+/// the operator paused collection for, and each stretch the daemon spent
+/// withholding its probes.
 ///
 /// The read side of both brackets, told apart by `kind`: `pause` rows are the
-/// silence of [`OBSERVATION_GAP_CTE`] (no samples at all), `passive` rows the
-/// withheld probes of [`PROBING_STRETCH_CTE`] (samples every tick, verdicts
-/// `SKIP`). Each is open-ended (`gap_closed_us` `NULL`) only when the record
-/// ends inside it.
-pub fn observation_gaps_sql() -> String {
+/// silence of [`OBSERVATION_GAP_CTE`] (no samples at all — exactly the rows of
+/// [`observation_gaps_sql`]), `passive` rows the withheld probes of
+/// [`PROBING_STRETCH_CTE`] (samples every tick, verdicts `SKIP`). Each is
+/// open-ended (`gap_closed_us` `NULL`) only when the record ends inside it.
+/// (realm net-observer, node #88)
+pub fn silences_sql() -> String {
     format!(
         "WITH {SAMPLE_TS_CTE},
 {OBSERVATION_GAP_CTE},
@@ -873,6 +894,11 @@ impl DuckdbStore {
     /// Run [`observation_gaps_sql`].
     pub fn observation_gaps(&self) -> Result<QueryTable, StoreError> {
         self.query_table(&observation_gaps_sql())
+    }
+
+    /// Run [`silences_sql`].
+    pub fn silences(&self) -> Result<QueryTable, StoreError> {
+        self.query_table(&silences_sql())
     }
 
     /// Run [`segments_sql`].
@@ -1840,10 +1866,13 @@ mod tests {
         assert_eq!(cell(&g, 0, "gap_closed_us"), (30 * SEC).to_string());
         assert_eq!(cell(&g, 1, "gap_opened_us"), (40 * SEC).to_string());
         assert_eq!(cell(&g, 1, "gap_closed_us"), (55 * SEC).to_string());
+        // The same rows, as `silences` lists them: every one a pause.
+        let all = s.silences().unwrap();
+        assert_eq!(all.rows.len(), 2);
         assert!(
-            g.rows.iter().all(|r| r[0] == "pause"),
-            "with no probing edge, every row is a pause: {:?}",
-            g.rows
+            all.rows.iter().all(|r| r[0] == "pause"),
+            "with no probing edge, every silence is a pause: {:?}",
+            all.rows
         );
     }
 
@@ -1851,11 +1880,16 @@ mod tests {
 
     /// A daemon that boots passive (the configured default, written as a
     /// peerless edge) and is switched to active by an operator: one `passive`
-    /// row, closed by `active`, listed next to the pauses. The `SKIP` ticks in
-    /// between do NOT close it — samples keep landing under passive — and a
-    /// moment inside it reads `unknown` from those `SKIP`s, never `gap`.
+    /// row, closed by `active`, listed by `silences` next to the pauses. The
+    /// `SKIP` ticks in between do NOT close it — samples keep landing under
+    /// passive — and a moment inside it reads `unknown` from those `SKIP`s,
+    /// never `gap`.
+    ///
+    /// `observation_gaps` (the `Gaps` query a pre-tier reader still asks for)
+    /// keeps its pauses-only shape: no `kind` column, and the stretch is NOT
+    /// among its rows — that reader would print it as a pause.
     #[test]
-    fn a_passive_stretch_is_listed_as_its_own_kind_and_is_not_a_gap() {
+    fn a_passive_stretch_is_a_silence_of_its_own_kind_and_is_not_a_gap() {
         let s = DuckdbStore::in_memory().unwrap();
         probing_edge(&s, 5 * SEC, ProbingTier::Passive, None);
         passive_tick(&s, 10 * SEC);
@@ -1863,12 +1897,24 @@ mod tests {
         probing_edge(&s, 30 * SEC, ProbingTier::Active, Some(501));
         healthy_tick(&s, 40 * SEC);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 1, "{:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "passive");
         assert_eq!(cell(&g, 0, "gap_opened_us"), (5 * SEC).to_string());
         assert_eq!(cell(&g, 0, "gap_closed_us"), (30 * SEC).to_string());
         assert_eq!(cell(&g, 0, "gap_closed_by"), "active");
+
+        let gaps = s.observation_gaps().unwrap();
+        assert_eq!(
+            gaps.columns,
+            vec!["gap_opened_us", "gap_closed_us", "gap_closed_by"],
+            "`Gaps` keeps the shape it shipped with"
+        );
+        assert!(
+            gaps.rows.is_empty(),
+            "a passive stretch is not a pause and must not reach a pre-tier reader as one: {:?}",
+            gaps.rows
+        );
 
         // Not a gap: the record exists and says "no measurement".
         let t = s.verdict_at(25 * SEC).unwrap();
@@ -1889,7 +1935,7 @@ mod tests {
         passive_tick(&s, 10 * SEC);
         passive_tick(&s, 25 * SEC);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 1);
         assert_eq!(cell(&g, 0, "kind"), "passive");
         assert_eq!(cell(&g, 0, "gap_closed_us"), "");
@@ -1912,7 +1958,7 @@ mod tests {
         probing_edge(&s, 60 * SEC, ProbingTier::Active, None);
         healthy_tick(&s, 65 * SEC);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 1, "one stretch, not two: {:?}", g.rows);
         assert_eq!(cell(&g, 0, "gap_opened_us"), (5 * SEC).to_string());
         assert_eq!(cell(&g, 0, "gap_closed_us"), (60 * SEC).to_string());
@@ -1933,7 +1979,7 @@ mod tests {
         probing_edge(&s, 45 * SEC, ProbingTier::Active, Some(501));
         healthy_tick(&s, 50 * SEC);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 2, "{:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "passive");
         assert_eq!(cell(&g, 0, "gap_opened_us"), (5 * SEC).to_string());
@@ -1953,6 +1999,7 @@ mod tests {
         let s = DuckdbStore::in_memory().unwrap();
         probing_edge(&s, 5 * SEC, ProbingTier::Active, None);
         healthy_tick(&s, 10 * SEC);
+        assert!(s.silences().unwrap().rows.is_empty());
         assert!(s.observation_gaps().unwrap().rows.is_empty());
     }
 

@@ -2881,6 +2881,7 @@ mod tests {
             ts_us: 1,
             kinds: None,
             observing: false,
+            probing: types::ProbingTier::Active,
         }))));
         assert!(feed.paused);
         feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Observing(

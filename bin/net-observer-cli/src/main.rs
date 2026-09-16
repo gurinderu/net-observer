@@ -564,9 +564,16 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             );
         }
         Command::Gaps => {
-            let table = diagnose_table(cli, DiagnosticQuery::Gaps, |off| {
-                run_query(off, &diagnosis::observation_gaps_sql())
-            })?;
+            // Every bracketed silence — pauses AND passive stretches — is
+            // `Silences`. A daemon built before it cannot read that request;
+            // it is then asked `Gaps`, the pauses-only shape it has, and the
+            // reader is told what the answer will lack. The offline record is
+            // read with the full query. (realm net-observer, node #88)
+            let table = diagnose_table_by(
+                cli,
+                |socket| ask_silences_or_gaps(socket, net_observer_ipc::diagnose),
+                |off| run_query(off, &diagnosis::silences_sql()),
+            )?;
             print!("{}", diagnose::format_observation_gaps(&table)?);
         }
         Command::Segments => {
@@ -705,10 +712,41 @@ fn diagnose_table(
     q: DiagnosticQuery,
     offline: impl FnOnce(&Offline) -> Result<QueryTable>,
 ) -> Result<Table> {
+    diagnose_table_by(cli, |s| net_observer_ipc::diagnose(s, q), offline)
+}
+
+/// Ask `Silences` and, on a daemon that cannot read it, `Gaps` instead —
+/// saying so on stderr, because the fallback answer lists the pauses only and
+/// a reader must not take "no passive stretch listed" for "there was none".
+/// `ask` is the socket round-trip, injected so the fallback rule is testable
+/// without a daemon; a daemon that reads `Silences` and fails it is NOT
+/// retried (the file would only meet the lock), and one older than `Gaps` too
+/// answers `Unsupported` twice, which [`route`] then sends to the file.
+fn ask_silences_or_gaps(
+    socket: &str,
+    ask: impl Fn(&str, DiagnosticQuery) -> std::io::Result<QueryOutcome>,
+) -> std::io::Result<QueryOutcome> {
+    match ask(socket, DiagnosticQuery::Silences)? {
+        QueryOutcome::Unsupported(m) => {
+            eprintln!(
+                "net-observerd at {socket} predates the `Silences` diagnosis ({m}); \
+                 asking `Gaps` instead — pauses only, passive stretches not listed"
+            );
+            ask(socket, DiagnosticQuery::Gaps)
+        }
+        answered => Ok(answered),
+    }
+}
+
+/// [`diagnose_table`] with the socket round-trip itself injected, for a
+/// command whose live question is not one fixed [`DiagnosticQuery`].
+fn diagnose_table_by(
+    cli: &Cli,
+    ask: impl FnOnce(&str) -> std::io::Result<QueryOutcome>,
+    offline: impl FnOnce(&Offline) -> Result<QueryTable>,
+) -> Result<Table> {
     let record = Record::resolve(cli)?;
-    match route(record.socket.as_deref(), |s| {
-        net_observer_ipc::diagnose(s, q)
-    })? {
+    match route(record.socket.as_deref(), ask)? {
         Route::Live { table, via } => {
             eprintln!("source: net-observerd via {via}");
             Ok(table)
@@ -1478,6 +1516,52 @@ mod tests {
         }
     }
 
+    /// `gaps` asks `Silences`; a daemon that cannot read it is asked `Gaps`
+    /// instead, and only then. A daemon that answers `Silences` — with a
+    /// table, or with a failure — is never asked twice.
+    #[test]
+    fn gaps_asks_silences_first_and_gaps_only_on_an_old_daemon() {
+        use std::cell::RefCell;
+        let asked: RefCell<Vec<DiagnosticQuery>> = RefCell::new(Vec::new());
+
+        // An old daemon: `Silences` is undecodable, `Gaps` answers.
+        let out = ask_silences_or_gaps("/run/observer.sock", |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(match q {
+                DiagnosticQuery::Silences => {
+                    QueryOutcome::Unsupported("bad request: unknown variant `Silences`".into())
+                }
+                _ => QueryOutcome::Table(Table::default()),
+            })
+        })
+        .unwrap();
+        assert_eq!(out, QueryOutcome::Table(Table::default()));
+        assert_eq!(
+            *asked.borrow(),
+            vec![DiagnosticQuery::Silences, DiagnosticQuery::Gaps]
+        );
+
+        // A current daemon: one question.
+        asked.borrow_mut().clear();
+        let out = ask_silences_or_gaps("/run/observer.sock", |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(QueryOutcome::Table(Table::default()))
+        })
+        .unwrap();
+        assert_eq!(out, QueryOutcome::Table(Table::default()));
+        assert_eq!(*asked.borrow(), vec![DiagnosticQuery::Silences]);
+
+        // A daemon that read `Silences` and failed it: reported, not retried.
+        asked.borrow_mut().clear();
+        let out = ask_silences_or_gaps("/run/observer.sock", |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(QueryOutcome::Failed("boom".into()))
+        })
+        .unwrap();
+        assert_eq!(out, QueryOutcome::Failed("boom".into()));
+        assert_eq!(*asked.borrow(), vec![DiagnosticQuery::Silences]);
+    }
+
     /// A daemon that read the request and could not run it, and a socket that
     /// is there but broken, are errors — never a detour to the file, where the
     /// lock would report the wrong problem.
@@ -1690,6 +1774,7 @@ mod tests {
             ts_us: 0,
             kinds: None,
             observing: false,
+            probing: ProbingTier::Active,
         });
         assert_eq!(
             format_frame_line(&ready),
