@@ -432,12 +432,13 @@ graph TD
   knob-left when paused); clicking it sends `Control(SetObserving(!observing))`
   over the socket (`send_set_observing`) and refreshes, and the header
   shows a muted "paused" state (grey dot) while collection is off. gpui's
-  build script needs Apple's **Metal shader compiler**, so the crate is a full
-  workspace member but is excluded from `default-members` — a bare `cargo build`
-  needs no GUI toolchain. Build the bar with `--all` / `-p net-observer-bar`
-  **from inside `nix develop`**, whose `xcrun` shim is what finds `metal`; the
-  bar is for that reason the one binary the flake cannot package (see
-  [Packaging (nix)](#packaging-nix)).
+  build script runs **bindgen over `dispatch.h`** (libclang plus the SDK
+  headers), so the crate is a full workspace member but is excluded from
+  `default-members` — a bare `cargo build` needs no GUI toolchain. Build the bar
+  with `--all` / `-p net-observer-bar` **from inside `nix develop`**. The
+  workspace pins gpui's `runtime_shaders` feature, so no Metal shader compiler
+  is involved at build time — which is what lets the flake package the bar like
+  the other two binaries (see [Packaging (nix)](#packaging-nix)).
 
 ## Data model (DuckDB)
 
@@ -1078,21 +1079,55 @@ there.
 
 ## Packaging (nix)
 
-The flake ships the daemon and the CLI, and owns the launchd job that runs them.
+The flake ships all three binaries and owns the launchd job that runs the daemon.
 
-- **`packages`** (per system, via `flake-utils.lib.eachDefaultSystem`) — one
-  `rustPlatform.buildRustPackage` named `net-observer`, exposed also as
-  `net-observerd`, `net-observer-cli` and `default`. The platform is built with
-  `makeRustPlatform` over the channel `rust-toolchain.toml` pins, because
-  `buildRustPackage` would otherwise take nixpkgs' rustc and "works in the dev
-  shell" would stop meaning anything. `cargoBuildFlags` names the two binaries
-  explicitly; `auditable = false` (the default `cargo-auditable` wrapper is built
-  against *nixpkgs'* rustc and drags a second toolchain — sometimes a rustc built
-  from source — into the build); `DUCKDB_LIB_DIR` is deliberately unset, so the
-  `duckdb` crate builds its own engine (nixpkgs carries 1.5.2 where
-  `libduckdb-sys` wants 1.5.5); `doCheck = false`, because testing is the dev
-  shell's job — `cargo test --all` covers the bar, which this derivation cannot
-  build at all.
+- **`packages`** (per system, via `flake-utils.lib.eachDefaultSystem`) — built
+  with **crate2nix**, one derivation per crate rather than one per package
+  (realm net-observer, node #76): a change rebuilds the crate that changed and
+  its dependents, and every dependency crate is a store path the next build
+  reuses. `net-observerd`, `net-observer-cli` and `net-observer-bar` are the
+  `build` outputs of the three workspace members; `net-observer` (also
+  `default`) is a `symlinkJoin` of the daemon and the CLI, the shape the old
+  single `buildRustPackage` derivation had. The derivations come out of
+  `buildRustCrateForPkgs`: `buildRustCrate` overridden to compile with the
+  channel `rust-toolchain.toml` pins — otherwise it would take nixpkgs' rustc
+  and "works in the dev shell" would stop meaning anything — and to merge the
+  flake's `crateOverrides` into `defaultCrateOverrides`.
+- **The checked-in `Cargo.nix`** (realm net-observer, node #95) — the crate
+  graph is not generated at evaluation time but by the crate2nix CLI the dev
+  shell carries (`crate2nix generate`, to be re-run whenever `Cargo.lock`
+  changes), because the eval-time generator vendors the duckdb-rs git fork
+  without its workspace root and the fork's `{ workspace = true }` inheritance
+  then breaks `cargo metadata`. `crate-hashes.json` beside it holds the fork's
+  source hash, which `Cargo.lock` does not. Evaluation is therefore pure — no
+  import from derivation, no network — and every system's attributes evaluate
+  from any host: from Linux the darwin derivations evaluate, they just cannot
+  build. The price is a file that can go stale; the `nix-build-daemon` CI job
+  regenerates it and fails on a diff.
+- **`crateOverrides`** (realm net-observer, node #80) — one override: gpui's
+  build script runs bindgen over `dispatch.h`, and `bindgenHook` supplies
+  libclang and the SDK include paths. The bar is packageable at all because the
+  workspace pins gpui's `runtime_shaders` feature: the Metal shader compiler
+  (`xcrun -sdk macosx metal`, Xcode-only and not redistributable, so never in a
+  nix closure) does not run at build time; the shaders compile at app launch.
+  Deliberately absent: `libduckdb-sys` builds the bundled DuckDB engine through
+  `cc` with nothing beyond stdenv's C++ compiler (`default-features = false`
+  turns its `pkg-config` feature off), and `DUCKDB_LIB_DIR` is never set — the
+  nixpkgs DuckDB is a different version from what the fork wants; `libiconv` is
+  added on darwin by `buildRustCrate` itself; no crate links libpcap, the pcap
+  ring runs `tcpdump` as a child.
+- **What `buildRustCrate` decides on its own** — it drives rustc directly, so
+  `[profile.release]` in `Cargo.toml` is ignored: every crate compiles with
+  `opt-level=3` and `codegen-units=1`, no thin LTO, no debuginfo. It runs no
+  tests; testing is the dev shell's job. And it resolves features **per
+  workspace root** (realm net-observer, node #117): the daemon's graph and the
+  CLI's graph do not share the `libduckdb-sys` derivation, so the DuckDB engine
+  is compiled twice — accepted for now; a warm store absorbs it after the first
+  green build.
+- **`checks`** — `store-crate` and `triggers-crate`, the two workspace crates
+  with no Apple-only dependency, built through the same `Cargo.nix`: the one
+  place the crate2nix route, bundled DuckDB engine included, is exercised on a
+  Linux host.
 - **`darwinModules.default`** — a nix-darwin module (`nix/darwin-module.nix`),
   deliberately **top-level, not** inside `eachDefaultSystem`: a darwin module
   takes no `system`, and nesting it would bury it under `aarch64-darwin` and force
@@ -1108,16 +1143,14 @@ The flake ships the daemon and the CLI, and owns the launchd job that runs them.
   LaunchDaemon this project replaces owns that file and two launchd jobs sharing a
   `StandardOutPath` would interleave into, and corrupt, the behavioural oracle.
   The activation script creates `/var/lib/observer` (root-owned, `755`).
-- **The menu bar is not packageable.** gpui compiles its Metal shaders by calling
-  `xcrun -sdk macosx metal`, and Apple does not permit redistributing that
-  compiler, so it cannot enter a nix closure. The `xcrun` nix puts on PATH is
-  xcbuild's reimplementation and has no `metal`. The dev shell therefore shims
-  **only** `xcrun` (`metalXcrun`, first on PATH) to export `DEVELOPER_DIR` when
-  Xcode is present and exec `/usr/bin/xcrun` — exporting `DEVELOPER_DIR` for the
-  whole shell would find `metal` but repoint `cc`/`ld` at Xcode's SDK, and
-  linking against the nix toolchain would then fail. It falls through untouched
-  when Xcode is absent, so the shell still works on a machine that simply cannot
-  build the GUI. Build the bar from inside `nix develop`.
+- **The carrier for "the packages build" is CI, not this host.** The three
+  packages are built by the `nix-build` workflow on macos-latest, one job per
+  package, each saving its own nix store cache when green (realm net-observer,
+  node #79); from a Linux host only the `checks` above can be built. Outside
+  nix, a cargo build of the bar on a Mac takes libclang from wherever
+  `xcode-select` points — the Command Line Tools suffice; the dev shell adds
+  nothing for it. Build the bar from inside `nix develop` all the same, so the
+  gate runs on the pinned toolchain.
 
 ## Privilege split
 

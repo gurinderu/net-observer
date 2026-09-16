@@ -84,13 +84,10 @@
           # No workspace crate depends on a `pcap` crate (the pcap ring runs
           # `tcpdump` as a child process at runtime, not a build-time link),
           # so libpcap is not carried forward from the old buildRustPackage
-          # flake. `iconv` — needed by *something* in the darwin link step on
-          # the old flake, evidence this Linux box cannot narrow further — is
-          # kept, conservatively, on the three binaries rather than guessed
-          # onto a specific library crate.
-          net-observerd = _attrs: { buildInputs = [ pkgs.iconv ]; };
-          "net-observer-cli" = _attrs: { buildInputs = [ pkgs.iconv ]; };
-          "net-observer-bar" = _attrs: { buildInputs = [ pkgs.iconv ]; };
+          # flake. Neither is `iconv`: buildRustCrate itself puts `libiconv`
+          # into every crate's buildInputs on a darwin host (nixpkgs
+          # `build-rust-crate/default.nix`), so an override here would only
+          # list it a second time.
         };
         buildRustCrateForPkgs =
           p:
@@ -106,10 +103,10 @@
         # Darwin-only by nature (AppKit/NSStatusItem), and its own derivation:
         # a pure IPC-socket client of net-observerd, no pcap, no DuckDB — its
         # store path does not move when the daemon's dependencies do, and vice
-        # versa.
-        net-observer-bar = workspace."net-observer-bar".build.overrideAttrs (_old: {
-          meta.mainProgram = "net-observer-bar";
-        });
+        # versa. Taken as buildRustCrate hands it over: it already sets
+        # `meta.mainProgram` to the crate name, and an `overrideAttrs` that
+        # re-set it would replace the whole `meta` set, `badPlatforms` included.
+        net-observer-bar = workspace."net-observer-bar".build;
         # Previously `net-observerd` and `net-observer-cli` were aliases of one
         # `buildRustPackage` derivation holding both binaries. crate2nix builds
         # each crate as its own derivation, so `net-observer` now joins the two

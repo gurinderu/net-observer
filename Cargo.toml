@@ -24,11 +24,12 @@ members = [
     "bin/net-observer-bar",
 ]
 # `net-observer-bar` (gpui GUI) is intentionally excluded from the default build set:
-# gpui's build script requires the macOS Metal Toolchain, which is not present on
-# every dev machine / CI runner. A plain `cargo build` therefore builds the
-# daemon workspace without the GUI toolchain. `net-observer-bar` remains a full
-# workspace member — build it explicitly with `cargo build -p net-observer-bar` (or
-# `--workspace`) on a machine that has the Metal Toolchain installed.
+# gpui's build script runs bindgen over dispatch.h, which needs libclang and the
+# macOS SDK headers — not present on every dev machine / CI runner. (The Metal
+# Toolchain it once needed on top is no longer involved: see `runtime_shaders`
+# below.) A plain `cargo build` therefore builds the daemon workspace without the
+# GUI toolchain. `net-observer-bar` remains a full workspace member — build it
+# explicitly with `cargo build -p net-observer-bar` (or `--workspace`).
 default-members = [
     "crates/types",
     "crates/config",
@@ -146,6 +147,9 @@ lldp = { path = "crates/lldp" }
 #     whole daemon. (realm net-observer)
 # jemalloc/PGO/BOLT deliberately NOT used: they optimise sustained CPU load this
 # daemon does not have. `target-cpu=native` lives in `.cargo/config.toml`.
+# The nix packages ignore this profile: buildRustCrate drives rustc directly, not
+# cargo, and compiles every crate with opt-level=3 and codegen-units=1 — no thin
+# LTO, no debuginfo (realm net-observer, node #76). Accepted as is.
 [profile.release]
 debug = "line-tables-only"
 lto = "thin"
