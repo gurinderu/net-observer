@@ -2309,9 +2309,11 @@ mod tests {
     /// The `endpoint-block` rule the daemon actually runs counts to
     /// [`ENDPOINT_BLOCK_CONSECUTIVE`] — two — all-fail cohorts, no fewer.
     ///
-    /// Dies under `ENDPOINT_BLOCK_CONSECUTIVE = 1` (the single-cohort stream
-    /// fires, so the first assertion reds) and under `= 3` (the two-cohort run
-    /// stays silent, so the second reds). The cohort counts are LITERALS on
+    /// The newest cohort is never judged (it ends the one before it), so the
+    /// fire lands on the first row of the cohort after the run. Dies under
+    /// `ENDPOINT_BLOCK_CONSECUTIVE = 1` (the single ended cohort fires, so the
+    /// second assertion reds) and under `= 3` (the two-cohort run stays
+    /// silent, so the third reds). The cohort counts are LITERALS on
     /// purpose — this test IS the constant's pin, exactly like the wedge pin
     /// above.
     ///
@@ -2334,13 +2336,19 @@ mod tests {
             "one all-fail cohort is one short of ENDPOINT_BLOCK_CONSECUTIVE and must not fire"
         );
 
-        // The second cohort completes the run.
+        // The second cohort is the run — once a newer cohort has ended it.
         feed(&mut fx.engine, &mut w, failed_endpoint(3, "1.1.1.1:443"));
         feed(&mut fx.engine, &mut w, failed_endpoint(3, "2.2.2.2:2053"));
         assert_eq!(
             incidents_for(&fx.store, "endpoint-block"),
+            0,
+            "the newest cohort is still being written and is not judged yet"
+        );
+        feed(&mut fx.engine, &mut w, failed_endpoint(4, "1.1.1.1:443"));
+        assert_eq!(
+            incidents_for(&fx.store, "endpoint-block"),
             1,
-            "the second consecutive all-fail cohort must fire the endpoint-block rule"
+            "the first row of a third cohort ends the second and fires the endpoint-block rule"
         );
     }
 

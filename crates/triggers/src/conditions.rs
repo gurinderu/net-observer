@@ -382,34 +382,35 @@ impl Condition for Starvation {
 }
 
 /// How many recent proxy samples `endpoint-block` scans when grouping rows into
-/// per-tick cohorts. The daemon retains at most 64 samples (its `WINDOW_CAP`),
-/// so this scan ceiling is the window itself.
+/// per-tick cohorts: `consecutive + 1` cohorts of at most seven endpoint rows
+/// fit in 64 several times over, so the scan stops long before the window's
+/// [`crate::WINDOW_CAP`].
 const ENDPOINT_BLOCK_SCAN: usize = 64;
 
-/// Fires when, for the newest `consecutive` proxy cohorts (one cohort = the
-/// per-endpoint rows sharing one `ts_us`), every endpoint's underlay TCP
-/// verdict is `Fail` while the newest link sample's `direct` probe is `Ok` —
-/// the selective-block / middlebox signature: the network path to the whole
-/// upstream fleet is dead from the underlay while the reference host answers.
+/// Fires when, for the `consecutive` proxy cohorts (one cohort = the
+/// per-endpoint rows sharing one `ts_us`) before the newest one, every
+/// endpoint's underlay TCP verdict is `Fail` while the newest link sample's
+/// `direct` probe is `Ok` — the selective-block / middlebox signature: the
+/// network path to the whole upstream fleet is dead from the underlay while
+/// the reference host answers.
 ///
 /// Distinct from `wedge`, which reads the TUN probe (the proxy PROCESS path):
 /// this one reads the per-endpoint underlay TCP verdicts and fires even while
 /// the tun probe still passes. A cohort containing a `Skip` row is the absence
 /// of a measurement (the `-` skip row means no endpoints were parsed) and
-/// breaks the run; a cohort with any `Ok` is not a fleet-wide block. Proxy
-/// history does not survive a resume (only the link change basis is carried),
-/// so after `clear_for_resume` this simply waits for `consecutive` fresh
-/// cohorts. (realm net-observer, node #69)
+/// breaks the run; a cohort with any `Ok` is not a fleet-wide block.
+/// (realm net-observer, node #69)
 ///
-/// The engine evaluates on every row, so the newest cohort is usually still
-/// being written. It is judged only once it is COMPLETE — its row count equals
-/// the immediately preceding cohort's — and until then it is not there yet:
-/// the `consecutive` cohorts before it are judged instead, so the fire lands
-/// on the last row of the completing cohort, never on its first. A fleet that
-/// changed size (config reload) reads incomplete until the next cohort matches
-/// it — one tick late, never suppressed. The `-` skip placeholder is a lone row
-/// and the tick's whole output, so it is complete by construction and breaks
-/// the run as before. (realm net-observer, node #73)
+/// The engine evaluates on every row, so the newest cohort in the window is
+/// always still being written. It is never judged: it is the end marker of
+/// the cohort before it — the cohort-end marker #73 asked for. The fire lands
+/// on the first row after the last of `consecutive` all-`Fail` cohorts,
+/// whatever that row's own verdict: at most one tick late, never suppressed,
+/// and no guessing at the fleet's size (a fleet that grows mid-block is read
+/// row by row and judged only once ended). Proxy history does not survive a
+/// resume (only the link change basis is carried), so after
+/// `clear_for_resume` this needs `consecutive + 1` fresh cohorts —
+/// `consecutive` to judge and one to end them. (realm net-observer, node #73)
 pub struct EndpointBlock {
     pub consecutive: usize,
 }
@@ -419,8 +420,6 @@ struct Cohort {
     ts_us: i64,
     rows: usize,
     all_fail: bool,
-    /// Holds the `-` skip placeholder: no endpoints were parsed this tick.
-    skipped: bool,
 }
 
 impl Condition for EndpointBlock {
@@ -443,21 +442,19 @@ impl Condition for EndpointBlock {
         for p in w.recent_proxy(ENDPOINT_BLOCK_SCAN) {
             // Exhaustive over the verdict: `Skip` carries no measurement, so
             // it can never count toward "every endpoint failed".
-            let (fail, skip) = match p.tcp {
-                TcpVerdict::Fail => (true, false),
-                TcpVerdict::Ok => (false, false),
-                TcpVerdict::Skip => (false, true),
+            let fail = match p.tcp {
+                TcpVerdict::Fail => true,
+                TcpVerdict::Ok | TcpVerdict::Skip => false,
             };
             match cohorts.last_mut() {
                 Some(c) if c.ts_us == p.ts_us => {
                     c.rows += 1;
                     c.all_fail = c.all_fail && fail;
-                    c.skipped = c.skipped || skip;
                 }
                 _ => {
-                    // A new cohort begins. One more than `consecutive` is
-                    // read: the newest may prove incomplete and be set aside,
-                    // and the run is then judged from the cohort after it.
+                    // A new cohort begins. `consecutive + 1` are read: the
+                    // newest is the end marker and is never judged, so the
+                    // run is the `consecutive` cohorts after it.
                     if cohorts.len() > self.consecutive {
                         break;
                     }
@@ -465,28 +462,16 @@ impl Condition for EndpointBlock {
                         ts_us: p.ts_us,
                         rows: 1,
                         all_fail: fail,
-                        skipped: skip,
                     });
                 }
             }
         }
-        // The newest cohort is complete when it matches its predecessor's row
-        // count, or when it is the skip placeholder (a lone row, the tick's
-        // whole output). With no predecessor it cannot be shown complete.
-        let complete = match cohorts.as_slice() {
-            [newest, prev, ..] => newest.skipped || newest.rows == prev.rows,
-            [newest] => newest.skipped,
-            [] => false,
-        };
-        let judged = if complete {
-            cohorts.as_slice()
-        } else {
-            cohorts.get(1..).unwrap_or_default()
-        };
+        // The newest cohort is still being written and is set aside; what is
+        // left holds at most `consecutive` ended cohorts.
+        let judged = cohorts.get(1..).unwrap_or_default();
         if judged.len() < self.consecutive {
             return None;
         }
-        let judged = &judged[..self.consecutive];
         if !judged.iter().all(|c| c.all_fail) {
             return None;
         }
@@ -533,10 +518,10 @@ impl Condition for PerClientBlock {
     }
 }
 
-/// How many recent link samples `ban-cycle` scans for ban starts. The daemon
-/// retains at most 64 samples (its `WINDOW_CAP`), so this scan ceiling is the
-/// window itself.
-const BAN_CYCLE_SCAN: usize = 64;
+/// How many recent link samples `ban-cycle` scans for ban starts: 160 at the
+/// 15 s link cadence is 40 min, the reach of the engine window itself
+/// ([`crate::WINDOW_CAP`] holds ≈ 157 ticks of the daemon's per-tick mix).
+const BAN_CYCLE_SCAN: usize = 160;
 
 /// The fewest measured dead readings (`Fail`/`NoGw`) a run needs to be a ban:
 /// Wi-Fi jitter loses single echoes, and one lost echo is not a ban. Tunable
@@ -551,9 +536,9 @@ const BAN_MIN_PERIOD_S: i64 = 60;
 /// Fires when the window holds at least `min_bans` gateway bans — a ban being
 /// a maximal run of dead gateway readings (`Fail` or `NoGw`: one run class,
 /// the same fold the CLI's `gw_drops()` uses) of at least
-/// [`BAN_MIN_RUN_TICKS`] measured ticks with an `Ok` reading on either side,
+/// `BAN_MIN_RUN_TICKS` measured ticks with an `Ok` reading on either side,
 /// the newest run possibly still open — and the mean interval between ban
-/// starts is at least [`BAN_MIN_PERIOD_S`]. The coworking ban-cycle
+/// starts is at least `BAN_MIN_PERIOD_S`. The coworking ban-cycle
 /// signature: the client is admitted, blocked, admitted again, and each round
 /// otherwise lands as its own `gw-drop`/`gw-change`/`per-client-block`
 /// incident with the cycle itself readable nowhere. This one names the cycle
@@ -761,7 +746,7 @@ direct underlay stream unmeasured"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::window::RecentWindow;
+    use crate::window::{RecentWindow, WINDOW_CAP};
     use types::{
         DnsSample, DnsVerdict, GwVerdict, HostSample, LinkSample, NeighborObs, NeighborRole,
         NeighborSource, NeighborsSample, NeighborsVerdict, ProxySample, Sample, TcpVerdict,
@@ -1521,6 +1506,13 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         w.push(proxy_ep(ts, "2.2.2.2:2053", TcpVerdict::Fail));
     }
 
+    /// The first row of the next tick — the end marker of the cohort before
+    /// it. Its own verdict is irrelevant to the judgement, and a healthy row
+    /// is used so a fire cannot be read as coming from this row.
+    fn push_end_marker(w: &mut RecentWindow, ts: i64) {
+        w.push(proxy_ep(ts, "1.1.1.1:443", TcpVerdict::Ok));
+    }
+
     /// The measured 2026-09-08 signature: every endpoint dead from the underlay
     /// for `consecutive` ticks while the reference host answers. The mid-way
     /// assertion dies under counting ROWS instead of cohorts — one tick's two
@@ -1536,18 +1528,71 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             "one cohort of two rows must not count as two ticks"
         );
         push_dead_cohort(&mut w, 20);
+        push_end_marker(&mut w, 30);
         let fire = c
             .eval(&w)
-            .expect("two all-fail cohorts with direct OK must fire");
+            .expect("two ended all-fail cohorts with direct OK must fire");
         assert!(
             fire.detail.contains("all 2 endpoints"),
-            "the detail must carry the newest cohort size: {}",
+            "the detail must carry the newest judged cohort size: {}",
             fire.detail
         );
         assert!(
             fire.detail.contains("2 ticks"),
             "the detail must carry the run length: {}",
             fire.detail
+        );
+    }
+
+    /// The engine evaluates on every row, so the newest cohort is always
+    /// still being written: it is never judged, it is the end marker of the
+    /// cohort before it. Two all-`Fail` cohorts alone are one judged cohort;
+    /// the first row of a third — whatever its verdict — ends the second and
+    /// fires. Dies under judging the newest cohort by any completeness
+    /// guess. (node #73)
+    #[test]
+    fn endpoint_block_judges_only_cohorts_with_a_successor() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        push_dead_cohort(&mut w, 20);
+        assert!(
+            c.eval(&w).is_none(),
+            "the newest cohort is unfinished: two cohorts alone are one judged"
+        );
+        w.push(proxy_ep(30, "1.1.1.1:443", TcpVerdict::Ok));
+        assert!(
+            c.eval(&w).is_some(),
+            "the first row of a third cohort ends the second, whatever its verdict"
+        );
+    }
+
+    /// The review's fleet-growth probe: the fleet grows from two to three
+    /// endpoints during a block and the new cohort arrives `Fail, Fail, Ok`.
+    /// Its first two rows look like a complete two-endpoint all-`Fail` cohort;
+    /// a row-count completeness guess fired there and closed one row later —
+    /// a false incident. Judging only ended cohorts never fires here: the
+    /// cohort has an `Ok` once it is ended.
+    #[test]
+    fn endpoint_block_silent_when_the_fleet_grows_into_a_partial_block() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        w.push(proxy_ep(20, "1.1.1.1:443", TcpVerdict::Fail));
+        assert!(c.eval(&w).is_none());
+        w.push(proxy_ep(20, "2.2.2.2:2053", TcpVerdict::Fail));
+        assert!(
+            c.eval(&w).is_none(),
+            "two rows matching the previous cohort's size is not a finished cohort"
+        );
+        w.push(proxy_ep(20, "3.3.3.3:443", TcpVerdict::Ok));
+        assert!(c.eval(&w).is_none());
+        push_end_marker(&mut w, 30);
+        assert!(
+            c.eval(&w).is_none(),
+            "ended, the grown cohort holds an Ok and is not a block"
         );
     }
 
@@ -1561,6 +1606,7 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         push_dead_cohort(&mut w, 10);
         w.push(proxy_ep(20, "1.1.1.1:443", TcpVerdict::Fail));
         w.push(proxy_ep(20, "2.2.2.2:2053", TcpVerdict::Ok));
+        push_end_marker(&mut w, 30);
         assert!(c.eval(&w).is_none());
     }
 
@@ -1574,7 +1620,30 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         w.push(link(1, TcpVerdict::Ok));
         w.push(proxy_ep(10, "-", TcpVerdict::Skip));
         w.push(proxy_ep(20, "-", TcpVerdict::Skip));
+        push_end_marker(&mut w, 30);
         assert!(c.eval(&w).is_none());
+    }
+
+    /// A skip placeholder is a row like any other as an END MARKER (the fire
+    /// lands on it), and the absence of a measurement once it is itself
+    /// judged: the cohort after it finds a broken run.
+    #[test]
+    fn endpoint_block_skip_placeholder_ends_a_run_and_then_breaks_it() {
+        let mut w = RecentWindow::new(16);
+        let c = EndpointBlock { consecutive: 2 };
+        w.push(link(1, TcpVerdict::Ok));
+        push_dead_cohort(&mut w, 10);
+        push_dead_cohort(&mut w, 20);
+        w.push(proxy_ep(30, "-", TcpVerdict::Skip));
+        assert!(
+            c.eval(&w).is_some(),
+            "the skip row ends the second dead cohort like any other row"
+        );
+        push_end_marker(&mut w, 40);
+        assert!(
+            c.eval(&w).is_none(),
+            "judged, the skip cohort is the absence of a measurement and breaks the run"
+        );
     }
 
     /// With the reference host dead too there is nothing SELECTIVE about the
@@ -1586,6 +1655,7 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         w.push(link(1, TcpVerdict::Fail));
         push_dead_cohort(&mut w, 10);
         push_dead_cohort(&mut w, 20);
+        push_end_marker(&mut w, 30);
         assert!(c.eval(&w).is_none());
     }
 
@@ -1597,83 +1667,9 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         let c = EndpointBlock { consecutive: 2 };
         w.push(link(1, TcpVerdict::Ok));
         push_dead_cohort(&mut w, 10);
+        push_end_marker(&mut w, 20);
         assert!(c.eval(&w).is_none());
     }
-
-    /// The engine evaluates on EVERY row, so the first `Fail` row of a new
-    /// cohort already read as a whole all-`Fail` cohort — one row early, on a
-    /// cohort still being written. A cohort is complete only once its row
-    /// count matches its predecessor's; until then it is not there yet, and
-    /// the fire lands on the LAST row of the completing cohort. Dies under the
-    /// row-agnostic scan that fired on the first row. (node #73)
-    #[test]
-    fn endpoint_block_waits_for_the_newest_cohort_to_complete() {
-        let mut w = RecentWindow::new(16);
-        let c = EndpointBlock { consecutive: 2 };
-        w.push(link(1, TcpVerdict::Ok));
-        push_dead_cohort(&mut w, 10);
-        w.push(proxy_ep(20, "1.1.1.1:443", TcpVerdict::Fail));
-        assert!(
-            c.eval(&w).is_none(),
-            "one row of a two-endpoint cohort is not a cohort yet"
-        );
-        w.push(proxy_ep(20, "2.2.2.2:2053", TcpVerdict::Fail));
-        assert!(
-            c.eval(&w).is_some(),
-            "the second row completes the cohort and the run"
-        );
-    }
-
-    /// A fleet that grew on a config reload reads incomplete until the next
-    /// cohort matches it: the fire is delayed one tick, never suppressed.
-    #[test]
-    fn endpoint_block_fires_one_tick_late_when_the_fleet_grows() {
-        let mut w = RecentWindow::new(16);
-        let c = EndpointBlock { consecutive: 2 };
-        w.push(link(1, TcpVerdict::Ok));
-        push_dead_cohort(&mut w, 10);
-        // Three rows now: the third makes the cohort larger than its
-        // predecessor, so it cannot be shown complete this tick.
-        push_dead_cohort(&mut w, 20);
-        w.push(proxy_ep(20, "3.3.3.3:443", TcpVerdict::Fail));
-        assert!(
-            c.eval(&w).is_none(),
-            "a cohort larger than its predecessor is not shown complete"
-        );
-        push_dead_cohort(&mut w, 30);
-        w.push(proxy_ep(30, "3.3.3.3:443", TcpVerdict::Fail));
-        let fire = c
-            .eval(&w)
-            .expect("two matching three-row cohorts complete the run");
-        assert!(
-            fire.detail.contains("all 3 endpoints"),
-            "the detail must carry the newest judged cohort size: {}",
-            fire.detail
-        );
-    }
-
-    /// The preflight-skip placeholder is a lone row and the tick's whole
-    /// output, so it is complete by construction and still breaks the run —
-    /// the completeness rule must not turn it transparent by setting a
-    /// one-row cohort aside as unfinished.
-    #[test]
-    fn endpoint_block_skip_placeholder_still_breaks_a_complete_run() {
-        let mut w = RecentWindow::new(16);
-        let c = EndpointBlock { consecutive: 2 };
-        w.push(link(1, TcpVerdict::Ok));
-        push_dead_cohort(&mut w, 10);
-        push_dead_cohort(&mut w, 20);
-        assert!(
-            c.eval(&w).is_some(),
-            "control: the run fires before the skip"
-        );
-        w.push(proxy_ep(30, "-", TcpVerdict::Skip));
-        assert!(
-            c.eval(&w).is_none(),
-            "a skip placeholder is the absence of a measurement and breaks the run"
-        );
-    }
-
     /// A link sample pinning what `PerClientBlock` reads: the gateway verdict
     /// and the probe-on-suspicion counts (direct Ok, everything else absent).
     fn link_lan(ts: i64, gw: GwVerdict, probed: Option<u16>, alive: Option<u16>) -> Sample {
@@ -1984,9 +1980,10 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
 
     /// Proxy history does not survive a resume (only the link change basis is
     /// carried), so a pre-pause cohort must not combine with a post-resume one
-    /// into a continuity that never existed. The inline control — a second
-    /// fresh cohort fires — proves the silence measures the clear and not a
-    /// fixture that could never fire.
+    /// into a continuity that never existed. Fresh, the run needs
+    /// `consecutive + 1` cohorts: `consecutive` to judge and one to end them.
+    /// The inline control — the third fresh cohort's first row fires — proves
+    /// the silence measures the clear and not a fixture that could never fire.
     #[test]
     fn endpoint_block_waits_for_fresh_cohorts_after_a_resume() {
         let mut w = RecentWindow::new(16);
@@ -2002,8 +1999,13 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         );
         push_dead_cohort(&mut w, 120);
         assert!(
+            c.eval(&w).is_none(),
+            "two fresh cohorts are one judged and one end marker, not a run"
+        );
+        push_end_marker(&mut w, 130);
+        assert!(
             c.eval(&w).is_some(),
-            "two fresh cohorts complete the run on their own"
+            "consecutive + 1 fresh cohorts complete the run on their own"
         );
     }
 
@@ -2249,5 +2251,57 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         let next = push_gw_ticks(&mut w, next, &BAN_ROUND);
         push_gw_ticks(&mut w, next, &BAN_ROUND);
         assert!(c.eval(&w).is_none());
+    }
+
+    /// Push one daemon tick's realistic sample mix at tick `tick`: the link
+    /// reading plus seven endpoint rows, three DNS rows and a host row — what
+    /// the engine window actually fills up with between two link readings
+    /// (no wifi helper exists here, so four of the five kinds).
+    fn push_field_tick(w: &mut RecentWindow, tick: i64, gw: GwVerdict) {
+        let ts = tick * TICK_US;
+        w.push(link_gw(ts, gw));
+        for ep in [
+            "1.1.1.1:443",
+            "2.2.2.2:2053",
+            "3.3.3.3:443",
+            "4.4.4.4:443",
+            "5.5.5.5:443",
+            "6.6.6.6:443",
+            "7.7.7.7:443",
+        ] {
+            w.push(proxy_ep(ts + 1, ep, TcpVerdict::Ok));
+        }
+        for probe in ["ru", "nks", "doh"] {
+            w.push(dns(ts + 2, probe, DnsVerdict::Ok, Some("10.0.0.1")));
+        }
+        w.push(host(ts + 3, 1.0));
+    }
+
+    /// The window is shared by every sample kind, so its capacity — not
+    /// `BAN_CYCLE_SCAN` — bounds how far back `ban-cycle` can see. At the
+    /// daemon's `WINDOW_CAP` three field rounds 150 s apart are all in view
+    /// and fire; at the 64 the daemon used to hold, the same stream keeps only
+    /// the last few ticks and the signature can never fire — the review's red
+    /// state.
+    #[test]
+    fn ban_cycle_needs_the_engine_window_to_hold_three_field_rounds() {
+        let c = BanCycle { min_bans: 3 };
+        let fill = |cap: usize| {
+            let mut w = RecentWindow::new(cap);
+            for round in 0..3 {
+                for (i, gw) in BAN_ROUND.iter().copied().enumerate() {
+                    push_field_tick(&mut w, round * 10 + i as i64, gw);
+                }
+            }
+            w
+        };
+        assert!(
+            c.eval(&fill(WINDOW_CAP)).is_some(),
+            "the engine window must hold three field rounds of the daemon's per-tick mix"
+        );
+        assert!(
+            c.eval(&fill(64)).is_none(),
+            "a 64-sample window holds a handful of ticks and cannot see a cycle"
+        );
     }
 }
