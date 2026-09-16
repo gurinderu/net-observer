@@ -1184,8 +1184,14 @@ pub(crate) struct FakeCollector {
     pub(crate) interval: std::time::Duration,
     /// Flipped by the test to make preflight succeed.
     pub(crate) ready: Arc<std::sync::atomic::AtomicBool>,
-    /// Ticks on which `collect()` actually ran.
+    /// Ticks on which `collect()` actually ran — counted on ENTRY, before the
+    /// gate below, so a test can see a tick being held open.
     pub(crate) collects: Arc<std::sync::atomic::AtomicUsize>,
+    /// When `Some`, `collect()` parks here until the test adds a permit: a
+    /// tick held open in flight, so a pause or a probing-tier switch can land
+    /// while the probe is "running" and the spawner's post-probe re-checks can
+    /// be reached. `None` = collect at once.
+    pub(crate) gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[cfg(test)]
@@ -1206,6 +1212,14 @@ impl Collector for FakeCollector {
     async fn collect(&self, ts_us: i64) -> Vec<Sample> {
         self.collects
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+        if let Some(gate) = &self.gate {
+            // One permit per released tick: the test decides when this probe
+            // "returns", and the next tick parks again.
+            gate.acquire()
+                .await
+                .expect("the test gate is never closed")
+                .forget();
+        }
         vec![Sample::Link(types::LinkSample {
             ts_us,
             gw: types::GwVerdict::Ok,
