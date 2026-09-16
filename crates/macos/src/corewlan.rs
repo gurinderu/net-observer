@@ -26,8 +26,9 @@
 //!
 //! SSID and BSSID are deliberately not read. macOS gates them behind Location
 //! Services, which a LaunchDaemon cannot obtain — root `wdutil` returns
-//! `SSID : <redacted>` on this machine while RSSI comes through fine. The SSID is
-//! collected by the `link` collector instead.
+//! `SSID : <redacted>` on this machine while RSSI comes through fine. The SSID
+//! and BSSID are collected by the `link` collector instead, from the
+//! command-line tools (`LinkSample::ssid`, `LinkSample::bssid`).
 
 use collector_core::Readiness;
 use collector_wifi::{WifiFacts, WifiRead, WifiReading};

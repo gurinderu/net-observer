@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime};
 
 use tokio::process::Command;
 
+use crate::neighbors::normalize_mac;
+
 /// Directory macOS writes Wi-Fi driver capture bundles into on a fault.
 const CORECAPTURE_WIFI_DIR: &str = "/Library/Logs/CrashReporter/CoreCapture/WiFi";
 
@@ -34,9 +36,11 @@ fn parse_ssid(output: &str) -> Option<String> {
 }
 
 /// Return the BSSID of the access point `iface` is associated with, lowercase
-/// `aa:bb:cc:dd:ee:ff`, or `None` if not associated (or the query fails).
-/// Read from `ipconfig getsummary`, which is not gated behind Location
-/// Services the way CoreWLAN's BSSID is (realm net-observer, node #59).
+/// `aa:bb:cc:dd:ee:ff`, or `None` when `ipconfig getsummary` prints no `BSSID`
+/// line (not associated) or the query fails. The command is an external
+/// surface (realm net-observer, node #93): the owner saw the line from a user
+/// session; what a root LaunchDaemon sees is unobserved, and `None` is the
+/// sanctioned answer when the line is absent.
 pub async fn current_bssid(iface: &str) -> Option<String> {
     let out = Command::new("ipconfig")
         .args(["getsummary", iface])
@@ -48,8 +52,12 @@ pub async fn current_bssid(iface: &str) -> Option<String> {
 }
 
 /// Extract the BSSID from `ipconfig getsummary` output: the line whose trimmed
-/// form is `BSSID : <mac>`. `None` when the line is absent (not associated) or
-/// its value is not a MAC — never a fabricated address.
+/// form is `BSSID : <mac>`, normalised through [`normalize_mac`] (lowercase,
+/// zero-padded octets; broadcast and multicast rejected). `None` when the line
+/// is absent (not associated) or its value is not a unicast MAC — never a
+/// fabricated address. `gw_arp_mac` is stored raw from `arp -n` and is NOT
+/// comparable to this field as stored; the AP-is-the-gateway comparison is
+/// deferred to the roam step.
 fn parse_bssid(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let value = line
@@ -58,13 +66,14 @@ fn parse_bssid(output: &str) -> Option<String> {
             .trim_start()
             .strip_prefix(':')?
             .trim();
-        normalise_mac(value)
+        normalize_mac(value)
     })
 }
 
-/// Return `iface`'s own MAC as currently assigned (`ifconfig <iface> ether`),
-/// lowercase, or `None` if it cannot be read. Private Wi-Fi Address rotates
-/// this per SSID, so it is read every tick rather than once.
+/// Return `iface`'s own MAC as currently assigned (`ifconfig <iface> ether`,
+/// an external surface: realm net-observer, node #93), lowercase, or `None`
+/// if it cannot be read. Private Wi-Fi Address rotates this per SSID, so it is
+/// read every tick rather than once.
 pub async fn interface_mac(iface: &str) -> Option<String> {
     let out = Command::new("ifconfig")
         .args([iface, "ether"])
@@ -75,40 +84,14 @@ pub async fn interface_mac(iface: &str) -> Option<String> {
     parse_ether(&text)
 }
 
-/// Extract the MAC from an `ifconfig` block: the indented `ether <mac>` line.
-/// `None` when the line is absent or its value is not a MAC.
+/// Extract the MAC from an `ifconfig` block: the indented `ether <mac>` line,
+/// normalised through [`normalize_mac`]. `None` when the line is absent or its
+/// value is not a unicast MAC.
 fn parse_ether(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let rest = line.trim().strip_prefix("ether ")?;
-        normalise_mac(rest.split_whitespace().next()?)
+        normalize_mac(rest.split_whitespace().next()?)
     })
-}
-
-/// Normalise a colon-separated MAC to lowercase, two-digit octets
-/// (`aa:bb:cc:dd:ee:ff`). Six groups of one or two hex digits are accepted —
-/// macOS tools print octets both zero-padded (`ifconfig`) and stripped
-/// (`arp`) — and anything else yields `None`: the caller records absence, not
-/// a guess. Zero-padding is the only rewriting done, so the same address read
-/// by two tools compares equal.
-fn normalise_mac(token: &str) -> Option<String> {
-    let octets: Vec<&str> = token.split(':').collect();
-    if octets.len() != 6 {
-        return None;
-    }
-    let mut out = String::with_capacity(17);
-    for (i, octet) in octets.iter().enumerate() {
-        if octet.is_empty() || octet.len() > 2 || !octet.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        if i > 0 {
-            out.push(':');
-        }
-        if octet.len() == 1 {
-            out.push('0');
-        }
-        out.push_str(&octet.to_ascii_lowercase());
-    }
-    Some(out)
 }
 
 /// `true` if a CoreCapture Wi-Fi bundle was written within `window` — i.e. the
@@ -194,8 +177,9 @@ mod tests {
         assert_eq!(parse_bssid(out), None);
     }
 
-    /// A `BSSID` line whose value is not a MAC is recorded as absence: a
-    /// fabricated identity would later read as a roam that never happened.
+    /// A `BSSID` line whose value is not a unicast MAC (the broadcast address
+    /// included) is recorded as absence: a fabricated identity would later
+    /// read as a roam that never happened.
     #[test]
     fn no_bssid_for_a_non_mac_value() {
         for value in [
@@ -203,6 +187,7 @@ mod tests {
             "3c:22:fb:12:34",
             "3c:22:fb:12:34:56:78",
             "zz:22:fb:12:34:56",
+            "ff:ff:ff:ff:ff:ff",
         ] {
             let out = format!("<dictionary> {{\n  BSSID : {value}\n  SSID : cowork\n}}\n");
             assert_eq!(parse_bssid(&out), None, "value {value:?} must not parse");
@@ -235,23 +220,28 @@ mod tests {
         assert_eq!(parse_ether(out), None);
     }
 
+    /// A non-MAC or the broadcast address is absence, not an identity: an
+    /// interface cannot BE `ff:ff:ff:ff:ff:ff`, and a later roam comparison
+    /// must never see it as one.
     #[test]
-    fn no_interface_mac_for_a_non_mac_value() {
-        let out = "en0: flags=8863<UP> mtu 1500\n\tether not-a-mac\n";
-        assert_eq!(parse_ether(out), None);
+    fn no_interface_mac_for_a_non_mac_or_broadcast_value() {
+        for value in ["not-a-mac", "ff:ff:ff:ff:ff:ff"] {
+            let out = format!("en0: flags=8863<UP> mtu 1500\n\tether {value}\n");
+            assert_eq!(parse_ether(&out), None, "value {value:?} must not parse");
+        }
     }
 
-    /// Octets are lowercased and zero-padded on the way through: macOS tools
-    /// print a MAC both padded (`ifconfig`) and stripped (`arp`), and an
-    /// address must compare equal to itself whichever tool read it.
+    /// Both parsers hand their value to the shared [`normalize_mac`]: octets
+    /// are lowercased and zero-padded, so the BSSID and the interface MAC are
+    /// stored in one shape however the tool printed them.
     #[test]
-    fn normalise_mac_lowercases_and_pads_stripped_octets() {
-        assert_eq!(
-            normalise_mac("3C:22:FB:1:2:3").as_deref(),
-            Some("3c:22:fb:01:02:03")
-        );
-        assert_eq!(normalise_mac("3c:22:fb::2:3"), None);
-        assert_eq!(normalise_mac("3c:22:fb:123:02:03"), None);
+    fn both_parsers_normalise_through_the_shared_function() {
+        let summary = "<dictionary> {\n  BSSID : 3C:22:FB:1:2:3\n}\n";
+        assert_eq!(parse_bssid(summary).as_deref(), Some("3c:22:fb:01:02:03"));
+        let ifconfig = "en0: flags=8863<UP> mtu 1500\n\tether F0:18:98:A:B:C\n";
+        assert_eq!(parse_ether(ifconfig).as_deref(), Some("f0:18:98:0a:0b:0c"));
+        assert_eq!(normalize_mac("3c:22:fb::2:3"), None);
+        assert_eq!(normalize_mac("3c:22:fb:123:02:03"), None);
     }
 
     #[test]
