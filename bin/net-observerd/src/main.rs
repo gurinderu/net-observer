@@ -41,8 +41,8 @@ use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
-    EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, Gated, GwChange, GwDrop, GwMacChange,
-    NeighborMacCollision, PerClientBlock, Starvation, Wedge,
+    BanCycle, EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, Gated, GwChange, GwDrop,
+    GwMacChange, NeighborMacCollision, PerClientBlock, Starvation, Wedge,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -98,6 +98,11 @@ const WEDGE_CONSECUTIVE: usize = 3;
 /// cohorts = 30s at the 15s proxy cadence — a single transition tick must not
 /// fire the fleet-wide signature.
 const ENDPOINT_BLOCK_CONSECUTIVE: usize = 2;
+
+/// Ban-cycle signal: this many gateway bans (`Fail` runs bounded by `Ok`) in
+/// the recent window read as one cycling incident with a period. Two bans are
+/// two outages; the third is the pattern.
+const BAN_CYCLE_MIN_BANS: usize = 3;
 
 /// Host load above which a dead tun counts as starvation (read from the `host`
 /// collector's newest sample by the `Starvation` condition), and above which
@@ -370,10 +375,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     // The observer's OWN collection on/off flag (self-control). `true` (default)
     // = collecting; `false` = paused. The interval + event collectors check it
     // each cycle (skip the probe / drop the batch while paused); the
-    // `SetObserving` control command flips it. Benign self-control — NOT gated by
-    // `acting.enabled` and it never touches sing-box or the network. While paused
-    // the daemon stays alive and the socket keeps serving, so the switch can turn
-    // collection back on. `StatusSnapshot::default()` already reports
+    // `SetObserving` control command flips it. Benign self-control — it never
+    // touches sing-box or the network. While paused the daemon stays alive and
+    // the socket keeps serving, so the switch can turn collection back on.
+    // `StatusSnapshot::default()` already reports
     // `observing: true`; the control handler mirrors every change into it.
     //
     // It always starts `true`, and is deliberately never loaded from disk (see
@@ -1136,6 +1141,8 @@ impl Collector for FakeCollector {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1154,6 +1161,8 @@ impl Collector for FakeCollector {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1325,12 +1334,10 @@ fn build_api_server(
     let socket_path = cfg.socket_path.clone();
     let socket_mode = cfg.socket_mode;
     let socket_owner_uid = cfg.socket_owner_uid;
-    // Thread the acting config through so the control path is gated by
-    // `acting.enabled` (off by default) in one place: `api::control_response`.
-    // The `observing` flag is threaded separately: `SetObserving` is benign
-    // self-control and must NOT be gated by that switch.
+    // Parameters of the manual actions, not a gate: config never stands between
+    // an authorised operator's command and its execution (realm net-observer,
+    // node #91).
     let acting = api::ActingConfig {
-        enabled: cfg.acting.enabled,
         singbox_service: cfg.acting.singbox_service.clone(),
     };
     api::ApiServer {
@@ -1347,8 +1354,8 @@ fn build_api_server(
         control_refusals: api::RateLimitedLog::new(api::REFUSAL_LOG_INTERVAL),
         sub_refusals: api::RateLimitedLog::new(api::REFUSAL_LOG_INTERVAL),
         acting,
-        // Who may send a `Request::Control` at all — orthogonal to
-        // `acting.enabled`, which only gates the acting *class* of commands.
+        // Who may send a `Request::Control` at all — the one gate on the
+        // control path.
         policy: api::ControlPolicy::from_config(cfg.socket_owner_uid, cfg.control_uids.clone()),
         observing: observing.clone(),
         // Shared, never fresh — for `quiet` the same reason as `observing`, and
@@ -1383,12 +1390,6 @@ fn build_api_server(
             // read: a pause landing mid-scan must reach the in-flight read.
             observing.clone(),
         )) as Arc<dyn AirScanner>),
-        // The config permission ceiling for the active scan.
-        scan_permission: net_observer_ipc::ScanOptions {
-            ports: cfg.collectors.neighbors.scan.ports,
-            banners: cfg.collectors.neighbors.scan.banners,
-            cve: cfg.collectors.neighbors.scan.cve,
-        },
         // Where the `cve` rung loads its snapshot; the availability check in
         // `scan_now` decides whether the rung is effective this run.
         scan_cve_snapshot: cfg
@@ -1409,7 +1410,7 @@ fn build_api_server(
 }
 
 /// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
-/// gw-mac-change, neighbor-mac-collision, per-client-block, fakeip,
+/// gw-mac-change, neighbor-mac-collision, per-client-block, ban-cycle, fakeip,
 /// fakeip-hijack, endpoint-block, established-stall, starvation). Every rule
 /// records an incident (durable, in DuckDB) and mirrors it into the live
 /// snapshot's ring for the socket API; gw-change and gw-mac-change
@@ -1486,6 +1487,22 @@ fn build_engine(
         Trigger::new(
             Box::new(Gated {
                 inner: PerClientBlock,
+                require_direct: false,
+                load_below: Some(STARVATION_LOAD),
+                settle_us: Some(SETTLE_US),
+            }),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        // No pcap freeze: the evidence is the recorded verdict sequence
+        // itself. No direct-path gate either — the pattern is measured
+        // THROUGH the dead gateways, so requiring a live uplink would
+        // suppress exactly what it looks for.
+        Trigger::new(
+            Box::new(Gated {
+                inner: BanCycle {
+                    min_bans: BAN_CYCLE_MIN_BANS,
+                },
                 require_direct: false,
                 load_below: Some(STARVATION_LOAD),
                 settle_us: Some(SETTLE_US),
@@ -1798,8 +1815,6 @@ mod tests {
             control_uids: vec![7, 9],
             blob_dir: "/tmp/net-observerd-wiring-test-blobs".into(),
             acting: config::ActingCfg {
-                // Also NOT the shipped default (`false`), for the same reason.
-                enabled: true,
                 singbox_service: "system/wiring-test".into(),
             },
             ..Config::default()
@@ -1817,6 +1832,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1973,10 +1990,6 @@ mod tests {
         assert_eq!(
             srv.socket_owner_uid, cfg.socket_owner_uid,
             "the socket must be chowned to the configured owner"
-        );
-        assert_eq!(
-            srv.acting.enabled, cfg.acting.enabled,
-            "the acting gate must come from config, not from a literal"
         );
         assert_eq!(
             srv.acting.singbox_service, cfg.acting.singbox_service,
@@ -2289,9 +2302,11 @@ mod tests {
     /// The `endpoint-block` rule the daemon actually runs counts to
     /// [`ENDPOINT_BLOCK_CONSECUTIVE`] — two — all-fail cohorts, no fewer.
     ///
-    /// Dies under `ENDPOINT_BLOCK_CONSECUTIVE = 1` (the single-cohort stream
-    /// fires, so the first assertion reds) and under `= 3` (the two-cohort run
-    /// stays silent, so the second reds). The cohort counts are LITERALS on
+    /// The newest cohort is never judged (it ends the one before it), so the
+    /// fire lands on the first row of the cohort after the run. Dies under
+    /// `ENDPOINT_BLOCK_CONSECUTIVE = 1` (the single ended cohort fires, so the
+    /// second assertion reds) and under `= 3` (the two-cohort run stays
+    /// silent, so the third reds). The cohort counts are LITERALS on
     /// purpose — this test IS the constant's pin, exactly like the wedge pin
     /// above.
     ///
@@ -2314,13 +2329,19 @@ mod tests {
             "one all-fail cohort is one short of ENDPOINT_BLOCK_CONSECUTIVE and must not fire"
         );
 
-        // The second cohort completes the run.
+        // The second cohort is the run — once a newer cohort has ended it.
         feed(&mut fx.engine, &mut w, failed_endpoint(3, "1.1.1.1:443"));
         feed(&mut fx.engine, &mut w, failed_endpoint(3, "2.2.2.2:2053"));
         assert_eq!(
             incidents_for(&fx.store, "endpoint-block"),
+            0,
+            "the newest cohort is still being written and is not judged yet"
+        );
+        feed(&mut fx.engine, &mut w, failed_endpoint(4, "1.1.1.1:443"));
+        assert_eq!(
+            incidents_for(&fx.store, "endpoint-block"),
             1,
-            "the second consecutive all-fail cohort must fire the endpoint-block rule"
+            "the first row of a third cohort ends the second and fires the endpoint-block rule"
         );
     }
 
@@ -2346,6 +2367,53 @@ mod tests {
             incidents_for(&fx.store, "per-client-block"),
             1,
             "a silent gateway with live neighbors must be recorded as per-client-block"
+        );
+    }
+
+    /// The `ban-cycle` rule the daemon actually runs counts to
+    /// [`BAN_CYCLE_MIN_BANS`] — three — gateway bans, no fewer. `gw-drop` and
+    /// `gw-change` fire on the same stream and are filtered out by
+    /// `incidents_for`. Dies under `BAN_CYCLE_MIN_BANS = 2` (the two-ban
+    /// stream fires, so the first assertion reds) and under a condition that
+    /// is written but never registered (the second never goes green).
+    #[test]
+    fn build_engine_registers_the_ban_cycle_rule() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(64);
+        // One ban round at the 15 s link cadence: admitted for two ticks,
+        // blocked for three, admitted for five.
+        let round = [
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Fail,
+            GwVerdict::Fail,
+            GwVerdict::Fail,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+            GwVerdict::Ok,
+        ];
+        for (tick, gw) in round.iter().chain(&round).copied().enumerate() {
+            feed(&mut fx.engine, &mut w, link(tick as i64 * 15_000_000, gw));
+        }
+        assert_eq!(
+            incidents_for(&fx.store, "ban-cycle"),
+            0,
+            "two bans are one short of BAN_CYCLE_MIN_BANS and must not fire"
+        );
+
+        for (tick, gw) in round.iter().copied().enumerate() {
+            feed(
+                &mut fx.engine,
+                &mut w,
+                link((20 + tick as i64) * 15_000_000, gw),
+            );
+        }
+        assert_eq!(
+            incidents_for(&fx.store, "ban-cycle"),
+            1,
+            "the third ban must be recorded as ban-cycle, once"
         );
     }
 

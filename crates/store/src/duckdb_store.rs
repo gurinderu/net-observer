@@ -185,7 +185,7 @@ impl Store for DuckdbStore {
         let c = self.conn.lock().unwrap();
         match s {
             Sample::Link(l) => c.execute(
-                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     l.ts_us,
                     l.gw.to_string(),
@@ -200,7 +200,9 @@ impl Store for DuckdbStore {
                     l.lan_probed,
                     l.lan_alive,
                     l.fakeip_route_if,
-                    l.singbox_tun_if
+                    l.singbox_tun_if,
+                    l.bssid,
+                    l.if_mac
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
@@ -947,6 +949,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: Some("incomplete".into()),
             ssid: Some("cowork".into()),
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -977,6 +981,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: Some(3),
             lan_alive: Some(1),
@@ -1025,6 +1031,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1036,6 +1044,59 @@ mod tests {
             s.query_scalar_i64(
                 "SELECT count(*) FROM link_sample \
                  WHERE fakeip_route_if = 'awdl0' AND singbox_tun_if = 'utun6'"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    /// The link's identity pair lands in its own columns, and an
+    /// undeterminable identity lands as NULL — "not associated / not readable"
+    /// must stay distinguishable from any real address, or a later roam
+    /// comparison would read a gap as a change.
+    #[test]
+    fn link_sample_identity_round_trips() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let base = LinkSample {
+            ts_us: 1000,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: Some("cowork".into()),
+            bssid: Some("3c:22:fb:12:34:56".into()),
+            if_mac: Some("f0:18:98:0a:0b:0c".into()),
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        };
+        s.write_sample(&Sample::Link(base.clone())).unwrap();
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 2000,
+            bssid: None,
+            if_mac: None,
+            ..base
+        }))
+        .unwrap();
+        let t = s
+            .query_table("SELECT ts_us, ssid, bssid, if_mac FROM link_sample ORDER BY ts_us")
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec!["1000", "cowork", "3c:22:fb:12:34:56", "f0:18:98:0a:0b:0c"],
+                vec!["2000", "cowork", "", ""],
+            ]
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample \
+                 WHERE ts_us = 2000 AND bssid IS NULL AND if_mac IS NULL"
             )
             .unwrap(),
             1
@@ -1256,6 +1317,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1486,6 +1549,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

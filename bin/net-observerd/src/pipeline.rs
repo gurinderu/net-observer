@@ -37,9 +37,6 @@ use triggers::handlers::Handler;
 use triggers::window::RecentWindow;
 use types::{BlobRef, NeighborLifetime, NeighborsSample, Sample};
 
-/// Capacity of the recent-sample window handed to the trigger engine.
-const WINDOW_CAP: usize = 64;
-
 /// How long, in MONOTONIC time, one resume edge's drain filter may stay open.
 ///
 /// The filter exists only to keep samples that were already queued when the pause
@@ -303,7 +300,7 @@ pub async fn run(
     // `0` = the daemon has never resumed.
     resume_at_us: Arc<AtomicI64>,
 ) {
-    let mut window = RecentWindow::new(WINDOW_CAP);
+    let mut window = RecentWindow::new(triggers::WINDOW_CAP);
     // The bounded post-resume drain filter, replacing the raw
     // `now_us < applied_resume_us` comparison a single backwards clock step could
     // otherwise make true for ever.
@@ -620,10 +617,13 @@ impl PcapFreezer for macos::PcapRing {
 /// real segment. The production impl is [`crate::SystemScanner`].
 pub trait NeighborScanner: Send + Sync {
     /// Run the scan, blocking for as long as its own budget allows. `opts` is the
-    /// EFFECTIVE option set (already intersected with config permission by the
-    /// caller), so the scanner runs exactly the rungs it is handed. `None` when
-    /// there is nothing to scan (no interface, no IPv4 subnet) — a refusal the
-    /// caller reports, not an error it swallows.
+    /// EFFECTIVE option set: the rungs the operator asked for, minus dependency
+    /// drops the caller already made (banners need ports; cve needs banners and
+    /// a provisioned snapshot). There is no permission ceiling — config never
+    /// gates an operator's command (realm net-observer, node #91) — so the
+    /// scanner runs exactly the rungs it is handed. `None` when there is nothing
+    /// to scan (no interface, no IPv4 subnet) — a refusal the caller reports,
+    /// not an error it swallows.
     fn scan(&self, opts: &net_observer_ipc::ScanOptions) -> Option<ScanReport>;
 }
 
@@ -1699,6 +1699,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1733,6 +1735,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

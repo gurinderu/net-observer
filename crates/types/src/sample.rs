@@ -15,6 +15,20 @@ pub struct LinkSample {
     pub dhcp_dns: Option<String>,
     pub gw_arp_mac: Option<String>,
     pub ssid: Option<String>,
+    /// BSSID of the access point currently associated on the link interface
+    /// (`ipconfig getsummary <iface>`), lowercase `aa:bb:cc:dd:ee:ff`. `None` =
+    /// not associated or not determinable — never a fabricated value. A change
+    /// of BSSID at the same SSID is a roam (band steering / twin SSIDs), which
+    /// the SSID alone cannot show (realm net-observer, node #59).
+    /// `serde(default)` so a pre-field daemon's samples still decode.
+    #[serde(default)]
+    pub bssid: Option<String>,
+    /// The link interface's OWN MAC as currently assigned (`ifconfig <iface>`
+    /// `ether` line), lowercase. Private Wi-Fi Address rotates it per SSID, so
+    /// a change here is a new DHCP identity toward the network (realm
+    /// net-observer, node #59). `serde(default)` as above.
+    #[serde(default)]
+    pub if_mac: Option<String>,
     pub wifi_capture_present: bool,
     /// Probe-on-suspicion: how many LAN neighbors were pinged on this tick.
     /// Measured only when the gateway verdict is `Fail`; `None` = not probed
@@ -123,8 +137,8 @@ pub struct HostSample {
 /// tick, never an absent one.
 ///
 /// SSID/BSSID are deliberately absent. macOS gates them behind Location Services,
-/// which a LaunchDaemon cannot obtain; the SSID is collected by the `link`
-/// collector instead.
+/// which a LaunchDaemon cannot obtain; the `link` collector reads both from the
+/// command-line tools instead ([`LinkSample::ssid`], [`LinkSample::bssid`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WifiSample {
     pub ts_us: i64,
@@ -201,6 +215,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

@@ -80,8 +80,8 @@ pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, GlanceError> {
 ///
 /// Like the other requests this maps to a `Control` command on the wire, but it is
 /// benign **self-control**: it pauses/resumes the observer's own collection only —
-/// it does NOT touch the proxy or the network, and the daemon does not gate it on
-/// `acting.enabled`.
+/// it does NOT touch the proxy or the network. Like every control command, the
+/// only thing the daemon checks before running it is the peer uid.
 /// The daemon stays alive and the socket keeps serving while paused, so the switch
 /// can turn collection back on. As with every request, a missing socket /
 /// connection-refused (daemon down) or a protocol error maps to `Err(String)` so
@@ -92,7 +92,8 @@ pub fn read_fresh(socket_path: &str) -> Result<StatusSnapshot, GlanceError> {
 ///
 /// Quiet is not a pause: the daemon keeps collecting and keeps emitting one link
 /// sample per tick — it just addresses no packet at the gateway, so the gateway
-/// verdict reads `SKIP`. Benign **self-control**, not gated by `acting.enabled`.
+/// verdict reads `SKIP`. Benign **self-control**; the daemon checks only the
+/// peer uid before running it.
 /// Transport failures map to `Err(String)` for the panel to surface, never a panic.
 pub fn send_set_quiet(socket_path: &str, on: bool) -> Result<ControlResult, String> {
     control_query(socket_path, ControlCmd::SetQuiet(on))
@@ -111,9 +112,10 @@ pub fn send_freeze_pcap(socket_path: &str) -> Result<ControlResult, String> {
 /// (`Control(ScanNeighbors)`): a sweep of the local subnet plus an mDNS browse.
 ///
 /// The one control action in the panel that puts packets on the wire towards
-/// machines that are not this one, so it is **acting-class** — a daemon without
-/// `acting.enabled` answers `ok: false` with a reason, shown like any other
-/// control outcome.
+/// machines that are not this one. The daemon runs it when asked — the press is
+/// the sanction, no config switch gates it (realm net-observer, node #91) — and
+/// answers `ok: false` with a reason when it cannot (paused, quiet, no subnet)
+/// or when the peer uid is not authorised, shown like any other control outcome.
 pub fn send_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult, String> {
     control_query(socket_path, ControlCmd::ScanNeighbors(opts))
 }
@@ -243,7 +245,7 @@ pub(crate) type ControlRoundTrip = fn(
 /// the shared model: the menu's entries and the map window's Rescan.
 ///
 /// The wiring stays in one place on purpose: "never block the gpui main thread",
-/// "a daemon that is not there is a message, not a crash", and "the acting gate's
+/// "a daemon that is not there is a message, not a crash", and "the daemon's
 /// refusal is surfaced verbatim" are decided once for every control button in the
 /// app, not re-decided per window.
 pub(crate) fn spawn_control_on<V: 'static>(

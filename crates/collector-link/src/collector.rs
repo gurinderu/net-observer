@@ -128,6 +128,13 @@ where
             None => None,
         };
         let ssid = self.facts.ssid().await;
+        // The link's identity pair: the AP associated with and the interface's
+        // own MAC. Two local reads (no packet on the wire), so they keep
+        // running under quiet mode. Recorded every tick because a roam between
+        // twin SSIDs shows up here and nowhere else (realm net-observer,
+        // node #59).
+        let bssid = self.facts.bssid().await;
+        let if_mac = self.facts.if_mac().await;
         let wifi_present = self.facts.wifi_capture_present().await;
         // Two local reads, not probes: the fakeip pool's route egress and the
         // interface carrying sing-box's own TUN address (the sing-box-alive
@@ -148,6 +155,8 @@ where
             fakeip_route_if,
             singbox_tun_if,
             ssid,
+            bssid,
+            if_mac,
             wifi_present,
         ))]
     }
@@ -163,6 +172,8 @@ where
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -221,8 +232,22 @@ mod tests {
             }
         }
     }
+    /// Link facts with a scripted identity pair: `bssid`/`if_mac` are returned
+    /// exactly as set, so a test can hand the collector a determinable or an
+    /// undeterminable identity and read what lands in the sample.
     struct FakeFacts {
         ready: bool,
+        bssid: Option<String>,
+        if_mac: Option<String>,
+    }
+    impl Default for FakeFacts {
+        fn default() -> Self {
+            Self {
+                ready: true,
+                bssid: Some("3c:22:fb:12:34:56".into()),
+                if_mac: Some("f0:18:98:0a:0b:0c".into()),
+            }
+        }
     }
     impl LinkFacts for FakeFacts {
         async fn default_gw(&self) -> Option<String> {
@@ -257,6 +282,12 @@ mod tests {
         async fn ssid(&self) -> Option<String> {
             None
         }
+        async fn bssid(&self) -> Option<String> {
+            self.bssid.clone()
+        }
+        async fn if_mac(&self) -> Option<String> {
+            self.if_mac.clone()
+        }
         async fn wifi_capture_present(&self) -> bool {
             false
         }
@@ -276,9 +307,19 @@ mod tests {
         LinkCollector::new(
             ping,
             FakeTcp,
-            FakeFacts { ready: true },
+            FakeFacts::default(),
             Duration::from_secs(15),
             quiet,
+        )
+    }
+
+    fn collector_with_facts(facts: FakeFacts) -> LinkCollector<CountingPing, FakeTcp, FakeFacts> {
+        LinkCollector::new(
+            CountingPing::default(),
+            FakeTcp,
+            facts,
+            Duration::from_secs(15),
+            Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -289,7 +330,10 @@ mod tests {
         LinkCollector::new(
             CountingPing::default(),
             FakeTcp,
-            FakeFacts { ready },
+            FakeFacts {
+                ready,
+                ..FakeFacts::default()
+            },
             Duration::from_secs(15),
             quiet,
         )
@@ -354,6 +398,37 @@ mod tests {
             panic!("expected a link sample")
         };
         assert_eq!(l.fakeip_route_if.as_deref(), Some("utun8"));
+    }
+
+    /// The identity pair the facts port reads — the AP's BSSID and the
+    /// interface's own MAC — lands in the sample every tick, untouched.
+    #[tokio::test]
+    async fn the_link_identity_lands_in_the_sample() {
+        let c = collector(true);
+        let samples = c.collect(42).await;
+        let Sample::Link(l) = &samples[0] else {
+            panic!("expected a link sample")
+        };
+        assert_eq!(l.bssid.as_deref(), Some("3c:22:fb:12:34:56"));
+        assert_eq!(l.if_mac.as_deref(), Some("f0:18:98:0a:0b:0c"));
+    }
+
+    /// An identity the facts port could not determine stays `None` in the
+    /// sample: not associated / not readable is recorded as absence, never as
+    /// a placeholder address a roam comparison could mistake for a real one.
+    #[tokio::test]
+    async fn an_undeterminable_link_identity_stays_none() {
+        let c = collector_with_facts(FakeFacts {
+            bssid: None,
+            if_mac: None,
+            ..FakeFacts::default()
+        });
+        let samples = c.collect(42).await;
+        let Sample::Link(l) = &samples[0] else {
+            panic!("expected a link sample")
+        };
+        assert_eq!(l.bssid, None);
+        assert_eq!(l.if_mac, None);
     }
 
     /// A silent gateway triggers the probe-on-suspicion: at most

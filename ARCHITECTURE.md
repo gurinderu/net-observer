@@ -11,14 +11,14 @@ daemon collects telemetry and fires *passive* triggers (record an incident,
 freeze the pcap ring) — it **never acts automatically**. The single write/control
 path is manual and human-in-the-loop: an operator's `Request::Control` (from the
 CLI `kickstart` subcommand — no longer surfaced in the bar) asks the daemon
-to `launchctl kickstart -k` the sing-box service, and the daemon runs it **only
-when `acting.enabled` is set** — off by default, so every acting-class control
-request is otherwise refused without running anything. Distinct from acting is an
-**observing on/off switch** (`ControlCmd::SetObserving`): benign *self-control*
-that pauses/resumes the daemon's OWN collection (the collectors stop producing
-samples; the daemon stays alive and the socket keeps serving). It touches neither
-sing-box nor the network, so it is **not** gated by `acting.enabled` — though,
-like every control request of either class, it must first pass the daemon's
+to `launchctl kickstart -k` the sing-box service, and the daemon runs it for any
+**authorised peer** — no config switch stands in front of a command the operator
+sends by hand; the invocation is the sanction (realm net-observer, node #91).
+Distinct from acting is an **observing on/off switch**
+(`ControlCmd::SetObserving`): benign *self-control* that pauses/resumes the
+daemon's OWN collection (the collectors stop producing samples; the daemon stays
+alive and the socket keeps serving). It touches neither sing-box nor the network
+— though, like every control request, it must first pass the daemon's
 peer-credential check, and every pause/resume edge is recorded durably so the
 resulting silence is bounded rather than bare. See
 [Control path](#control-path). No watchdog, no automatic recovery, no
@@ -90,12 +90,14 @@ flowchart LR
   `gw-drop`, `gw-change` (unconditional pcap freeze on any gateway change),
   `gw-mac-change` (pcap freeze too), `neighbor-mac-collision`,
   `per-client-block` (gateway silent while probed LAN neighbors answer),
-  `fakeip`, `fakeip-hijack` (a fakeip-pool address routes out a non-tunnel
-  interface), `endpoint-block` (whole upstream fleet dead from the underlay
-  while the direct reference answers), `established-stall` (a held long-lived
-  stream through the tunnel stops carrying while fresh probes succeed; the
-  direct underlay stream's fate scopes the verdict), `starvation`. Each fires
-  at most once per 5 min (backoff) and disarms until the signal returns to OK.
+  `ban-cycle` (three or more gateway bans in the window read as one cycling
+  incident with a period), `fakeip`, `fakeip-hijack` (a fakeip-pool address
+  routes out a non-tunnel interface), `endpoint-block` (whole upstream fleet
+  dead from the underlay while the direct reference answers),
+  `established-stall` (a held long-lived stream through the tunnel stops
+  carrying while fresh probes succeed; the direct underlay stream's fate scopes
+  the verdict), `starvation`. Each fires at most once per 5 min (backoff) and
+  disarms until the signal returns to OK.
 - **Live snapshot + local socket API** — the consumer keeps an in-memory
   `StatusSnapshot` (the latest sample per collector + `generated_us`) current on
   every tick, and a passive `SnapshotHandler` mirrors each fired incident into a
@@ -446,7 +448,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 
 | Table | Columns | Notes |
 | --- | --- | --- |
-| `link_sample` | `ts_us, gw, gw_rtt_ms, direct, direct_rtt_ms, dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present, lan_probed, lan_alive, fakeip_route_if, singbox_tun_if` | Local path: gateway ping, direct TCP (bound to phys iface), DHCP/ARP facts, Wi-Fi SSID + CoreCapture presence. `lan_probed`/`lan_alive` are the probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL tick (NULL = not probed). `fakeip_route_if` is the egress interface the route table resolves for a fakeip-pool address; `singbox_tun_if` is the interface carrying sing-box's own TUN address (present only while sing-box runs — the sing-box-alive fact, not "any utun", so a foreign VPN's utun does not read as sing-box being up). Both NULL = could not be determined. |
+| `link_sample` | `ts_us, gw, gw_rtt_ms, direct, direct_rtt_ms, dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present, lan_probed, lan_alive, fakeip_route_if, singbox_tun_if, bssid, if_mac` | Local path: gateway ping, direct TCP (bound to phys iface), DHCP/ARP facts, Wi-Fi SSID + CoreCapture presence. `lan_probed`/`lan_alive` are the probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL tick (NULL = not probed). `fakeip_route_if` is the egress interface the route table resolves for a fakeip-pool address; `singbox_tun_if` is the interface carrying sing-box's own TUN address (present only while sing-box runs — the sing-box-alive fact, not "any utun", so a foreign VPN's utun does not read as sing-box being up). Both NULL = could not be determined. `bssid` is the BSSID of the access point associated with and `if_mac` the interface's own MAC as currently assigned (Private Wi-Fi Address rotates it per SSID), both lowercase; a BSSID change at the same SSID is a roam the SSID alone cannot show, an `if_mac` change a new DHCP identity toward the network. NULL = not associated / not determinable. |
 | `proxy_sample` | `ts_us, server_ip, tcp, rtt_ms, tun_code, selector, est_direct_alive, est_direct_age_s, est_tun_alive, est_tun_age_s` | Per-VLESS TCP reachability, tun HTTP 204 (`tun_code`), Clash selector. The `est_*` columns are the established-flow discriminator (held reference streams: direct underlay / through the tunnel), per-tick facts replicated across the tick's rows like `tun_code`; NULL = no measurement. |
 | `dns_sample` | `ts_us, probe, server, verdict, ip, rtt_ms` | One row per resolver probe (name label × resolver path); `verdict` drives the `fakeip` trigger. |
 | `route_event` | `ts_us, kind, iface, detail` | PF_ROUTE event stream (`kind` = `iface` / `addr` / `route`): iface up/down, addr add/loss, default-route change. |
@@ -614,10 +616,10 @@ the durable record; the socket is the live, low-latency read path.
     problem. (realm net-observer, node #58)
   - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
     write/control path (see [Control path](#control-path) below); the only
-    non-read request. Four commands today, one acting-class and three
-    self-control: `ControlCmd::KickstartProxy` (acting-class, gated) and
-    `SetObserving(bool)` / `SetQuiet(bool)` / `FreezePcap` (self-control,
-    ungated by `acting.enabled` — never by the peer check).
+    non-read request. Six commands today — `ControlCmd::KickstartProxy`,
+    `SetObserving(bool)`, `SetQuiet(bool)`, `FreezePcap`,
+    `ScanNeighbors(ScanOptions)`, `ScanAir` — every one behind the same
+    peer-credential check and none behind a config switch.
   - `Request::Subscribe { kinds }` → a **held-open stream** of newline-JSON
     `StreamFrame`s (not a single `Response`, and not bare `Event`s) — the
     realtime pub/sub path (see [Event bus and live
@@ -681,8 +683,8 @@ the durable record; the socket is the live, low-latency read path.
   answer a **one-shot** request (`Status` / `Incidents` / `Query` / `Control`)
   from the shared `Arc<Mutex<StatusSnapshot>>` the pipeline keeps current (or,
   for a `Query`, run the named diagnosis against the store on the blocking pool;
-  for a `Control`, pass the peer-credential gate and then run the class-gated
-  command), write one `Response`, and close; or, for a `Subscribe`, **hold the connection
+  for a `Control`, pass the peer-credential gate and then run the command),
+  write one `Response`, and close; or, for a `Subscribe`, **hold the connection
   open** and stream `StreamFrame`s until the client disconnects (see [Event bus
   and live subscriptions](#event-bus-and-live-subscriptions)). The lock is held
   only long enough to clone what a reply needs — never across an `.await`, so a
@@ -859,13 +861,19 @@ sequenceDiagram
 ### Control path
 
 The one **write** path over the socket: a `Request::Control(ControlCmd)`. It
-passes **two orthogonal gates**, both applied in exactly one place,
-`api::control_request`: a peer-credential check that every control request of
-either class must pass, and then the `acting.enabled` class gate below.
+passes **one gate**, applied in exactly one place, `api::control_request`: a
+peer-credential check that every control request must pass. No config switch
+follows it — config may switch off what the daemon does by itself (a per-tick
+probe, a passive handler), never a command the operator sends by hand; the
+invocation is the sanction (realm net-observer, node #91). What an arm can
+still refuse, with a reason, is a contradiction of the daemon's own state (a
+scan while paused or quiet) or a missing dependency (no ring, no scanner, no
+CVE snapshot).
 
-**Gate 1 — who may command the daemon at all.** Before any dispatch on the
-`ControlCmd`, the connection's peer credentials are read from the `UnixStream`
-(`peer_cred()`, `getpeereid(2)` on macOS — the peer at `connect(2)` time) and put
+**The peer-credential gate — who may command the daemon at all.** Before any
+dispatch on the `ControlCmd`, the connection's peer credentials are read from the
+`UnixStream` (`peer_cred()`, `getpeereid(2)` on macOS — the peer at `connect(2)`
+time) and put
 through the pure predicate `api::control_authorized`. It admits:
 
 - **root** (uid 0) — it can already stop and reconfigure the daemon, so refusing
@@ -917,22 +925,18 @@ Two structural guarantees make this unskippable rather than conventional:
   actually dispatches — takes one **by value**, so "dispatch without a peer
   check" is unrepresentable rather than merely discouraged. The token also
   carries the peer's uid, which is what lands in `observing_edge.peer_uid`.
-- The `acting.enabled` gate is derived from **one exhaustive**
-  `ControlAuthority::of(&cmd)` match rather than a per-arm decision, so adding a
-  third command fails to compile until someone classifies it — no command can
-  inherit the weaker gate by omission.
 
-**Gate 2 — what the daemon may touch.** Two classes of command, gated
-differently and dispatched in exactly one place, `api::control_response`:
+**Dispatch** happens in exactly one place, `api::control_response`, on an
+already-authorised command:
 
-1. **Acting-class — gated by `acting.enabled`.** `ControlCmd::KickstartProxy`
-   asks the daemon to restart the sing-box service via
-   `launchctl kickstart -k <service>`. The client only *sends the request* — it
-   never runs `launchctl` itself; the root daemon is the sole actor, and only when
-   acting is on. This capability lives in the CLI (`net-observer-cli kickstart`); it is
-   **not** surfaced in the bar (the bar has no "Restart sing-box" control).
+1. **`ControlCmd::KickstartProxy`** asks the daemon to restart the sing-box
+   service via `launchctl kickstart -k <service>` (the service name is the one
+   parameter `config::ActingCfg` holds). The client only *sends the request* —
+   it never runs `launchctl` itself; the root daemon is the sole actor. This
+   capability lives in the CLI (`net-observer-cli kickstart`); it is **not**
+   surfaced in the bar (the bar has no "Restart sing-box" control).
 
-2. **Self-control — NOT gated by `acting.enabled`.** `ControlCmd::SetObserving(b)`
+2. **Self-control — `ControlCmd::SetObserving(b)`**
    turns the observer's OWN collection on/off. Under the snapshot mutex (the only
    thing serialising concurrent control connections, and this is the sole writer
    of both) it stores `b` into the shared `observing` `AtomicBool` the collectors
@@ -943,13 +947,11 @@ differently and dispatched in exactly one place, `api::control_response`:
    synchronised with it and no post-resume sample can reach the consumer while it
    still reads the old epoch (see the window clear under
    [Async collectors](#async-collectors)). It touches neither sing-box nor the
-   network — a purely benign, reversible pause of the daemon's own probing — so
-   the *acting* gate deliberately does not apply: a client can pause/resume
-   collection even with `acting.enabled == false`. It is exempt from the acting
-   gate, **not** from authorisation: like every control request it must first
-   pass gate 1. The daemon stays alive and the socket keeps serving throughout,
-   so the same switch can turn collection back on. Clients: the bar's toggle
-   switch and the CLI `observe on|off` subcommand.
+   network — a purely benign, reversible pause of the daemon's own probing. Like
+   every control request it must first pass the peer-credential gate. The daemon
+   stays alive and the socket keeps serving throughout, so the same switch can
+   turn collection back on. Clients: the bar's toggle switch and the CLI
+   `observe on|off` subcommand.
 
    A **real transition** then goes to two sinks, from one `types::ObservingEdge`
    built once and stamped with one `ts_us`, so the offline record and the wire
@@ -979,26 +981,23 @@ differently and dispatched in exactly one place, `api::control_response`:
    operator believing an artifact exists. Client: the bar footer's **Freeze
    pcap** action.
 
-`ControlAuthority::of` is the one exhaustive match that classifies all four, so a
-fifth command fails to compile until someone classifies it.
+The `ScanNeighbors` and `ScanAir` arms are described under their own
+subsystems; both take the same path below and are refused only by a state they
+contradict (paused; for the sweep also quiet) or a missing dependency.
 
 ```
 Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
                               │
-                              ├─ GATE 1: control_authorized(policy, peer_uid, console_uid())
+                              ├─ PEER-CREDENTIAL GATE: control_authorized(policy, peer_uid, console_uid())
                               │     ├─ refused / peer unknown
                               │     │     └─► ControlResult { ok: false, "control refused: …" }
                               │     │         (fails closed; nothing is dispatched)
                               │     └─ allowed ─► PeerAuthorized(uid)  ── required BY VALUE by ──┐
                               │                                                                  │
                               └─ control_response(cmd, authorized, &cx)  ◄──────────────────────┘
+                                    │   (no config gate here — realm net-observer, node #91)
                                     │
-                                    ├─ GATE 2: ControlAuthority::of(&cmd) == Acting && !acting.enabled
-                                    │     └─► ControlResult { ok: false, "acting disabled" }
-                                    │         (returns before touching the actuator —
-                                    │          nothing is executed)
-                                    │
-                                    ├─ SetObserving(b)  — SelfControl, ungated by acting
+                                    ├─ SetObserving(b)
                                     │     └─► [resume: resume_at_us.store(ts)] + observing.store(b)
                                     │         + snapshot.observing = b
                                     │         └─► on a real EDGE only:
@@ -1007,30 +1006,29 @@ Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
                                     │         └─► ControlResult { ok: true, "observing on|off" }
                                     │             (never touches sing-box or the network)
                                     │
-                                    ├─ SetQuiet(b)      — SelfControl, ungated by acting
+                                    ├─ SetQuiet(b)
                                     │     └─► quiet.store(b) + snapshot.quiet = b
                                     │         (NO observing_edge row: the record keeps
                                     │          receiving one SKIP-gw sample per tick)
                                     │
-                                    ├─ FreezePcap       — SelfControl, ungated by acting
+                                    ├─ FreezePcap
                                     │     └─► freeze_now(cx) → freezer.freeze(dir)
                                     │         — or ok: false with a
                                     │         reason when no ring is running
                                     │
-                                    └─ KickstartProxy   — Acting-class, gated above
+                                    └─ KickstartProxy
                                           └─► acting::kickstart_proxy(&singbox_service)
                                               (the ONLY place launchctl runs)
                                               └─► ControlResult { ok, message }
 ```
 
-**Safety invariant:** `acting.enabled` defaults to `false` (`config::ActingCfg`),
-and no code path reaches the actuator (`bin/net-observerd/src/acting.rs`) unless a
-`KickstartProxy` request arrives from an **authorised peer** *and* acting is
-enabled. Acting is never triggered by the pipeline or a passive handler — only by
-an explicit operator request. `SetObserving` is exempt from the *acting* gate by
-design (self-control, no external effect) but never from authorisation: it is a
-`Control` request over the same socket, so gate 1 and the socket hardening below
-apply to it unchanged.
+**Safety invariant:** no code path reaches the actuator
+(`bin/net-observerd/src/acting.rs`) unless a `KickstartProxy` request arrives
+from an **authorised peer**. Acting is never triggered by the pipeline or a
+passive handler — only by an explicit operator request, and that request is its
+own sanction: `config::ActingCfg` holds the service name and gates nothing.
+`SetObserving` is a `Control` request over the same socket, so the
+peer-credential gate and the socket hardening below apply to it unchanged.
 
 **Pause semantics: process-scoped, never persisted.** The `observing` state lives
 only in the running process — it is deliberately **not** written to the store or
@@ -1045,12 +1043,13 @@ that was in effect when the process died (see the note under
 
 **Socket ownership / hardening.** The socket's mode and owner are *defence in
 depth*, not the authorisation mechanism — the peer-credential gate above is, and
-it applies whatever the file permissions are. Still, an operator enabling
-`acting` should narrow who can even connect: set `socket_mode = 0o600` and
+it applies whatever the file permissions are. Still, an operator who uses the
+control path should narrow who can even connect: set `socket_mode = 0o600` and
 `socket_owner_uid = <logged-in uid>` so only that owner reaches the endpoint at
 all. With the default `socket_mode = 0o666` the socket is world-connectable (fine
-for read-only status; a stranger's `Control` is refused by gate 1, but tightening
-the mode removes the attempt as well as the effect), and `socket_owner_uid` is
+for read-only status; a stranger's `Control` is refused by the peer-credential
+gate, but tightening the mode removes the attempt as well as the effect), and
+`socket_owner_uid` is
 `None` (the socket keeps the daemon's root ownership — and then authorises no one
 through that clause). On a host with no console session, `control_uids` is the
 way to authorise an administrator, since the console-user rule admits nobody
@@ -1126,5 +1125,5 @@ accepting privileged commands is the **peer-credential gate** on every
 `Request::Control` — root, the daemon's own uid, `socket_owner_uid`, the
 logged-in console user, or a uid in `control_uids` — not the file mode; a
 restrictive `socket_mode = 0o600` paired with `socket_owner_uid` is defence in
-depth on top of it, worth setting whenever `acting.enabled` is turned on (see
+depth on top of it, worth setting wherever the control path is used (see
 [Control path](#control-path)).

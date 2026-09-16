@@ -21,7 +21,9 @@ use types::{GwVerdict, LinkSample, TcpVerdict};
 /// `fakeip_route_if` is the egress interface the route table resolves for a
 /// fakeip-pool address and `singbox_tun_if` the interface carrying sing-box's
 /// own TUN address (`None` = could not be determined / sing-box not up),
-/// equally untouched.
+/// equally untouched. `bssid` and `if_mac` are the link's identity pair — the
+/// AP associated with and the interface's own (rotating) MAC — passed through
+/// as read, `None` meaning not determinable, never a fabricated value.
 #[allow(clippy::too_many_arguments)]
 pub fn build_link_sample(
     ts_us: i64,
@@ -35,6 +37,8 @@ pub fn build_link_sample(
     fakeip_route_if: Option<String>,
     singbox_tun_if: Option<String>,
     ssid: Option<String>,
+    bssid: Option<String>,
+    if_mac: Option<String>,
     wifi_present: bool,
 ) -> LinkSample {
     let (gw, gw_rtt_ms) = match &gw_addr {
@@ -71,6 +75,8 @@ pub fn build_link_sample(
         dhcp_dns,
         gw_arp_mac: arp,
         ssid,
+        bssid,
+        if_mac,
         wifi_capture_present: wifi_present,
         lan_probed,
         lan_alive,
@@ -105,6 +111,8 @@ mod tests {
             None,
             None,
             Some("cowork".into()),
+            None,
+            None,
             false,
         );
         assert_eq!(s.gw, GwVerdict::NoGw);
@@ -126,6 +134,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             false,
         );
         assert_eq!(s.gw, GwVerdict::Fail);
@@ -144,6 +154,8 @@ mod tests {
             (None, None),
             Some("aa:bb".into()),
             (None, None),
+            None,
+            None,
             None,
             None,
             None,
@@ -169,6 +181,8 @@ mod tests {
             None,
             None,
             Some("cowork".into()),
+            None,
+            None,
             false,
         );
         assert_eq!(s.gw, GwVerdict::Skip);
@@ -195,6 +209,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             false,
         );
         assert_eq!(s.gw, GwVerdict::NoGw);
@@ -214,6 +230,8 @@ mod tests {
             Some("awdl0".into()),
             Some("utun6".into()),
             Some("cowork".into()),
+            Some("3c:22:fb:12:34:56".into()),
+            Some("f0:18:98:0a:0b:0c".into()),
             true,
         );
         assert_eq!(s.ts_us, 7);
@@ -223,6 +241,34 @@ mod tests {
         assert_eq!(s.fakeip_route_if.as_deref(), Some("awdl0"));
         assert_eq!(s.singbox_tun_if.as_deref(), Some("utun6"));
         assert_eq!(s.ssid.as_deref(), Some("cowork"));
+        assert_eq!(s.bssid.as_deref(), Some("3c:22:fb:12:34:56"));
+        assert_eq!(s.if_mac.as_deref(), Some("f0:18:98:0a:0b:0c"));
         assert!(s.wifi_capture_present);
+    }
+
+    /// The identity pair is passed through as read: an undeterminable BSSID or
+    /// interface MAC stays `None` — never a placeholder that a later roam
+    /// comparison could mistake for a real address.
+    #[test]
+    fn an_undeterminable_identity_stays_none() {
+        let s = build_link_sample(
+            8,
+            outcome(true),
+            outcome(true),
+            false,
+            Some("10.20.0.1".into()),
+            (None, None),
+            None,
+            (None, None),
+            None,
+            None,
+            Some("cowork".into()),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(s.ssid.as_deref(), Some("cowork"));
+        assert_eq!(s.bssid, None);
+        assert_eq!(s.if_mac, None);
     }
 }

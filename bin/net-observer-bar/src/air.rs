@@ -198,7 +198,10 @@ const GOLDEN_ANGLE_DEG: f64 = 137.507_764_05;
 /// A message from the subscription thread to the gpui bridge task.
 #[derive(Debug)]
 enum BridgeMsg {
-    Frame(StreamFrame),
+    /// One decoded frame from the daemon. Boxed: a frame carries a whole
+    /// sample, so an inline payload would size every message in the channel to
+    /// the largest sample (clippy `large_enum_variant`).
+    Frame(Box<StreamFrame>),
     /// The daemon is down or the stream dropped; the thread will retry.
     Offline(String),
     /// This daemon could not read our filter, so the subscription was widened to
@@ -341,7 +344,7 @@ impl AirFeed {
     fn apply(&mut self, msg: BridgeMsg) {
         match msg {
             BridgeMsg::Frame(frame) => {
-                match frame {
+                match *frame {
                     StreamFrame::Event(Event::Air(a)) => {
                         self.offline = None;
                         self.air = Some(a);
@@ -2263,7 +2266,7 @@ fn run_subscription(sock_path: &str, tx: &mpsc::SyncSender<BridgeMsg>, shutdown:
                 }
                 // The ack carries the daemon's collection state, which is what
                 // tells the window a stalled map is a pause and not a hang.
-                let ready = BridgeMsg::Frame(StreamFrame::Ready(sub.ready().clone()));
+                let ready = BridgeMsg::Frame(Box::new(StreamFrame::Ready(sub.ready().clone())));
                 if !bridge_send(tx, ready) {
                     return;
                 }
@@ -2279,7 +2282,7 @@ fn run_subscription(sock_path: &str, tx: &mpsc::SyncSender<BridgeMsg>, shutdown:
                             if !concerns_this_window(&frame) {
                                 continue;
                             }
-                            if !bridge_send(tx, BridgeMsg::Frame(frame)) {
+                            if !bridge_send(tx, BridgeMsg::Frame(Box::new(frame))) {
                                 return;
                             }
                         }
@@ -2417,13 +2420,13 @@ mod tests {
     #[test]
     fn an_error_frame_is_surfaced_rather_than_swallowed() {
         let mut feed = AirFeed::default();
-        feed.apply(BridgeMsg::Frame(StreamFrame::Error(
+        feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Error(
             net_observer_ipc::StreamError {
                 ts_us: 1,
                 code: net_observer_ipc::StreamErrorCode::TooManySubscribers,
                 message: "too many subscribers".to_string(),
             },
-        )));
+        ))));
         let note = feed.offline.clone().expect("the refusal is shown");
         assert!(note.contains("too many subscribers"), "{note}");
     }
@@ -2569,8 +2572,8 @@ mod tests {
         let mut feed = AirFeed::default();
         feed.apply(BridgeMsg::Scan(ScanState::Scanning));
         assert_eq!(feed.scan, ScanState::Scanning);
-        feed.apply(BridgeMsg::Frame(StreamFrame::Event(Event::Air(scan(
-            vec![],
+        feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Event(Event::Air(
+            scan(vec![]),
         )))));
         assert_eq!(feed.scan, ScanState::Idle);
         assert!(feed.air.is_some());
@@ -2621,12 +2624,12 @@ mod tests {
     #[test]
     fn an_unreadable_frame_is_named_rather_than_swallowed() {
         let mut feed = AirFeed::default();
-        feed.apply(BridgeMsg::Frame(StreamFrame::Unrecognized(
+        feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Unrecognized(
             net_observer_ipc::Unrecognized {
                 ts_us: 1,
                 detail: "unknown variant `Ether`".to_string(),
             },
-        )));
+        ))));
         let note = feed.offline.clone().expect("the lost frame is named");
         assert!(note.contains("Ether"), "{note}");
     }
@@ -2812,16 +2815,16 @@ mod tests {
     #[test]
     fn feed_keeps_only_the_latest_slice_and_own_reading() {
         let mut feed = AirFeed::default();
-        feed.apply(BridgeMsg::Frame(StreamFrame::Event(Event::Air(scan(
-            vec![ap(36, "5ghz", Some(80), Some(-60))],
+        feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Event(Event::Air(
+            scan(vec![ap(36, "5ghz", Some(80), Some(-60))]),
         )))));
-        feed.apply(BridgeMsg::Frame(StreamFrame::Event(Event::Air(scan(
-            vec![],
+        feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Event(Event::Air(
+            scan(vec![]),
         )))));
         assert!(feed.air.as_ref().unwrap().aps.is_empty());
         assert!(feed.own_span().is_none());
 
-        feed.apply(BridgeMsg::Frame(StreamFrame::Event(Event::Wifi(
+        feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Event(Event::Wifi(
             WifiSample {
                 ts_us: 2,
                 wifi: WifiVerdict::Ok,
@@ -2835,7 +2838,7 @@ mod tests {
                 channel_width_mhz: Some(80),
                 channel_band: Some("5ghz".to_string()),
             },
-        ))));
+        )))));
         let own = feed.own_span().unwrap();
         assert_eq!(own.channel, 56);
         assert_eq!(own.band, Band::FiveGhz);
@@ -2846,7 +2849,7 @@ mod tests {
     #[test]
     fn a_skipped_wifi_reading_gives_no_own_channel() {
         let mut feed = AirFeed::default();
-        feed.apply(BridgeMsg::Frame(StreamFrame::Event(Event::Wifi(
+        feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Event(Event::Wifi(
             WifiSample {
                 ts_us: 2,
                 wifi: WifiVerdict::Skip,
@@ -2860,7 +2863,7 @@ mod tests {
                 channel_width_mhz: Some(80),
                 channel_band: Some("5ghz".to_string()),
             },
-        ))));
+        )))));
         assert!(feed.own_span().is_none());
     }
 
@@ -2869,18 +2872,20 @@ mod tests {
     #[test]
     fn pause_state_comes_from_the_stream() {
         let mut feed = AirFeed::default();
-        feed.apply(BridgeMsg::Frame(StreamFrame::Ready(Ready {
+        feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Ready(Ready {
             ts_us: 1,
             kinds: None,
             observing: false,
-        })));
+        }))));
         assert!(feed.paused);
-        feed.apply(BridgeMsg::Frame(StreamFrame::Observing(ObservingEdge {
-            ts_us: 2,
-            observing: true,
-            peer_uid: Some(501),
-            cause: ObservingCause::Control,
-        })));
+        feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Observing(
+            ObservingEdge {
+                ts_us: 2,
+                observing: true,
+                peer_uid: Some(501),
+                cause: ObservingCause::Control,
+            },
+        ))));
         assert!(!feed.paused);
     }
 
@@ -2891,8 +2896,8 @@ mod tests {
         let mut feed = AirFeed::default();
         feed.apply(BridgeMsg::Offline("daemon down".to_string()));
         assert!(feed.offline.is_some());
-        feed.apply(BridgeMsg::Frame(StreamFrame::Event(Event::Air(scan(
-            vec![],
+        feed.apply(BridgeMsg::Frame(Box::new(StreamFrame::Event(Event::Air(
+            scan(vec![]),
         )))));
         assert!(feed.offline.is_none());
     }

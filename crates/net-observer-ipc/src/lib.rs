@@ -56,9 +56,10 @@ pub enum Request {
     /// [`diagnose`] helper drives this path and tells an old daemon that cannot
     /// read the request apart from one that ran the query and failed.
     Query(DiagnosticQuery),
-    /// Ask the daemon to run a write/control action (the "acting" path). The
-    /// daemon executes it as root **only** when `acting.enabled` is set (off by
-    /// default); otherwise the request is refused without running anything.
+    /// Ask the daemon to run a write/control action. The daemon executes it as
+    /// root for an authorised peer — the peer-credential check is the one gate
+    /// on this path; no config switch stands in front of a command the operator
+    /// sends by hand (realm net-observer, node #91).
     Control(ControlCmd),
     /// Open a live event subscription. Unlike the one-shot requests above, a
     /// `Subscribe` connection is **not** answered by a single [`Response`]: the
@@ -74,9 +75,9 @@ pub enum Request {
 
 /// A write/control command the client asks the daemon to execute.
 ///
-/// Extensible — one conservative, human-in-the-loop action for now. The daemon
-/// (never a client) is the only process that executes these, and only when
-/// acting is explicitly enabled in its config.
+/// Human-in-the-loop by construction: the daemon (never a client) is the only
+/// process that executes these, and only on an explicit request from an
+/// authorised peer. Nothing here ever runs on a timer.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ControlCmd {
     /// Restart the sing-box proxy service (`launchctl kickstart -k <service>`),
@@ -84,15 +85,14 @@ pub enum ControlCmd {
     KickstartProxy,
     /// Turn the observer's OWN collection on (`true`) or off (`false`) —
     /// pause/resume. This is benign **self-control**: it does NOT touch sing-box
-    /// or the network, and is NOT gated by `acting.enabled`. While paused the
-    /// daemon stays alive and the socket keeps serving so the switch can turn
-    /// collection back on.
+    /// or the network. While paused the daemon stays alive and the socket keeps
+    /// serving so the switch can turn collection back on.
     SetObserving(bool),
     /// Copy the pcap ring out NOW, into a fresh freeze directory — the same
     /// passive artifact the `gw-change` trigger produces, but operator-initiated.
     /// **Self-control**: it touches only files the daemon already owns and sends
-    /// nothing on the network, so it is NOT gated by `acting.enabled`. Refused
-    /// (`ok: false`) when the ring is disabled or never started.
+    /// nothing on the network. Refused (`ok: false`) when the ring is disabled
+    /// or never started.
     FreezePcap,
     /// Turn "quiet" on (`true`) or off (`false`): while quiet the daemon
     /// addresses NO packet AT the gateway — in this daemon that is the link
@@ -106,25 +106,26 @@ pub enum ControlCmd {
     /// subnet so the kernel resolves every address, and browse mDNS for names.
     ///
     /// The one command in this daemon that deliberately addresses machines that
-    /// are not this one, which is why it is **acting-class** and refused unless
-    /// `acting.enabled` is set — and why every run writes a `neighbor_scan` row
-    /// saying what was probed. The passive `neighbors` collector needs none of
-    /// this: it only ever reads caches the OS already filled.
+    /// are not this one, which is why every run writes a `neighbor_scan` row
+    /// saying what was probed — and why the daemon refuses it while paused or
+    /// quiet, the two states a sweep would contradict. No config switch gates
+    /// it: the operator's command is the sanction (realm net-observer, node
+    /// #91). The passive `neighbors` collector needs none of this: it only ever
+    /// reads caches the OS already filled.
     ///
     /// Carries [`ScanOptions`]: which rungs of the scan this run should include.
-    /// The daemon runs a rung only when it is BOTH requested here and permitted
-    /// by config; a requested-but-unpermitted rung is dropped and the result
-    /// message says so.
+    /// Every requested rung runs; a rung whose dependency is missing (banners
+    /// without an effective port scan, cve without banners or without a
+    /// provisioned snapshot) is dropped and the result message says why.
     ScanNeighbors(ScanOptions),
     /// Read the radio environment ONCE, now — the same slice the `air` collector
     /// produces on its slow period, taken on operator demand instead.
     ///
-    /// **Self-control, like [`ControlCmd::FreezePcap`] and [`ControlCmd::SetQuiet`],
-    /// and deliberately NOT acting-class.** The daemon asks the operating system
-    /// for its own radio's report; it addresses no host and originates no frame of
-    /// its own on the air. That is the whole difference from
-    /// [`ControlCmd::ScanNeighbors`], which speaks to machines that are not this
-    /// one and therefore takes the stronger gate.
+    /// **Self-control, like [`ControlCmd::FreezePcap`] and [`ControlCmd::SetQuiet`].**
+    /// The daemon asks the operating system for its own radio's report; it
+    /// addresses no host and originates no frame of its own on the air. That is
+    /// the whole difference from [`ControlCmd::ScanNeighbors`], which speaks to
+    /// machines that are not this one — and is why quiet does not refuse it.
     ///
     /// One press, one scan: the daemon starts at most one on-demand scan at a
     /// time and refuses a second while the first runs, or too soon after it — the
@@ -152,8 +153,8 @@ pub struct ScanOptions {
     #[serde(default)]
     pub ports: bool,
     /// Grab banners from the open ports the port scan found. Needs `ports` in
-    /// the same run to have anything to grab from; the daemon enforces the
-    /// effective intersection.
+    /// the same run to have anything to grab from; without it the daemon drops
+    /// it and says so.
     #[serde(default)]
     pub banners: bool,
     /// Match the grabbed banners against the daemon's local CVE snapshot. Needs
@@ -168,10 +169,12 @@ pub struct ScanOptions {
 /// human-readable message the client surfaces to the operator.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ControlResult {
-    /// `true` iff the action ran and succeeded. A refusal (acting disabled) or a
-    /// failed action is `false`.
+    /// `true` iff the action ran and succeeded. A refusal (unauthorised peer, a
+    /// state the command contradicts, a missing dependency) or a failed action
+    /// is `false`.
     pub ok: bool,
-    /// A readable explanation (e.g. `"acting disabled"`, or the actuator output).
+    /// A readable explanation (e.g. `"control refused: …"`, or the actuator
+    /// output).
     pub message: String,
 }
 
@@ -1655,6 +1658,8 @@ mod tests {
                 dhcp_dns: None,
                 gw_arp_mac: None,
                 ssid: Some("home".into()),
+                bssid: None,
+                if_mac: None,
                 wifi_capture_present: false,
                 lan_probed: None,
                 lan_alive: None,
@@ -1729,10 +1734,11 @@ mod tests {
         assert!(snap.observing);
     }
 
-    /// A daemon from before the probe-on-suspicion counts and the route/TUN
-    /// interface fields emits link samples without `lan_probed`/`lan_alive`/
-    /// `fakeip_route_if`/`singbox_tun_if`. They must decode as `None` — "not
-    /// measured" — never fail the whole frame.
+    /// A daemon from before the probe-on-suspicion counts, the route/TUN
+    /// interface fields and the link identity pair emits link samples without
+    /// `lan_probed`/`lan_alive`/`fakeip_route_if`/`singbox_tun_if`/`bssid`/
+    /// `if_mac`. They must decode as `None` — "not measured" — never fail the
+    /// whole frame.
     #[test]
     fn link_sample_decodes_frames_from_before_the_new_fields() {
         let old = r#"{"ts_us":1,"gw":"Ok","gw_rtt_ms":null,"direct":"Ok","direct_rtt_ms":null,"dhcp_router":null,"dhcp_dns":null,"gw_arp_mac":null,"ssid":null,"wifi_capture_present":false}"#;
@@ -1741,6 +1747,8 @@ mod tests {
         assert_eq!(l.lan_alive, None);
         assert_eq!(l.fakeip_route_if, None);
         assert_eq!(l.singbox_tun_if, None);
+        assert_eq!(l.bssid, None);
+        assert_eq!(l.if_mac, None);
     }
 
     /// Same guarantee for the proxy sample: a frame from before the
@@ -1935,6 +1943,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

@@ -32,6 +32,12 @@ pub trait LinkFacts: Send + Sync {
     /// one tick.
     async fn singbox_tun_iface(&self) -> Option<String>;
     async fn ssid(&self) -> Option<String>;
+    /// BSSID of the access point the link interface is associated with,
+    /// lowercase; `None` = not associated or not determinable.
+    async fn bssid(&self) -> Option<String>;
+    /// The link interface's own MAC as currently assigned, lowercase; `None`
+    /// = not determinable. Private Wi-Fi Address rotates it per SSID.
+    async fn if_mac(&self) -> Option<String>;
     async fn wifi_capture_present(&self) -> bool;
     /// Runtime capability probe: Ready iff the `link` collector can work here/now
     /// (e.g. a physical interface is resolvable), else `Unavailable(reason)`.

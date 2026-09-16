@@ -73,8 +73,8 @@ pub struct Glance {
     /// event-log window can open its subscription.
     pub socket_path: String,
     /// The most recent control-action outcome (e.g. the observing toggle outcome
-    /// or `"acting disabled"`), surfaced as a transient line in the panel. `None`
-    /// until the operator triggers a control action.
+    /// or `"control refused: …"`), surfaced as a transient line in the panel.
+    /// `None` until the operator triggers a control action.
     pub control_msg: Option<String>,
     /// The live event-log window, if one is open. Stashed here (persists across
     /// panel re-opens) so a second "Events" click focuses the existing window
@@ -213,6 +213,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
