@@ -13,8 +13,10 @@
 //!   `store::diagnosis` queries, so "which layer failed" is reachable without
 //!   writing SQL. Each asks the running daemon first (`Request::Query`, answered
 //!   from the daemon's own store while it keeps collecting) and opens the
-//!   DuckDB file itself only when no daemon answers on the socket — see
-//!   [`diagnose_table`] for the exact rule. (realm net-observer, node #58)
+//!   DuckDB file itself only when no daemon answers on the socket — unless the
+//!   operator gave `--db`, which names the record and means the socket is not
+//!   asked at all. Every diagnosis prints which record answered (`source:` on
+//!   stderr). See [`route`] for the exact rule. (realm net-observer, node #58)
 //! - **OFFLINE** — `query <SQL>` and `air` open the DuckDB file directly. This
 //!   only works while the daemon is stopped; if `net-observerd` is running it
 //!   holds the lock and the open fails with a clear message rather than a panic.
@@ -48,13 +50,29 @@ struct Cli {
     /// socket path for every command that talks to the running daemon.
     #[arg(long)]
     config: Option<String>,
-    /// Path to the observer DuckDB file. Opened directly by the offline `query`
-    /// and `air` commands, and by the diagnoses only when no daemon answers on
-    /// the socket (a running daemon holds the DB lock and is asked instead).
-    #[arg(long, default_value = "/var/lib/observer/observer.duckdb")]
-    db: String,
+    /// Path to the observer DuckDB file [default: /var/lib/observer/observer.duckdb].
+    /// Giving it means "read this file": the diagnoses then never ask the
+    /// daemon's socket. Without it they ask the running daemon first and read
+    /// the default file only when nothing answers on the socket. `query <SQL>`
+    /// and `air` always read the file. Every diagnosis prints which record
+    /// answered as a `source:` line on stderr.
+    #[arg(long)]
+    db: Option<String>,
     #[command(subcommand)]
     command: Command,
+}
+
+/// Where the daemon writes the record unless told otherwise — the file the
+/// diagnoses fall back to, and `query`/`air` read, when `--db` is not given.
+const DEFAULT_DB: &str = "/var/lib/observer/observer.duckdb";
+
+impl Cli {
+    /// The record file: `--db` when given, else [`DEFAULT_DB`]. Whether it was
+    /// GIVEN is a separate fact (`self.db.is_some()`) that [`diagnose_table`]
+    /// routes on.
+    fn db_path(&self) -> &str {
+        self.db.as_deref().unwrap_or(DEFAULT_DB)
+    }
 }
 
 #[derive(Subcommand)]
@@ -400,7 +418,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 DiagnosticQuery::Neighbors {
                     network: network.clone(),
                 },
-                |db| run_query(db, &sql),
+                |off| run_query(off, &sql),
             )?;
             print!("{}", format_table(&table));
         }
@@ -411,7 +429,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 DiagnosticQuery::Vulns {
                     network: network.clone(),
                 },
-                |db| run_query(db, &sql),
+                |off| run_query(off, &sql),
             )?;
             print!("{}", format_table(&table));
         }
@@ -422,39 +440,41 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 DiagnosticQuery::Topology {
                     iface: iface.clone(),
                 },
-                |db| run_query(db, &sql),
+                |off| run_query(off, &sql),
             )?;
             print!("{}", format_table(&table));
         }
         Command::Air => {
             // Three reads, one moment: the scan itself (so a SKIP is rendered as
             // a refusal), what it heard, and our own channel to compare against.
-            let scan = table_from_query(run_query(&cli.db, diagnosis::AIR_LATEST_SCAN_SQL)?);
-            let aps = table_from_query(run_query(&cli.db, diagnosis::AIR_LATEST_APS_SQL)?);
-            let own = table_from_query(run_query(&cli.db, diagnosis::AIR_SELF_CHANNEL_SQL)?);
+            let scan =
+                table_from_query(run_query(&file_only(cli), diagnosis::AIR_LATEST_SCAN_SQL)?);
+            let aps = table_from_query(run_query(&file_only(cli), diagnosis::AIR_LATEST_APS_SQL)?);
+            let own =
+                table_from_query(run_query(&file_only(cli), diagnosis::AIR_SELF_CHANNEL_SQL)?);
             print!("{}", diagnose::format_air(&scan, &aps, &own)?);
         }
         Command::Query { sql } => {
-            let table = table_from_query(run_query(&cli.db, sql)?);
+            let table = table_from_query(run_query(&file_only(cli), sql)?);
             print!("{}", format_table(&table));
         }
         Command::Why { at } => {
             let ts_us = diagnose::parse_at(at)?;
-            let table = diagnose_table(cli, DiagnosticQuery::Why { ts_us }, |db| {
-                run_prepared(db, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))
+            let table = diagnose_table(cli, DiagnosticQuery::Why { ts_us }, |off| {
+                run_prepared(off, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))
             })?;
             print!("{}", diagnose::format_verdict_at(&table, ts_us)?);
         }
         Command::IncidentContext => {
-            let table = diagnose_table(cli, DiagnosticQuery::IncidentContext, |db| {
-                run_prepared(db, &diagnosis::incident_context_sql(LOAD_THRESHOLD))
+            let table = diagnose_table(cli, DiagnosticQuery::IncidentContext, |off| {
+                run_prepared(off, &diagnosis::incident_context_sql(LOAD_THRESHOLD))
             })?;
             print!("{}", diagnose::format_incident_context(&table)?);
         }
         Command::WedgeOrStarvation => {
-            let table = diagnose_table(cli, DiagnosticQuery::WedgeVsStarvation, |db| {
+            let table = diagnose_table(cli, DiagnosticQuery::WedgeVsStarvation, |off| {
                 run_prepared(
-                    db,
+                    off,
                     &diagnosis::wedge_vs_starvation_sql(
                         LOAD_THRESHOLD,
                         diagnosis::DEFAULT_EPISODE_GAP_US,
@@ -474,7 +494,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     drop_ts_us,
                     window_us: *window_us,
                 },
-                |db| run_prepared(db, &diagnosis::gateway_ramp_sql(drop_ts_us, *window_us)),
+                |off| run_prepared(off, &diagnosis::gateway_ramp_sql(drop_ts_us, *window_us)),
             )?;
             print!(
                 "{}",
@@ -482,14 +502,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             );
         }
         Command::Gaps => {
-            let table = diagnose_table(cli, DiagnosticQuery::Gaps, |db| {
-                run_query(db, &diagnosis::observation_gaps_sql())
+            let table = diagnose_table(cli, DiagnosticQuery::Gaps, |off| {
+                run_query(off, &diagnosis::observation_gaps_sql())
             })?;
             print!("{}", diagnose::format_observation_gaps(&table)?);
         }
         Command::Segments => {
-            let table = diagnose_table(cli, DiagnosticQuery::Segments, |db| {
-                run_query(db, &diagnosis::segments_sql())
+            let table = diagnose_table(cli, DiagnosticQuery::Segments, |off| {
+                run_query(off, &diagnosis::segments_sql())
             })?;
             print!("{}", format_table(&table));
         }
@@ -517,7 +537,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     network: network.clone(),
                     window,
                 },
-                |db| run_query(db, &sql),
+                |off| run_query(off, &sql),
             )?;
             print!("{}", format_table(&table));
         }
@@ -551,45 +571,107 @@ fn daemon_query(socket_path: &str, req: &Request) -> Result<Response> {
     })
 }
 
-/// Run one named diagnosis: ask the running daemon first, and read the DuckDB
-/// file only when no daemon answers. (realm net-observer, node #58)
+/// Where a diagnosis is read from, with the words that go with it. Decided by
+/// [`route`] from what the operator asked for and what the socket said — and
+/// then printed, always, as one `source:` line on stderr, because a forensic
+/// reader must know which record answered. (realm net-observer, node #58)
+#[derive(Debug, Clone, PartialEq)]
+enum Route {
+    /// The daemon answered over `via`; here is its table.
+    Live { table: Table, via: String },
+    /// Read the file. `why` is the one line saying what sent the reader there
+    /// (`None` when the operator asked for the file with `--db`); `locked` is
+    /// the sentence to print if a daemon turns out to hold the file's lock —
+    /// the same reason again, so the lock message never contradicts what just
+    /// happened.
+    Offline { why: Option<String>, locked: String },
+}
+
+/// The rule, pure: `socket` is `None` when the operator named the record with
+/// `--db` (the socket is then never asked), and `ask` is the round-trip over
+/// the socket it is given.
 ///
-/// The record must be reachable live and post-mortem by one rule, and the
-/// daemon's lock decides which path can work — so the rule keys on what the
-/// socket says, never on guessing whether the file is locked:
-///
-/// - the daemon answers → its table, read while it keeps collecting;
-/// - nothing listens on the socket ([`daemon_not_running`]) → `offline`,
-///   exactly the pre-socket path, against `--db`;
+/// - `--db` given → the file, no socket, no question asked: an answer from a
+///   running daemon over a file the operator pointed at would be an answer
+///   from the wrong record, silently;
+/// - the daemon answers → its table;
+/// - nothing listens on the socket ([`daemon_not_running`]) → the file, saying
+///   which socket was tried;
 /// - the daemon is there but cannot READ the request (built before
-///   `Request::Query`) → `offline` too, with one line on stderr saying so —
-///   that daemon still holds the lock, and the reader deserves to know why the
-///   open that follows is about to fail;
-/// - the daemon read the request and could not run it → its own message and a
-///   non-zero exit. Never the offline path: the file would only meet the lock
-///   and report the wrong problem.
+///   `Request::Query`) → the file too, saying so — that daemon still holds the
+///   lock, and the reader deserves to know why the open that follows will fail;
+/// - the daemon read the request and could not run it, or the socket is there
+///   and broken → an error and a non-zero exit. Never the file: it would only
+///   meet the lock and report the wrong problem.
+fn route(
+    socket: Option<&str>,
+    ask: impl FnOnce(&str) -> std::io::Result<QueryOutcome>,
+) -> Result<Route> {
+    let Some(socket) = socket else {
+        return Ok(Route::Offline {
+            why: None,
+            locked: "--db was given, so the socket was not asked".to_string(),
+        });
+    };
+    let locked = format!("the socket at {socket} did not answer or could not decode the request");
+    match ask(socket) {
+        Ok(QueryOutcome::Table(table)) => Ok(Route::Live {
+            table,
+            via: socket.to_string(),
+        }),
+        Ok(QueryOutcome::Failed(m)) => Err(anyhow!("net-observerd returned an error: {m}")),
+        Ok(QueryOutcome::Unsupported(m)) => Ok(Route::Offline {
+            why: Some(format!(
+                "net-observerd at {socket} cannot decode the request ({m})"
+            )),
+            locked,
+        }),
+        Err(e) if daemon_not_running(&e) => Ok(Route::Offline {
+            why: Some(format!("no daemon answered on {socket} ({e})")),
+            locked,
+        }),
+        Err(e) => Err(anyhow!(
+            "failed to query net-observerd over socket {socket}: {e}"
+        )),
+    }
+}
+
+/// Run one named diagnosis by the rule in [`route`], print its source, and
+/// hand back the table whichever record it came from.
 fn diagnose_table(
     cli: &Cli,
     q: DiagnosticQuery,
-    offline: impl FnOnce(&str) -> Result<QueryTable>,
+    offline: impl FnOnce(&Offline) -> Result<QueryTable>,
 ) -> Result<Table> {
-    let cfg = load_config(cli)?;
-    match net_observer_ipc::diagnose(&cfg.socket_path, q) {
-        Ok(QueryOutcome::Table(table)) => return Ok(table),
-        Ok(QueryOutcome::Failed(m)) => return Err(anyhow!("net-observerd returned an error: {m}")),
-        Ok(QueryOutcome::Unsupported(m)) => eprintln!(
-            "net-observerd cannot answer diagnoses over the socket ({m}); reading {} offline",
-            cli.db
-        ),
-        Err(e) if daemon_not_running(&e) => {}
-        Err(e) => {
-            return Err(anyhow!(
-                "failed to query net-observerd over socket {}: {e}",
-                cfg.socket_path
-            ));
+    // The config (for the socket path) is loaded only when the socket is going
+    // to be asked; an explicit `--db` needs none of it.
+    let cfg = match cli.db {
+        Some(_) => None,
+        None => Some(load_config(cli)?),
+    };
+    let socket = cfg.as_ref().map(|c| c.socket_path.as_str());
+    match route(socket, |s| net_observer_ipc::diagnose(s, q))? {
+        Route::Live { table, via } => {
+            eprintln!("source: net-observerd via {via}");
+            Ok(table)
+        }
+        Route::Offline { why, locked } => {
+            if let Some(why) = why {
+                eprintln!("{why}; reading the file instead");
+            }
+            let db_path = cli.db_path();
+            eprintln!("source: file {db_path}");
+            offline(&Offline { db_path, locked }).map(table_from_query)
         }
     }
-    offline(&cli.db).map(table_from_query)
+}
+
+/// The offline record and the sentence to print if a daemon holds its lock —
+/// the reason the reader is at the file, so the lock message never
+/// contradicts what just happened.
+struct Offline<'a> {
+    db_path: &'a str,
+    locked: String,
 }
 
 /// `store::QueryTable` → the wire's [`Table`]: the same two fields, moved, so
@@ -836,12 +918,12 @@ fn format_control(result: &ControlResult) -> String {
     format!("{tag}: {}\n", result.message)
 }
 
-/// Open the DuckDB file directly and run one query (offline forensics). If
-/// `net-observerd` is running it holds the per-process DuckDB lock, so the open
-/// fails — detect that and print a clear, actionable message instead of leaking
-/// the raw driver error (and never panic).
-fn run_query(db_path: &str, sql: &str) -> Result<QueryTable> {
-    open_store(db_path)?
+/// Open the DuckDB file directly and run one query (offline forensics). If a
+/// daemon holds the per-process DuckDB lock the open fails — detect that and
+/// print a clear message that repeats why the file is being read at all,
+/// instead of leaking the raw driver error (and never panic).
+fn run_query(offline: &Offline, sql: &str) -> Result<QueryTable> {
+    open_store(offline)?
         .query_table(sql)
         .map_err(|e| anyhow!("query failed: {e}"))
 }
@@ -850,25 +932,37 @@ fn run_query(db_path: &str, sql: &str) -> Result<QueryTable> {
 /// parameterized `diagnosis` builders (`why`, `incident-context`,
 /// `wedge-or-starvation`, `gateway-ramp`): the moment/threshold values are
 /// bound, not interpolated.
-fn run_prepared(db_path: &str, p: &diagnosis::PreparedSql) -> Result<QueryTable> {
-    open_store(db_path)?
+fn run_prepared(offline: &Offline, p: &diagnosis::PreparedSql) -> Result<QueryTable> {
+    open_store(offline)?
         .query_prepared(p)
         .map_err(|e| anyhow!("query failed: {e}"))
 }
 
-fn open_store(db_path: &str) -> Result<DuckdbStore> {
-    DuckdbStore::open(db_path).map_err(|e| {
+fn open_store(offline: &Offline) -> Result<DuckdbStore> {
+    DuckdbStore::open(offline.db_path).map_err(|e| {
         let msg = e.to_string();
         if is_lock_error(&msg) {
-            anyhow!(
-                "net-observerd is running and holds the DuckDB lock; stop it for \
-                 offline SQL — `status`/`incidents` and the named diagnoses read \
-                 the running daemon over its socket instead"
-            )
+            anyhow!("{}", lock_message(offline.db_path, &offline.locked))
         } else {
-            anyhow!("failed to open DuckDB at {db_path}: {msg}")
+            anyhow!("failed to open DuckDB at {}: {msg}", offline.db_path)
         }
     })
+}
+
+/// The message for a file a daemon holds the lock on: the record, and the
+/// reason the reader came to the file — never a claim that the daemon would
+/// have answered, which is exactly what did not happen.
+fn lock_message(db_path: &str, locked: &str) -> String {
+    format!("a daemon holds the lock on {db_path}; {locked}")
+}
+
+/// The offline context of `query <SQL>` and `air`, which read the file by
+/// ruling and never ask the socket.
+fn file_only(cli: &Cli) -> Offline<'_> {
+    Offline {
+        db_path: cli.db_path(),
+        locked: "`query` and `air` read the file only; stop the daemon for them".to_string(),
+    }
 }
 
 /// The `ts_us` of the newest gateway drop in the record, used when
@@ -877,8 +971,8 @@ fn open_store(db_path: &str) -> Result<DuckdbStore> {
 /// Read the way every diagnosis is: the daemon first, the file when it is not
 /// there.
 fn latest_gw_drop(cli: &Cli) -> Result<i64> {
-    let table = diagnose_table(cli, DiagnosticQuery::GwDrops, |db| {
-        run_query(db, diagnosis::GW_DROPS_SQL)
+    let table = diagnose_table(cli, DiagnosticQuery::GwDrops, |off| {
+        run_query(off, diagnosis::GW_DROPS_SQL)
     })?;
     newest_drop(&table)
 }
@@ -1184,6 +1278,127 @@ mod tests {
         let out = format_table(&table);
         assert!(out.contains("ts_us") && out.contains("gw"));
         assert!(out.contains("42") && out.contains("OK"));
+    }
+
+    /// An explicit `--db` means the operator named the record: the socket is
+    /// NOT asked — a daemon answering over a file the operator pointed at
+    /// would be an answer from the wrong record, silently.
+    #[test]
+    fn an_explicit_db_never_asks_the_socket() {
+        let asked = std::cell::Cell::new(false);
+        let r = route(None, |_| {
+            asked.set(true);
+            Ok(QueryOutcome::Table(Table::default()))
+        })
+        .unwrap();
+        match r {
+            Route::Offline { why: None, locked } => {
+                assert!(locked.contains("--db was given"), "{locked}");
+            }
+            other => panic!("expected Offline without a reason, got {other:?}"),
+        }
+        assert!(
+            !asked.get(),
+            "the socket must not be asked when --db is given"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_answers_is_the_live_source() {
+        let t = Table {
+            columns: vec!["a".into()],
+            rows: vec![],
+        };
+        let r = route(Some("/run/observer.sock"), |s| {
+            assert_eq!(s, "/run/observer.sock");
+            Ok(QueryOutcome::Table(t.clone()))
+        })
+        .unwrap();
+        assert_eq!(
+            r,
+            Route::Live {
+                table: t,
+                via: "/run/observer.sock".into()
+            }
+        );
+    }
+
+    /// Nothing listening on the socket is the ONE case that reads the file by
+    /// itself — and the reason names the socket that was tried, so a reader
+    /// pointed at the wrong socket sees that rather than a silent detour; the
+    /// lock sentence names it again.
+    #[test]
+    fn no_daemon_on_the_socket_reads_the_file_and_names_the_socket() {
+        let r = route(Some("/run/observer.sock"), |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+        })
+        .unwrap();
+        match r {
+            Route::Offline {
+                why: Some(why),
+                locked,
+            } => {
+                assert!(why.contains("/run/observer.sock"), "{why}");
+                assert!(locked.contains("/run/observer.sock"), "{locked}");
+                assert!(locked.contains("did not answer"), "{locked}");
+            }
+            other => panic!("expected Offline with a reason, got {other:?}"),
+        }
+    }
+
+    /// A daemon too old to read the request also sends the reader to the file,
+    /// saying so and naming the socket.
+    #[test]
+    fn an_old_daemon_reads_the_file_and_says_why() {
+        let r = route(Some("/run/observer.sock"), |_| {
+            Ok(QueryOutcome::Unsupported(
+                "bad request: unknown variant `Query`".into(),
+            ))
+        })
+        .unwrap();
+        match r {
+            Route::Offline { why: Some(why), .. } => {
+                assert!(why.contains("/run/observer.sock"), "{why}");
+                assert!(why.contains("unknown variant `Query`"), "{why}");
+            }
+            other => panic!("expected Offline with a reason, got {other:?}"),
+        }
+    }
+
+    /// A daemon that read the request and could not run it, and a socket that
+    /// is there but broken, are errors — never a detour to the file, where the
+    /// lock would report the wrong problem.
+    #[test]
+    fn a_failed_diagnosis_and_a_broken_socket_are_errors_not_detours() {
+        let failed = route(Some("/run/observer.sock"), |_| {
+            Ok(QueryOutcome::Failed("not a segment key: nope".into()))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(failed.contains("not a segment key"), "{failed}");
+
+        let broken = route(Some("/run/observer.sock"), |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "no",
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(broken.contains("/run/observer.sock"), "{broken}");
+    }
+
+    /// The lock message never contradicts what just happened: it names the
+    /// record and repeats the reason the file was read at all.
+    #[test]
+    fn the_lock_message_names_the_record_and_the_reason() {
+        let m = lock_message(
+            "/var/lib/observer/observer.duckdb",
+            "the socket at /run/observer.sock did not answer or could not decode the request",
+        );
+        assert!(m.contains("/var/lib/observer/observer.duckdb"), "{m}");
+        assert!(m.contains("/run/observer.sock"), "{m}");
+        assert!(!m.contains("read the running daemon"), "{m}");
     }
 
     /// The offline path renders through the wire shape: the conversion must
