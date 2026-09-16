@@ -2151,6 +2151,79 @@ link address {MAC_A} -> {MAC_B} (new DHCP identity)"
         assert!(WifiChurn.eval(&w).is_none());
     }
 
+    /// The #57 episode replayed: macOS hopping between the twin SSIDs of one
+    /// access point (different names, 5 GHz / 6 GHz) every 12 ticks — 3 min
+    /// at 15 s — first with a per-SSID private address (regime A: every hop
+    /// is DHCP from scratch), then with the address aligned across the twins
+    /// (regime B: every hop keeps it). Each hop fires `roam` in its class,
+    /// naming the SSID move, and nothing fires between hops; `wifi-churn` —
+    /// the observe-only aggregate the oracle raised — fires in both regimes
+    /// once four BSSID changes sit inside a quarter hour, and its detail
+    /// says how the identity moved.
+    #[test]
+    fn twin_ssid_episode_replays_as_roams_and_churn() {
+        const HOP_TICKS: i64 = 12;
+        const REGIME_B_FROM: i64 = 60;
+        let identity = |tick: i64| -> (&str, &str, &str) {
+            let on_6g = (tick / HOP_TICKS) % 2 == 1;
+            let (ssid, ap) = if on_6g {
+                ("cowork-6g", AP_B)
+            } else {
+                ("cowork-5g", AP_A)
+            };
+            let mac = if tick < REGIME_B_FROM && on_6g {
+                MAC_B
+            } else {
+                MAC_A
+            };
+            (ssid, ap, mac)
+        };
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        for tick in 0..=96 {
+            let (ssid, ap, mac) = identity(tick);
+            w.push(link_identity(
+                tick * TICK_US,
+                Some(ssid),
+                Some(ap),
+                Some(mac),
+            ));
+            let churn = WifiChurn.eval(&w);
+            match tick {
+                47 => assert!(churn.is_none(), "three hops are not churn"),
+                48 => assert_eq!(
+                    churn
+                        .expect("the fourth hop of regime A completes the churn")
+                        .detail,
+                    "wifi identity churn: 4 changes in ~540s (bssid: 4, link address: 4)"
+                ),
+                96 => assert_eq!(
+                    churn
+                        .expect("regime B churns too, with the address kept")
+                        .detail,
+                    "wifi identity churn: 6 changes in ~900s (bssid: 6, link address: 2)"
+                ),
+                _ => {}
+            }
+            let roam = Roam.eval(&w);
+            if tick == 0 || tick % HOP_TICKS != 0 {
+                assert!(roam.is_none(), "tick {tick}: nothing moved");
+                continue;
+            }
+            let (old_ssid, old_ap, old_mac) = identity(tick - 1);
+            let fire = roam.unwrap_or_else(|| panic!("tick {tick}: a hop must fire roam"));
+            let address = if tick < REGIME_B_FROM {
+                format!("link address {old_mac} -> {mac} (new DHCP identity)")
+            } else {
+                "link address kept".to_string()
+            };
+            assert_eq!(
+                fire.detail,
+                format!("roam: BSSID {old_ap} -> {ap}, SSID {old_ssid} -> {ssid}; {address}"),
+                "tick {tick}"
+            );
+        }
+    }
+
     #[test]
     fn neighbor_mac_collision_fires_on_two_macs_for_one_ip() {
         let mut w = RecentWindow::new(8);
