@@ -91,8 +91,10 @@ enum BridgeMsg {
     /// One decoded frame from the daemon — the opening ack, an event, a gap, an
     /// observing transition, or a server-side error. All five become rows, so a
     /// hole in the stream and a pause are visible in the log rather than
-    /// inferred from silence.
-    Frame(StreamFrame),
+    /// inferred from silence. Boxed: a frame carries a whole sample, so an
+    /// inline payload would size every message in the channel to the largest
+    /// sample (clippy `large_enum_variant`).
+    Frame(Box<StreamFrame>),
     /// The daemon is down or the stream dropped; the thread will retry.
     Offline(String),
 }
@@ -638,7 +640,7 @@ fn run_subscription(sock_path: &str, tx: &mpsc::SyncSender<BridgeMsg>, shutdown:
                 // daemon's collection state, and so the model's offline note is
                 // cleared by a frame rather than by a separate "online" message
                 // that could disagree with the stream.
-                let ready = BridgeMsg::Frame(StreamFrame::Ready(sub.ready().clone()));
+                let ready = BridgeMsg::Frame(Box::new(StreamFrame::Ready(sub.ready().clone())));
                 if !bridge_send(tx, ready, &mut dropped) {
                     return; // receiver gone — the window closed
                 }
@@ -648,7 +650,7 @@ fn run_subscription(sock_path: &str, tx: &mpsc::SyncSender<BridgeMsg>, shutdown:
                 for item in sub {
                     match item {
                         Ok(frame) => {
-                            if !bridge_send(tx, BridgeMsg::Frame(frame), &mut dropped) {
+                            if !bridge_send(tx, BridgeMsg::Frame(Box::new(frame)), &mut dropped) {
                                 return;
                             }
                         }
@@ -883,7 +885,7 @@ mod tests {
     fn event_log_caps_at_capacity() {
         let mut log = EventLog::new();
         for i in 0..(EVENT_CAP + 50) {
-            log.apply(BridgeMsg::Frame(StreamFrame::Event(Event::Host(
+            log.apply(BridgeMsg::Frame(Box::new(StreamFrame::Event(Event::Host(
                 HostSample {
                     ts_us: i as i64,
                     // Carried into the rendered line so the front row is
@@ -893,7 +895,7 @@ mod tests {
                     load5: 0.0,
                     load15: 0.0,
                 },
-            ))));
+            )))));
         }
         assert_eq!(log.events.len(), EVENT_CAP);
         // The 50 oldest were dropped, so the front is now the i=50 event.
@@ -909,7 +911,7 @@ mod tests {
     fn apply_formats_the_row_once() {
         let mut log = EventLog::new();
         let frame = StreamFrame::Event(incident_event());
-        log.apply(BridgeMsg::Frame(frame.clone()));
+        log.apply(BridgeMsg::Frame(Box::new(frame.clone())));
 
         let row = log.events.front().unwrap();
         assert_eq!(row.kind, Some(EventKind::Incident));
@@ -928,25 +930,25 @@ mod tests {
         // `as_str` rather than `Option::as_deref`.
         assert_eq!(offline_note(&log), Some("daemon down"));
 
-        log.apply(BridgeMsg::Frame(StreamFrame::Event(Event::Host(
+        log.apply(BridgeMsg::Frame(Box::new(StreamFrame::Event(Event::Host(
             HostSample {
                 ts_us: 1,
                 load1: 0.0,
                 load5: 0.0,
                 load15: 0.0,
             },
-        ))));
+        )))));
         assert!(
             log.offline.is_none(),
             "an event marks the stream live again"
         );
 
         log.apply(BridgeMsg::Offline("closed".to_string()));
-        log.apply(BridgeMsg::Frame(StreamFrame::Ready(Ready {
+        log.apply(BridgeMsg::Frame(Box::new(StreamFrame::Ready(Ready {
             ts_us: 2,
             kinds: None,
             observing: true,
-        })));
+        }))));
         assert!(
             log.offline.is_none(),
             "the subscription ack clears the offline note"
