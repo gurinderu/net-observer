@@ -45,11 +45,19 @@ pub trait Condition: Send + Sync {
 /// Skip row with no `tun_code`: the pipeline's preflight skip, or a tick the
 /// passive probing tier withheld) is the absence of a measurement (the rule
 /// `GwDrop` documents: realm net-observer, node #25) — every reader here
-/// treats it as transparent, never as a dead tun. A measured tick is DEAD
-/// unless the probe answered exactly 204 (the shell watchdog's `tun != 204`).
+/// treats it as transparent, never as a dead tun.
+///
+/// Two readings of a measured tick, because two rules read it differently:
+/// `dead` — the probe answered anything but 204 (the shell watchdog's
+/// `tun != 204`, what `wedge` counts); `unanswered` — no HTTP answer at all
+/// (`tun_code` 0, or absent on a measured row: the transport failed), the
+/// offline record's `tun_code = 0` that `starvation` shares with `why` and
+/// `wedge-or-starvation`, so a captive portal's 200 under load never opens a
+/// live incident the record calls healthy.
 struct ProxyTick {
     measured: bool,
     dead: bool,
+    unanswered: bool,
 }
 
 /// Fold `rows` (newest first, as [`RecentWindow::recent_proxy`] yields them)
@@ -61,6 +69,7 @@ fn proxy_ticks<'a>(rows: &'a [&'a ProxySample]) -> impl Iterator<Item = ProxyTic
         let mut tick = ProxyTick {
             measured: false,
             dead: true,
+            unanswered: true,
         };
         while let Some(r) = rows.get(i).filter(|r| r.ts_us == ts) {
             if r.tun_code.is_some() || r.tcp != TcpVerdict::Skip {
@@ -68,6 +77,9 @@ fn proxy_ticks<'a>(rows: &'a [&'a ProxySample]) -> impl Iterator<Item = ProxyTic
             }
             if r.tun_code == Some(204) {
                 tick.dead = false;
+            }
+            if r.tun_code.is_some_and(|code| code != 0) {
+                tick.unanswered = false;
             }
             i += 1;
         }
@@ -668,12 +680,16 @@ impl Condition for FakeIp {
 /// starvation discriminator: a wedge caused by CPU/IO pressure rather than a
 /// network fault. `load1` is read from the `host` collector's newest sample.
 ///
-/// "Dead" is a MEASUREMENT: the newest proxy tick whose probe ran (the
-/// [`ProxyTick`] definition `wedge` shares) answered anything but 204. A Skip
+/// "Dead" is a MEASUREMENT, and it is the offline record's: the newest proxy
+/// tick whose probe ran (the [`ProxyTick`] fold `wedge` shares) got no HTTP
+/// answer at all — `tun_code = 0`, or absent on a measured row — the same
+/// `tun_code = 0` that `why` and `wedge-or-starvation` read, so a tick that
+/// answered (a captive portal's 200, a 5xx) is not starvation however high the
+/// load; `wedge`'s `!= 204` is a different reading and stays its own. A Skip
 /// placeholder tick — the preflight skip, or every tick of the passive probing
-/// tier — is no measurement and no fire, however high the load: a loaded host
-/// with no probe sent is not a starved tun, and reading it as one opened an
-/// incident on every passive tick under load (realm net-observer, node #88).
+/// tier — is no measurement and no fire: a loaded host with no probe sent is
+/// not a starved tun, and reading it as one opened an incident on every
+/// passive tick under load (realm net-observer, node #88).
 pub struct Starvation {
     pub load_threshold: f64,
 }
@@ -686,7 +702,7 @@ impl Condition for Starvation {
         let newest_measured = proxy_ticks(&rows).find(|t| t.measured)?;
         // Load from the newest `host` sample; absent ⇒ 0.0 (cannot be starvation).
         let load1 = w.last_host().map_or(0.0, |h| h.load1);
-        (newest_measured.dead && load1 > self.load_threshold).then(|| Fire {
+        (newest_measured.unanswered && load1 > self.load_threshold).then(|| Fire {
             detail: format!("tun dead under load {load1:.2}"),
         })
     }
@@ -1569,6 +1585,34 @@ mod tests {
         w.push(skip_proxy(6));
         w.push(skip_proxy(7));
         assert!(c.eval(&w).is_none(), "the newest measured tick is healthy");
+    }
+
+    /// Starvation's "dead" is the offline reading's (`tun_code = 0`, or no
+    /// answer at all): a tun that ANSWERED — a captive portal's 200, a 5xx —
+    /// is not dead for starvation, however high the load, because `why` calls
+    /// that tick healthy and a live incident the record contradicts is worse
+    /// than none. (`wedge`'s `!= 204` is a different, pre-existing reading.)
+    #[test]
+    fn starvation_does_not_read_an_answered_tun_as_dead() {
+        let mut w = RecentWindow::new(16);
+        let c = Starvation {
+            load_threshold: 10.0,
+        };
+        w.push(host(1, 20.0));
+        w.push(proxy(2, 200));
+        assert!(c.eval(&w).is_none(), "a captive portal's 200 is an answer");
+        w.push(proxy(3, 502));
+        assert!(c.eval(&w).is_none(), "a 5xx is an answer too");
+        // No HTTP answer at all — the transport failed (`tun_probe` = `None`
+        // on a measured row) — IS dead, exactly as `tun=000` was.
+        w.push(Sample::Proxy(ProxySample {
+            tun_code: None,
+            ..match proxy(4, 0) {
+                Sample::Proxy(p) => p,
+                other => panic!("{other:?}"),
+            }
+        }));
+        assert!(c.eval(&w).is_some(), "no answer under load is starvation");
     }
 
     #[test]
