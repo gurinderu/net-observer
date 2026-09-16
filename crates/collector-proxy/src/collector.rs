@@ -84,9 +84,11 @@ impl<T: TcpProber, F: ProxyFacts, S: StallProbe> Collector for ProxyCollector<T,
         // Read the tier ONCE per tick, so the probes withheld and the verdicts
         // that report them cannot disagree.
         let tier = self.probing.tier();
-        // Await the probes, then a sync `build_*` composes the samples.
+        // Await the probes, then a sync `build_*` composes the samples. An
+        // attempted probe always yields a code — the HTTP status, or `0` for
+        // no status at all; `None` means it was not attempted (see `TunProbe`).
         let tun_code = if tier.emits(EmissionClass::TunProbe) {
-            self.facts.tun_probe(&self.tun_url).await
+            Some(self.facts.tun_probe(&self.tun_url).await.code())
         } else {
             None
         };
@@ -153,7 +155,7 @@ impl<T: TcpProber, F: ProxyFacts, S: StallProbe> Collector for ProxyCollector<T,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::probes::{StallReading, StreamCheck};
+    use crate::probes::{StallReading, StreamCheck, TunProbe};
     use collector_core::PingOutcome;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use types::ProbingTier;
@@ -173,18 +175,20 @@ mod tests {
         }
     }
 
-    /// Facts that count the TUN probes actually sent.
+    /// Facts that count the TUN probes actually sent and answer them as
+    /// scripted.
     struct Facts {
         readiness: Readiness,
         tun_probes: Arc<AtomicUsize>,
+        tun_answer: TunProbe,
     }
     impl ProxyFacts for Facts {
         async fn server_endpoints(&self) -> Vec<String> {
             vec!["1.1.1.1:443".into()]
         }
-        async fn tun_probe(&self, _: &str) -> Option<u16> {
+        async fn tun_probe(&self, _: &str) -> TunProbe {
             self.tun_probes.fetch_add(1, Ordering::Release);
-            Some(204)
+            self.tun_answer
         }
         async fn selector(&self) -> Option<String> {
             Some("node-a".into())
@@ -224,12 +228,21 @@ mod tests {
         readiness: Readiness,
         tier: ProbingTier,
     ) -> (ProxyCollector<T, Facts, FakeStall>, Arc<ProbingState>) {
+        collector_answering(readiness, tier, TunProbe::Status(204))
+    }
+
+    fn collector_answering(
+        readiness: Readiness,
+        tier: ProbingTier,
+        tun_answer: TunProbe,
+    ) -> (ProxyCollector<T, Facts, FakeStall>, Arc<ProbingState>) {
         let probing = Arc::new(ProbingState::new(tier));
         let c = ProxyCollector::new(
             T::default(),
             Facts {
                 readiness,
                 tun_probes: Arc::default(),
+                tun_answer,
             },
             FakeStall::default(),
             "http://x/204".into(),
@@ -242,6 +255,24 @@ mod tests {
 
     fn collector(readiness: Readiness) -> ProxyCollector<T, Facts, FakeStall> {
         collector_in(readiness, ProbingTier::Active).0
+    }
+
+    /// The record's dead-tun shape: a probe that was ATTEMPTED and got no HTTP
+    /// status lands as `tun_code = 0` (the shell oracle's curl `000`), the
+    /// value `why`, `wedge-or-starvation` and the live `starvation` rule all
+    /// read as dead — distinct from `None`, which only a probe never attempted
+    /// (the passive tier, above) leaves behind.
+    #[tokio::test]
+    async fn a_probe_with_no_http_status_records_tun_code_zero() {
+        let (c, _) = collector_answering(Readiness::Ready, ProbingTier::Active, TunProbe::NoStatus);
+        let samples = c.collect(7).await;
+        let Sample::Proxy(p) = &samples[0] else {
+            panic!("expected a proxy sample")
+        };
+        assert_eq!(p.tun_code, Some(0), "attempted, no status: 0, never NULL");
+        assert_eq!(c.facts.tun_probes.load(Ordering::Acquire), 1);
+        assert_eq!(TunProbe::Status(502).code(), 502);
+        assert_eq!(TunProbe::NoStatus.code(), 0);
     }
 
     #[tokio::test]

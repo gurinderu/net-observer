@@ -29,6 +29,9 @@ ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS if_mac VARCHAR;
 -- realm net-observer, nodes #93, #108). NULL = not determinable. Same
 -- migration treatment.
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS medium VARCHAR;
+-- `tun_code`: the HTTP status the TUN probe got; 0 = probed, no HTTP status
+-- (the shell oracle's curl 000) — the dead tun every reading takes it for;
+-- NULL = not probed (passive tier, preflight skip), neither health nor fault.
 CREATE TABLE IF NOT EXISTS proxy_sample (
   ts_us BIGINT, server_ip VARCHAR, tcp VARCHAR, rtt_ms DOUBLE, tun_code USMALLINT, selector VARCHAR);
 -- Established-flow discriminator: whether the held reference streams (direct
