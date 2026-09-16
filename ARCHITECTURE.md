@@ -441,8 +441,30 @@ graph TD
   gpui-drawn pill (green track + knob-right when `snapshot.observing`, grey +
   knob-left when paused); clicking it sends `Control(SetObserving(!observing))`
   over the socket (`send_set_observing`) and refreshes, and the header
-  shows a muted "paused" state (grey dot) while collection is off. gpui's
-  build script runs **bindgen over `dispatch.h`** (libclang plus the SDK
+  shows a muted "paused" state (grey dot) while collection is off.
+  **The map window runs the audit ladder by rung and shows its findings.**
+  The network-map window's control row is four rungs — `Scan · Ports ·
+  Banners · CVE` — each a `Control(ScanNeighbors(ScanOptions))` carrying the
+  ladder up to itself (`Scan` = the base sweep + mDNS; `Ports` adds the port
+  scan; `Banners` = ports + banner grab; `CVE` = ports + banners + the match
+  against the daemon's local CVE snapshot), sent through the same
+  background-executor wiring as every other control button, so the daemon's
+  answer — a refusal, or a rung it dropped for a missing dependency, named —
+  lands verbatim in the line under the rungs. The bar only asks: which rungs
+  actually run is the daemon's decision (see [Control path](#control-path)).
+  While one is in flight all four are inert and `scanning…` stands beside
+  them. A **Findings** reading, beside Graph and List, lists every CVE the
+  record hypothesises for an open port — a read-only
+  `Query(Vulns { network: None })` over the socket on the background executor,
+  fetched when the window opens and again after each rung completes, never on
+  a timer — one line per finding grouped by host (`ip:port  cve_id ·
+  confidence · cvss · KEV`, `KEV` only when the daemon flagged it as
+  known-exploited), `no findings` for an empty table, and the daemon's own
+  words when it could not answer (a query it read but could not run, or a
+  daemon built before `Request::Query` existed). Each finding is a hypothesis
+  carrying its confidence, and the caption says so. (realm net-observer, node
+  #90)
+  gpui's build script runs **bindgen over `dispatch.h`** (libclang plus the SDK
   headers), so the crate is a full workspace member but is excluded from
   `default-members` — a bare `cargo build` needs no GUI toolchain. Build the bar
   with `--all` / `-p net-observer-bar` **from inside `nix develop`**. The
@@ -510,7 +532,7 @@ carries, lives in `types` for the same reason.
 | --- | --- |
 | `verdict_at(ts_us)` | every layer's state at a moment, plus the `layer` the record blames |
 | `incident_context()` | for each incident, the layer state at or just before it opened |
-| `wedge_vs_starvation()` | contiguous `tun=000` episodes, each named `link` / `vless` / `starvation` / `wedge` / `unknown` |
+| `wedge_vs_starvation()` | episodes of ticks whose tun answered anything but 204 (`0` = a silent probe, a captive portal's 200, a 5xx), each named `link` / `vless` / `starvation` / `wedge` / `unknown` |
 | `gw_drops()` | the first link sample of each run of `FAIL`/`NOGW` (`SKIP` ticks removed first, so a quiet run cannot manufacture an edge) |
 | `gateway_ramp(drop_ts_us)` | gateway RTT over the window before a drop, with a least-squares `slope_ms_per_s` over the answered ticks — the ~40 s coworking climb as data |
 | `fakeip_bugs()` | `FAKEIP` on a `.ru` name, which is always a bug |
@@ -521,11 +543,17 @@ The `layer` vocabulary is `link` / `vless` / `proxy` / `host` / `healthy` /
 health or as fault, and two situations make a query decline outright rather than
 answer:
 
-- **A dead tun with no `load1`.** `tun_code = 0` is a wedge if the host was idle
-  and starvation if it was not, and without a host sample the record cannot tell
-  them apart — so the layer is `unknown`, never a guess at `proxy`. The
-  distinction is the one the project paid nine hours to learn on 2026-07-27: a
-  restart cures a wedge and *tears down live flows* under starvation.
+- **A dead-tun episode with no `load1`.** An episode is a run of ticks whose
+  tun answered anything but 204 (`0` — the probe got no status at all; a
+  captive portal's 200; a 5xx). It is `starvation` only when the host was
+  loaded *and* every tick in the episode was silent (`tun_code = 0`
+  throughout); it is `wedge` otherwise — an episode with even one
+  answered-but-wrong tick is a wedge no matter the load, because the tunnel
+  answered and load does not explain a wrong answer. Without a host sample
+  the record cannot tell wedge from starvation at all, so it declines
+  outright: `unknown`, never a guess. The distinction is the one the project
+  paid nine hours to learn on 2026-07-27: a restart cures a wedge and *tears
+  down live flows* under starvation.
 - **A moment inside an observation gap.** An `ASOF JOIN` would honestly hand back
   the newest sample from *before* a pause as though it were a reading taken at
   the moment asked about, with nothing in the row saying otherwise — a gap that
