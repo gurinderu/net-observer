@@ -1475,16 +1475,15 @@ fn build_engine(
             BACKOFF_US,
         ),
         Trigger::new(Box::new(GwChange), gw_change_handlers, BACKOFF_US),
-        // A roam — a new BSSID at the same SSID, or a new interface MAC — is
-        // its own incident, not the `gw-drop`/`per-client-block` it used to
+        // A roam — a BSSID hop, or a new link address on Wi-Fi — is its own
+        // incident, not the `gw-drop`/`per-client-block` it used to
         // masquerade as. Not gated: the settle window would suppress exactly
         // this event. No pcap freeze: the evidence is the two identities in
-        // the record. (realm net-observer, node #59)
-        Trigger::new(
-            Box::new(Roam),
-            vec![record.clone(), snap.clone()],
-            BACKOFF_US,
-        ),
+        // the record. NO backoff: the field cadence is a hop every 2.5–3 min
+        // and every hop is its own incident — under `BACKOFF_US` most would
+        // be silently dropped; `wifi-churn` below carries the aggregate's
+        // rate limit. (realm net-observer, node #59)
+        Trigger::new(Box::new(Roam), vec![record.clone(), snap.clone()], 0),
         // Four or more identity changes in a quarter hour are one churn
         // incident, not a string of roams. A change signature, so not gated;
         // no pcap freeze, the evidence is the recorded identities; and
