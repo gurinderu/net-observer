@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::window::{LinkProvenance, RecentWindow};
-use types::{DnsVerdict, GwVerdict, LinkSample, NeighborsVerdict, TcpVerdict};
+use types::{DnsVerdict, GwVerdict, LinkSample, NeighborsVerdict, ProxySample, TcpVerdict};
 
 /// How many recent DNS samples the `fakeip` condition scans (one polling tick
 /// emits several probe rows, so a small window covers the latest tick).
@@ -27,6 +27,52 @@ pub trait Condition: Send + Sync {
     fn eval(&self, w: &RecentWindow) -> Option<Fire>;
 }
 
+/// One proxy TICK as the tun-reading conditions see it: the rows sharing one
+/// `ts_us`, folded.
+///
+/// Proxy rows arrive one per ENDPOINT with the tick's shared `tun_code`
+/// replicated across them, so rows must be folded into ticks before any
+/// counting. The first cut of `wedge` counted ROWS, which made `consecutive` a
+/// fraction of ONE tick — a single transient transport failure opened an
+/// incident (observed live 2026-09-10: two wedge incidents minutes apart while
+/// the shell oracle's TICK log showed tun=204 on every surrounding probe).
+///
+/// A tick is MEASURED when its tun probe ran: a `tun_code` is present, or it
+/// is absent on a non-Skip row (the probe ran and failed at the transport —
+/// `tun_probe` returns `None` exactly then). A Skip placeholder tick (a lone
+/// Skip row with no `tun_code`: the pipeline's preflight skip, or a tick the
+/// passive probing tier withheld) is the absence of a measurement (the rule
+/// `GwDrop` documents: realm net-observer, node #25) — every reader here
+/// treats it as transparent, never as a dead tun. A measured tick is DEAD
+/// unless the probe answered exactly 204 (the shell watchdog's `tun != 204`).
+struct ProxyTick {
+    measured: bool,
+    dead: bool,
+}
+
+/// Fold `rows` (newest first, as [`RecentWindow::recent_proxy`] yields them)
+/// into [`ProxyTick`]s, newest first.
+fn proxy_ticks<'a>(rows: &'a [&'a ProxySample]) -> impl Iterator<Item = ProxyTick> + 'a {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        let ts = rows.get(i)?.ts_us;
+        let mut tick = ProxyTick {
+            measured: false,
+            dead: true,
+        };
+        while let Some(r) = rows.get(i).filter(|r| r.ts_us == ts) {
+            if r.tun_code.is_some() || r.tcp != TcpVerdict::Skip {
+                tick.measured = true;
+            }
+            if r.tun_code == Some(204) {
+                tick.dead = false;
+            }
+            i += 1;
+        }
+        Some(tick)
+    })
+}
+
 /// Fires when the last `consecutive` link samples all have `direct == Ok` while
 /// the last `consecutive` MEASURED proxy ticks all found the tun dead (anything
 /// but a 204 from the probe — mirroring the shell watchdog's `tun != 204`).
@@ -45,44 +91,12 @@ impl Condition for Wedge {
         if !links.iter().all(|l| l.direct == TcpVerdict::Ok) {
             return None;
         }
-        // Proxy rows arrive one per ENDPOINT with the tick's shared `tun_code`
-        // replicated across them, so rows must be folded into ticks (groups
-        // sharing `ts_us`) before counting. The first cut counted ROWS, which
-        // made `consecutive` a fraction of ONE tick — a single transient
-        // transport failure opened an incident (observed live 2026-09-10: two
-        // wedge incidents minutes apart while the shell oracle's TICK log
-        // showed tun=204 on every surrounding probe).
-        //
-        // A tick is MEASURED when its tun probe ran: a `tun_code` is present,
-        // or it is absent on a non-Skip row (the probe ran and failed at the
-        // transport — `tun_probe` returns `None` exactly then). The pipeline's
-        // preflight-skip placeholder (a lone Skip row with no `tun_code`) is
-        // the absence of a measurement and is transparent here — it neither
-        // advances nor resets the dead run (the same rule `GwDrop` documents:
-        // realm net-observer, node #25). A measured tick counts as dead
-        // unless the probe answered exactly 204; a measured healthy tick
-        // breaks the run.
+        // Count MEASURED ticks only (see [`ProxyTick`]): a placeholder neither
+        // advances nor resets the dead run; a measured healthy tick breaks it.
         let rows = w.recent_proxy(usize::MAX);
         let mut dead_ticks = 0usize;
-        let mut i = 0;
-        while i < rows.len() {
-            let ts = rows[i].ts_us;
-            let mut measured = false;
-            let mut dead = true;
-            while i < rows.len() && rows[i].ts_us == ts {
-                let r = rows[i];
-                if r.tun_code.is_some() || r.tcp != TcpVerdict::Skip {
-                    measured = true;
-                }
-                if r.tun_code == Some(204) {
-                    dead = false;
-                }
-                i += 1;
-            }
-            if !measured {
-                continue;
-            }
-            if !dead {
+        for tick in proxy_ticks(&rows).filter(|t| t.measured) {
+            if !tick.dead {
                 return None;
             }
             dead_ticks += 1;
@@ -170,7 +184,11 @@ impl<C: Condition> Condition for Gated<C> {
 }
 
 /// How far back `gw-change` looks for a comparable (non-`SKIP`) predecessor when
-/// the operator's quiet mode has suppressed the echo for a run of ticks.
+/// the echo has been withheld for a run of ticks — by the operator's quiet mode
+/// or by the passive probing tier. It therefore bounds the rule's reach across
+/// a passive stretch: a change straddling a stretch longer than this many
+/// ticks is not named by `gw-change` (its basis has left the window), while
+/// `gw-drop` still catches a `FAIL` on the first measured tick after it.
 const GW_CHANGE_SCAN: usize = 64;
 
 /// Fires when the newest link sample's gateway verdict is `Fail` or `NoGw`.
@@ -207,18 +225,19 @@ impl Condition for GwChange {
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let last = w.last_link()?;
         // A `SKIP` tick carries no measurement, so it can be neither side of a
-        // change: `OK -> SKIP` is the operator flipping quiet on, not the gateway
-        // moving, and firing on it would manufacture an incident out of a
-        // control-socket click.
+        // change: `OK -> SKIP` is the operator flipping quiet on or the tier
+        // to passive, not the gateway moving, and firing on it would
+        // manufacture an incident out of a control-socket click.
         if last.gw == GwVerdict::Skip {
             return None;
         }
-        // Reach back past a quiet run for the newest predecessor that actually
-        // measured something. Without this the change that quiet mode straddled
-        // (`OK` -> quiet -> `FAIL`) would be suppressed once and then never seen
-        // again — silence, exactly what the SKIP token exists to prevent.
+        // Reach back past a withheld run (quiet, or the passive tier) for the
+        // newest predecessor that actually measured something. Without this
+        // the change the run straddled (`OK` -> withheld -> `FAIL`) would be
+        // suppressed once and then never seen again — silence, exactly what
+        // the SKIP token exists to prevent.
         let recent = w.recent_link(GW_CHANGE_SCAN);
-        let quiet_run = recent
+        let withheld_run = recent
             .iter()
             .skip(1)
             .take_while(|l| l.gw == GwVerdict::Skip)
@@ -235,12 +254,13 @@ impl Condition for GwChange {
         // A change measured against the basis carried across a pause is real —
         // the oracle freezes on ANY gateway change — but it is not two
         // consecutive ticks, and the incident must not read as though it were.
-        // A change straddling a quiet run is real for the same reason, and is
-        // labelled for the same reason.
-        let across = match (provenance, quiet_run) {
+        // A change straddling a withheld run is real for the same reason, and
+        // is labelled for the same reason — "withheld", because quiet and the
+        // passive tier both produce it and a SKIP run does not say which.
+        let across = match (provenance, withheld_run) {
             (LinkProvenance::AcrossGap, _) => " (across an observation gap)".to_string(),
             (LinkProvenance::Contiguous, 0) => String::new(),
-            (LinkProvenance::Contiguous, n) => format!(" (across {n} quiet tick(s))"),
+            (LinkProvenance::Contiguous, n) => format!(" (across {n} withheld tick(s))"),
         };
         (last.gw != prev.gw).then(|| Fire {
             detail: format!("gateway {} -> {}{}", prev.gw, last.gw, across),
@@ -364,6 +384,13 @@ impl Condition for FakeIp {
 /// Fires when the tun is dead while host load exceeds `load_threshold` — the
 /// starvation discriminator: a wedge caused by CPU/IO pressure rather than a
 /// network fault. `load1` is read from the `host` collector's newest sample.
+///
+/// "Dead" is a MEASUREMENT: the newest proxy tick whose probe ran (the
+/// [`ProxyTick`] definition `wedge` shares) answered anything but 204. A Skip
+/// placeholder tick — the preflight skip, or every tick of the passive probing
+/// tier — is no measurement and no fire, however high the load: a loaded host
+/// with no probe sent is not a starved tun, and reading it as one opened an
+/// incident on every passive tick under load (realm net-observer, node #88).
 pub struct Starvation {
     pub load_threshold: f64,
 }
@@ -372,10 +399,11 @@ impl Condition for Starvation {
         "starvation"
     }
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
-        let last = w.last_proxy()?;
+        let rows = w.recent_proxy(usize::MAX);
+        let newest_measured = proxy_ticks(&rows).find(|t| t.measured)?;
         // Load from the newest `host` sample; absent ⇒ 0.0 (cannot be starvation).
         let load1 = w.last_host().map_or(0.0, |h| h.load1);
-        (last.tun_code.unwrap_or(0) == 0 && load1 > self.load_threshold).then(|| Fire {
+        (newest_measured.dead && load1 > self.load_threshold).then(|| Fire {
             detail: format!("tun dead under load {load1:.2}"),
         })
     }
@@ -1156,6 +1184,38 @@ mod tests {
         assert!(c.eval(&w).is_none());
     }
 
+    /// A passive tick lands as the proxy Skip placeholder (`tcp = SKIP`, no
+    /// `tun_code`): no probe ran, so there is no dead tun to blame the load
+    /// for. Dies under reading an absent `tun_code` as a dead tun — which
+    /// opened a `starvation` incident on every passive tick under load.
+    #[test]
+    fn starvation_needs_a_measured_dead_tun_not_a_skip_placeholder() {
+        let mut w = RecentWindow::new(16);
+        let c = Starvation {
+            load_threshold: 10.0,
+        };
+        w.push(skip_proxy(1));
+        w.push(host(2, 12.0));
+        assert!(
+            c.eval(&w).is_none(),
+            "a Skip placeholder is no measurement, so no starvation"
+        );
+        // The placeholder is transparent, as for `wedge`: the newest MEASURED
+        // tick decides. A measured dead tick before it still fires...
+        w.push(proxy(3, 0));
+        w.push(skip_proxy(4));
+        assert!(
+            c.eval(&w).is_some(),
+            "the newest measured tick is dead and the load is high"
+        );
+        // ...and a measured healthy tick before it does not, however many
+        // placeholders follow.
+        w.push(proxy(5, 204));
+        w.push(skip_proxy(6));
+        w.push(skip_proxy(7));
+        assert!(c.eval(&w).is_none(), "the newest measured tick is healthy");
+    }
+
     #[test]
     fn gw_drop_and_change() {
         let mut w = RecentWindow::new(8);
@@ -1210,9 +1270,11 @@ mod tests {
             "detail must name both measured verdicts: {}",
             fire.detail
         );
+        // Quiet and the passive tier both withhold the echo, and a SKIP run
+        // does not say which: the label names the withholding, not quiet.
         assert!(
-            fire.detail.contains("quiet"),
-            "the detail must say the change straddled quiet ticks: {}",
+            fire.detail.ends_with(" (across 2 withheld tick(s))"),
+            "the detail must say the change straddled withheld ticks: {}",
             fire.detail
         );
     }
