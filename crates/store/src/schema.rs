@@ -23,6 +23,12 @@ ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS singbox_tun_if VARCHAR;
 -- treatment.
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS bssid VARCHAR;
 ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS if_mac VARCHAR;
+-- The medium of the default-route interface (`wifi` | `wired`), measured from
+-- the hardware-port table, so an if_mac change can be judged as a Wi-Fi roam
+-- or a dock/undock without a readable SSID or BSSID (under root neither is:
+-- realm net-observer, nodes #93, #108). NULL = not determinable. Same
+-- migration treatment.
+ALTER TABLE link_sample ADD COLUMN IF NOT EXISTS medium VARCHAR;
 CREATE TABLE IF NOT EXISTS proxy_sample (
   ts_us BIGINT, server_ip VARCHAR, tcp VARCHAR, rtt_ms DOUBLE, tun_code USMALLINT, selector VARCHAR);
 -- Established-flow discriminator: whether the held reference streams (direct

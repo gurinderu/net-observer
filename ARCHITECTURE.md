@@ -88,15 +88,20 @@ flowchart LR
   into the `RecentWindow`, and evaluates the engine.
 - **TriggerEngine** — rules ported from the oracle and grown since: `wedge`,
   `gw-drop`, `gw-change` (unconditional pcap freeze on any gateway change),
-  `gw-mac-change` (pcap freeze too), `neighbor-mac-collision`,
-  `per-client-block` (gateway silent while probed LAN neighbors answer),
-  `ban-cycle` (three or more gateway bans in the window read as one cycling
-  incident with a period), `fakeip`, `fakeip-hijack` (a fakeip-pool address
-  routes out a non-tunnel interface), `endpoint-block` (whole upstream fleet
-  dead from the underlay while the direct reference answers),
-  `established-stall` (a held long-lived stream through the tunnel stops
-  carrying while fresh probes succeed; the direct underlay stream's fate scopes
-  the verdict), `starvation`. Each fires at most once per 5 min (backoff) and
+  `roam` (a BSSID hop or a new link address on Wi-Fi, classified by whether
+  the link address was kept), `wifi-churn` (four or more Wi-Fi identity
+  changes in a quarter hour read as one incident), `gw-mac-change` (pcap
+  freeze too), `neighbor-mac-collision`, `per-client-block` (gateway silent
+  while probed LAN neighbors answer), `ban-cycle` (three or more gateway bans
+  in the window read as one cycling incident with a period), `fakeip`,
+  `fakeip-hijack` (a fakeip-pool address routes out a non-tunnel interface),
+  `endpoint-block` (whole upstream fleet dead from the underlay while the
+  direct reference answers), `established-stall` (a held long-lived stream
+  through the tunnel stops carrying while fresh probes succeed; the direct
+  underlay stream's fate scopes the verdict), `starvation`. Each fires at most
+  once per 5 min (backoff) — except `roam`, which has no backoff so that each
+  hop at the field cadence is its own incident (hops on consecutive ticks
+  merge into one under the engine's latch; the rows still record both) — and
   disarms until the signal returns to OK.
 - **Live snapshot + local socket API** — the consumer keeps an in-memory
   `StatusSnapshot` (the latest sample per collector + `generated_us`) current on
@@ -448,7 +453,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 
 | Table | Columns | Notes |
 | --- | --- | --- |
-| `link_sample` | `ts_us, gw, gw_rtt_ms, direct, direct_rtt_ms, dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present, lan_probed, lan_alive, fakeip_route_if, singbox_tun_if, bssid, if_mac` | Local path: gateway ping, direct TCP (bound to phys iface), DHCP/ARP facts, Wi-Fi SSID + CoreCapture presence. `lan_probed`/`lan_alive` are the probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL tick (NULL = not probed). `fakeip_route_if` is the egress interface the route table resolves for a fakeip-pool address; `singbox_tun_if` is the interface carrying sing-box's own TUN address (present only while sing-box runs — the sing-box-alive fact, not "any utun", so a foreign VPN's utun does not read as sing-box being up). Both NULL = could not be determined. `bssid` is the BSSID of the access point associated with and `if_mac` the interface's own MAC as currently assigned (Private Wi-Fi Address rotates it per SSID), both lowercase; a BSSID change at the same SSID is a roam the SSID alone cannot show, an `if_mac` change a new DHCP identity toward the network. NULL = not associated / not determinable. |
+| `link_sample` | `ts_us, gw, gw_rtt_ms, direct, direct_rtt_ms, dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present, lan_probed, lan_alive, fakeip_route_if, singbox_tun_if, bssid, if_mac, medium` | Local path: gateway ping, direct TCP (bound to phys iface), DHCP/ARP facts, Wi-Fi SSID + CoreCapture presence. `lan_probed`/`lan_alive` are the probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL tick (NULL = not probed). `fakeip_route_if` is the egress interface the route table resolves for a fakeip-pool address; `singbox_tun_if` is the interface carrying sing-box's own TUN address (present only while sing-box runs — the sing-box-alive fact, not "any utun", so a foreign VPN's utun does not read as sing-box being up). Both NULL = could not be determined. `bssid` is the BSSID of the access point associated with and `if_mac` the interface's own MAC as currently assigned (Private Wi-Fi Address rotates it per SSID), both lowercase; a BSSID change at the same SSID is a roam the SSID alone cannot show, an `if_mac` change a new DHCP identity toward the network. NULL = not associated / not determinable. `medium` is the medium of the default-route interface (`wifi` or `wired`), measured from the hardware-port table so an `if_mac` change can be judged as a Wi-Fi roam or a dock/undock without a readable SSID or BSSID; NULL = not determinable. |
 | `proxy_sample` | `ts_us, server_ip, tcp, rtt_ms, tun_code, selector, est_direct_alive, est_direct_age_s, est_tun_alive, est_tun_age_s` | Per-VLESS TCP reachability, tun HTTP 204 (`tun_code`), Clash selector. The `est_*` columns are the established-flow discriminator (held reference streams: direct underlay / through the tunnel), per-tick facts replicated across the tick's rows like `tun_code`; NULL = no measurement. |
 | `dns_sample` | `ts_us, probe, server, verdict, ip, rtt_ms` | One row per resolver probe (name label × resolver path); `verdict` drives the `fakeip` trigger. |
 | `route_event` | `ts_us, kind, iface, detail` | PF_ROUTE event stream (`kind` = `iface` / `addr` / `route`): iface up/down, addr add/loss, default-route change. |
