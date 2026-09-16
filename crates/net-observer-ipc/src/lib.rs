@@ -1379,6 +1379,8 @@ mod tests {
                 dhcp_dns: None,
                 gw_arp_mac: None,
                 ssid: Some("home".into()),
+                bssid: None,
+                if_mac: None,
                 wifi_capture_present: false,
                 lan_probed: None,
                 lan_alive: None,
@@ -1453,10 +1455,11 @@ mod tests {
         assert!(snap.observing);
     }
 
-    /// A daemon from before the probe-on-suspicion counts and the route/TUN
-    /// interface fields emits link samples without `lan_probed`/`lan_alive`/
-    /// `fakeip_route_if`/`singbox_tun_if`. They must decode as `None` — "not
-    /// measured" — never fail the whole frame.
+    /// A daemon from before the probe-on-suspicion counts, the route/TUN
+    /// interface fields and the link identity pair emits link samples without
+    /// `lan_probed`/`lan_alive`/`fakeip_route_if`/`singbox_tun_if`/`bssid`/
+    /// `if_mac`. They must decode as `None` — "not measured" — never fail the
+    /// whole frame.
     #[test]
     fn link_sample_decodes_frames_from_before_the_new_fields() {
         let old = r#"{"ts_us":1,"gw":"Ok","gw_rtt_ms":null,"direct":"Ok","direct_rtt_ms":null,"dhcp_router":null,"dhcp_dns":null,"gw_arp_mac":null,"ssid":null,"wifi_capture_present":false}"#;
@@ -1465,6 +1468,8 @@ mod tests {
         assert_eq!(l.lan_alive, None);
         assert_eq!(l.fakeip_route_if, None);
         assert_eq!(l.singbox_tun_if, None);
+        assert_eq!(l.bssid, None);
+        assert_eq!(l.if_mac, None);
     }
 
     /// Same guarantee for the proxy sample: a frame from before the
@@ -1659,6 +1664,8 @@ mod tests {
             dhcp_dns: None,
             gw_arp_mac: None,
             ssid: None,
+            bssid: None,
+            if_mac: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

@@ -25,10 +25,13 @@
 //! refines the same function with the ports it found open.
 //!
 //! **Deliberately deferred — do NOT build:** AP detection via the associated
-//! BSSID. macOS gates the BSSID behind Location Services for a LaunchDaemon, so
-//! it is not reliably available to this daemon; naming a device an AP from an
-//! absent BSSID would be exactly the guess this module refuses. When a reliable
-//! BSSID source appears, it attaches here as another infra signal.
+//! BSSID. CoreWLAN gates the BSSID behind Location Services for a LaunchDaemon,
+//! and naming a device an AP from an absent BSSID would be exactly the guess
+//! this module refuses. A candidate source now exists — `LinkSample::bssid`,
+//! read from `ipconfig getsummary` (realm net-observer, node #93) — but its
+//! visibility to a root LaunchDaemon is unobserved. AP detection stays deferred
+//! until that source is observed under root; then it attaches here as another
+//! infra signal.
 
 use oui_db::{OuiDb, VendorLookup};
 use types::{NeighborObs, NeighborRole, NeighborsSample, RoleConfidence};

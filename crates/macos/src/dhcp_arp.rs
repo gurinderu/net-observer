@@ -1,7 +1,8 @@
 //! Link-layer facts gathered from macOS command-line tools:
 //! default gateway + physical interface (`route -n get default`), the DHCP
 //! lease (`ipconfig getpacket`), the gateway's ARP entry (`arp -n`), the
-//! joined SSID and any recent Wi-Fi driver capture.
+//! joined SSID, the link's identity pair (the AP's BSSID and the interface's
+//! own MAC, see `wifi`) and any recent Wi-Fi driver capture.
 //!
 //! Every field parses defensively: a missing tool, non-zero exit, or
 //! unrecognised output yields `None`, never a panic — "absence is a signal".
@@ -141,6 +142,16 @@ impl LinkFacts for SystemFacts {
     async fn ssid(&self) -> Option<String> {
         let iface = self.phys_iface().await?;
         wifi::current_ssid(&iface).await
+    }
+
+    async fn bssid(&self) -> Option<String> {
+        let iface = self.phys_iface().await?;
+        wifi::current_bssid(&iface).await
+    }
+
+    async fn if_mac(&self) -> Option<String> {
+        let iface = self.phys_iface().await?;
+        wifi::interface_mac(&iface).await
     }
 
     async fn wifi_capture_present(&self) -> bool {

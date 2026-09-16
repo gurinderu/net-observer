@@ -1708,6 +1708,8 @@ mod tests {
                 dhcp_dns: None,
                 gw_arp_mac: None,
                 ssid: Some("home".into()),
+                bssid: None,
+                if_mac: None,
                 wifi_capture_present: false,
                 lan_probed: None,
                 lan_alive: None,
