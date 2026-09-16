@@ -394,8 +394,20 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // Incidents left open by the previous process can never be closed by it
     // again — the closing edge lived in its memory. Stamp them closed at the
-    // observation bound rather than leaving forever-open rows.
-    match store.close_open_incidents(types::now_us()) {
+    // observation bound: the record's own newest sample, not this new
+    // process's start time, which is always later and would make a crashed
+    // run's incidents read as though they had lasted until now (realm
+    // net-observer, node #124).
+    let stale_close_ts = match store.latest_sample_ts_us() {
+        Ok(Some(ts)) => ts,
+        Ok(None) => types::now_us(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read the record's newest sample; \
+                closing stale incidents at now instead");
+            types::now_us()
+        }
+    };
+    match store.close_open_incidents(stale_close_ts) {
         Ok(0) => {}
         Ok(n) => tracing::info!(n, "closed stale open incidents from a previous run"),
         Err(e) => tracing::warn!(error = %e, "failed to close stale open incidents"),
