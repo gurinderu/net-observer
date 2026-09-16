@@ -383,7 +383,22 @@ impl Event {
                 let iface = r.iface.as_deref().unwrap_or("-");
                 format!("{} {} {}", r.kind, iface, r.detail)
             }
-            Event::Host(h) => format!("load {:.2}/{:.2}/{:.2}", h.load1, h.load5, h.load15),
+            // Disk and swap are optional facts (a pre-field daemon never sends
+            // them): an unmeasured one renders as `-`, never as an omission.
+            Event::Host(h) => {
+                let disk = match (h.disk_used_pct, h.disk_free_mb) {
+                    (Some(pct), Some(free)) => format!("{pct:.1}% used, {free} MB free"),
+                    _ => "-".to_string(),
+                };
+                let swap = h
+                    .swap_used_mb
+                    .map(|m| format!("{m} MB"))
+                    .unwrap_or_else(|| "-".to_string());
+                format!(
+                    "load {:.2}/{:.2}/{:.2}; disk {disk}; swap {swap}",
+                    h.load1, h.load5, h.load15
+                )
+            }
             // A SKIP renders as its reason, so a reader never sees a row of
             // dashes with no explanation for them.
             Event::Wifi(w) => match w.wifi {
@@ -2018,11 +2033,26 @@ mod tests {
             load1: 1.0,
             load5: 2.0,
             load15: 3.0,
+            disk_used_pct: Some(42.06),
+            disk_free_mb: Some(120_000),
+            swap_used_mb: Some(1024),
+        });
+        assert_eq!(
+            host.detail(),
+            "load 1.00/2.00/3.00; disk 42.1% used, 120000 MB free; swap 1024 MB"
+        );
+        // Unmeasured disk and swap (a pre-field daemon) print as `-`, never
+        // drop out of the line.
+        let host = Event::Host(HostSample {
+            ts_us: 0,
+            load1: 1.0,
+            load5: 2.0,
+            load15: 3.0,
             disk_used_pct: None,
             disk_free_mb: None,
             swap_used_mb: None,
         });
-        assert_eq!(host.detail(), "load 1.00/2.00/3.00");
+        assert_eq!(host.detail(), "load 1.00/2.00/3.00; disk -; swap -");
 
         let inc = Event::Incident(IncidentSummary {
             id: "inc-1".into(),
