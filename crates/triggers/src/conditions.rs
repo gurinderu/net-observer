@@ -27,13 +27,17 @@ pub trait Condition: Send + Sync {
     fn eval(&self, w: &RecentWindow) -> Option<Fire>;
 }
 
-/// How many recent proxy rows `wedge` scans for its dead-tick run: one tick
-/// emits one row per endpoint, ~7 rows with the daemon's defaults, so 64 rows
-/// ≈ 9 ticks ≈ 2 min at the 15 s cadence. The run it counts is the daemon's
-/// `WEDGE_CONSECUTIVE = 3`, so the scan needs only a few ticks beyond that;
-/// an unbounded scan reached across the whole 2048-sample window and fired
-/// on a dead run any number of unmeasured ticks old (#96). Tunable by the
-/// owner.
+/// How many recent proxy rows `wedge` scans for its dead-tick run. The
+/// reach in time depends on what a tick emits: a MEASURED tick emits one row
+/// per endpoint, ~7 rows with the daemon's defaults, so 64 rows ≈ 9 ticks
+/// ≈ 2 min at the 15 s cadence; a tick whose preflight skipped emits one
+/// placeholder row, so a run of those — the #96 scenario — stretches the
+/// same 64 rows to ≈ 64 ticks ≈ 16 min, which is how far behind the present
+/// a dead run can still be counted. The run it counts is the daemon's
+/// `WEDGE_CONSECUTIVE = 3`, so a few measured ticks beyond that suffice; an
+/// unbounded scan reached across the whole 2048-sample window (≈ 40 min)
+/// and fired on a dead run any number of unmeasured ticks old. Tunable by
+/// the owner.
 const WEDGE_SCAN: usize = 64;
 
 /// Fires when the last `consecutive` link samples all have `direct == Ok` while

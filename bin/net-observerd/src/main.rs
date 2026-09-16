@@ -1418,11 +1418,11 @@ fn build_api_server(
 }
 
 /// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
-/// gw-mac-change, neighbor-mac-collision, per-client-block, ban-cycle, fakeip,
-/// fakeip-hijack, endpoint-block, established-stall, starvation). Every rule
-/// records an incident (durable, in DuckDB) and mirrors it into the live
-/// snapshot's ring for the socket API; gw-change and gw-mac-change
-/// additionally freeze the pcap ring when one is available.
+/// roam, wifi-churn, gw-mac-change, neighbor-mac-collision, per-client-block,
+/// ban-cycle, fakeip, fakeip-hijack, endpoint-block, established-stall,
+/// starvation). Every rule records an incident (durable, in DuckDB) and
+/// mirrors it into the live snapshot's ring for the socket API; gw-change and
+/// gw-mac-change additionally freeze the pcap ring when one is available.
 fn build_engine(
     store: Arc<DuckdbStore>,
     cfg: &Config,

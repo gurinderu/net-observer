@@ -88,16 +88,19 @@ flowchart LR
   into the `RecentWindow`, and evaluates the engine.
 - **TriggerEngine** — rules ported from the oracle and grown since: `wedge`,
   `gw-drop`, `gw-change` (unconditional pcap freeze on any gateway change),
-  `gw-mac-change` (pcap freeze too), `neighbor-mac-collision`,
-  `per-client-block` (gateway silent while probed LAN neighbors answer),
-  `ban-cycle` (three or more gateway bans in the window read as one cycling
-  incident with a period), `fakeip`, `fakeip-hijack` (a fakeip-pool address
-  routes out a non-tunnel interface), `endpoint-block` (whole upstream fleet
-  dead from the underlay while the direct reference answers),
-  `established-stall` (a held long-lived stream through the tunnel stops
-  carrying while fresh probes succeed; the direct underlay stream's fate scopes
-  the verdict), `starvation`. Each fires at most once per 5 min (backoff) and
-  disarms until the signal returns to OK.
+  `roam` (a BSSID hop or a new link address on Wi-Fi, classified by whether
+  the link address was kept), `wifi-churn` (four or more Wi-Fi identity
+  changes in a quarter hour read as one incident), `gw-mac-change` (pcap
+  freeze too), `neighbor-mac-collision`, `per-client-block` (gateway silent
+  while probed LAN neighbors answer), `ban-cycle` (three or more gateway bans
+  in the window read as one cycling incident with a period), `fakeip`,
+  `fakeip-hijack` (a fakeip-pool address routes out a non-tunnel interface),
+  `endpoint-block` (whole upstream fleet dead from the underlay while the
+  direct reference answers), `established-stall` (a held long-lived stream
+  through the tunnel stops carrying while fresh probes succeed; the direct
+  underlay stream's fate scopes the verdict), `starvation`. Each fires at most
+  once per 5 min (backoff) — except `roam`, which has no backoff so that every
+  hop is its own incident — and disarms until the signal returns to OK.
 - **Live snapshot + local socket API** — the consumer keeps an in-memory
   `StatusSnapshot` (the latest sample per collector + `generated_us`) current on
   every tick, and a passive `SnapshotHandler` mirrors each fired incident into a
