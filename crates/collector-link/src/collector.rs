@@ -83,7 +83,11 @@ where
     async fn collect(&self, ts_us: i64) -> Vec<Sample> {
         // Await the probes/facts, then a sync `build_*` composes the sample.
         let gw_addr = self.facts.default_gw().await;
-        let iface = self.facts.phys_iface().await.unwrap_or_default();
+        // Resolved ONCE per tick and handed to every per-interface read below,
+        // so a default-route move mid-tick (a dock or undock) cannot stamp one
+        // sample with one adapter's medium and the other's MAC.
+        let phys_iface = self.facts.phys_iface().await;
+        let iface = phys_iface.clone().unwrap_or_default();
         // Read the switch ONCE per tick, so the packet that is skipped and the
         // verdict that reports it can never disagree.
         let quiet = self.quiet.load(Ordering::Acquire);
@@ -127,18 +131,26 @@ where
             Some(gw) => self.facts.gw_arp_mac(gw).await,
             None => None,
         };
-        let ssid = self.facts.ssid().await;
-        // The link's identity pair: the AP associated with and the interface's
-        // own MAC. Two local reads (no packet on the wire), so they keep
-        // running under quiet mode. Recorded every tick because a roam between
-        // twin SSIDs shows up here and nowhere else (realm net-observer,
-        // node #59).
-        let bssid = self.facts.bssid().await;
-        let if_mac = self.facts.if_mac().await;
-        // The medium `if_mac` belongs to, measured from the hardware-port table
-        // (not inferred from a readable Wi-Fi name): the identity rules judge
-        // an `if_mac` change by it, and a wired hop must never read as a roam.
-        let medium = self.facts.medium().await;
+        // The SSID and the link's identity triple — the AP associated with,
+        // the interface's own MAC and the medium that MAC belongs to (measured
+        // from the hardware-port table, not inferred from a readable Wi-Fi
+        // name: the identity rules judge an `if_mac` change by it, and a
+        // wired hop must never read as a roam). Local reads, no packet on
+        // the wire, so they keep running under quiet mode; recorded every
+        // tick because a roam between twin SSIDs shows up here and nowhere
+        // else (realm net-observer, node #59). All four are read from the
+        // ONE interface this tick resolved; with no interface there is
+        // nothing to read them from, and each is the absence of a
+        // measurement.
+        let (ssid, bssid, if_mac, medium) = match phys_iface.as_deref() {
+            Some(iface) => (
+                self.facts.ssid(iface).await,
+                self.facts.bssid(iface).await,
+                self.facts.if_mac(iface).await,
+                self.facts.medium(iface).await,
+            ),
+            None => (None, None, None, None),
+        };
         let wifi_present = self.facts.wifi_capture_present().await;
         // Two local reads, not probes: the fakeip pool's route egress and the
         // interface carrying sing-box's own TUN address (the sing-box-alive
@@ -239,14 +251,19 @@ mod tests {
             }
         }
     }
-    /// Link facts with a scripted identity pair: `bssid`/`if_mac` are returned
-    /// exactly as set, so a test can hand the collector a determinable or an
-    /// undeterminable identity and read what lands in the sample.
+    /// Link facts with a scripted identity triple: `bssid`/`if_mac`/`medium`
+    /// are returned exactly as set, so a test can hand the collector a
+    /// determinable or an undeterminable identity and read what lands in the
+    /// sample. `route_lookups` counts the `phys_iface` resolutions and
+    /// `asked_for` records the interface each per-interface read was given,
+    /// so a test can hold the collector to one route lookup per tick.
     struct FakeFacts {
         ready: bool,
         bssid: Option<String>,
         if_mac: Option<String>,
         medium: Option<LinkMedium>,
+        route_lookups: Arc<std::sync::atomic::AtomicUsize>,
+        asked_for: Arc<std::sync::Mutex<Vec<String>>>,
     }
     impl Default for FakeFacts {
         fn default() -> Self {
@@ -255,7 +272,14 @@ mod tests {
                 bssid: Some("3c:22:fb:12:34:56".into()),
                 if_mac: Some("f0:18:98:0a:0b:0c".into()),
                 medium: Some(LinkMedium::Wifi),
+                route_lookups: Arc::default(),
+                asked_for: Arc::default(),
             }
+        }
+    }
+    impl FakeFacts {
+        fn asked(&self, iface: &str) {
+            self.asked_for.lock().unwrap().push(iface.to_string());
         }
     }
     impl LinkFacts for FakeFacts {
@@ -263,6 +287,8 @@ mod tests {
             Some("10.0.0.1".into())
         }
         async fn phys_iface(&self) -> Option<String> {
+            self.route_lookups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some("en0".into())
         }
         async fn dhcp(&self) -> (Option<String>, Option<String>) {
@@ -288,16 +314,20 @@ mod tests {
         async fn singbox_tun_iface(&self) -> Option<String> {
             Some("utun8".into())
         }
-        async fn ssid(&self) -> Option<String> {
+        async fn ssid(&self, iface: &str) -> Option<String> {
+            self.asked(iface);
             None
         }
-        async fn bssid(&self) -> Option<String> {
+        async fn bssid(&self, iface: &str) -> Option<String> {
+            self.asked(iface);
             self.bssid.clone()
         }
-        async fn if_mac(&self) -> Option<String> {
+        async fn if_mac(&self, iface: &str) -> Option<String> {
+            self.asked(iface);
             self.if_mac.clone()
         }
-        async fn medium(&self) -> Option<LinkMedium> {
+        async fn medium(&self, iface: &str) -> Option<LinkMedium> {
+            self.asked(iface);
             self.medium
         }
         async fn wifi_capture_present(&self) -> bool {
@@ -466,6 +496,30 @@ mod tests {
             assert_eq!(l.medium, medium, "medium {medium:?} must land as read");
             assert_eq!(l.bssid, None);
         }
+    }
+
+    /// One route lookup per tick: the SSID and the identity triple are read
+    /// from the interface the tick resolved, never each from a resolution of
+    /// its own. Dies under per-read `phys_iface` calls — a default-route
+    /// move between two of them (a dock or undock) then stamps one sample
+    /// with one adapter's medium and the other's MAC, a roam that never was.
+    #[tokio::test]
+    async fn the_identity_triple_is_read_from_the_interface_the_tick_resolved() {
+        let facts = FakeFacts::default();
+        let route_lookups = facts.route_lookups.clone();
+        let asked_for = facts.asked_for.clone();
+        let c = collector_with_facts(facts);
+        c.collect(42).await;
+        assert_eq!(
+            route_lookups.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the tick resolves the interface once"
+        );
+        assert_eq!(
+            *asked_for.lock().unwrap(),
+            vec!["en0"; 4],
+            "ssid, bssid, if_mac and medium are all read from that interface"
+        );
     }
 
     /// A silent gateway triggers the probe-on-suspicion: at most

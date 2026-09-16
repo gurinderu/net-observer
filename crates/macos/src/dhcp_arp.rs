@@ -140,24 +140,20 @@ impl LinkFacts for SystemFacts {
         iface_with_inet(&out, &addr)
     }
 
-    async fn ssid(&self) -> Option<String> {
-        let iface = self.phys_iface().await?;
-        wifi::current_ssid(&iface).await
+    async fn ssid(&self, iface: &str) -> Option<String> {
+        wifi::current_ssid(iface).await
     }
 
-    async fn bssid(&self) -> Option<String> {
-        let iface = self.phys_iface().await?;
-        wifi::current_bssid(&iface).await
+    async fn bssid(&self, iface: &str) -> Option<String> {
+        wifi::current_bssid(iface).await
     }
 
-    async fn if_mac(&self) -> Option<String> {
-        let iface = self.phys_iface().await?;
-        wifi::interface_mac(&iface).await
+    async fn if_mac(&self, iface: &str) -> Option<String> {
+        wifi::interface_mac(iface).await
     }
 
-    async fn medium(&self) -> Option<LinkMedium> {
-        let iface = self.phys_iface().await?;
-        wifi::interface_medium(&iface).await
+    async fn medium(&self, iface: &str) -> Option<LinkMedium> {
+        wifi::interface_medium(iface).await
     }
 
     async fn wifi_capture_present(&self) -> bool {
