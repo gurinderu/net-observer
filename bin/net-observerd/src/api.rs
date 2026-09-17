@@ -2699,6 +2699,9 @@ mod tests {
                 .recv();
             self.inner.query_prepared_within(p, budget)
         }
+        fn schema_drift(&self) -> Result<Vec<store::SchemaDrift>, store::StoreError> {
+            self.inner.schema_drift()
+        }
     }
 
     /// One diagnosis in flight, and a second is refused AT ONCE with
