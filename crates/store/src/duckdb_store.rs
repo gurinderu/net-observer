@@ -473,7 +473,7 @@ impl Store for DuckdbStore {
                         n.reason,
                         i32::try_from(n.neighbors.len()).unwrap_or(i32::MAX),
                         n.heard.map(|h| h.total),
-                        n.heard.map(|h| h.own)
+                        n.heard.and_then(|h| h.own)
                     ],
                 )?;
                 let key = n.network_key.as_deref().unwrap_or(UNKNOWN_NETWORK);
@@ -992,7 +992,7 @@ mod tests {
         ts_us: i64,
         ip: Option<&str>,
         detail: Option<&str>,
-        heard: (u32, u32),
+        heard: (u32, Option<u32>),
     ) -> Sample {
         use types::{AnnounceKind, AnnouncedService, HeardFrames};
         Sample::Neighbors(NeighborsSample {
@@ -1034,11 +1034,12 @@ mod tests {
             1000,
             Some("192.168.1.6"),
             Some("0xFF"),
-            (7, 2),
+            (7, Some(2)),
         ))
         .unwrap();
-        // The repeat: no address, no detail, more frames.
-        s.write_sample(&listener_flush(2000, None, None, (3, 0)))
+        // The repeat: no address, no detail, more frames, and no own MAC to
+        // tell our frames by.
+        s.write_sample(&listener_flush(2000, None, None, (3, None)))
             .unwrap();
 
         let t = s
@@ -1048,7 +1049,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(t.rows[0], vec!["1000", "7", "2", "1"]);
-        assert_eq!(t.rows[1], vec!["2000", "3", "0", "1"]);
+        // A window with no readable own MAC: heard counted, own NULL — not 0.
+        assert_eq!(t.rows[1], vec!["2000", "3", "", "1"]);
 
         let t = s
             .query_table("SELECT source, hostname, ip FROM neighbor")

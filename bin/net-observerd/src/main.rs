@@ -663,60 +663,44 @@ async fn run_daemon() -> anyhow::Result<()> {
     if cfg.collectors.neighbors.enabled && cfg.collectors.neighbors.announce {
         // The passive announce listener: Event-cadence like `route`, over a
         // second `tcpdump` child's pcap stream. Readiness is decided here —
-        // an interface to listen on, its own MAC to recognise our frames by,
-        // and a child that started — and, like `route`, not retried: an
-        // Unavailable event collector is logged and skipped for the life of
-        // the process. The probing tier does not gate it: a tier withholds
-        // emissions and this collector has none (realm net-observer, nodes
-        // #88, #92). Shares the link collector's `SystemFacts`, so the
-        // segment it keys every window by is the same key the neighbour
-        // cache and the scan write under.
+        // an interface to listen on and a child that proved it captures by
+        // writing an Ethernet pcap header (`AnnounceCapture::start`) — and,
+        // like `route`, not retried: an Unavailable event collector is
+        // logged and skipped for the life of the process. The probing tier
+        // does not gate it: a tier withholds emissions and this collector
+        // has none (realm net-observer, nodes #88, #92). Shares the link
+        // collector's `SystemFacts`, so the segment it keys every window by
+        // is the same key the neighbour cache and the scan write under, and
+        // the interface's own MAC — what it drops our own frames by — is
+        // read afresh for every window through the same `SystemSegment`,
+        // since a Private Wi-Fi Address rotates it per network.
         let (source, ready): (Box<dyn EventSource>, Readiness) = match &phys_iface {
             None => (
                 Box::new(NullEventSource),
                 Readiness::Unavailable("no physical interface resolved".into()),
             ),
-            Some(iface) => {
-                let facts = SystemFacts::new(
-                    cfg.collectors.link.gw.clone(),
-                    cfg.collectors.link.phys_iface.clone(),
-                );
-                match facts
-                    .if_mac(iface)
-                    .await
-                    .as_deref()
-                    .and_then(collector_announce::mac_octets)
-                {
-                    // Without the interface's own MAC our frames cannot be
-                    // told from the segment's, and the daemon's own SSDP
-                    // searches would be recorded as a neighbour: refuse
-                    // rather than record wrong data.
-                    None => (
-                        Box::new(NullEventSource),
-                        Readiness::Unavailable(format!(
-                            "own MAC of {iface} unreadable; cannot tell our frames apart"
-                        )),
-                    ),
-                    Some(own_mac) => match AnnounceCapture::start(iface) {
-                        Ok(capture) => (
-                            Box::new(AnnounceSource::new(
-                                capture,
-                                own_mac,
-                                Some(iface.clone()),
-                                SystemSegment::new(facts, tokio::runtime::Handle::current()),
-                                collector_announce::FLUSH_EVERY,
-                            )),
-                            Readiness::Ready,
+            Some(iface) => match AnnounceCapture::start(iface) {
+                Ok(capture) => (
+                    Box::new(AnnounceSource::new(
+                        capture,
+                        Some(iface.clone()),
+                        SystemSegment::new(
+                            SystemFacts::new(
+                                cfg.collectors.link.gw.clone(),
+                                cfg.collectors.link.phys_iface.clone(),
+                            ),
+                            iface.clone(),
+                            tokio::runtime::Handle::current(),
                         ),
-                        Err(e) => (
-                            Box::new(NullEventSource),
-                            Readiness::Unavailable(format!(
-                                "tcpdump announce listener on {iface}: {e}"
-                            )),
-                        ),
-                    },
-                }
-            }
+                        collector_announce::FLUSH_EVERY,
+                    )),
+                    Readiness::Ready,
+                ),
+                Err(e) => (
+                    Box::new(NullEventSource),
+                    Readiness::Unavailable(format!("tcpdump announce listener on {iface}: {e}")),
+                ),
+            },
         };
         collectors.push(AnyCollector::Announce(AnnounceCollector::new(
             source, ready,

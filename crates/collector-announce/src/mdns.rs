@@ -7,15 +7,18 @@
 //!
 //! Decoding is `simple-dns`'s; this module turns records into facts:
 //!
-//! * `A` / `AAAA` — the owner name is a hostname of the sender; the strongest
-//!   claim is the one whose address is the frame's own source.
+//! * `A` / `AAAA` — the owner name is a hostname of the sender ONLY when the
+//!   record's address is the frame's own source. A responder speaks for
+//!   others too: a Bonjour Sleep Proxy re-announces a sleeping host's records
+//!   from its own address, so an `A` for another address, or an `SRV`
+//!   target, would put the sleeper's name on the proxy's row. Neither is a
+//!   name claim here.
 //! * `SRV` — the owner is a service *instance* (`Nick._companion-link._tcp.local`):
-//!   its type is the service, its first label the detail; the SRV target is
-//!   another hostname claim.
+//!   its type is the service, its first label the detail.
 //! * `PTR` — under `_services._dns-sd._udp.local` the target names a type the
 //!   sender offers; under a service type the target is an instance of it;
 //!   under `in-addr.arpa` / `ip6.arpa` the target is a reverse-lookup name,
-//!   the weakest hostname claim.
+//!   a claim only when the owner spells the frame's own source address.
 //!
 //! `TXT`, `NSEC`, `OPT` and every other type carry nothing the record wants.
 
@@ -27,9 +30,10 @@ use simple_dns::{Name, Packet, ResourceRecord};
 /// The facts one mDNS message announced about its sender.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MdnsFacts {
-    /// Hostnames the sender claimed, strongest claim first, trailing `.local`
-    /// kept (`0xFF.local`), no trailing dot — the form the operator-pressed
-    /// mDNS scan records too.
+    /// Hostnames the packet ties to the sender's own address, strongest
+    /// claim first (an address record before a reverse pointer), trailing
+    /// `.local` kept (`0xFF.local`), no trailing dot — the form the
+    /// operator-pressed mDNS scan records too.
     pub hostnames: Vec<String>,
     /// `(service type, detail)`: the type without `.local`
     /// (`_companion-link._tcp`), the detail an instance name when the record
@@ -78,19 +82,20 @@ fn absorb(
     let owner = labels(&rr.name);
     match &rr.rdata {
         RData::A(a) => {
-            let same = src_ip == IpAddr::V4(Ipv4Addr::from(a.address));
-            names.push((if same { 0 } else { 3 }, join(&owner)));
+            if src_ip == IpAddr::V4(Ipv4Addr::from(a.address)) {
+                names.push((0, join(&owner)));
+            }
         }
         RData::AAAA(a) => {
-            let same = src_ip == IpAddr::V6(Ipv6Addr::from(a.address));
-            names.push((if same { 0 } else { 3 }, join(&owner)));
+            if src_ip == IpAddr::V6(Ipv6Addr::from(a.address)) {
+                names.push((0, join(&owner)));
+            }
         }
-        RData::SRV(srv) => {
+        RData::SRV(_) => {
             // Owner: <instance> . <_type> . <_tcp|_udp> . local
             if let Some((service, instance)) = split_instance(&owner) {
                 services.push((service, Some(instance)));
             }
-            names.push((1, join(&labels(&srv.target))));
         }
         RData::PTR(ptr) => {
             let target = labels(&ptr.0);
@@ -99,11 +104,8 @@ fn absorb(
                 if let Some(service) = service_type(&target) {
                     services.push((service, None));
                 }
-            } else if owner.len() >= 2
-                && (owner.last().is_some_and(|l| l == "arpa"))
-                && matches!(owner[owner.len() - 2].as_str(), "in-addr" | "ip6")
-            {
-                names.push((2, join(&target)));
+            } else if is_reverse_of(&owner, src_ip) {
+                names.push((1, join(&target)));
             } else if let Some(service) = service_type(&owner) {
                 let instance = split_instance(&target).map(|(_, i)| i);
                 services.push((service, instance));
@@ -111,6 +113,33 @@ fn absorb(
         }
         _ => {}
     }
+}
+
+/// Whether `owner` is the reverse-lookup name of `ip`: `d.c.b.a.in-addr.arpa`
+/// for an IPv4 `a.b.c.d`, or the 32 reversed nibbles under `ip6.arpa`.
+fn is_reverse_of(owner: &[String], ip: IpAddr) -> bool {
+    let expected: Vec<String> = match ip {
+        IpAddr::V4(v4) => v4
+            .octets()
+            .iter()
+            .rev()
+            .map(ToString::to_string)
+            .chain(["in-addr".to_string(), "arpa".to_string()])
+            .collect(),
+        IpAddr::V6(v6) => v6
+            .octets()
+            .iter()
+            .rev()
+            .flat_map(|o| [o & 0x0f, o >> 4])
+            .map(|n| format!("{n:x}"))
+            .chain(["ip6".to_string(), "arpa".to_string()])
+            .collect(),
+    };
+    owner.len() == expected.len()
+        && owner
+            .iter()
+            .zip(&expected)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 /// A name as its labels, rendered lossily as text — a label may hold any
@@ -209,15 +238,22 @@ pub(crate) mod tests {
         );
     }
 
-    /// The name whose address IS the frame's source outranks a name learned
-    /// second-hand (an SRV target, a reverse PTR, an A for another address).
+    /// Only a name the packet ties to the frame's own source is the sender's:
+    /// an `A` for its address, or a reverse pointer spelling that address.
+    /// An SRV target and an `A` for another address are somebody else's name
+    /// (a Sleep Proxy re-announces a sleeper's records from its own address)
+    /// and must never land on the sender's row.
     #[test]
-    fn hostname_claims_are_ranked_by_how_directly_they_name_the_sender() {
+    fn only_names_tied_to_the_senders_own_address_are_its_hostname() {
         let src = Ipv4Addr::new(192, 168, 1, 6);
         let mut p = Packet::new_reply(0);
         p.answers.push(rr(
             "6.1.168.192.in-addr.arpa",
             RData::PTR(PTR(Name::new_unchecked("reverse.local"))),
+        ));
+        p.answers.push(rr(
+            "9.1.168.192.in-addr.arpa",
+            RData::PTR(PTR(Name::new_unchecked("someone-else.local"))),
         ));
         p.answers.push(rr(
             "printer._ipp._tcp.local",
@@ -241,21 +277,68 @@ pub(crate) mod tests {
             }),
         ));
         let facts = decode(&p.build_bytes_vec().unwrap(), IpAddr::V4(src)).unwrap();
-        assert_eq!(
-            facts.hostnames,
-            vec![
-                "self.local",
-                "srv-target.local",
-                "reverse.local",
-                "other.local"
-            ]
-        );
+        assert_eq!(facts.hostnames, vec!["self.local", "reverse.local"]);
         assert_eq!(
             facts.services,
             vec![("_ipp._tcp".to_string(), Some("printer".to_string()))]
         );
     }
 
+    /// The Sleep Proxy shape itself: a proxy announcing a sleeper's `A`, `SRV`
+    /// and reverse pointer from the proxy's own address names nobody, while
+    /// the services it offers on the sleeper's behalf are still announced
+    /// from the proxy's MAC (they are reachable there — that is the point).
+    #[test]
+    fn a_sleep_proxys_announcement_carries_no_hostname_for_the_proxy() {
+        let proxy = Ipv4Addr::new(192, 168, 1, 9);
+        let sleeper = Ipv4Addr::new(192, 168, 1, 6);
+        let mut p = Packet::new_reply(0);
+        p.answers.push(rr(
+            "Sleeper._afpovertcp._tcp.local",
+            RData::SRV(SRV {
+                priority: 0,
+                weight: 0,
+                port: 548,
+                target: Name::new_unchecked("sleeper.local"),
+            }),
+        ));
+        p.additional_records.push(rr(
+            "sleeper.local",
+            RData::A(A {
+                address: u32::from(sleeper),
+            }),
+        ));
+        p.additional_records.push(rr(
+            "6.1.168.192.in-addr.arpa",
+            RData::PTR(PTR(Name::new_unchecked("sleeper.local"))),
+        ));
+        let facts = decode(&p.build_bytes_vec().unwrap(), IpAddr::V4(proxy)).unwrap();
+        assert!(facts.hostnames.is_empty(), "{:?}", facts.hostnames);
+        assert_eq!(
+            facts.services,
+            vec![("_afpovertcp._tcp".to_string(), Some("Sleeper".to_string()))]
+        );
+    }
+
+    /// The reverse-pointer check, both families, case-insensitively.
+    #[test]
+    fn a_reverse_pointer_must_spell_the_source_address() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 6));
+        let lab = |s: &str| s.split('.').map(str::to_string).collect::<Vec<_>>();
+        assert!(is_reverse_of(&lab("6.1.168.192.in-addr.arpa"), v4));
+        assert!(!is_reverse_of(&lab("7.1.168.192.in-addr.arpa"), v4));
+        assert!(!is_reverse_of(&lab("6.1.168.192.arpa"), v4));
+        let v6: IpAddr = "fe80::1".parse().unwrap();
+        assert!(is_reverse_of(
+            &lab("1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.E.F.ip6.arpa"),
+            v6
+        ));
+        assert!(!is_reverse_of(
+            &lab("2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa"),
+            v6
+        ));
+        assert!(!is_reverse_of(&lab("6.1.168.192.in-addr.arpa"), v6));
+    }
     /// A probe (a host joining) carries its proposed records in the authority
     /// section; they are announcements too.
     #[test]

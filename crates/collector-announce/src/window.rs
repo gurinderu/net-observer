@@ -6,14 +6,16 @@
 //! What a frame contributes:
 //!
 //! * Its Ethernet source is the sender. Our own frames (source = the
-//!   interface's MAC) are counted and dropped: a machine is not its own
-//!   neighbour, and the count is what lets the record check that the daemon
-//!   itself put nothing on the wire.
+//!   interface's own MAC, read afresh for every window because a Private
+//!   Wi-Fi Address rotates it per network) are counted and dropped: a
+//!   machine is not its own neighbour. A window that could not read its own
+//!   MAC drops nothing as ours and says so (`own = None`).
 //! * ARP: the sender pair from the ARP body, unless the sender address is
 //!   unspecified (an address-conflict probe, RFC 5227) — or the frame is a
 //!   *reply* from the gateway's MAC, which may be proxy ARP: the router
-//!   answering for an off-link host with its own MAC. The gateway's own
-//!   requests and gratuitous announcements still pair it.
+//!   answering for an off-link host with its own MAC. Request-form
+//!   gratuitous ARP pairs, from the gateway as from anyone; reply-form GARP
+//!   from the gateway is refused by that same proxy guard.
 //! * Every IPv4/IPv6 frame: the Ethernet source paired with the IP source —
 //!   except when the Ethernet source is the gateway's own MAC. The gateway
 //!   forwards: a DHCP reply relayed from an off-link server, an SSDP
@@ -22,15 +24,23 @@
 //!   gateway's row. The gateway's own address comes from its ARP requests
 //!   instead, which never carry anyone else's — and from the neighbour-cache
 //!   tick, which always holds it.
-//! * mDNS: the sender's strongest hostname claim and the service types it
-//!   announced; SSDP: the type a `NOTIFY` / search response announced; DHCP:
-//!   a client's hostname and vendor class, a server's replies as the
+//! * mDNS: the name the sender ties to its own address and the service types
+//!   it announced; SSDP: the type a `NOTIFY` / search response announced;
+//!   DHCP: a client's hostname and vendor class, a server's replies as the
 //!   `dhcp-server` role, and the address an `ACK` confirms for a client.
 //!
-//! Devices are keyed by MAC and services by `(MAC, service)`, so a window is
-//! bounded by the segment's size, not by its chatter.
+//! Devices are keyed by MAC and services by `(MAC, service)`, and each is
+//! capped ([`MAX_DEVICES`], [`MAX_IPS_PER_DEVICE`],
+//! [`MAX_SERVICES_PER_DEVICE`], [`MAX_PENDING_NAMES`]), so a window is bounded
+//! by these numbers, never by the segment's chatter; what the caps refuse is
+//! counted in `dropped` and logged at the flush.
+//!
+//! One rule picks the address a row carries, for the neighbour row and the
+//! service row alike: a routable IPv4 first, then a routable IPv6, then a
+//! link-local IPv4 (`169.254/16`), then a link-local IPv6 (`fe80::/10`) —
+//! and among equals the one seen first.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use types::{
@@ -54,19 +64,31 @@ const DHCP_SERVER_SERVICE: &str = "dhcp-server";
 /// The service name under which a DHCP client's vendor class is recorded.
 const DHCP_VENDOR_CLASS_SERVICE: &str = "vendor-class";
 
+/// Most devices one window keeps; a sighting of a further MAC is dropped and
+/// counted. A /24 holds 254 hosts, so the cap is not reached by a segment,
+/// only by a flood of forged senders.
+pub const MAX_DEVICES: usize = 512;
+/// Most addresses kept per device (a dual-stack host has two or three).
+pub const MAX_IPS_PER_DEVICE: usize = 8;
+/// Most distinct services kept per device.
+pub const MAX_SERVICES_PER_DEVICE: usize = 64;
+/// Most DHCP hostnames held waiting for an `ACK`.
+pub const MAX_PENDING_NAMES: usize = 512;
+
 #[derive(Debug, Default)]
 struct Device {
-    /// Every address this MAC was paired with; the lowest IPv4 is the one the
-    /// sample carries (`IpAddr` orders every v4 before every v6), a v6 only
-    /// when the device showed no v4 — the same preference the neighbour-cache
-    /// reading applies.
-    ips: BTreeSet<IpAddr>,
+    /// Every address this MAC was paired with, in the order first seen;
+    /// [`preferred`] picks the one a row carries.
+    ips: Vec<IpAddr>,
     hostname: Option<String>,
+    /// Distinct services announced by this MAC this window (the cap's count).
+    services: usize,
 }
 
 #[derive(Debug)]
 struct Announced {
-    ip: Option<IpAddr>,
+    /// Addresses the service was announced from, in the order first seen.
+    ips: Vec<IpAddr>,
     kind: AnnounceKind,
     detail: Option<String>,
 }
@@ -74,13 +96,16 @@ struct Announced {
 /// The accumulator for one flush window.
 #[derive(Debug)]
 pub struct Window {
-    own_mac: Mac,
+    /// The interface's own MAC for this window; `None` when it could not be
+    /// read, in which case nothing is dropped as ours.
+    own_mac: Option<Mac>,
     gateway_mac: Option<Mac>,
     network_key: Option<String>,
     iface: Option<String>,
     heard: u32,
     own: u32,
     undecoded: u32,
+    dropped: u32,
     devices: BTreeMap<Mac, Device>,
     services: BTreeMap<(Mac, String), Announced>,
     /// Hostnames from DHCP requests whose client had no address yet, waiting
@@ -90,9 +115,10 @@ pub struct Window {
 
 impl Window {
     /// An empty window keyed by `network_key` (the gateway's MAC, which also
-    /// arms the forwarding guard) on `iface`, dropping frames from `own_mac`.
+    /// arms the forwarding guard) on `iface`, dropping frames from `own_mac`
+    /// when one is known.
     #[must_use]
-    pub fn new(own_mac: Mac, network_key: Option<String>, iface: Option<String>) -> Self {
+    pub fn new(own_mac: Option<Mac>, network_key: Option<String>, iface: Option<String>) -> Self {
         let gateway_mac = network_key.as_deref().and_then(mac_octets);
         Self {
             own_mac,
@@ -102,6 +128,7 @@ impl Window {
             heard: 0,
             own: 0,
             undecoded: 0,
+            dropped: 0,
             devices: BTreeMap::new(),
             services: BTreeMap::new(),
             pending_names: BTreeMap::new(),
@@ -115,7 +142,7 @@ impl Window {
             self.undecoded = self.undecoded.saturating_add(1);
             return;
         };
-        if frame.src_mac == self.own_mac {
+        if self.is_own(frame.src_mac) {
             self.own = self.own.saturating_add(1);
             return;
         }
@@ -129,7 +156,7 @@ impl Window {
                 // A reply from the gateway may be proxy ARP — the router
                 // answering for an off-link host with its own MAC — so only
                 // the gateway's own requests and announcements pair it.
-                if sender_mac != self.own_mac
+                if !self.is_own(sender_mac)
                     && !sender_ip.is_unspecified()
                     && !(reply && from_gateway)
                 {
@@ -160,12 +187,13 @@ impl Window {
         }
     }
 
-    /// The frame counts so far.
+    /// The frame counts so far; `own` is `None` when this window has no own
+    /// MAC to recognise its frames by.
     #[must_use]
     pub fn heard(&self) -> HeardFrames {
         HeardFrames {
             total: self.heard,
-            own: self.own,
+            own: self.own_mac.map(|_| self.own),
         }
     }
 
@@ -173,6 +201,12 @@ impl Window {
     #[must_use]
     pub fn undecoded(&self) -> u32 {
         self.undecoded
+    }
+
+    /// Sightings, names, services and addresses the caps refused this window.
+    #[must_use]
+    pub fn dropped(&self) -> u32 {
+        self.dropped
     }
 
     /// Whether nothing at all was heard.
@@ -191,7 +225,7 @@ impl Window {
             .devices
             .into_iter()
             .filter_map(|(mac, dev)| {
-                let ip = dev.ips.iter().next()?;
+                let ip = preferred(&dev.ips)?;
                 Some(NeighborObs {
                     mac: mac_text(&mac),
                     ip: ip.to_string(),
@@ -206,7 +240,7 @@ impl Window {
             .into_iter()
             .map(|((mac, service), a)| AnnouncedService {
                 mac: mac_text(&mac),
-                ip: a.ip.map(|ip| ip.to_string()),
+                ip: preferred(&a.ips).map(ToString::to_string),
                 service,
                 kind: a.kind,
                 detail: a.detail,
@@ -224,24 +258,38 @@ impl Window {
         }
     }
 
+    fn is_own(&self, mac: Mac) -> bool {
+        self.own_mac == Some(mac)
+    }
+
+    /// The device slot for `mac`, or `None` (counted as dropped) when the
+    /// MAC cannot name a device or the window holds its full count already.
+    fn device(&mut self, mac: Mac) -> Option<&mut Device> {
+        if !is_unicast(&mac) {
+            return None;
+        }
+        if !self.devices.contains_key(&mac) && self.devices.len() >= MAX_DEVICES {
+            self.dropped = self.dropped.saturating_add(1);
+            return None;
+        }
+        Some(self.devices.entry(mac).or_default())
+    }
+
     /// Record that `mac` was seen using `ip`.
     fn sight(&mut self, mac: Mac, ip: IpAddr) {
-        if !is_unicast(&mac) {
+        let Some(dev) = self.device(mac) else {
             return;
+        };
+        if !push_capped(&mut dev.ips, ip, MAX_IPS_PER_DEVICE) {
+            self.dropped = self.dropped.saturating_add(1);
         }
-        self.devices.entry(mac).or_default().ips.insert(ip);
     }
 
     /// Attach a name to `mac`, keeping one already learned this window.
     fn name(&mut self, mac: Mac, hostname: String) {
-        if !is_unicast(&mac) {
-            return;
+        if let Some(dev) = self.device(mac) {
+            dev.hostname.get_or_insert(hostname);
         }
-        self.devices
-            .entry(mac)
-            .or_default()
-            .hostname
-            .get_or_insert(hostname);
     }
 
     fn announce(
@@ -252,16 +300,28 @@ impl Window {
         kind: AnnounceKind,
         detail: Option<String>,
     ) {
-        if !is_unicast(&mac) {
+        let key = (mac, service);
+        let new = !self.services.contains_key(&key);
+        let Some(dev) = self.device(mac) else {
             return;
+        };
+        if new {
+            if dev.services >= MAX_SERVICES_PER_DEVICE {
+                self.dropped = self.dropped.saturating_add(1);
+                return;
+            }
+            dev.services += 1;
         }
-        let slot = self
-            .services
-            .entry((mac, service))
-            .or_insert(Announced { ip, kind, detail });
+        let slot = self.services.entry(key).or_insert(Announced {
+            ips: Vec::new(),
+            kind,
+            detail,
+        });
         // A later repeat may carry what the first lacked; it never erases.
-        if slot.ip.is_none() {
-            slot.ip = ip;
+        if let Some(ip) = ip
+            && !push_capped(&mut slot.ips, ip, MAX_IPS_PER_DEVICE)
+        {
+            self.dropped = self.dropped.saturating_add(1);
         }
     }
 
@@ -297,7 +357,7 @@ impl Window {
         match msg.op {
             dhcp::Op::Request => {
                 let client = msg.chaddr;
-                if client == self.own_mac {
+                if self.is_own(client) {
                     return;
                 }
                 let addr = msg.ciaddr.map(IpAddr::V4);
@@ -308,9 +368,7 @@ impl Window {
                             self.name(client, h);
                         }
                     }
-                    (None, Some(h)) => {
-                        self.pending_names.entry(client).or_insert(h);
-                    }
+                    (None, Some(h)) => self.remember_name(client, h),
                     (None, None) => {}
                 }
                 if let Some(class) = msg.vendor_class {
@@ -335,7 +393,7 @@ impl Window {
                 );
                 if msg.message_type == Some("ack")
                     && let Some(ip) = msg.yiaddr
-                    && msg.chaddr != self.own_mac
+                    && !self.is_own(msg.chaddr)
                 {
                     self.sight(msg.chaddr, IpAddr::V4(ip));
                     if let Some(h) = self.pending_names.remove(&msg.chaddr) {
@@ -345,6 +403,43 @@ impl Window {
             }
         }
     }
+
+    /// Hold a DHCP hostname until the `ACK` that names its address.
+    fn remember_name(&mut self, client: Mac, hostname: String) {
+        if self.pending_names.contains_key(&client) {
+            return;
+        }
+        if self.pending_names.len() >= MAX_PENDING_NAMES {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        self.pending_names.insert(client, hostname);
+    }
+}
+
+/// Append `ip` to `ips` unless already there; `false` (nothing appended)
+/// when the cap is reached.
+fn push_capped(ips: &mut Vec<IpAddr>, ip: IpAddr, cap: usize) -> bool {
+    if ips.contains(&ip) {
+        return true;
+    }
+    if ips.len() >= cap {
+        return false;
+    }
+    ips.push(ip);
+    true
+}
+
+/// The one address a row carries, by the rule in the module doc: a routable
+/// IPv4, then a routable IPv6, then link-local IPv4, then link-local IPv6 —
+/// and among equals the first seen (`min_by_key` keeps the first minimum).
+pub fn preferred(ips: &[IpAddr]) -> Option<&IpAddr> {
+    ips.iter().min_by_key(|ip| match ip {
+        IpAddr::V4(v4) if v4.is_link_local() => 2,
+        IpAddr::V4(_) => 0,
+        IpAddr::V6(v6) if v6.is_unicast_link_local() => 3,
+        IpAddr::V6(_) => 1,
+    })
 }
 
 /// Whether an IP source can name a device: not unspecified (a DHCP client
@@ -375,7 +470,7 @@ mod tests {
     const SSDP_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 
     fn window() -> Window {
-        Window::new(OWN, Some(mac_text(&GATEWAY)), Some("en0".into()))
+        Window::new(Some(OWN), Some(mac_text(&GATEWAY)), Some("en0".into()))
     }
 
     fn obs<'a>(s: &'a NeighborsSample, mac: &Mac) -> &'a NeighborObs {
@@ -428,13 +523,25 @@ mod tests {
             M_SEARCH.as_bytes(),
         ));
 
-        assert_eq!(w.heard(), HeardFrames { total: 5, own: 1 });
+        assert_eq!(
+            w.heard(),
+            HeardFrames {
+                total: 5,
+                own: Some(1)
+            }
+        );
         let s = w.flush(42);
         assert_eq!(s.ts_us, 42);
         assert_eq!(s.verdict, NeighborsVerdict::Ok);
         assert_eq!(s.network_key.as_deref(), Some("60:22:32:aa:25:21"));
         assert_eq!(s.iface.as_deref(), Some("en0"));
-        assert_eq!(s.heard, Some(HeardFrames { total: 5, own: 1 }));
+        assert_eq!(
+            s.heard,
+            Some(HeardFrames {
+                total: 5,
+                own: Some(1)
+            })
+        );
         assert!(s.is_listener_flush());
 
         assert_eq!(s.neighbors.len(), 3, "{:?}", s.neighbors);
@@ -480,7 +587,13 @@ mod tests {
             5353,
             &owner_announcement(OWN_IP),
         ));
-        assert_eq!(w.heard(), HeardFrames { total: 1, own: 1 });
+        assert_eq!(
+            w.heard(),
+            HeardFrames {
+                total: 1,
+                own: Some(1)
+            }
+        );
         let s = w.flush(1);
         assert!(s.neighbors.is_empty());
         assert!(s.services.is_empty());
@@ -548,7 +661,7 @@ mod tests {
     /// Without a gateway key there is no guard: every unicast IP frame pairs.
     #[test]
     fn without_a_network_key_every_ip_frame_pairs() {
-        let mut w = Window::new(OWN, None, None);
+        let mut w = Window::new(Some(OWN), None, None);
         w.absorb(&udp4(
             GATEWAY,
             GW_IP,
@@ -588,7 +701,7 @@ mod tests {
             &discover,
         ));
         // Nothing addressable yet: no neighbour row, but the class is known.
-        assert!(w.devices.is_empty());
+        assert!(w.devices.values().all(|d| d.ips.is_empty()));
         let ack = dhcp_message(
             2,
             PEER,
@@ -637,7 +750,13 @@ mod tests {
         assert_eq!(s.neighbors[0].ip, "192.168.1.6");
         assert_eq!(s.neighbors[0].hostname.as_deref(), Some("0xFF.local"));
         assert_eq!(s.services.len(), 3);
-        assert_eq!(s.heard, Some(HeardFrames { total: 3, own: 0 }));
+        assert_eq!(
+            s.heard,
+            Some(HeardFrames {
+                total: 3,
+                own: Some(0)
+            })
+        );
     }
 
     /// A v6-only announcer keeps its v6 address — it has no v4 to lose to.
@@ -665,7 +784,13 @@ mod tests {
         w.absorb(&udp4(BROADCAST, PEER_IP, MDNS_GROUP, 5353, 5353, b"x"));
         w.absorb(&[1, 2, 3]);
         assert_eq!(w.undecoded(), 1);
-        assert_eq!(w.heard(), HeardFrames { total: 3, own: 0 });
+        assert_eq!(
+            w.heard(),
+            HeardFrames {
+                total: 3,
+                own: Some(0)
+            }
+        );
         assert!(!w.is_empty());
         let s = w.flush(1);
         assert!(s.neighbors.is_empty(), "{:?}", s.neighbors);
@@ -679,6 +804,204 @@ mod tests {
         let s = w.flush(7);
         assert_eq!(s.verdict, NeighborsVerdict::Ok);
         assert!(s.neighbors.is_empty());
-        assert_eq!(s.heard, Some(HeardFrames { total: 0, own: 0 }));
+        assert_eq!(
+            s.heard,
+            Some(HeardFrames {
+                total: 0,
+                own: Some(0)
+            })
+        );
+    }
+
+    /// The own MAC is a per-window fact: a Private Wi-Fi Address rotates it
+    /// per network, so two windows on two networks each drop their own frames
+    /// by the MAC that was theirs at the time.
+    #[test]
+    fn two_windows_with_different_own_macs_each_drop_their_own_frames() {
+        let first_mac: Mac = [0x3c, 0x22, 0xfb, 0x00, 0x00, 0x01];
+        let second_mac: Mac = [0xda, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let ours = |mac: Mac| arp(mac, mac, OWN_IP, GW_IP, false);
+
+        let mut w = Window::new(Some(first_mac), None, None);
+        w.absorb(&ours(first_mac));
+        w.absorb(&ours(second_mac));
+        assert_eq!(
+            w.heard(),
+            HeardFrames {
+                total: 2,
+                own: Some(1)
+            }
+        );
+        let s = w.flush(1);
+        assert_eq!(s.neighbors.len(), 1);
+        assert_eq!(s.neighbors[0].mac, mac_text(&second_mac));
+
+        let mut w = Window::new(Some(second_mac), None, None);
+        w.absorb(&ours(first_mac));
+        w.absorb(&ours(second_mac));
+        assert_eq!(
+            w.heard(),
+            HeardFrames {
+                total: 2,
+                own: Some(1)
+            }
+        );
+        let s = w.flush(2);
+        assert_eq!(s.neighbors.len(), 1);
+        assert_eq!(s.neighbors[0].mac, mac_text(&first_mac));
+    }
+
+    /// No own MAC: nothing is dropped as ours, and the reading says so with
+    /// `own = None` rather than a zero that would read as "we were silent".
+    #[test]
+    fn a_window_without_an_own_mac_drops_nothing_and_says_so() {
+        let mut w = Window::new(None, None, None);
+        w.absorb(&arp(OWN, OWN, OWN_IP, GW_IP, false));
+        assert_eq!(
+            w.heard(),
+            HeardFrames {
+                total: 1,
+                own: None
+            }
+        );
+        let s = w.flush(1);
+        assert_eq!(
+            s.heard,
+            Some(HeardFrames {
+                total: 1,
+                own: None
+            })
+        );
+        assert_eq!(s.neighbors.len(), 1, "our own frame is a sighting here");
+    }
+
+    /// A flood of forged senders fills the device cap; every sighting past
+    /// it is refused and counted, never a growing window.
+    #[test]
+    fn a_flood_of_senders_is_capped_and_counted() {
+        let mut w = window();
+        for i in 0..1000u32 {
+            let [a, b] = (i as u16).to_be_bytes();
+            let mac: Mac = [0x02, 0x00, 0x00, 0x00, a, b];
+            let ip = Ipv4Addr::new(10, 0, a, b);
+            w.absorb(&arp(mac, mac, ip, GW_IP, false));
+        }
+        assert_eq!(w.dropped(), 488);
+        let s = w.flush(1);
+        assert_eq!(s.neighbors.len(), MAX_DEVICES);
+        assert_eq!(
+            s.heard,
+            Some(HeardFrames {
+                total: 1000,
+                own: Some(0)
+            })
+        );
+    }
+
+    /// The per-device caps: addresses past the eighth and services past the
+    /// sixty-fourth are refused and counted; a repeat of a kept one is not.
+    #[test]
+    fn addresses_and_services_per_device_are_capped() {
+        let mut w = window();
+        for i in 0..12u8 {
+            w.absorb(&arp(
+                PEER,
+                PEER,
+                Ipv4Addr::new(10, 0, 0, i + 1),
+                GW_IP,
+                false,
+            ));
+        }
+        w.absorb(&arp(PEER, PEER, Ipv4Addr::new(10, 0, 0, 1), GW_IP, false));
+        assert_eq!(w.dropped(), 12 - MAX_IPS_PER_DEVICE as u32);
+        assert_eq!(w.devices[&PEER].ips.len(), MAX_IPS_PER_DEVICE);
+
+        let mut w = window();
+        let notify = |i: u32| {
+            NOTIFY_ALIVE.replace("upnp-org:device:InternetGatewayDevice:1", &format!("x:{i}"))
+        };
+        for i in 0..70u32 {
+            w.absorb(&udp4(
+                PEER,
+                PEER_IP,
+                SSDP_GROUP,
+                1900,
+                1900,
+                notify(i).as_bytes(),
+            ));
+        }
+        w.absorb(&udp4(
+            PEER,
+            PEER_IP,
+            SSDP_GROUP,
+            1900,
+            1900,
+            notify(0).as_bytes(),
+        ));
+        assert_eq!(w.dropped(), 70 - MAX_SERVICES_PER_DEVICE as u32);
+        assert_eq!(w.flush(1).services.len(), MAX_SERVICES_PER_DEVICE);
+    }
+
+    /// One rule for the neighbour row and the service row: a routable IPv4
+    /// beats a routable IPv6, both beat link-local, and among equals the
+    /// address seen first wins.
+    #[test]
+    fn the_row_address_prefers_routable_over_link_local_then_first_seen() {
+        let ll4: Ipv4Addr = Ipv4Addr::new(169, 254, 7, 7);
+        let ll6: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
+        let g6: std::net::Ipv6Addr = "2001:db8::6".parse().unwrap();
+        let msg = owner_announcement(PEER_IP);
+        let mdns6 = |src| udp6(PEER, src, "ff02::fb".parse().unwrap(), 5353, 5353, &msg);
+
+        // Link-local v6, then link-local v4, then routable v6: the v6 wins.
+        let mut w = window();
+        w.absorb(&mdns6(ll6));
+        w.absorb(&udp4(PEER, ll4, MDNS_GROUP, 5353, 5353, &msg));
+        w.absorb(&mdns6(g6));
+        let s = w.flush(1);
+        assert_eq!(s.neighbors[0].ip, "2001:db8::6");
+        assert!(
+            s.services
+                .iter()
+                .all(|a| a.ip.as_deref() == Some("2001:db8::6"))
+        );
+
+        // A routable v4 seen later still beats it.
+        let mut w = window();
+        w.absorb(&mdns6(g6));
+        w.absorb(&udp4(PEER, PEER_IP, MDNS_GROUP, 5353, 5353, &msg));
+        let s = w.flush(1);
+        assert_eq!(s.neighbors[0].ip, "192.168.1.6");
+        assert!(
+            s.services
+                .iter()
+                .all(|a| a.ip.as_deref() == Some("192.168.1.6"))
+        );
+
+        // Two routable v4s: the first seen, not the lowest.
+        let mut w = window();
+        w.absorb(&arp(
+            PEER,
+            PEER,
+            Ipv4Addr::new(192, 168, 1, 9),
+            GW_IP,
+            false,
+        ));
+        w.absorb(&arp(
+            PEER,
+            PEER,
+            Ipv4Addr::new(192, 168, 1, 2),
+            GW_IP,
+            false,
+        ));
+        assert_eq!(w.flush(1).neighbors[0].ip, "192.168.1.9");
+
+        // Only link-local: v4 before v6.
+        let mut w = window();
+        w.absorb(&mdns6(ll6));
+        w.absorb(&udp4(PEER, ll4, MDNS_GROUP, 5353, 5353, &msg));
+        assert_eq!(w.flush(1).neighbors[0].ip, "169.254.7.7");
+
+        assert_eq!(preferred(&[]), None);
     }
 }

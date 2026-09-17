@@ -41,11 +41,12 @@ pub fn mac_octets(text: &str) -> Option<Mac> {
     (n == 6).then_some(out)
 }
 
-/// Whether a MAC can name a device: not the broadcast address and not a
-/// group (multicast) address — the least-significant bit of the first octet.
+/// Whether a MAC can name a device: not the broadcast address, not a group
+/// (multicast) address — the least-significant bit of the first octet — and
+/// not all zeros, which is no device but an unset field.
 #[must_use]
 pub fn is_unicast(mac: &Mac) -> bool {
-    mac[0] & 1 == 0 && mac.iter().any(|&o| o != 0xff)
+    mac[0] & 1 == 0 && mac.iter().any(|&o| o != 0xff) && mac.iter().any(|&o| o != 0)
 }
 
 /// What one frame said, once the Ethernet header is off.
@@ -233,6 +234,10 @@ pub(crate) mod tests {
         assert!(!is_unicast(&BROADCAST));
         assert!(!is_unicast(&[0x01, 0x00, 0x5e, 0, 0, 0xfb]));
         assert!(!is_unicast(&[0x33, 0x33, 0, 0, 0, 0xfb]));
+        assert!(
+            !is_unicast(&[0; 6]),
+            "all zeros is an unset field, not a device"
+        );
     }
 
     #[test]

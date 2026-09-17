@@ -12,9 +12,12 @@
 //! **Passive by construction.** Nothing here opens a socket or addresses a
 //! packet at anybody. The bytes come from a pcap stream — on the daemon, a
 //! second `tcpdump` child's stdout, spawned by the `macos` crate — and this
-//! crate only reads. Its own frames it recognises by the interface's MAC,
-//! counts and drops: the count is what lets the record check the daemon kept
-//! quiet.
+//! crate only reads. This machine's own frames — the OS's ARP, mDNS, SSDP
+//! and DHCP that match the filter, never the daemon's probes, which do not
+//! — it recognises by the interface's own MAC, read afresh for every window,
+//! counts and drops: a machine is not its own neighbour, and the count says
+//! the listener saw itself and ignored it. The passivity proof is elsewhere
+//! (the frozen pcap slice, realm net-observer, node #88).
 //!
 //! **Pure Rust, tested where it runs.** [`pcap::PcapStream`] walks the
 //! classic savefile format over any `Read`; [`frame`] slices Ethernet / ARP
@@ -43,5 +46,5 @@ pub mod window;
 
 pub use collector::{AnnounceCollector, META};
 pub use frame::{Mac, mac_octets, mac_text};
-pub use source::{AnnounceSource, FLUSH_EVERY, SegmentIdentity};
+pub use source::{AnnounceSource, FLUSH_EVERY, SegmentIdentity, SegmentIdentityReading};
 pub use window::Window;

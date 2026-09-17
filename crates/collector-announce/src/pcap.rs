@@ -14,8 +14,8 @@
 
 use std::io::{self, Read};
 
-/// Bytes of the global header.
-const GLOBAL_HEADER: usize = 24;
+/// Bytes of the global header — what a capture must produce before its first record.
+pub const GLOBAL_HEADER: usize = 24;
 /// Bytes of each record header.
 const RECORD_HEADER: usize = 16;
 /// The largest `incl_len` accepted. A classic savefile's snaplen field caps it
@@ -40,7 +40,7 @@ pub struct PcapStream<R: Read> {
     layout: Option<Layout>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Layout {
     little_endian: bool,
     nanos: bool,
@@ -111,32 +111,55 @@ impl<R: Read> PcapStream<R> {
     fn read_global_header(&mut self) -> io::Result<Layout> {
         let mut header = [0u8; GLOBAL_HEADER];
         self.reader.read_exact(&mut header)?;
-        let layout = match [header[0], header[1], header[2], header[3]] {
-            [0xa1, 0xb2, 0xc3, 0xd4] => Layout {
-                little_endian: false,
-                nanos: false,
-            },
-            [0xd4, 0xc3, 0xb2, 0xa1] => Layout {
-                little_endian: true,
-                nanos: false,
-            },
-            [0xa1, 0xb2, 0x3c, 0x4d] => Layout {
-                little_endian: false,
-                nanos: true,
-            },
-            [0x4d, 0x3c, 0xb2, 0xa1] => Layout {
-                little_endian: true,
-                nanos: true,
-            },
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("not a classic pcap stream (magic {other:02x?})"),
-                ));
-            }
-        };
-        Ok(layout)
+        Ok(parse_global_header(&header)?.layout)
     }
+}
+
+/// The link-layer type of every record in the stream, as the global header
+/// declares it. Only Ethernet (`LINKTYPE_ETHERNET` = 1) is a stream this
+/// crate can decode.
+pub const LINKTYPE_ETHERNET: u32 = 1;
+
+/// A decoded classic-pcap global header: how the records are laid out and
+/// what link layer they carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobalHeader {
+    layout: Layout,
+    /// The `linktype` field, e.g. [`LINKTYPE_ETHERNET`].
+    pub link_type: u32,
+}
+
+/// Decode the 24-byte global header: the magic selects byte order and
+/// timestamp resolution, the last word is the link type. `InvalidData` for
+/// a magic that is not classic pcap (a pcapng stream, or not a capture at
+/// all).
+pub fn parse_global_header(header: &[u8; GLOBAL_HEADER]) -> io::Result<GlobalHeader> {
+    let layout = match [header[0], header[1], header[2], header[3]] {
+        [0xa1, 0xb2, 0xc3, 0xd4] => Layout {
+            little_endian: false,
+            nanos: false,
+        },
+        [0xd4, 0xc3, 0xb2, 0xa1] => Layout {
+            little_endian: true,
+            nanos: false,
+        },
+        [0xa1, 0xb2, 0x3c, 0x4d] => Layout {
+            little_endian: false,
+            nanos: true,
+        },
+        [0x4d, 0x3c, 0xb2, 0xa1] => Layout {
+            little_endian: true,
+            nanos: true,
+        },
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("not a classic pcap stream (magic {other:02x?})"),
+            ));
+        }
+    };
+    let link_type = layout.u32([header[20], header[21], header[22], header[23]]);
+    Ok(GlobalHeader { layout, link_type })
 }
 
 #[cfg(test)]
@@ -193,6 +216,24 @@ pub(crate) mod tests {
             assert_eq!(s.next_record().unwrap().unwrap().data, b);
             assert_eq!(s.next_record().unwrap(), None);
         }
+    }
+
+    /// The global header names the link layer in the magic's own byte
+    /// order; the capture adapter checks it before trusting a child.
+    #[test]
+    fn the_global_header_yields_the_link_type_in_either_byte_order() {
+        for magic in [[0xa1, 0xb2, 0xc3, 0xd4], [0xd4, 0xc3, 0xb2, 0xa1]] {
+            let file = savefile(magic, &[]);
+            let header: [u8; GLOBAL_HEADER] = file[..GLOBAL_HEADER].try_into().unwrap();
+            let h = parse_global_header(&header).unwrap();
+            assert_eq!(h.link_type, LINKTYPE_ETHERNET, "magic {magic:02x?}");
+        }
+        let mut ng = [0u8; GLOBAL_HEADER];
+        ng[..4].copy_from_slice(&[0x0a, 0x0d, 0x0d, 0x0a]);
+        assert_eq!(
+            parse_global_header(&ng).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

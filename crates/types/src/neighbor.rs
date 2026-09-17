@@ -178,8 +178,8 @@ pub struct AnnouncedService {
 }
 
 /// What the `announce` listener heard in one window, counted at the frame
-/// level so the record can show the listener was alive AND that the daemon
-/// itself stayed quiet (realm net-observer, node #92).
+/// level so the record shows the listener was alive and how much of what it
+/// heard was this machine's own chatter (realm net-observer, node #92).
 ///
 /// Present on a [`NeighborsSample`] exactly when the reading is a listener
 /// flush rather than a neighbour-cache tick or a scan — that is how the daemon
@@ -190,11 +190,18 @@ pub struct AnnouncedService {
 pub struct HeardFrames {
     /// Every frame the capture delivered in the window, our own included.
     pub total: u32,
-    /// The frames whose Ethernet source was this interface's own MAC. They are
-    /// dropped from the neighbour map — a machine is not its own neighbour —
-    /// but counted, because "zero frames of ours" under the passive tier is a
-    /// claim the record must be able to check.
-    pub own: u32,
+    /// Of those, the frames this machine itself sent that match the capture
+    /// filter — the OS's own ARP, mDNS, SSDP and DHCP traffic, never the
+    /// daemon's probes (ICMP, TCP and DNS do not pass the filter). Recognised
+    /// by the interface's own MAC, re-read at every window's start because a
+    /// Private Wi-Fi Address rotates it per network; dropped from the
+    /// neighbour map — a machine is not its own neighbour — but counted, so
+    /// the record shows the listener saw itself and ignored it. `None` when
+    /// the window's own MAC could not be read: nothing was dropped as ours,
+    /// and the reading says so rather than claiming a zero. This counter is
+    /// NOT the passivity proof — that stays the frozen pcap slice (realm
+    /// net-observer, node #88).
+    pub own: Option<u32>,
 }
 
 /// One tick of the `neighbors` collector.
@@ -236,6 +243,17 @@ impl NeighborsSample {
     #[must_use]
     pub fn is_listener_flush(&self) -> bool {
         self.heard.is_some()
+    }
+
+    /// Whether this reading is the `SKIP` row that brackets the listener's
+    /// end: a listener flush carrying the `Skip` verdict. Not an observation
+    /// — it counts no frames and drops none — but the bracket the record
+    /// needs even through an operator pause, so the daemon lets it past the
+    /// pause drop that swallows every other event batch (realm net-observer,
+    /// node #92).
+    #[must_use]
+    pub fn is_listener_bracket(&self) -> bool {
+        self.is_listener_flush() && self.verdict == NeighborsVerdict::Skip
     }
 }
 
@@ -314,7 +332,10 @@ mod tests {
                 kind: AnnounceKind::Mdns,
                 detail: Some("0xFF".into()),
             }],
-            heard: Some(HeardFrames { total: 7, own: 2 }),
+            heard: Some(HeardFrames {
+                total: 7,
+                own: Some(2),
+            }),
         };
         assert!(flush.is_listener_flush());
         let json = serde_json::to_string(&flush).unwrap();

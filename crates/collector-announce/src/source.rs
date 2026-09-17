@@ -11,6 +11,13 @@
 //! `recv_timeout` can — so a silent 15 s still produces its reading ("the
 //! segment said nothing"), and the frame counts still land.
 //!
+//! Each window opens with ONE [`SegmentIdentity`] read: the segment's key and
+//! the interface's own MAC as they are at that moment. The own MAC is what
+//! the window recognises this machine's own filter-matching traffic by (the
+//! OS's ARP, mDNS, SSDP and DHCP — never the daemon's probes, which do not
+//! pass the filter), counts and drops; it is re-read per window because a
+//! Private Wi-Fi Address rotates it per network.
+//!
 //! When the stream ends — `tcpdump` exited, the pipe broke, the bytes
 //! stopped being pcap — the final batch carries what the last window heard
 //! and then a `SKIP` sample whose `reason` says why the listener stopped,
@@ -29,10 +36,10 @@ use crate::pcap::PcapStream;
 use crate::window::Window;
 
 /// How often the listener flushes a window: the link tick, so a flush can be
-/// set beside a link sample by `ASOF JOIN` and the "zero frames of ours"
-/// count reads at the same resolution as the probes it vouches for. Wall
-/// time, not a frame count — a frame count never fires on a silent segment,
-/// and silence is exactly a reading this listener must not skip.
+/// set beside a link sample by `ASOF JOIN` and the frame counts read at the
+/// same resolution as the probes. Wall time, not a frame count — a frame
+/// count never fires on a silent segment, and silence is exactly a reading
+/// this listener must not skip.
 pub const FLUSH_EVERY: Duration = Duration::from_secs(15);
 
 /// Frames the reader thread may run ahead of a flush. When full the reader
@@ -42,13 +49,27 @@ pub const FLUSH_EVERY: Duration = Duration::from_secs(15);
 /// `tcpdump` counts them, never in a growing queue here.
 const FRAME_QUEUE: usize = 4096;
 
-/// The segment's identity, read at the start of every window so a window
-/// that straddles a network change is keyed by the segment it was actually
-/// heard on. The real implementation reads the default gateway's ARP entry —
-/// the same key the neighbour-cache collector writes under.
+/// What one window is read against: the segment it was heard on and the
+/// MAC that was this machine's own at the time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentIdentityReading {
+    /// The gateway's MAC, normalised lowercase — the `network_key` the
+    /// neighbour-cache collector writes under; `None` when it cannot be read.
+    pub network_key: Option<String>,
+    /// The interface's own MAC; `None` when it cannot be read, in which case
+    /// the window drops nothing as ours and its flush says so.
+    pub own_mac: Option<Mac>,
+}
+
+/// The segment's identity, read ONCE at the start of every window — so a
+/// window that straddles a network change is keyed by the segment it was
+/// actually heard on, and so the own MAC follows a Private Wi-Fi Address
+/// that rotates per network rather than being the boot-time value for the
+/// life of the process. The real implementation reads the default gateway's
+/// ARP entry and the interface's `ether` line.
 pub trait SegmentIdentity: Send {
-    /// The gateway's MAC, normalised lowercase; `None` when it cannot be read.
-    fn network_key(&self) -> Option<String>;
+    /// Both facts, as readable now.
+    fn identity(&self) -> SegmentIdentityReading;
 }
 
 enum Feed {
@@ -62,7 +83,6 @@ pub struct AnnounceSource<R, S> {
     /// Taken by the reader thread on the first `next()`.
     reader: Option<R>,
     rx: Option<Receiver<Feed>>,
-    own_mac: Mac,
     iface: Option<String>,
     identity: S,
     flush_every: Duration,
@@ -72,20 +92,13 @@ pub struct AnnounceSource<R, S> {
 
 impl<R: Read + Send + 'static, S: SegmentIdentity> AnnounceSource<R, S> {
     /// A source over `reader` (a pcap stream: the capture child's stdout) on
-    /// `iface`, dropping frames from `own_mac` (the interface's own MAC) and
-    /// keying each window by `identity`. Nothing is read until the first
+    /// `iface`, reading each window's segment key and own MAC from `identity`
+    /// as the window opens. Nothing is read until the first
     /// [`EventSource::next`].
-    pub fn new(
-        reader: R,
-        own_mac: Mac,
-        iface: Option<String>,
-        identity: S,
-        flush_every: Duration,
-    ) -> Self {
+    pub fn new(reader: R, iface: Option<String>, identity: S, flush_every: Duration) -> Self {
         Self {
             reader: Some(reader),
             rx: None,
-            own_mac,
             iface,
             identity,
             flush_every,
@@ -133,7 +146,10 @@ fn read_stream<R: Read>(reader: R, tx: &SyncSender<Feed>) {
     }
 }
 
-/// The `SKIP` row that brackets the listener's end.
+/// The `SKIP` row that brackets the listener's end. Not an observation — it
+/// counts no frames and drops none — but the bracket the record needs even
+/// through an operator pause, which is why the daemon lets it through the
+/// pause drop (see `NeighborsSample::is_listener_bracket`).
 fn stopped(
     ts_us: i64,
     network_key: Option<String>,
@@ -148,7 +164,10 @@ fn stopped(
         iface,
         neighbors: Vec::new(),
         services: Vec::new(),
-        heard: Some(HeardFrames { total: 0, own: 0 }),
+        heard: Some(HeardFrames {
+            total: 0,
+            own: Some(0),
+        }),
     })
 }
 
@@ -157,9 +176,12 @@ impl<R: Read + Send + 'static, S: SegmentIdentity> EventSource for AnnounceSourc
         if self.done {
             return None;
         }
-        let network_key = self.identity.network_key();
+        let SegmentIdentityReading {
+            network_key,
+            own_mac,
+        } = self.identity.identity();
         let iface = self.iface.clone();
-        let (own_mac, flush_every) = (self.own_mac, self.flush_every);
+        let flush_every = self.flush_every;
         let rx = match self.feed() {
             Ok(rx) => rx,
             Err(reason) => {
@@ -197,11 +219,13 @@ impl<R: Read + Send + 'static, S: SegmentIdentity> EventSource for AnnounceSourc
         if ended.is_none() || !window.is_empty() {
             let heard = window.heard();
             let undecoded = window.undecoded();
+            let dropped = window.dropped();
             let sample = window.flush(ts_us);
-            tracing::info!(
+            tracing::debug!(
                 heard = heard.total,
-                own = heard.own,
+                own = ?heard.own,
                 undecoded,
+                dropped,
                 neighbours = sample.neighbors.len(),
                 services = sample.services.len(),
                 "announce: window flushed"
@@ -226,11 +250,28 @@ mod tests {
     use crate::pcap::tests::{MAGIC_LE_US, savefile};
     use std::io::Cursor;
     use std::net::Ipv4Addr;
+    use std::sync::Mutex;
 
-    struct FixedKey(Option<&'static str>);
-    impl SegmentIdentity for FixedKey {
-        fn network_key(&self) -> Option<String> {
-            self.0.map(str::to_string)
+    /// An identity that answers the same every window.
+    struct Fixed(Option<&'static str>, Option<Mac>);
+    impl SegmentIdentity for Fixed {
+        fn identity(&self) -> SegmentIdentityReading {
+            SegmentIdentityReading {
+                network_key: self.0.map(str::to_string),
+                own_mac: self.1,
+            }
+        }
+    }
+
+    /// An identity that hands out a different own MAC on every read — a
+    /// Private Wi-Fi Address rotating between windows.
+    struct Rotating(Mutex<std::vec::IntoIter<Option<Mac>>>);
+    impl SegmentIdentity for Rotating {
+        fn identity(&self) -> SegmentIdentityReading {
+            SegmentIdentityReading {
+                network_key: None,
+                own_mac: self.0.lock().unwrap().next().flatten(),
+            }
         }
     }
 
@@ -249,6 +290,26 @@ mod tests {
                 std::thread::sleep(self.hold);
             }
             Ok(n)
+        }
+    }
+
+    /// A pipe that releases its records one batch at a time, when told.
+    struct Gated {
+        batches: std::sync::mpsc::Receiver<Vec<u8>>,
+        pending: Cursor<Vec<u8>>,
+    }
+    impl Read for Gated {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                let n = self.pending.read(buf)?;
+                if n > 0 {
+                    return Ok(n);
+                }
+                match self.batches.recv() {
+                    Ok(bytes) => self.pending = Cursor::new(bytes),
+                    Err(_) => return Ok(0),
+                }
+            }
         }
     }
 
@@ -286,9 +347,8 @@ mod tests {
     fn a_finished_stream_flushes_once_then_brackets_its_end() {
         let mut src = AnnounceSource::new(
             Cursor::new(frames()),
-            OWN,
             Some("en0".into()),
-            FixedKey(Some("60:22:32:aa:25:21")),
+            Fixed(Some("60:22:32:aa:25:21"), Some(OWN)),
             Duration::from_secs(5),
         );
         let batch = src.next().expect("a batch");
@@ -297,7 +357,13 @@ mod tests {
             panic!("expected a neighbours flush")
         };
         assert_eq!(flush.verdict, NeighborsVerdict::Ok);
-        assert_eq!(flush.heard, Some(HeardFrames { total: 3, own: 1 }));
+        assert_eq!(
+            flush.heard,
+            Some(HeardFrames {
+                total: 3,
+                own: Some(1)
+            })
+        );
         assert_eq!(flush.network_key.as_deref(), Some("60:22:32:aa:25:21"));
         assert_eq!(flush.neighbors.len(), 2);
         assert!(flush.neighbors.iter().any(|n| n.mac == mac_text(&PEER)));
@@ -315,6 +381,8 @@ mod tests {
             stop.reason
         );
         assert!(stop.is_listener_flush());
+        assert!(stop.is_listener_bracket());
+        assert!(!flush.is_listener_bracket());
         assert!(src.next().is_none());
         assert!(src.next().is_none());
     }
@@ -330,9 +398,8 @@ mod tests {
         };
         let mut src = AnnounceSource::new(
             reader,
-            OWN,
             None,
-            FixedKey(None),
+            Fixed(None, Some(OWN)),
             Duration::from_millis(150),
         );
         let first = src.next().expect("first window");
@@ -353,7 +420,13 @@ mod tests {
         let Sample::Neighbors(s) = &second[0] else {
             panic!()
         };
-        assert_eq!(s.heard, Some(HeardFrames { total: 0, own: 0 }));
+        assert_eq!(
+            s.heard,
+            Some(HeardFrames {
+                total: 0,
+                own: Some(0)
+            })
+        );
         assert_eq!(s.verdict, NeighborsVerdict::Ok);
         // Then the EOF lands: an empty cut-short window yields only the bracket.
         let last = src.next().expect("the end");
@@ -365,14 +438,77 @@ mod tests {
         assert!(src.next().is_none());
     }
 
+    /// The own MAC is read as each window opens: the same frames, heard in
+    /// two windows under two own MACs, are dropped as ours by whichever MAC
+    /// was ours at the time — and a window with no readable MAC drops
+    /// nothing and says so.
+    #[test]
+    fn each_window_drops_its_own_frames_by_the_mac_read_as_it_opens() {
+        let (batch_tx, batches) = std::sync::mpsc::channel::<Vec<u8>>();
+        let reader = Gated {
+            batches,
+            pending: Cursor::new(Vec::new()),
+        };
+        let identity = Rotating(Mutex::new(vec![Some(OWN), Some(PEER), None].into_iter()));
+        let mut src = AnnounceSource::new(reader, None, identity, Duration::from_millis(150));
+
+        // Window 1: OWN is ours.
+        batch_tx.send(frames()).unwrap();
+        let w1 = src.next().expect("window 1");
+        let Sample::Neighbors(s) = &w1[0] else {
+            panic!()
+        };
+        assert_eq!(
+            s.heard,
+            Some(HeardFrames {
+                total: 3,
+                own: Some(1)
+            })
+        );
+        assert!(s.neighbors.iter().all(|n| n.mac != mac_text(&OWN)));
+        assert!(s.neighbors.iter().any(|n| n.mac == mac_text(&PEER)));
+
+        // Window 2: the same frames again (records only — the stream's header
+        // was consumed by window 1), now PEER is ours.
+        batch_tx.send(frames()[24..].to_vec()).unwrap();
+        let w2 = src.next().expect("window 2");
+        let Sample::Neighbors(s) = &w2[0] else {
+            panic!()
+        };
+        assert_eq!(
+            s.heard,
+            Some(HeardFrames {
+                total: 3,
+                own: Some(1)
+            })
+        );
+        assert!(s.neighbors.iter().all(|n| n.mac != mac_text(&PEER)));
+        assert!(s.neighbors.iter().any(|n| n.mac == mac_text(&OWN)));
+
+        // Window 3: no own MAC readable — nothing dropped, and it says so.
+        batch_tx.send(frames()[24..].to_vec()).unwrap();
+        let w3 = src.next().expect("window 3");
+        let Sample::Neighbors(s) = &w3[0] else {
+            panic!()
+        };
+        assert_eq!(
+            s.heard,
+            Some(HeardFrames {
+                total: 3,
+                own: None
+            })
+        );
+        assert_eq!(s.neighbors.len(), 3);
+        drop(batch_tx);
+    }
+
     /// Bytes that are not pcap end the listener with a reason naming that.
     #[test]
     fn a_stream_that_is_not_pcap_stops_with_the_reason() {
         let mut src = AnnounceSource::new(
             Cursor::new(b"not a pcap stream at all, just text".to_vec()),
-            OWN,
             None,
-            FixedKey(None),
+            Fixed(None, None),
             Duration::from_secs(5),
         );
         let batch = src.next().unwrap();
