@@ -630,7 +630,8 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `blob_ref` | `id, incident_id, ts_us, kind, path` | On-disk forensics blobs (pcap freeze, dumps) referenced by path. |
 | `trigger_fired` | `ts_us, trigger_id, incident_id, detail` | One row per trigger fire. |
 | `observing_edge` | `ts_us, observing, peer_uid, cause` | One row per collection boundary — the one sanctioned gap in "SKIP, never silence"; `observing` is the state entered, so `false` opens a gap and `true` closes one. `peer_uid` attributes it to the control-socket peer that asked (SQL `NULL` when nobody did), and `cause` (`control` / `startup`) says what produced it. |
-| `probing_edge` | `ts_us, tier, peer_uid` | One row per switch of the probing tier (`tier` is the tier entered, `passive` / `active`). Not a gap — a passive daemon keeps writing a row per tick with every probe verdict `SKIP` — but the bracket that says those `SKIP`s were *withheld*, not failed, and by whom. `peer_uid` is `NULL` for the startup edge, which records the configured default so a record that begins passive says so. (realm net-observer, node #88) |
+| `probing_edge` | `ts_us, tier, peer_uid, reason` | One row per switch of the probing tier (`tier` is the tier entered, `passive` / `active`). Not a gap — a passive daemon keeps writing a row per tick with every probe verdict `SKIP` — but the bracket that says those `SKIP`s were *withheld*, not failed, and by whom. `peer_uid` is `NULL` for the startup edge, which records the configured default so a record that begins passive says so. `reason` (`control` / `startup` / `experiment` / `experiment-end`) says what produced the edge; added with the experiment window, so older rows read back `NULL`, which means `control` — what they were (realm net-observer, nodes #88, #61). The experiment pair is the one place an edge may repeat the tier already in force: a window on an already-passive daemon still marks its bounds. |
+| `experiment` | `id PK, start_us, end_us, tier_before, report_json` | One row per finished experiment window (realm net-observer, node #61): its bounds, the tier it restored, and the whole `types::ExperimentReport` as JSON — the same report the daemon answers `Query(Experiment { id })` with, kept so it outlives the process that computed it. A window the daemon was restarted under leaves no row; its opening `probing_edge` (`reason = experiment`) without a closing one is the trace. |
 
 `dns_sample`, `route_event`, and `host_sample` are created by the v1.1 `dns`,
 `route-events`, and `host-metrics` collectors respectively.
@@ -889,10 +890,11 @@ the durable record; the socket is the live, low-latency read path.
     (realm net-observer, node #58)
   - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
     write/control path (see [Control path](#control-path) below); the only
-    non-read request. Six commands today — `ControlCmd::KickstartProxy`,
+    non-read request. Seven commands today — `ControlCmd::KickstartProxy`,
     `SetObserving(bool)`, `SetProbing(ProbingTier)`, `FreezePcap`,
-    `ScanNeighbors(ScanOptions)`, `ScanAir` — every one behind
-    the same peer-credential check and none behind a config switch.
+    `ScanNeighbors(ScanOptions)`, `ScanAir`, `StartExperiment { minutes }` —
+    every one behind the same peer-credential check and none behind a config
+    switch.
   - `Request::Subscribe { kinds }` → a **held-open stream** of newline-JSON
     `StreamFrame`s (not a single `Response`, and not bare `Event`s) — the
     realtime pub/sub path (see [Event bus and live
@@ -907,9 +909,11 @@ the durable record; the socket is the live, low-latency read path.
     `Gap` (this subscriber fell behind the bus and lost `skipped` events),
     `Observing` (a real pause/resume transition — the state at subscribe time
     rides on `Ready` instead, so a state report can never be mistaken for an edge
-    that never happened), `Probing` (a real switch of the probing tier, the same
+    that never happened), `Probing` (a switch of the probing tier, the same
     `types::ProbingEdge` the daemon writes to `probing_edge`; the tier in force
-    is read from `StatusSnapshot::probing`), and `Error` (a daemon-side refusal
+    is read from `StatusSnapshot::probing` — and an experiment window's
+    bracket may repeat the tier already in force, so a subscriber sets its
+    tier from the frame rather than toggling on it), and `Error` (a daemon-side refusal
     or failure, reported **in band** instead of as a bare close). Only `Event`
     frames are subject to the `kinds` filter (`None` = every `EventKind`,
     `Some(list)` = server-side);
@@ -1293,6 +1297,62 @@ already-authorised command:
    operator believing an artifact exists. Client: the bar footer's **Freeze
    pcap** action.
 
+5. **Self-control — `ControlCmd::StartExperiment { minutes }`.** "Is it us or
+   the network", as a command (realm net-observer, node #61): the manual
+   procedure — switch everything off, watch `tcpdump`, count by hand — run by
+   the daemon for a window of 1 to 60 minutes. The arm switches to the
+   passive tier with a `probing_edge` whose `reason` is `experiment`, written
+   even if the daemon was passive already (the window is marked either way;
+   `api::EdgePolicy::Always`), freezes the pcap ring into
+   `blob_dir/freeze-experiment-<start_us>-start`, records the window as
+   running, and answers **at once** with the id `experiment-<start_us>` — the
+   opening edge's own `ts_us`. The window then runs in a spawned task, not on
+   the connection, so a dropped socket loses nothing. One window at a time:
+   a second `StartExperiment` is refused with the running id and its end. A
+   missing ring does not refuse the window — the record's half of the report
+   needs no ring — the message and the report say the freeze was not taken.
+
+   When the window elapses the task takes the end instant, freezes the ring
+   again (`…-end`), restores the tier that was in force with a second edge
+   (`reason = experiment-end`, again written whether or not it changes
+   anything), reads this machine's MAC **once** from the newest link sample
+   the snapshot holds, and computes the report on the blocking pool: the END
+   freeze's `ring.pcap*` files are walked with the same pure-Rust
+   `PcapStream` the announce listener reads through
+   (`collector_announce::count_own_frames`), counting inside
+   `[start_us, end_us]` the frames whose Ethernet source is that MAC — ICMP
+   echo *requests* (the daemon's own probes, expected 0), ARP and DHCP (the
+   OS's) and other — plus every frame in the window, the slice's earliest
+   stamp (whether the ring still reached back to the start) and whether a
+   file was cut mid-record; the START freeze is walked for its record count;
+   and `store::experiment::window_facts` counts what the record says the
+   network did in the same minutes — `route_event` rows, incidents opened
+   (by trigger; roams and Wi-Fi churn read off it), the `link_sample.gw`
+   verdict distribution (all `SKIP` under passive, said outright), announce
+   flushes and the frames they heard, the flow table's newest tick at each
+   bound, the Wi-Fi signal's range. The `types::ExperimentReport` goes to two
+   sinks, like an edge: the in-memory registry and an `experiment` row
+   (`report_json`), and every count that could not be taken is a note in it —
+   an unreadable MAC, a ring that was not running, a slice that was cut —
+   never a zero. Its verdict line is derived from the counts on render: `our
+   probes: 0 frames in 5.0 minutes — the daemon was silent (…); the network
+   showed: 2 route events, 1 incidents (…), 0 roams`.
+
+   Reading it: `Request::Query(DiagnosticQuery::Experiment { id })`. A window
+   this process holds in memory answers from there without the query gate —
+   `still running (ends at …)` as a `Response::Error` the CLI's poll waits
+   through (spelled once, `net_observer_ipc::experiment_running_message`),
+   or the finished report as a two-column `key | value` `Table`
+   (`From<&ExperimentReport> for Table`); an id the process does not remember
+   goes through the gated `api_query` path to the `experiment` table, and an
+   id the record does not hold is a plain failure — the cue that the daemon
+   restarted mid-window, its tier back at the configured default and the
+   report never computed. Clients: `net-observer-cli experiment [--minutes N]
+   [--no-wait]`, which prints the id and polls every 5 s until the table
+   comes (waiting through socket errors up to a minute, since the window runs
+   in the daemon), and `experiment-report <id>`, which asks the daemon first
+   and reads the file's `experiment` table when none answers.
+
 The `ScanNeighbors` and `ScanAir` arms are described under their own
 subsystems; both take the same path below and are refused only by a state they
 contradict (paused) or a missing dependency.
@@ -1325,9 +1385,18 @@ Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
                                     │             events_tx.send(StreamFrame::Probing(edge))
                                     │
                                     ├─ FreezePcap
-                                    │     └─► freeze_now(cx) → freezer.freeze(dir)
+                                    │     └─► freeze_now(cx) → freeze_ring(freezer, dir)
                                     │         — or ok: false with a
                                     │         reason when no ring is running
+                                    │
+                                    ├─ StartExperiment { minutes }
+                                    │     └─► switch_probing(Passive, reason=experiment, EdgePolicy::Always)
+                                    │         + freeze_ring(…-start) + experiments[id] = Running
+                                    │         └─► ControlResult { ok: true, "experiment <id> started …" }
+                                    │         └─► tokio::spawn: sleep(minutes) → finish_experiment
+                                    │               freeze_ring(…-end) → switch_probing(tier_before,
+                                    │               reason=experiment-end, Always) → count (blocking pool)
+                                    │               → store.write_experiment + experiments[id] = Finished
                                     │
                                     └─ KickstartProxy
                                           └─► acting::kickstart_proxy(&singbox_service)
