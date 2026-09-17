@@ -20,7 +20,7 @@ pub const META: CollectorMeta = CollectorMeta {
 /// The `air` collector: one radio-environment slice per period.
 ///
 /// Entirely passive — it reads the system's own wireless report and puts nothing
-/// on the air itself, so there is no `quiet` switch to honour here.
+/// on the air itself, so there is no probing-tier switch to honour here.
 ///
 /// **Its own interval, deliberately separate from the daemon's tick**: producing
 /// the report costs seconds on this machine (realm net-observer, node #47), so

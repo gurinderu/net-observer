@@ -27,8 +27,8 @@ pub const HISTORY_LEN: usize = 120;
 /// One refresh tick's worth of plottable values.
 ///
 /// Both fields are `Option` on purpose. A tick where the measurement did not
-/// happen — no sample yet, a paused daemon, quiet mode (`gw = SKIP`), a gateway
-/// that failed or is absent, or an unreachable daemon — is a **gap**, and a gap is
+/// happen — no sample yet, a paused daemon, the passive tier (`gw = SKIP`), a
+/// gateway that failed or is absent, or an unreachable daemon — is a **gap**, and a gap is
 /// not a zero. Plotting a missing measurement as a value on the floor is the same
 /// lie the `SKIP` verdict exists to prevent (see `AGENTS.md`, "SKIP, never
 /// silence"): it would draw a flat healthy-looking 0ms line for a gateway that was
@@ -53,7 +53,7 @@ pub fn history_point(snapshot: &StatusSnapshot, online: bool) -> HistoryPoint {
     }
     let gw_rtt_ms = snapshot.link.as_ref().and_then(|l| match l.gw {
         // Only an answered echo carries a time. FAIL/NOGW have no RTT to plot and
-        // SKIP means quiet mode — the echo was deliberately not sent.
+        // SKIP means the passive tier — the echo was deliberately not sent.
         types::GwVerdict::Ok => l.gw_rtt_ms,
         types::GwVerdict::Fail | types::GwVerdict::NoGw | types::GwVerdict::Skip => None,
     });
@@ -272,8 +272,8 @@ mod tests {
         let empty = StatusSnapshot::default();
         assert_eq!(history_point(&empty, true), HistoryPoint::default());
 
-        // Gateway verdicts that carry no measured reply time. SKIP is quiet mode:
-        // the echo was deliberately never sent.
+        // Gateway verdicts that carry no measured reply time. SKIP is the
+        // passive tier: the echo was deliberately never sent.
         for gw in [
             types::GwVerdict::Fail,
             types::GwVerdict::NoGw,

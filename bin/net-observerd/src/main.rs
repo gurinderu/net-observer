@@ -456,21 +456,14 @@ async fn run_daemon() -> anyhow::Result<()> {
     // the startup log below for why).
     let observing = Arc::new(AtomicBool::new(true));
 
-    // The operator's "quiet" flag: while set, the daemon addresses NO packet at
-    // the gateway (the link collector's ICMP echo is not sent; its tick still
-    // lands, carrying `gw = SKIP`). Shared with the link collector and the
-    // control socket exactly the way `observing` is. Process-scoped and, like
-    // `observing`, deliberately never persisted — a restart resumes probing.
-    let quiet = Arc::new(AtomicBool::new(false));
-
     // The probing tier: which emission classes the link, proxy and dns
     // collectors may put on the wire. Boots into the configured default —
     // `passive`, nothing on the wire, unless the operator's config says
     // otherwise — and is shared with those three collectors and the control
-    // socket exactly the way `quiet` is. Process-scoped and, like `quiet`,
-    // deliberately never persisted: a restart returns to the configured
-    // default, and only `SetProbing` moves it while the daemon runs.
-    // (realm net-observer, node #88)
+    // socket exactly the way `observing` is. Process-scoped and, like
+    // `observing`, deliberately never persisted: a restart returns to the
+    // configured default, and only `SetProbing` moves it while the daemon
+    // runs. (realm net-observer, node #88)
     let probing = Arc::new(ProbingState::new(cfg.probing.default));
 
     // The observing state is process-scoped and deliberately NEVER persisted: a
@@ -562,7 +555,6 @@ async fn run_daemon() -> anyhow::Result<()> {
             // the proxy facts adapter does; absent, the field records None.
             .with_singbox_config(SINGBOX_CONFIG_PATH),
             cfg.collectors.link.interval,
-            quiet.clone(),
             probing.clone(),
         )));
     }
@@ -780,7 +772,6 @@ async fn run_daemon() -> anyhow::Result<()> {
             &cfg,
             snapshot.clone(),
             observing.clone(),
-            quiet.clone(),
             probing.clone(),
             freezer.clone(),
             resume_at_us.clone(),
@@ -1451,7 +1442,6 @@ fn build_api_server(
     cfg: &Config,
     snapshot: Arc<Mutex<StatusSnapshot>>,
     observing: Arc<AtomicBool>,
-    quiet: Arc<AtomicBool>,
     probing: Arc<ProbingState>,
     freezer: Arc<PcapRingSlot>,
     resume_at_us: Arc<AtomicI64>,
@@ -1490,10 +1480,9 @@ fn build_api_server(
         // control path.
         policy: api::ControlPolicy::from_config(cfg.socket_owner_uid, cfg.control_uids.clone()),
         observing: observing.clone(),
-        // Shared, never fresh — for `quiet` and `probing` the same reason as
-        // `observing`, and the ring handle so `FreezePcap` copies the ring that
-        // is actually running rather than refusing next to a live capture.
-        quiet,
+        // Shared, never fresh — for `probing` the same reason as `observing`,
+        // and the ring handle so `FreezePcap` copies the ring that is actually
+        // running rather than refusing next to a live capture.
         probing,
         freezer,
         // Built unconditionally: whether there is anything to scan is decided
@@ -2109,7 +2098,6 @@ mod tests {
         let cfg = test_cfg();
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let observing = Arc::new(AtomicBool::new(true));
-        let quiet = Arc::new(AtomicBool::new(false));
         let probing = Arc::new(ProbingState::new(ProbingTier::Passive));
         let resume_at_us = Arc::new(AtomicI64::new(0));
         let session_end_us = Arc::new(AtomicI64::new(0));
@@ -2123,7 +2111,6 @@ mod tests {
             &cfg,
             snapshot.clone(),
             observing.clone(),
-            quiet.clone(),
             probing.clone(),
             // No pcap ring in this test: `FreezePcap` must refuse rather than
             // panic, which is the empty slot's whole job.
@@ -2221,12 +2208,6 @@ mod tests {
             Arc::ptr_eq(&srv.observing, &observing),
             "a fresh `observing` leaves the control socket acking a pause every \
              collector keeps ignoring"
-        );
-        assert!(
-            Arc::ptr_eq(&srv.quiet, &quiet),
-            "a fresh `quiet` leaves the control socket acking a quiet mode the \
-             link collector never enters, so the gateway keeps being pinged \
-             while the capture is being gathered to prove it is not us"
         );
         assert!(
             Arc::ptr_eq(&srv.probing, &probing),

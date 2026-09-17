@@ -42,7 +42,7 @@ pub struct LinkSample {
     pub wifi_capture_present: bool,
     /// Probe-on-suspicion: how many LAN neighbors were pinged on this tick.
     /// Measured only when the gateway verdict is `Fail`; `None` = not probed
-    /// (healthy gateway, quiet mode, or no gateway) — never a zero.
+    /// (healthy gateway, the passive tier, or no gateway) — never a zero.
     /// `serde(default)` so a pre-field daemon's samples still decode.
     #[serde(default)]
     pub lan_probed: Option<u16>,

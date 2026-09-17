@@ -4,7 +4,7 @@
 //!
 //! **Passive by construction.** This collector reads caches the OS already
 //! filled; it addresses no packet at anybody, which is why it keeps running
-//! under quiet mode exactly like the DHCP-lease and ARP reads the `link`
+//! in the passive tier exactly like the DHCP-lease and ARP reads the `link`
 //! collector does. Filling those caches deliberately — a subnet sweep, an mDNS
 //! query — is a separate, operator-pressed action and never happens on this
 //! timer.
