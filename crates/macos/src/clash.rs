@@ -181,7 +181,9 @@ fn non_empty(s: String) -> Option<String> {
 
 /// The process name from the API's `processPath`: the ` (<user>)` suffix
 /// sing-box appends is dropped, then only the last path component is kept.
-/// Empty in → `None`.
+/// Empty in → `None`, and so is a bare integer: when sing-box could resolve
+/// only the uid of the flow's owner it writes that uid as the path (`"501"`),
+/// and a uid is not a process name.
 fn process_name(process_path: &str) -> Option<String> {
     let path = process_path.trim();
     let path = match path.rsplit_once(" (") {
@@ -189,7 +191,10 @@ fn process_name(process_path: &str) -> Option<String> {
         _ => path,
     };
     let name = path.rsplit('/').next().unwrap_or(path).trim();
-    non_empty(name.to_string())
+    if name.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Build the async HTTP client used for Clash/TUN requests, applying
@@ -607,5 +612,17 @@ mod tests {
         assert_eq!(process_name("/usr/bin/curl").as_deref(), Some("curl"));
         assert_eq!(process_name("curl").as_deref(), Some("curl"));
         assert_eq!(process_name(""), None);
+    }
+
+    /// When sing-box knows only the uid of the flow's owner it writes that
+    /// uid as the path; a bare integer is not a process name, so the fact is
+    /// absent rather than a process called `501`.
+    #[test]
+    fn a_bare_uid_is_not_a_process() {
+        assert_eq!(process_name("501"), None);
+        assert_eq!(process_name("0"), None);
+        assert_eq!(process_name(" 501 "), None);
+        // A name that merely ends in digits is still a name.
+        assert_eq!(process_name("/usr/bin/python3").as_deref(), Some("python3"));
     }
 }

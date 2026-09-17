@@ -830,8 +830,12 @@ pub fn connections_sql(group_by: ConnectionsGroupBy) -> String {
     let key = match group_by {
         ConnectionsGroupBy::Host => "coalesce(host, dst_ip, '-')",
         ConnectionsGroupBy::Ip => "coalesce(dst_ip, host, '-')",
+        // A v6 address carries colons of its own, so it is bracketed the way
+        // a socket address is written (`[2a00::1]:443`); a name never is.
         ConnectionsGroupBy::IpPort => {
-            "coalesce(dst_ip, host, '-') || ':' || coalesce(CAST(dst_port AS VARCHAR), '-')"
+            "CASE WHEN dst_ip LIKE '%:%' THEN '[' || dst_ip || ']' \
+             ELSE coalesce(dst_ip, host, '-') END \
+             || ':' || coalesce(CAST(dst_port AS VARCHAR), '-')"
         }
         ConnectionsGroupBy::Process => "coalesce(process, '-')",
     };
@@ -2377,7 +2381,7 @@ mod tests {
             dst_port,
             process: process.map(str::to_string),
             network: "tcp".into(),
-            chain: Some("vless-main".into()),
+            chain: Some("vless-out-6".into()),
             count,
             upload,
             download: 0,
@@ -2499,6 +2503,37 @@ mod tests {
         );
         assert!(keys.contains(&"194.221.250.50:443".to_string()), "{keys:?}");
         assert_eq!(keys.len(), 5, "{keys:?}");
+    }
+
+    /// A v6 destination is bracketed in the address:port key, so its own
+    /// colons cannot be read as the port separator.
+    #[test]
+    fn connections_by_ip_port_bracket_a_v6_address() {
+        let s = DuckdbStore::in_memory().unwrap();
+        connections(
+            &s,
+            20 * SEC,
+            types::ConnectionsVerdict::Ok,
+            vec![
+                conn_row(
+                    Some("claude.ai"),
+                    Some("2606:4700::6810:84e5"),
+                    Some(443),
+                    None,
+                    1,
+                    1,
+                ),
+                conn_row(None, Some("1.1.1.1"), Some(53), None, 1, 1),
+            ],
+        );
+        let t = s.connections(ConnectionsGroupBy::IpPort).unwrap();
+        let keys: Vec<String> = (0..t.rows.len()).map(|i| cell(&t, i, "key")).collect();
+        assert!(
+            keys.contains(&"[2606:4700::6810:84e5]:443".to_string()),
+            "{keys:?}"
+        );
+        assert!(keys.contains(&"1.1.1.1:53".to_string()), "{keys:?}");
+        assert_eq!(keys.len(), 2, "{keys:?}");
     }
 
     /// By process, the two `stable` flows fold with both their names listed,
