@@ -1523,6 +1523,8 @@ impl Condition for SingboxDialTimeout {
                 (_, TcpVerdict::Fail | TcpVerdict::Skip) | (None, _) => None,
             };
         }
+        // A tick of reading-only rows measured nothing: no fleet answered.
+        let fleet_ok = fleet_ok.filter(|n| *n >= 1);
         // Each node with a dial-timeout row, newest first; the first whose
         // own burst reaches the threshold and whose context holds fires. A
         // row naming no node is not attributable to one and is skipped.
@@ -4839,6 +4841,19 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             "{}",
             fire.detail
         );
+
+        // A tick of reading-only rows measured no endpoint: "all 0 endpoints
+        // answer" is not a fleet answering.
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep_reading(1, "-", TcpVerdict::Skip, "vless-out-9"));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-7"),
+        ));
+        assert!(c.eval(&w).is_none(), "no measured endpoint, no fleet");
     }
 
     // ---- sing-box's own URL test (realm net-observer, node #62) ----------
