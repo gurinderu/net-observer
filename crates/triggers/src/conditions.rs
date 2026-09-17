@@ -1452,18 +1452,48 @@ impl Condition for SingboxNoRoute {
     }
 }
 
+/// The raw TCP verdict of one node's endpoint on one proxy tick, found
+/// through the URL-test reading the proxy collector rides on the node's
+/// endpoint row (realm net-observer, node #62): the row whose `urltest_node`
+/// is `node` names the endpoint in `server_ip`, and its own `tcp` is that
+/// listener's verdict — unless it is a reading-only row (`tcp = SKIP` under
+/// the node: the endpoint row was taken by another node on the same address,
+/// or not probed), in which case the endpoint's own row, if the tick has one,
+/// carries the verdict. `None` when the tick carries no reading for `node`,
+/// or a reading whose endpoint is unknown (`-`): the endpoint is unmapped.
+fn node_endpoint<'a>(tick: &[&'a ProxySample], node: &str) -> Option<(&'a str, TcpVerdict)> {
+    let reading = tick
+        .iter()
+        .find(|r| r.urltest_node.as_deref() == Some(node))?;
+    let endpoint = reading.server_ip.as_str();
+    if endpoint == "-" {
+        return None;
+    }
+    let tcp = if is_reading_only(reading) {
+        tick.iter()
+            .find(|r| r.server_ip == endpoint && !is_reading_only(r))
+            .map_or(TcpVerdict::Skip, |r| r.tcp)
+    } else {
+        reading.tcp
+    };
+    Some((endpoint, tcp))
+}
+
 /// Fires when sing-box's dial through one node times out —
 /// [`SINGBOX_MIN_LINES`] or more `dial-timeout` lines via that node within
-/// [`SINGBOX_SPAN_US`] — while the newest measured proxy tick reaches every
-/// upstream endpoint by raw TCP: the path is open and sing-box's own dial is
-/// not (realm net-observer, node #141).
+/// [`SINGBOX_SPAN_US`] — while raw TCP to that node's endpoint answers on the
+/// newest proxy tick: the listener is reachable, and sing-box's own dial to it
+/// is not (realm net-observer, node #141).
 ///
-/// The window cannot map a node to its endpoint: a proxy row carries the
-/// endpoint address and the tick-wide selector name, never the node each
-/// address belongs to. So the context gate is the whole fleet — every
-/// measured endpoint of the newest tick `Ok`; a tick with a `Fail` is
-/// `endpoint-block`'s question, a tick of `Skip`s no measurement — and the
-/// detail says the node's own endpoint is unmapped. Clears after
+/// The node's endpoint is read off the proxy tick through the URL-test
+/// reading ([`node_endpoint`], node #62); the newest two ticks are consulted,
+/// since the newest may still be being written when the engine evaluates. An
+/// endpoint whose row reads `Fail` is `endpoint-block`'s question, a `Skip`
+/// no measurement — neither fires. A node the proxy collector carries no
+/// reading for (unknown to it, or a passive placeholder only) falls back to
+/// the whole fleet: every measured endpoint of the newest tick `Ok`
+/// (reading-only rows measure nothing and are not counted), and the detail
+/// says the node's own endpoint is unmapped. Clears after
 /// [`SINGBOX_CLEAR_TICKS`] link ticks with no such line.
 pub struct SingboxDialTimeout;
 impl Condition for SingboxDialTimeout {
@@ -1471,20 +1501,31 @@ impl Condition for SingboxDialTimeout {
         "singbox-dial-timeout"
     }
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
-        // The newest proxy tick: the rows sharing the newest row's `ts_us`.
-        // Exhaustive over the verdict: `Skip` is no measurement.
+        // The newest two proxy ticks, newest first: the rows sharing a
+        // `ts_us`. No proxy tick at all is no measurement.
         let proxy = w.recent_proxy(ENDPOINT_BLOCK_SCAN);
-        let tick_ts = proxy.first()?.ts_us;
-        let mut endpoints = 0usize;
-        for p in proxy.iter().take_while(|p| p.ts_us == tick_ts) {
-            match p.tcp {
-                TcpVerdict::Ok => endpoints += 1,
-                TcpVerdict::Fail | TcpVerdict::Skip => return None,
-            }
+        let mut ticks: Vec<&[&ProxySample]> = Vec::new();
+        let mut start = 0;
+        while start < proxy.len() && ticks.len() < 2 {
+            let ts = proxy[start].ts_us;
+            let end = start + proxy[start..].iter().take_while(|p| p.ts_us == ts).count();
+            ticks.push(&proxy[start..end]);
+            start = end;
+        }
+        let newest = *ticks.first()?;
+        // The fallback context: every measured endpoint of the newest tick
+        // answers. Exhaustive over the verdict: `Skip` is no measurement, and
+        // a `Fail` is a fleet the underlay does not reach.
+        let mut fleet_ok = Some(0usize);
+        for p in newest.iter().filter(|p| !is_reading_only(p)) {
+            fleet_ok = match (fleet_ok, p.tcp) {
+                (Some(n), TcpVerdict::Ok) => Some(n + 1),
+                (_, TcpVerdict::Fail | TcpVerdict::Skip) | (None, _) => None,
+            };
         }
         // Each node with a dial-timeout row, newest first; the first whose
-        // own burst reaches the threshold fires. A row naming no node is not
-        // attributable to one and is skipped.
+        // own burst reaches the threshold and whose context holds fires. A
+        // row naming no node is not attributable to one and is skipped.
         let all = w.recent_singbox_log(SINGBOX_LOG_SCAN);
         let mut seen: Vec<&str> = Vec::new();
         for node in all
@@ -1505,17 +1546,32 @@ impl Condition for SingboxDialTimeout {
             if lines < SINGBOX_MIN_LINES {
                 continue;
             }
-            return Some(Fire {
-                detail: format!(
-                    "sing-box's dial through {node} times out ({lines} in 60 s) while raw TCP \
-to all {endpoints} endpoints answers (the node's own endpoint is not in the window)"
-                ),
-            });
+            match ticks.iter().find_map(|t| node_endpoint(t, node)) {
+                Some((endpoint, TcpVerdict::Ok)) => {
+                    return Some(Fire {
+                        detail: format!(
+                            "sing-box's dial through {node} times out ({lines} in 60 s) while \
+raw TCP to {endpoint} answers"
+                        ),
+                    });
+                }
+                Some((_, TcpVerdict::Fail | TcpVerdict::Skip)) => continue,
+                None => {
+                    let Some(endpoints) = fleet_ok else {
+                        continue;
+                    };
+                    return Some(Fire {
+                        detail: format!(
+                            "sing-box's dial through {node} times out ({lines} in 60 s) while \
+raw TCP to all {endpoints} endpoints answers (the node's own endpoint is not in the window)"
+                        ),
+                    });
+                }
+            }
         }
         None
     }
 }
-
 /// How many recent proxy rows `endpoint-dial-stall` looks through for the
 /// newest tick that carries the traffic-carrying node's reading: two ticks'
 /// worth — the newest tick is still being written when the engine
@@ -4622,6 +4678,167 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         w.push(link(30 * S, TcpVerdict::Ok));
         w.push(proxy_ep(30 * S + 1, "1.1.1.1:443", TcpVerdict::Ok));
         assert!(c.eval(&w).is_none(), "two quiet ticks clear");
+    }
+
+    /// A proxy row on `endpoint` carrying `node`'s URL-test reading — the
+    /// mapping the proxy collector rides on the node's endpoint row (node
+    /// #62): `tcp` is that listener's raw verdict. A reading-only row is the
+    /// same shape with `tcp = Skip` (the endpoint row taken or not probed).
+    fn proxy_ep_reading(ts: i64, endpoint: &str, tcp: TcpVerdict, node: &str) -> Sample {
+        let Sample::Proxy(mut p) = proxy_ep(ts, endpoint, tcp) else {
+            unreachable!("proxy_ep builds a proxy sample")
+        };
+        p.urltest_node = Some(node.into());
+        Sample::Proxy(p)
+    }
+
+    /// The mapped case: the newest tick names the node's endpoint through
+    /// its reading, raw TCP to it answers, and the detail names the endpoint
+    /// — while the rest of the fleet may well be failing.
+    #[test]
+    fn singbox_dial_timeout_names_the_nodes_endpoint_when_mapped() {
+        let c = SingboxDialTimeout;
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "9.9.9.9:443", TcpVerdict::Fail));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Ok,
+            "vless-out-2",
+        ));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-2"),
+        ));
+        let fire = c.eval(&w).expect("the node's own endpoint answers");
+        assert_eq!(
+            fire.detail,
+            "sing-box's dial through vless-out-2 times out (3 in 60 s) while raw TCP to \
+             2.2.2.2:2053 answers"
+        );
+
+        // A reading-only row (the endpoint row taken by another node on the
+        // same address) defers to the endpoint's own row.
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Ok,
+            "vless-out-1",
+        ));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Skip,
+            "vless-out-2",
+        ));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-2"),
+        ));
+        let fire = c.eval(&w).expect("the shared endpoint's own row answers");
+        assert!(
+            fire.detail.ends_with("raw TCP to 2.2.2.2:2053 answers"),
+            "{}",
+            fire.detail
+        );
+    }
+
+    /// Mapped and dead from the underlay: `endpoint-block`'s question, not
+    /// this one — even while the rest of the fleet answers. A reading-only
+    /// row whose endpoint has no own row is no measurement, likewise silent.
+    #[test]
+    fn singbox_dial_timeout_is_silent_when_the_mapped_endpoint_fails_or_is_unmeasured() {
+        let c = SingboxDialTimeout;
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Fail,
+            "vless-out-2",
+        ));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-2"),
+        ));
+        assert!(
+            c.eval(&w).is_none(),
+            "the node's own endpoint is dead from the underlay"
+        );
+
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Skip,
+            "vless-out-2",
+        ));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-2"),
+        ));
+        assert!(c.eval(&w).is_none(), "the node's endpoint was not probed");
+    }
+
+    /// Unmapped — the newest ticks carry no reading for the node, or one
+    /// whose endpoint is unknown — falls back to the fleet: every measured
+    /// endpoint answers (a reading-only row measures nothing and does not
+    /// count), and the detail says the endpoint is unmapped.
+    #[test]
+    fn singbox_dial_timeout_falls_back_to_the_fleet_when_unmapped() {
+        let c = SingboxDialTimeout;
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Ok,
+            "vless-out-2",
+        ));
+        w.push(proxy_ep_reading(1, "-", TcpVerdict::Skip, "vless-out-9"));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-7"),
+        ));
+        let fire = c.eval(&w).expect("the fleet answers");
+        assert_eq!(
+            fire.detail,
+            "sing-box's dial through vless-out-7 times out (3 in 60 s) while raw TCP to all \
+             2 endpoints answers (the node's own endpoint is not in the window)"
+        );
+
+        // A reading whose endpoint is unknown (`-`) is unmapped too.
+        w.push(singbox_row(
+            3,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-9"),
+        ));
+        let fire = c.eval(&w).expect("unmapped, and the fleet answers");
+        assert!(
+            fire.detail
+                .starts_with("sing-box's dial through vless-out-9")
+                && fire.detail.contains("not in the window"),
+            "{}",
+            fire.detail
+        );
     }
 
     // ---- sing-box's own URL test (realm net-observer, node #62) ----------

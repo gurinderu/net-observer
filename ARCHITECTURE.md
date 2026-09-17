@@ -214,10 +214,14 @@ flowchart LR
   the restart tick as `types::local_instant` spells it
   — since a restart tears the TUN down and explains the burst),
   `singbox-dial-timeout` (three or
-  more `dial-timeout` lines through one node within a minute while every
-  measured endpoint of the newest proxy tick answers raw TCP — the window
-  cannot map a node to its endpoint, so the gate is the whole fleet and the
-  detail says so; both clear after two link ticks with no such line, the link
+  more `dial-timeout` lines through one node within a minute while raw TCP to
+  that node's endpoint answers on the newest proxy tick — the endpoint read
+  through the URL-test reading the proxy collector rides on the node's
+  endpoint row (`urltest_node`, node #62): a `FAIL` there is `endpoint-block`'s,
+  a `SKIP` no measurement; a node the proxy collector carries no reading for
+  falls back to the whole fleet answering, and the detail then says the
+  node's own endpoint is unmapped; both clear after two link ticks with no
+  such line, the link
   collector being the tick clock since the reader writes nothing on a quiet
   tick; realm net-observer, node #141), `starvation`.
   Each fires at most
