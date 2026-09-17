@@ -55,8 +55,11 @@ use pipeline::{
     ScanReport, SnapshotHandler, run, spawn_event_collector, spawn_interval_collector,
 };
 
-/// How often the pcap supervisor re-checks the ring. Bounded on purpose: every
-/// attempt may spawn a `tcpdump` child, so this is a slow patrol, not a tick.
+/// How often a capture supervisor re-checks its `tcpdump` child — the pcap
+/// ring's, and through [`supervise_on_iface`] the announce listener's and the
+/// topology patrol's, one number for all three (realm net-observer, node #134).
+/// Bounded on purpose: every attempt may spawn a `tcpdump` child, so this is a
+/// slow patrol, not a tick.
 const PCAP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How often the topology patrol opens a fresh short-lived LLDP/CDP capture.
@@ -660,52 +663,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         };
         collectors.push(AnyCollector::Route(RouteCollector::new(source, ready)));
     }
-    if cfg.collectors.neighbors.enabled && cfg.collectors.neighbors.announce {
-        // The passive announce listener: Event-cadence like `route`, over a
-        // second `tcpdump` child's pcap stream. Readiness is decided here —
-        // an interface to listen on and a child that proved it captures by
-        // writing an Ethernet pcap header (`AnnounceCapture::start`) — and,
-        // like `route`, not retried: an Unavailable event collector is
-        // logged and skipped for the life of the process. The probing tier
-        // does not gate it: a tier withholds emissions and this collector
-        // has none (realm net-observer, nodes #88, #92). Shares the link
-        // collector's `SystemFacts`, so the segment it keys every window by
-        // is the same key the neighbour cache and the scan write under, and
-        // the interface's own MAC — what it drops our own frames by — is
-        // read afresh for every window through the same `SystemSegment`,
-        // since a Private Wi-Fi Address rotates it per network.
-        let (source, ready): (Box<dyn EventSource>, Readiness) = match &phys_iface {
-            None => (
-                Box::new(NullEventSource),
-                Readiness::Unavailable("no physical interface resolved".into()),
-            ),
-            Some(iface) => match AnnounceCapture::start(iface) {
-                Ok(capture) => (
-                    Box::new(AnnounceSource::new(
-                        capture,
-                        Some(iface.clone()),
-                        SystemSegment::new(
-                            SystemFacts::new(
-                                cfg.collectors.link.gw.clone(),
-                                cfg.collectors.link.phys_iface.clone(),
-                            ),
-                            iface.clone(),
-                            tokio::runtime::Handle::current(),
-                        ),
-                        collector_announce::FLUSH_EVERY,
-                    )),
-                    Readiness::Ready,
-                ),
-                Err(e) => (
-                    Box::new(NullEventSource),
-                    Readiness::Unavailable(format!("tcpdump announce listener on {iface}: {e}")),
-                ),
-            },
-        };
-        collectors.push(AnyCollector::Announce(AnnounceCollector::new(
-            source, ready,
-        )));
-    }
+    // The announce listener is NOT built here: it is an event collector over a
+    // `tcpdump` child on the physical interface, so it is constructed by its
+    // supervisor below, once that capture starts (realm net-observer, node #134).
 
     // Filter by OS meta + preflight, then spawn survivors with one uniform loop.
     let os = Os::current();
@@ -725,15 +685,20 @@ async fn run_daemon() -> anyhow::Result<()> {
         // while unavailable and real ones as soon as it can. Startup readiness is
         // logged only as context.
         //
-        // Event cadence is different and stays one-shot: the `route` collector's
-        // PF_ROUTE socket is opened once, before construction, and the source is
-        // moved into the collector — there is nothing left to re-probe per tick,
-        // and the blocking thread has no tick to re-probe on. Retrying it means
-        // reopening the socket, which is a different change (a supervisor around
-        // `spawn_event_collector`) than this one.
+        // Event cadence is different: the source is opened before construction
+        // and moved into the collector, so there is nothing left to re-probe per
+        // tick and the blocking thread has no tick to re-probe on. Which event
+        // collectors reach this loop is therefore decided by what their source
+        // needs. `route` needs no interface — its PF_ROUTE socket opens at boot
+        // or never — so it is built above and stays one-shot: an Unavailable
+        // `route` is logged and skipped for the life of the process. The
+        // announce listener needs the physical interface, which a `RunAtLoad`
+        // daemon boots without, so it never comes through here: it is started
+        // by `supervise_on_iface` below, and started again when its stream
+        // ends, like the pcap ring (realm net-observer, node #134).
         match (c.source(), c.preflight().await) {
             (Source::Event, Readiness::Unavailable(reason)) => {
-                tracing::warn!(collector = name, %reason, "preflight failed; skipping (event cadence: not retried)");
+                tracing::warn!(collector = name, %reason, "preflight failed; skipping (event cadence with no interface to wait for: not retried)");
                 continue;
             }
             (Source::Interval(_), Readiness::Unavailable(reason)) => {
@@ -758,6 +723,70 @@ async fn run_daemon() -> anyhow::Result<()> {
             Source::Event => handles.push(spawn_event_collector(c, tx.clone(), observing.clone())),
         }
     }
+
+    // The physical interface as it is NOW, for every supervisor that opens a
+    // `tcpdump` child on it: re-resolved on each attempt, never the boot-time
+    // value above, which a `RunAtLoad` daemon resolves to nothing.
+    let resolve_iface = {
+        let gw = cfg.collectors.link.gw.clone();
+        let configured_iface = cfg.collectors.link.phys_iface.clone();
+        move || {
+            let facts = SystemFacts::new(gw.clone(), configured_iface.clone());
+            async move { facts.phys_iface().await }
+        }
+    };
+
+    // The passive announce listener (realm net-observer, node #92): Event
+    // cadence like `route`, over a second `tcpdump` child's pcap stream on the
+    // physical interface. Supervised, not attempted once (node #134): the
+    // supervisor resolves the interface, `AnnounceCapture::start` proves the
+    // child captures (it has written an Ethernet pcap header), and only then
+    // is the collector constructed — always Ready — and driven like any event
+    // collector; when the stream ends the source brackets it with a `SKIP` row
+    // and the supervisor starts a new one. The probing tier does not gate it:
+    // a tier withholds emissions and this collector has none (node #88).
+    // Shares the link collector's `SystemFacts`, so the segment it keys every
+    // window by is the same key the neighbour cache and the scan write under,
+    // and the interface's own MAC — what it drops our own frames by — is read
+    // afresh for every window through the same `SystemSegment`, since a
+    // Private Wi-Fi Address rotates it per network.
+    if cfg.collectors.neighbors.enabled && cfg.collectors.neighbors.announce {
+        let name = collector_announce::META.name;
+        if collector_announce::META.supports(os) {
+            let tx = tx.clone();
+            let observing = observing.clone();
+            let resolve_iface = resolve_iface.clone();
+            let gw = cfg.collectors.link.gw.clone();
+            let configured_iface = cfg.collectors.link.phys_iface.clone();
+            handles.push(tokio::spawn(async move {
+                supervise_on_iface(name, PCAP_RETRY_INTERVAL, resolve_iface, move |iface| {
+                    let capture = AnnounceCapture::start(iface)?;
+                    let source = AnnounceSource::new(
+                        capture,
+                        Some(iface.to_string()),
+                        SystemSegment::new(
+                            SystemFacts::new(gw.clone(), configured_iface.clone()),
+                            iface.to_string(),
+                            tokio::runtime::Handle::current(),
+                        ),
+                        collector_announce::FLUSH_EVERY,
+                    );
+                    let collector = AnyCollector::Announce(AnnounceCollector::new(
+                        Box::new(source),
+                        Readiness::Ready,
+                    ));
+                    Ok(spawn_event_collector(
+                        collector,
+                        tx.clone(),
+                        observing.clone(),
+                    ))
+                })
+                .await;
+            }));
+        } else {
+            tracing::warn!(collector = name, ?os, "unsupported OS; skipping");
+        }
+    }
     // Drop our own sender so the consumer stops once every collector is gone.
     drop(tx);
 
@@ -775,17 +804,13 @@ async fn run_daemon() -> anyhow::Result<()> {
         let ring_dir = Path::new(&cfg.blob_dir).join("ring");
         let ring_mb = cfg.collectors.pcap_ring.ring_mb;
         let filter = cfg.collectors.pcap_ring.filter.clone();
-        let gw = cfg.collectors.link.gw.clone();
-        let configured_iface = cfg.collectors.link.phys_iface.clone();
+        let resolve_iface = resolve_iface.clone();
         tokio::spawn(async move {
             supervise_pcap_ring(
                 slot,
                 PCAP_RETRY_INTERVAL,
                 pcap_reason,
-                || {
-                    let facts = SystemFacts::new(gw.clone(), configured_iface.clone());
-                    async move { facts.phys_iface().await }
-                },
+                resolve_iface,
                 move |iface| {
                     PcapRing::start(iface, ring_dir.clone(), ring_mb, &filter)
                         .map(|r| Arc::new(r) as Arc<dyn PcapFreezer>)
@@ -797,25 +822,37 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // Passive switch-topology discovery: a slow patrol that opens its OWN
     // short-lived LLDP/CDP capture (never the shared incident ring), maps each
-    // received frame to an uplink edge, and records it. Gated on the config
-    // toggle and on having resolved a physical interface to listen on. Pushed
-    // onto `handles` so it is aborted with the collectors on shutdown. The LIVE
-    // capture is a project Ceiling (needs root + BPF on a real network); the
-    // patrol degrades honestly when it cannot open one (see `lldp_capture`).
-    // Gated on the neighbours subsystem being enabled AND the topology
-    // toggle: disabling neighbours turns its sub-feature off too, no surprise.
+    // received frame to an uplink edge, and records it. Gated on the neighbours
+    // subsystem being enabled AND the topology toggle: disabling neighbours
+    // turns its sub-feature off too, no surprise. The patrol needs a physical
+    // interface to listen on, so it too waits under `supervise_on_iface` for
+    // one to appear rather than being skipped for the life of a process that
+    // booted without one (realm net-observer, node #134); once started it runs
+    // on that interface, its own capture bounded per run. Pushed onto `handles`
+    // so it is aborted with the collectors on shutdown. The LIVE capture is a
+    // project Ceiling (needs root + BPF on a real network); the patrol degrades
+    // honestly when it cannot open one (see `lldp_capture`).
     if cfg.collectors.neighbors.enabled && cfg.collectors.neighbors.topology {
-        match phys_iface.clone() {
-            Some(iface) => handles.push(spawn_topology_patrol(
-                store.clone(),
-                snapshot.clone(),
-                observing.clone(),
-                iface,
-            )),
-            None => tracing::warn!(
-                "topology discovery enabled but no physical interface resolved; not capturing LLDP/CDP"
-            ),
-        }
+        let store = store.clone();
+        let snapshot = snapshot.clone();
+        let observing = observing.clone();
+        let resolve_iface = resolve_iface.clone();
+        handles.push(tokio::spawn(async move {
+            supervise_on_iface(
+                "topology",
+                PCAP_RETRY_INTERVAL,
+                resolve_iface,
+                move |iface| {
+                    Ok(spawn_topology_patrol(
+                        store.clone(),
+                        snapshot.clone(),
+                        observing.clone(),
+                        iface.to_string(),
+                    ))
+                },
+            )
+            .await;
+        }));
     }
 
     // Serve the read-only status socket for the unprivileged bar. Best-effort: a
@@ -1497,6 +1534,119 @@ async fn supervise_pcap_ring<R, Fut, S>(
     }
 }
 
+/// Keep a capture that needs the physical interface running, for as long as
+/// this task runs.
+///
+/// The announce listener and the topology patrol both open a `tcpdump` child on
+/// the physical interface, and a `RunAtLoad` daemon boots exactly when there is
+/// none to open it on — so, like the pcap ring, they are supervised rather than
+/// attempted once: every `interval` this re-resolves the interface and tries to
+/// start the capture, and when a running one ends it is started again after the
+/// same interval. The end itself is already in the record — the announce source
+/// brackets it with the `SKIP` row it emits — so the restart writes no row of
+/// its own (realm net-observer, node #134).
+///
+/// What ends a capture is its own child dying: a running listener stays on the
+/// interface it STARTED on, and a default route moving to another interface is
+/// not a restart trigger yet — that needs a stop path into the child inside the
+/// reader thread, a follow-up — so until the child dies, windows keyed by the
+/// current gateway may carry the old interface's hearing.
+///
+/// `start` opens the capture on the interface and spawns what drives it,
+/// returning the task that ends when the capture does (`spawn_event_collector`'s
+/// handle completes when its source thread returns; the topology patrol's never
+/// does, so it is started once per interface resolution). It may block —
+/// `AnnounceCapture::start` waits for the child's pcap header, up to its bound
+/// — so it runs on the blocking pool, never on a runtime worker. Aborting this
+/// task aborts the awaited TOKIO task only: the topology patrol, or, for the
+/// listener, just the oneshot bridge — its event thread, the reader thread
+/// holding the `AnnounceCapture` and the `tcpdump` child run until process exit
+/// (EPIPE on the next frame, launchd's process group), as `spawn_event_collector`
+/// says.
+///
+/// Logging is by *change of reason*, never per attempt, as for the ring: the
+/// first failure and each subsequent different reason are logged, and so is
+/// every start and every end. The ring's supervisor is not reused here because
+/// its liveness is a slot it polls, while this one awaits the end of a task;
+/// the interface resolver, the interval and the log discipline are the same.
+async fn supervise_on_iface<R, Fut, S>(
+    name: &'static str,
+    interval: Duration,
+    resolve_iface: R,
+    start: S,
+) where
+    R: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+    S: Fn(&str) -> std::io::Result<JoinHandle<()>> + Send + Sync + 'static,
+{
+    let start = Arc::new(start);
+    let mut last_reason: Option<String> = None;
+    loop {
+        let reason = match resolve_iface().await {
+            None => Some("no physical interface resolved".to_string()),
+            Some(iface) => {
+                // Off the runtime workers: the announce start waits for the
+                // child's header. The blocking pool's threads carry the runtime
+                // context, so `tokio::spawn` and `Handle::current()` inside
+                // `start` are valid there.
+                let started = {
+                    let (start, iface) = (start.clone(), iface.clone());
+                    tokio::task::spawn_blocking(move || start(&iface)).await
+                };
+                match started {
+                    Ok(Ok(handle)) => {
+                        tracing::info!(capture = name, iface, "capture started");
+                        last_reason = None;
+                        let mut running = AbortOnDrop(handle);
+                        match (&mut running.0).await {
+                            Ok(()) => tracing::warn!(
+                                capture = name,
+                                retry_s = interval.as_secs(),
+                                "capture ended; will restart"
+                            ),
+                            Err(e) => tracing::error!(
+                                capture = name,
+                                error = %e,
+                                retry_s = interval.as_secs(),
+                                "capture task failed; will restart"
+                            ),
+                        }
+                        None
+                    }
+                    Ok(Err(e)) => Some(format!("tcpdump could not be started on {iface}: {e}")),
+                    Err(e) => Some(format!("capture start task failed on {iface}: {e}")),
+                }
+            }
+        };
+        if reason != last_reason {
+            if let Some(reason) = &reason {
+                tracing::warn!(
+                    capture = name,
+                    %reason,
+                    retry_s = interval.as_secs(),
+                    "capture not running; will retry"
+                );
+            }
+            last_reason = reason;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// A spawned task that is aborted when this handle is dropped — so the tokio
+/// task [`supervise_on_iface`] is awaiting is aborted with the supervisor
+/// (which `abort_all` drops) instead of being detached, as dropping a bare
+/// [`JoinHandle`] would. That reaches the topology patrol's task; for the
+/// listener it reaches only the oneshot bridge, never the detached threads or
+/// the `tcpdump` child behind it.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Assemble the socket API server from `cfg` plus the daemon's shared state.
 ///
 /// Split out of [`run_daemon`] so the wiring itself is addressable: this block is
@@ -1803,7 +1953,10 @@ mod tests {
     fn the_declaration_covers_exactly_the_collectors_the_daemon_can_spawn() {
         use net_observer_ipc::EventKind;
 
-        // One entry per `AnyCollector` variant, by the collector's own metadata.
+        // One entry per `AnyCollector` variant, by the collector's own metadata —
+        // all but `announce`, which produces no kind of its own: its samples are
+        // `Sample::Neighbors`, declared under `neighbors`, and its supervisor
+        // starts it under that same switch (`neighbors.announce`).
         let spawnable: Vec<&'static str> = vec![
             collector_link::META.name,
             collector_proxy::META.name,
@@ -2024,6 +2177,191 @@ mod tests {
             "the replacement must be a live ring"
         );
         task.abort();
+    }
+
+    /// A blocking event source that ends when the test drops its feeding end —
+    /// the announce stream ending when its `tcpdump` child dies.
+    struct EndsWhenDropped(std::sync::mpsc::Receiver<Vec<Sample>>);
+    impl EventSource for EndsWhenDropped {
+        fn next(&mut self) -> Option<Vec<Sample>> {
+            self.0.recv().ok()
+        }
+    }
+
+    /// The defect this branch closes (realm net-observer, node #134): no
+    /// interface at boot must not leave the announce listener unstarted for the
+    /// life of the process, and a listener whose stream ended must be started
+    /// again. Driven with fakes (no `tcpdump`, no root) through the REAL
+    /// `spawn_event_collector`, so the handle the supervisor awaits is the one
+    /// production hands it: the interface is absent for the first attempts and
+    /// present afterwards; the listener must start exactly once, forward what
+    /// its stream yields, be left alone while the stream is open, and be
+    /// started again — after the interval — once the stream ends.
+    ///
+    /// Dies under: returning early instead of looping, starting with no
+    /// interface, restarting an open stream, an event-spawner handle that
+    /// completes before the source ends, or a restart with no interval.
+    #[tokio::test]
+    async fn the_listener_starts_by_itself_once_an_interface_appears_and_again_when_it_ends() {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+
+        let iface_up = Arc::new(AtomicBool::new(false));
+        let resolves = Arc::new(AtomicI64::new(0));
+        let starts = Arc::new(AtomicI64::new(0));
+        // One stream per start; the test holds the feeding end of each, so it
+        // decides when a stream ends.
+        let feeds: Arc<Mutex<Vec<std::sync::mpsc::Sender<Vec<Sample>>>>> = Arc::default();
+        let (tx, mut rx) = mpsc::channel::<Sample>(16);
+        let observing = Arc::new(AtomicBool::new(true));
+
+        let task = {
+            let (iface_up, resolves, starts, feeds) = (
+                iface_up.clone(),
+                resolves.clone(),
+                starts.clone(),
+                feeds.clone(),
+            );
+            tokio::spawn(async move {
+                supervise_on_iface(
+                    "announce",
+                    TEST_PATROL,
+                    move || {
+                        resolves.fetch_add(1, Release);
+                        let up = iface_up.load(Acquire);
+                        async move { up.then(|| "en0".to_string()) }
+                    },
+                    move |_iface| {
+                        starts.fetch_add(1, Release);
+                        let (feed, batches) = std::sync::mpsc::channel();
+                        feeds.lock().unwrap().push(feed);
+                        let c = AnyCollector::Announce(AnnounceCollector::new(
+                            Box::new(EndsWhenDropped(batches)),
+                            Readiness::Ready,
+                        ));
+                        Ok(spawn_event_collector(c, tx.clone(), observing.clone()))
+                    },
+                )
+                .await;
+            })
+        };
+
+        // Several attempts with no interface: nothing started.
+        wait_until("two resolutions with no interface", || {
+            resolves.load(Acquire) >= 2
+        })
+        .await;
+        assert_eq!(
+            starts.load(Acquire),
+            0,
+            "the supervisor must not start a listener with no interface to capture on"
+        );
+
+        iface_up.store(true, Release);
+        wait_until("the listener to start on its own", || {
+            starts.load(Acquire) == 1
+        })
+        .await;
+
+        // Driven by the real event spawner: what its stream yields reaches the
+        // consumer.
+        feeds.lock().unwrap()[0]
+            .send(vec![link(1, GwVerdict::Ok)])
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the started listener forwards within 5s")
+            .expect("channel open");
+        assert!(matches!(got, Sample::Link(_)), "{got:?}");
+
+        // An open stream is left alone: no churn of tcpdump children.
+        tokio::time::sleep(TEST_PATROL * 5).await;
+        assert_eq!(
+            starts.load(Acquire),
+            1,
+            "a running listener must not be restarted every patrol"
+        );
+
+        // The stream ends (the child died): a new listener is started, after
+        // the interval rather than at once, and it forwards too.
+        let ended_at = Instant::now();
+        drop(feeds.lock().unwrap().remove(0));
+        wait_until("the listener to be started again", || {
+            starts.load(Acquire) == 2
+        })
+        .await;
+        assert!(
+            ended_at.elapsed() >= TEST_PATROL,
+            "a restart waits the interval; it must not respawn tcpdump at once"
+        );
+        feeds.lock().unwrap()[0]
+            .send(vec![link(2, GwVerdict::Ok)])
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the restarted listener forwards within 5s")
+            .expect("channel open");
+        assert!(
+            matches!(got, Sample::Link(ref l) if l.ts_us == 2),
+            "{got:?}"
+        );
+        task.abort();
+    }
+
+    /// Shutdown: `abort_all` aborts the supervisor, and the TOKIO task it was
+    /// awaiting must be aborted with it — the topology patrol's case, which
+    /// would otherwise keep opening captures after the daemon had stopped its
+    /// collectors. This proves nothing about the listener's threads or its
+    /// `tcpdump` child: those are detached and run until process exit, and the
+    /// abort reaches only the oneshot bridge in front of them.
+    ///
+    /// Dies under: awaiting a bare `JoinHandle` (dropping one detaches the task).
+    #[tokio::test]
+    async fn aborting_the_supervisor_aborts_the_capture_it_awaits() {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+
+        /// Set when the capture task's future is dropped — which an abort does.
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Release);
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let capture_dropped = Arc::new(AtomicBool::new(false));
+        let task = {
+            let (started, capture_dropped) = (started.clone(), capture_dropped.clone());
+            tokio::spawn(async move {
+                supervise_on_iface(
+                    "topology",
+                    TEST_PATROL,
+                    || async { Some("en0".to_string()) },
+                    move |_iface| {
+                        started.store(true, Release);
+                        let guard = SetOnDrop(capture_dropped.clone());
+                        // A patrol: never ends on its own.
+                        Ok(tokio::spawn(async move {
+                            let _guard = guard;
+                            std::future::pending::<()>().await;
+                        }))
+                    },
+                )
+                .await;
+            })
+        };
+
+        wait_until("the capture to start", || started.load(Acquire)).await;
+        tokio::time::sleep(TEST_PATROL * 5).await;
+        assert!(
+            !capture_dropped.load(Acquire),
+            "a running capture is left alone"
+        );
+
+        task.abort();
+        wait_until("the capture to be aborted with its supervisor", || {
+            capture_dropped.load(Acquire)
+        })
+        .await;
     }
 
     /// A config whose only deviations from the shipped defaults are the ones the
