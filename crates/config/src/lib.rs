@@ -9,6 +9,10 @@ use types::ProbingTier;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub db_path: String,
+    /// How long the record at `db_path` keeps its sample rows. Absent: keep
+    /// forever (realm net-observer, node #130).
+    #[serde(default)]
+    pub record: RecordCfg,
     pub blob_dir: String,
     /// Unix-domain socket the daemon binds and the bar connects to for live status.
     pub socket_path: String,
@@ -33,6 +37,40 @@ pub struct Config {
     pub probing: ProbingCfg,
     /// Parameters of the manual actions the control path can run. Gates nothing.
     pub acting: ActingCfg,
+}
+
+/// Retention of the record's sample tables: the mechanism only — the POLICY
+/// (how long to keep) is the owner's, and the default changes nothing (realm
+/// net-observer, node #130).
+///
+/// The daemon prunes at startup and then once a day: every row of each named
+/// table whose `ts_us` is older than `retention_days` is deleted. The names
+/// are checked against the store's own list of sample tables, never
+/// interpolated as given, so config can name nothing else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordCfg {
+    /// Days of samples to keep; `0` (the default) keeps forever and runs no
+    /// prune at all.
+    #[serde(default)]
+    pub retention_days: u32,
+    /// The tables the prune touches. Default: `connection_sample` alone — one
+    /// row per flow key per tick, an order of magnitude more than any other
+    /// table; the owner widens the list by config.
+    #[serde(default = "default_retention_tables")]
+    pub retention_tables: Vec<String>,
+}
+
+impl Default for RecordCfg {
+    fn default() -> Self {
+        RecordCfg {
+            retention_days: 0,
+            retention_tables: default_retention_tables(),
+        }
+    }
+}
+
+fn default_retention_tables() -> Vec<String> {
+    vec!["connection_sample".to_string()]
 }
 
 /// The probing tier at startup. Applied once, when the daemon boots, and
@@ -298,6 +336,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             db_path: "/var/lib/observer/observer.duckdb".into(),
+            record: RecordCfg::default(),
             blob_dir: "/var/lib/observer/blobs".into(),
             socket_path: "/var/lib/observer/observer.sock".into(),
             socket_mode: 0o666,
@@ -744,6 +783,59 @@ mod tests {
             Config::load(Some(p.to_str().unwrap())).is_err(),
             "an unknown tier is an error, never a silent fall-back"
         );
+    }
+    /// Keep forever when nothing is configured — the default changes nothing
+    /// — with `connection_sample` the one table a widening starts from; a
+    /// `[record]` section sets the days and may widen or replace the list
+    /// (realm net-observer, node #130).
+    #[test]
+    fn record_retention_defaults_to_keep_forever_and_reads_from_toml() {
+        let c = Config::load(None).unwrap();
+        assert_eq!(c.record.retention_days, 0);
+        assert_eq!(c.record.retention_tables, ["connection_sample"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        // The section without the list: the days land, the list keeps its
+        // default.
+        std::fs::write(&p, "[record]\nretention_days = 30\n").unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert_eq!(c.record.retention_days, 30);
+        assert_eq!(c.record.retention_tables, ["connection_sample"]);
+
+        std::fs::write(
+            &p,
+            "[record]\nretention_days = 90\n\
+             retention_tables = [\"connection_sample\", \"proxy_sample\"]\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert_eq!(c.record.retention_days, 90);
+        assert_eq!(
+            c.record.retention_tables,
+            ["connection_sample", "proxy_sample"]
+        );
+
+        // A config from before the section keeps loading, on keep-forever.
+        std::fs::write(&p, "[collectors.link]\ninterval = \"5s\"\n").unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert_eq!(c.record.retention_days, 0);
+    }
+    /// The shipped example loads and mirrors the defaults, with every root
+    /// key still at the root: a `[section]` header placed above one would
+    /// silently claim it.
+    #[test]
+    fn the_example_config_loads_and_mirrors_the_defaults() {
+        let p = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../net-observer.example.toml"
+        );
+        let c = Config::load(Some(p)).unwrap();
+        assert_eq!(c.db_path, "/var/lib/observer/observer.duckdb");
+        assert_eq!(c.blob_dir, "/var/lib/observer/blobs");
+        assert_eq!(c.socket_path, "/var/lib/observer/observer.sock");
+        assert_eq!(c.record.retention_days, 0);
+        assert_eq!(c.record.retention_tables, ["connection_sample"]);
     }
     #[test]
     fn control_uids_can_be_set_via_toml() {

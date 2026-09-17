@@ -294,3 +294,28 @@ CREATE TABLE IF NOT EXISTS experiment (
 ALTER TABLE experiment ADD COLUMN IF NOT EXISTS freeze_start_dir VARCHAR;
 ALTER TABLE experiment ADD COLUMN IF NOT EXISTS freeze_end_dir VARCHAR;
 "#;
+
+/// The record's SAMPLE tables — the ones that take a row per tick (or per
+/// event, or per scan slice) and grow without bound, and therefore the only
+/// ones [`crate::Store::prune_older_than`] will touch (realm net-observer,
+/// node #130). Every table here has a `ts_us` column the prune cuts on.
+///
+/// Deliberately NOT here: `incident`, `blob_ref`, `trigger_fired` (the
+/// evidence a prune exists to protect), `observing_edge` / `probing_edge`
+/// (the brackets that make a silence attributable — pruning them would turn a
+/// recorded pause into an unexplained gap), `neighbor_scan` (the record of the
+/// daemon having spoken on the segment), `experiment`, and the keyed entity
+/// tables (`neighbor*`, `topology_link`), which hold one row per thing seen
+/// and do not grow per tick.
+pub const SAMPLE_TABLES: &[&str] = &[
+    "link_sample",
+    "proxy_sample",
+    "dns_sample",
+    "route_event",
+    "host_sample",
+    "wifi_sample",
+    "air_sample",
+    "air_ap",
+    "neighbor_sample",
+    "connection_sample",
+];

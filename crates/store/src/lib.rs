@@ -6,6 +6,7 @@ mod schema;
 pub use duckdb_store::{
     DuckdbStore, ExperimentRecord, NeighborPort, NeighborScan, NeighborVuln, QueryTable, StoreError,
 };
+pub use schema::SAMPLE_TABLES;
 use types::{
     BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, TopologyLifetime,
     TopologyLink, TriggerFired,
@@ -105,4 +106,12 @@ pub trait Store {
         p: &diagnosis::PreparedSql,
         budget: std::time::Duration,
     ) -> Result<QueryTable, StoreError>;
+    /// Delete every row of `table` whose `ts_us` is older than `cutoff_us`,
+    /// returning how many went — the record's retention mechanism (realm
+    /// net-observer, node #130). `table` must be one of [`SAMPLE_TABLES`]:
+    /// any other name is [`StoreError::NotPrunable`], and the name reaches
+    /// the SQL only as the allow-list's own literal, never as given — the
+    /// list comes from config. A prune that deleted rows also runs
+    /// `CHECKPOINT`, since DuckDB frees the rows' blocks for reuse only then.
+    fn prune_older_than(&self, table: &str, cutoff_us: i64) -> Result<u64, StoreError>;
 }

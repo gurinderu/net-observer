@@ -40,6 +40,22 @@ socket_mode = 0o666
 # Env override: NET_OBSERVER_CONTROL_UIDS="[501,502]"
 # control_uids = [501]
 
+# Retention of the record's sample tables in `db_path` (realm net-observer,
+# node #130). No table is pruned unless this says so: `retention_days = 0`
+# (the default) keeps forever. Set it and the daemon deletes, at startup and
+# then once a day, every row of each table in `retention_tables` whose `ts_us`
+# is older than that many days. Only sample tables can be named (link_sample,
+# proxy_sample, dns_sample, route_event, host_sample, wifi_sample, air_sample,
+# air_ap, neighbor_sample, connection_sample); any other name is refused and
+# logged, never touched. Measured on the owner's Mac 2026-09-17:
+# connection_sample takes one row per flow key per 15 s tick, ~3.3 k rows/hour
+# (~80 k rows/day) — the whole file grew ~1.3 MB/day before that collector and
+# ~8 MB/day is the estimate with it — which is why it is the one table pruned
+# by default; widen the list here if the rest should follow.
+[record]
+retention_days = 0
+retention_tables = ["connection_sample"]
+
 # The `link` collector probes the local network path: default gateway
 # reachability, a direct TCP connectivity check, DHCP/ARP facts and Wi-Fi SSID.
 [collectors.link]

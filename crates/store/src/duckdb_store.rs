@@ -1,4 +1,8 @@
-use crate::{Store, diagnosis::PreparedSql, schema::SCHEMA_SQL};
+use crate::{
+    Store,
+    diagnosis::PreparedSql,
+    schema::{SAMPLE_TABLES, SCHEMA_SQL},
+};
 use duckdb::{Connection, InterruptHandle, params};
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -107,6 +111,11 @@ pub enum StoreError {
     /// The message is the panic's own payload.
     #[error("store panicked under its connection lock: {0}")]
     Panicked(String),
+    /// [`Store::prune_older_than`] was asked for a table that is not one of
+    /// the record's sample tables ([`SAMPLE_TABLES`]) — a config typo, or a
+    /// table whose rows a prune must never touch. Nothing was run.
+    #[error("`{table}` is not a sample table of the record; nothing pruned")]
+    NotPrunable { table: String },
 }
 
 pub struct DuckdbStore {
@@ -864,6 +873,30 @@ impl Store for DuckdbStore {
                 }
                 other => other,
             }
+        })
+    }
+
+    fn prune_older_than(&self, table: &str, cutoff_us: i64) -> Result<u64, StoreError> {
+        // The name that reaches the SQL is the allow-list's own literal, found
+        // by equality — the configured string itself is never interpolated
+        // (realm net-observer, node #130).
+        let Some(table) = SAMPLE_TABLES.iter().copied().find(|t| *t == table) else {
+            return Err(StoreError::NotPrunable {
+                table: table.to_string(),
+            });
+        };
+        self.with_conn(|conn| {
+            let deleted = conn.execute(
+                &format!("DELETE FROM {table} WHERE ts_us < ?"),
+                params![cutoff_us],
+            )?;
+            // DuckDB keeps a deleted row's blocks until the next checkpoint;
+            // nothing else in this store checkpoints, so a prune that freed
+            // rows asks for one here rather than waiting for the WAL to fill.
+            if deleted > 0 {
+                conn.execute_batch("CHECKPOINT")?;
+            }
+            Ok(deleted as u64)
         })
     }
 }
@@ -2871,5 +2904,120 @@ mod tests {
             s.query_table("SELECT 4").unwrap().rows,
             vec![vec!["4".to_string()]]
         );
+    }
+
+    /// One flow-table tick with `n` aggregate rows at `ts_us`.
+    fn connections_tick(ts_us: i64, n: u32) -> Sample {
+        use types::{ConnectionsSample, ConnectionsVerdict};
+        Sample::Connections(ConnectionsSample {
+            ts_us,
+            verdict: ConnectionsVerdict::Ok,
+            rows: (0..n)
+                .map(|i| connection_row(Some(&format!("host-{i}")), None, None, 1))
+                .collect(),
+        })
+    }
+
+    fn host_tick(ts_us: i64) -> Sample {
+        Sample::Host(types::HostSample {
+            ts_us,
+            load1: 1.0,
+            load5: 1.0,
+            load15: 1.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        })
+    }
+
+    /// The prune cuts strictly BEFORE the cutoff, on the named table only, and
+    /// returns exactly the rows it deleted — the count the daemon logs. The
+    /// deleting path also runs the checkpoint (realm net-observer, node #130).
+    #[test]
+    fn prune_deletes_only_the_named_tables_rows_before_the_cutoff_and_counts_them() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&connections_tick(1000, 2)).unwrap();
+        s.write_sample(&connections_tick(2000, 1)).unwrap();
+        s.write_sample(&connections_tick(3000, 1)).unwrap();
+        s.write_sample(&host_tick(1000)).unwrap();
+
+        assert_eq!(s.prune_older_than("connection_sample", 2000).unwrap(), 2);
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM connection_sample")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT min(ts_us) FROM connection_sample")
+                .unwrap(),
+            2000,
+            "the row AT the cutoff stays"
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM host_sample")
+                .unwrap(),
+            1,
+            "a table the prune was not asked about is untouched"
+        );
+        // Nothing left before the cutoff: a second pass deletes nothing and
+        // says so.
+        assert_eq!(s.prune_older_than("connection_sample", 2000).unwrap(), 0);
+        // The store is still whole after the checkpoint the first pass ran.
+        s.write_sample(&connections_tick(4000, 1)).unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM connection_sample")
+                .unwrap(),
+            3
+        );
+    }
+
+    /// A name outside the allow-list — an evidence table, a bracket table, a
+    /// typo, an injection — is refused before any SQL runs, and the refusal
+    /// names the table. The record is exactly as it was.
+    #[test]
+    fn prune_refuses_a_table_that_is_not_a_sample_table() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.open_incident(&types::Incident {
+            id: "gw-drop-1".into(),
+            opened_us: 10,
+            closed_us: None,
+            trigger_id: "gw-drop".into(),
+            signature: "gw=FAIL".into(),
+        })
+        .unwrap();
+        for name in [
+            "incident",
+            "observing_edge",
+            "probing_edge",
+            "trigger_fired",
+            "neighbor",
+            "connection_sample; DROP TABLE incident",
+            "CONNECTION_SAMPLE",
+            "",
+        ] {
+            match s.prune_older_than(name, i64::MAX) {
+                Err(StoreError::NotPrunable { table }) => assert_eq!(table, name),
+                other => panic!("`{name}` must be refused, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM incident").unwrap(),
+            1
+        );
+    }
+
+    /// Every allow-listed name is a real table with a `ts_us` column: a prune
+    /// on each runs, so a table renamed in the schema without the list
+    /// following it fails here rather than in the daemon's log.
+    #[test]
+    fn every_sample_table_is_prunable() {
+        let s = DuckdbStore::in_memory().unwrap();
+        for table in SAMPLE_TABLES {
+            assert_eq!(
+                s.prune_older_than(table, i64::MAX)
+                    .unwrap_or_else(|e| panic!("{table}: {e}")),
+                0
+            );
+        }
     }
 }
