@@ -42,6 +42,7 @@ flowchart LR
         dns["dns\nInterval"]
         host["host\nInterval"]
         conns["connections\nInterval (Clash API)"]
+        sblog["singbox-log\nInterval (log tail)"]
         evt["route-events\nEvent (PF_ROUTE)"]
         announce["announce\nEvent (tcpdump pcap pipe)"]
     end
@@ -51,6 +52,7 @@ flowchart LR
     dns -- "Sample::Dns" --> stream
     host -- "Sample::Host" --> stream
     conns -- "Sample::Connections" --> stream
+    sblog -- "Sample::SingboxLog (per class seen)" --> stream
     evt -- "Sample::Route (event)" --> stream
     announce -- "Sample::Neighbors (every 15s)" --> stream
 
@@ -151,6 +153,29 @@ flowchart LR
   (`DiagnosticQuery::Connections`, `net-observer-cli connections --by …`)
   rather than carried on the status snapshot (realm net-observer, nodes #75,
   #127).
+- **`singbox-log`** — what sing-box itself says. Under the passive tier the
+  daemon records `SKIP` for the proxy and cannot say why the network died
+  through sing-box; sing-box's own log (`/var/log/sing-box.log`, launchd's
+  stdout/stderr file, world-readable, rotated in place by a launchd agent —
+  realm net-observer, node #140) is the one place its dial failures and its
+  "missing default interface" are written. The collector tails it from its
+  end each tick (`collector-singbox-log`: `LogTail` reads the bytes appended
+  since the last tick, keeps a partial trailing line, follows a rotation by
+  reopening from the new file's start and counts it), keeps the ERROR/WARN
+  lines by a byte scan for the level token before parsing anything (the log
+  is DEBUG-level and large), strips the ANSI colours, parses the line
+  (`<offset> <date> <time> <LEVEL> [<conn-id> <duration>]? <component>[<tag>]?:
+  <message>`) and classes it by the observed vocabulary (`no-route`,
+  `unreachable`, `dial-timeout`, `canceled`, `no-default-iface`,
+  `dns-servers-failed`, `dns-exchange-failed`, `dns-bad-packet`,
+  `icmp-reply-timeout`, `stream-closed`, `icmp-unsupported`, else `other`),
+  folding the tick into one `Sample::SingboxLog` per `(class, node)` with its
+  count and the first message. A tick with no such line writes **nothing**
+  (the absence of errors is the healthy state; the tick is evidenced by the
+  other collectors); a tick on which the log could not be read writes one
+  `unreadable` row with count 0 and the I/O error — SKIP's spirit. Reads a
+  local file and sends nothing, so it runs under both probing tiers (realm
+  net-observer, node #141).
 - **TriggerEngine** — rules ported from the oracle and grown since: `wedge`,
   `gw-drop`, `gw-change` (unconditional pcap freeze on any gateway change),
   `roam` (three identity axes — a BSSID hop, a Wi-Fi channel hop (the router
@@ -166,7 +191,17 @@ flowchart LR
   `endpoint-block` (whole upstream fleet dead from the underlay while the
   direct reference answers), `established-stall` (a held long-lived stream
   through the tunnel stops carrying while fresh probes succeed; the direct
-  underlay stream's fate scopes the verdict), `starvation`. Each fires at most
+  underlay stream's fate scopes the verdict), `singbox-no-route` (three or
+  more `no-route` / `unreachable` / `no-default-iface` lines of sing-box's own
+  log within a minute while the newest link sample still holds a DHCP router
+  with an `OK` or `SKIP` gateway — the OS has a network and sing-box cannot
+  see it; `NOGW`/`FAIL` are `gw-drop`'s), `singbox-dial-timeout` (three or
+  more `dial-timeout` lines through one node within a minute while every
+  measured endpoint of the newest proxy tick answers raw TCP — the window
+  cannot map a node to its endpoint, so the gate is the whole fleet and the
+  detail says so; both clear after two link ticks with no such line, the link
+  collector being the tick clock since the reader writes nothing on a quiet
+  tick; realm net-observer, node #141), `starvation`. Each fires at most
   once per 5 min (backoff) — except `roam`, which has no backoff so that each
   hop at the field cadence is its own incident (hops on consecutive ticks
   merge into one under the engine's latch; the rows still record both) — and
@@ -404,6 +439,7 @@ graph TD
     cwifi["collector-wifi\nWifiFacts, build_wifi_sample,\nWifiCollector, META (Interval)"]
     cconns["collector-connections\nConnectionFacts, build_connections_sample,\nConnectionsCollector, META (Interval)"]
     cannounce["collector-announce\npcap stream + ARP/mDNS/SSDP/DHCP decoders,\nAnnounceSource, AnnounceCollector, META (Event)"]
+    csblog["collector-singbox-log\nLogTail, parse_line, classify, fold_lines,\nSingboxLogCollector, META (Interval)"]
     triggers["triggers\nCondition/Handler/Trigger, engine"]
     config["config\nfigment per-subsystem toggles"]
     macos["macos\nreal adapters: ICMP, IP_BOUND_IF,\nClash API, DHCP/ARP, pcap ring,\nDNS resolve, PF_ROUTE, loadavg"]
@@ -423,6 +459,7 @@ graph TD
     ccore --> cwifi
     ccore --> cconns
     ccore --> cannounce
+    ccore --> csblog
     types --> clink
     types --> cproxy
     types --> cdns
@@ -430,6 +467,7 @@ graph TD
     types --> chost
     types --> cconns
     types --> cannounce
+    types --> csblog
 
     ccore --> macos
     clink --> macos
@@ -449,6 +487,7 @@ graph TD
     croute --> net-observerd
     chost --> net-observerd
     cconns --> net-observerd
+    csblog --> net-observerd
     macos --> net-observerd
     store --> net-observerd
     triggers --> net-observerd
@@ -474,7 +513,10 @@ graph TD
   depends on `types` + `collector-core` and holds its port trait (`LinkFacts` /
   `ProxyFacts` / `DnsFacts` / `HostFacts` / `WifiFacts` / `ConnectionFacts`),
   the pure `build_*` mapping logic (unit-tested with fakes), a static `META`,
-  and the `Collector` impl.
+  and the `Collector` impl. `collector-singbox-log` is an `Interval` collector
+  with no adapter in `macos`: its port is the `TailSource` trait over the
+  crate's own `LogTail` (a plain file tail — nothing platform-specific), and
+  its pure logic is `parse_line` / `classify` / `fold_lines`.
 - `collector-route` is the first **Event**-cadence collector: it wraps a
   `Box<dyn EventSource>` (the real PF_ROUTE source lives in `macos`) and reports
   `Source::Event`; `net-observerd` drives its blocking `next()` loop on a dedicated
@@ -654,6 +696,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `host_sample` | `ts_us, load1, load5, load15, disk_used_pct, disk_free_mb, swap_used_mb` | Host load averages — the `starvation` discriminator — plus the usage of the volume holding the record (`disk_used_pct` as `df` computes capacity, `disk_free_mb` what a writer can still take, in MiB) and the swap in use in MiB: the ENOSPC and memory-pressure discriminators the shell oracle carried. A store write that fails for want of space is logged as a gap; these columns let the record name the cause. NULL = not measured, never a zero. |
 | `wifi_sample` | `ts_us, wifi, reason, rssi_dbm, noise_dbm, snr_db, tx_rate_mbps, phy_mode, channel, channel_width_mhz, channel_band` | Wi-Fi air quality from CoreWLAN. `rssi_dbm`/`noise_dbm` are the raw pair and `snr_db` is derived (`rssi - noise`), so the derivation can be revisited from the columns actually measured. `wifi = SKIP` with a `reason` when the radio could not be read (no interface, powered off, not associated) — a row every tick, never an absent one. No SSID/BSSID: macOS gates them behind Location Services, which a LaunchDaemon cannot obtain. |
 | `connection_sample` | `ts_us, verdict, host, dst_ip, dst_port, process, network, chain, count, upload, download` | What this machine talks to: the live flows sing-box's Clash API lists (`GET /connections`, realm net-observer, node #127), aggregated per tick by `(host, dst_ip, dst_port, process, network, chain)` — `count` flows shared the key, `upload`/`download` their bytes summed. `host` is the name asked for (a sniffed SNI is whatever the client put there), `dst_ip` the real destination (NULL when the proxy resolves the name on the far side), `process` the client's executable name, `chain` the outbound that actually carried the flow — the first element of the Clash API's `chains` (sing-box lists them node-first; the last is the constant top-level selector). One row per aggregate row per tick with the tick's `verdict` on each; a tick with no rows — the API did not answer (`SKIP`) or it listed nothing (`OK`) — writes ONE row with every key column NULL, so "could not look" and "nothing is talking" are different rows and neither is an absent tick (realm net-observer, node #75). |
+| `singbox_log_sample` | `ts_us, class, count, node, sample_message` | What sing-box itself says: its ERROR/WARN lines, read passively from its own log (`/var/log/sing-box.log`, realm net-observer, node #140) and classed — one row per `(class, node)` per tick of the `singbox-log` collector, `count` lines of that class in the tick, `node` the outbound the line names (`using outbound/vless[<node>]`; NULL when it names none), `sample_message` the first such line, ANSI stripped, at most 200 characters. `class` is the kebab-case token of `types::SingboxLogClass` (`no-route`, `unreachable`, `dial-timeout`, `canceled`, `no-default-iface`, `dns-servers-failed`, `dns-exchange-failed`, `dns-bad-packet`, `icmp-reply-timeout`, `stream-closed`, `icmp-unsupported`, `other`, `unreadable`). A tick with no ERROR/WARN line writes NO row — the absence of errors is the healthy state, evidenced by the other collectors' rows for that tick; a tick on which the log could not be read writes one `unreadable` row with `count` 0 and the I/O error as its message, so a stretch where the reader could not look is never read as "no errors" (realm net-observer, node #141). |
 | `neighbor_sample` | `ts_us, network_key, iface, verdict, reason, neighbor_count, heard_frames, own_frames, dropped_obs` | One row per neighbour reading — a neighbour-cache tick, an operator-pressed scan, or an `announce` listener flush — including its `SKIP`s. `heard_frames` / `own_frames` are the listener's counts for the window it flushed: every frame the capture delivered and, of those, the frames this machine itself sent that match the capture filter — the OS's own traffic and, during an operator-pressed scan, the sweep's ARP and the mDNS browse; never the periodic probes (ICMP, TCP and DNS do not pass the filter) — recognised by the interface's own MAC as read at that window's start, counted and never recorded as a neighbour. The count says the listener saw itself and ignored it, nothing more; the passivity proof stays the frozen pcap slice (realm net-observer, node #88). Both NULL on a cache tick or a scan, never a zero: `heard_frames = 0` is a window in which the segment said nothing, and `own_frames` NULL under a non-NULL `heard_frames` is a window whose own MAC could not be read, so nothing was dropped as ours. `dropped_obs` is how many observations that window refused — a sighting past the 512-device cap, an address or service past its per-device cap, a DHCP name past the pending cap, a service a Sleep Proxy announced on a sleeper's behalf — NULL exactly when `heard_frames` is, `0` when nothing was refused; a flush that refused anything is also warned about in the log and carries `dropped=<n>` on its bus line. The neighbour entity tables (`neighbor`, `neighbor_scan`, `neighbor_port`, `neighbor_vuln`) are documented in `crates/store/src/schema.rs`; `neighbor.source` now also takes `announce` — the device said so itself (realm net-observer, node #92). |
 | `neighbor_service` | `network_key, mac, ip, service, kind, detail, first_seen_us, last_seen_us` | A service a neighbour announced, heard passively by the `announce` listener. Keyed by `(network_key, mac, service)` with first/last seen like `neighbor_port`, so an announcement repeated every few seconds is one row: "this device has been announcing `_companion-link._tcp` since X". `service` is what was announced (an mDNS service type, an SSDP notification type, a DHCP role — `dhcp-server`, `vendor-class`), `kind` which protocol carried it (`mdns` / `ssdp` / `dhcp`), `detail` the specifics that came with it (the mDNS instance name, the SSDP `SERVER` string, the DHCP message type or vendor class), `ip` the address it was announced from (NULL for a DHCP client still without one). A later sighting that carries no `ip` or `detail` keeps the ones already learned. |
 | `incident` | `id PK, opened_us, closed_us, trigger_id, signature` | Open incident ⇒ `closed_us IS NULL`. |
@@ -699,7 +742,7 @@ carries, lives in `types` for the same reason.
 
 | Query | Answers |
 | --- | --- |
-| `verdict_at(ts_us)` | every layer's state at a moment, plus the `layer` the record blames |
+| `verdict_at(ts_us)` | every layer's state at a moment, plus the `layer` the record blames — and, as its last column `singbox_log`, what sing-box's own log said within ±30 s of the moment: one line per `singbox_log_sample` row, `<class> ×<count> via <node> at <RFC3339>`, newest first, at most five, NULL when the log said nothing then (an `unreadable` row IS listed, so "could not read the log" never reads as silence); the CLI's `why` prints each as a `sing-box log` line between the measurements and the verdict (realm net-observer, node #141) |
 | `incident_context()` | for each incident, the layer state at or just before it opened |
 | `wedge_vs_starvation()` | episodes of ticks whose tun answered anything but 204 (`0` = a silent probe, a captive portal's 200, a 5xx), each named `link` / `vless` / `starvation` / `wedge` / `unknown` |
 | `gw_drops()` | the first link sample of each run of `FAIL`/`NOGW` (`SKIP` ticks removed first, so a quiet run cannot manufacture an edge) |
