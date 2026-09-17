@@ -25,23 +25,47 @@
 //! tick's verdict, because "the API did not answer" (`SKIP`) and "nothing is
 //! talking" (`OK`) are different answers and the daemon keeps them apart. The
 //! tick is dated absolutely above the rows, so the reader knows which moment
-//! the picture is of rather than taking it for now.
+//! the picture is of rather than taking it for now. The rows are a
+//! [`uniform_list`], as the event log's are: an `ip:port` tick from one browser
+//! runs to dozens of groups, and a plain column would lay the rest out past the
+//! window's bottom edge, where gpui paints nothing.
+
+use std::ops::Range;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyWindowHandle, App, AsyncApp, Context, Entity, SharedString, TitlebarOptions, Window,
-    WindowBounds, WindowHandle, WindowKind, WindowOptions, div, px, rgb, size,
+    AnyWindowHandle, App, AsyncApp, Context, Entity, ScrollStrategy, SharedString, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions, div,
+    px, rgb, size, uniform_list,
 };
 
 use net_observer_ipc::Table;
 use types::ConnectionsGroupBy;
 
-use crate::ui::{Dating, Glance, PROVENANCE_TEXT, Theme, dated, separator};
+use crate::ui::{Dating, Glance, Theme, dated, note, separator};
 
 /// Initial size of the connections window (resizable afterwards), gpui logical
-/// px — the map's.
-const WIN_W: f32 = 360.0;
+/// px. Wider than the map's default by exactly what the table needs: the
+/// column widths below plus the section's `px_3` padding, so an `ip:port` row
+/// keeps its port and its hosts at the size the window first opens at.
+const WIN_W: f32 = 440.0;
 const WIN_H: f32 = 320.0;
+
+/// The columns, in gpui logical px. `key` is the widest thing a row must show
+/// **without losing a character** — the grouping is the point of the row, and
+/// under `ip:port` the port sits at its tail, exactly where an ellipsis would
+/// land — so it is floored at a bracketed v6 address with its port and never
+/// shrinks; `hosts` is the column that gives way. The count and the two byte
+/// columns are fixed at their widest figure (`999.9 KB`).
+const KEY_MIN_W: f32 = 170.0;
+const FLOWS_W: f32 = 40.0;
+const BYTES_W: f32 = 56.0;
+const HOSTS_MIN_W: f32 = 80.0;
+/// The section's horizontal padding (`px_3` on both sides).
+const SIDE_PAD: f32 = 24.0;
+// The default window fits the whole row: a window that opened too narrow for
+// its own table would cut the hosts column at the edge on first sight.
+const _: () = assert!(WIN_W >= SIDE_PAD + KEY_MIN_W + FLOWS_W + 2.0 * BYTES_W + HOSTS_MIN_W);
 
 /// How many names the `hosts` cell spells out before summarising the rest as
 /// `+N`: a group by address can sit behind dozens of names, and the row is one
@@ -59,22 +83,30 @@ fn group_label(group_by: ConnectionsGroupBy) -> &'static str {
     }
 }
 
+/// Whether the `hosts` column is drawn under `group_by`: under `host` it would
+/// repeat the key on every row, so it is not.
+fn shows_hosts(group_by: ConnectionsGroupBy) -> bool {
+    group_by != ConnectionsGroupBy::Host
+}
+
 /// A byte count as a reader-sized figure: `999 B`, `12.3 KB`, `4.0 MB` —
-/// decimal units, one decimal above bytes. Pure, so the spelling is a testable
-/// fact.
+/// decimal units, one decimal above bytes. The unit is picked AFTER rounding:
+/// a figure that would print as `1000.0 KB` is `1.0 MB`. Pure, so the spelling
+/// is a testable fact.
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1000.0;
+    let mut unit = 1;
+    // Anything at or above 999.95 rounds to `1000.0` at one decimal, which is
+    // `1.0` of the next unit — unless there is no next unit.
+    while value >= 999.95 && unit < UNITS.len() - 1 {
         value /= 1000.0;
         unit += 1;
     }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 /// A byte cell of the table as the row draws it: the figure, or `-` for a cell
@@ -191,6 +223,13 @@ fn tick_rows(table: &Table) -> Result<Tick, String> {
     Ok(Tick::Flows { ts_us: ts, rows })
 }
 
+/// The daemon's answer, reduced to what the window draws — or the words for
+/// why there is none: the daemon's own ([`crate::ui::fetch_connections`]), or
+/// a table whose shape this window cannot read ([`tick_rows`]).
+fn reduce(answer: Result<Table, String>) -> Result<Tick, String> {
+    answer.and_then(|table| tick_rows(&table))
+}
+
 /// The line that dates the picture: the tick's moment, absolutely — the
 /// reading is presented, so it gets the clock rather than an age (see the
 /// vocabulary rule in `ui::parts`). A tick with no usable stamp says so rather
@@ -223,146 +262,87 @@ fn empty_line(verdict: &str) -> String {
 /// The words for a table with no tick at all.
 const NO_TICK: &str = "no connections tick in the record";
 
-/// A one-line state under a selector, so a headless test asserts what the
-/// window says rather than only that it said something. The caller picks the
-/// ink: warn for an absence the daemon caused, muted for one that is simply
-/// the state of the record.
-fn note(
-    base: gpui::Div,
-    selector: String,
-    message: impl Into<String>,
-    color: u32,
-) -> gpui::AnyElement {
-    let message: String = message.into();
-    base.child(
-        div()
-            .debug_selector(move || selector)
-            .py_1()
-            .text_size(px(11.0))
-            .text_color(rgb(color))
-            .child(message),
-    )
-    .into_any_element()
-}
+/// The words shown before the first read returns.
+const PENDING: &str = "connections not read yet";
 
-/// The muted provenance line above the rows or the empty note.
-fn provenance_line(line: String, theme: Theme) -> impl IntoElement {
+/// The header over the rows, on the same column widths as [`flow_row`]. The
+/// key and hosts cells carry selectors: the rows are built lazily and carry
+/// only their key, so the header is where a headless test reads the columns'
+/// widths and which of them are drawn.
+fn header_row(show_hosts: bool, theme: Theme) -> impl IntoElement {
     div()
+        .flex()
+        .w_full()
         .pb_1()
-        .text_size(px(PROVENANCE_TEXT))
+        .text_size(px(10.0))
         .text_color(rgb(theme.muted))
-        .child(line)
+        .child(
+            div()
+                .debug_selector(|| "connections-col-key".into())
+                .flex_1()
+                .min_w(px(KEY_MIN_W))
+                .flex_shrink_0()
+                .child("key"),
+        )
+        .child(div().w(px(FLOWS_W)).flex_shrink_0().child("flows"))
+        .child(div().w(px(BYTES_W)).flex_shrink_0().child("up"))
+        .child(div().w(px(BYTES_W)).flex_shrink_0().child("down"))
+        .children(show_hosts.then(|| {
+            div()
+                .debug_selector(|| "connections-col-hosts".into())
+                .flex_1()
+                .min_w(px(HOSTS_MIN_W))
+                .child("hosts")
+        }))
 }
 
-/// The body: the table as rows under a header, or the words for why there are
-/// none — rendered from the window's last `DiagnosticQuery::Connections`
-/// answer (see [`ConnectionsView::spawn_fetch`]).
-fn body(
-    table: Option<&Result<Table, String>>,
-    group_by: ConnectionsGroupBy,
-    theme: Theme,
-) -> gpui::AnyElement {
-    let base = div().flex().flex_col().px_3().py_2();
-    let table = match table {
-        None => {
-            return note(
-                base,
-                "connections-pending".to_string(),
-                "connections not read yet",
-                theme.muted,
-            );
-        }
-        Some(Err(why)) => {
-            return note(
-                base,
-                format!("connections-error:{why}"),
-                format!("connections unavailable: {why}"),
-                theme.warn,
-            );
-        }
-        Some(Ok(table)) => table,
-    };
-    let now = crate::ui::now_us();
-    let (ts_us, rows) = match tick_rows(table) {
-        Err(why) => {
-            return note(
-                base,
-                format!("connections-error:{why}"),
-                format!("connections unavailable: {why}"),
-                theme.warn,
-            );
-        }
-        Ok(Tick::Absent) => {
-            return note(base, "connections-empty".to_string(), NO_TICK, theme.muted);
-        }
-        Ok(Tick::Empty { ts_us, verdict }) => {
-            return note(
-                base.child(provenance_line(tick_line(ts_us, now), theme)),
-                "connections-empty".to_string(),
-                empty_line(&verdict),
-                theme.muted,
-            );
-        }
-        Ok(Tick::Flows { ts_us, rows }) => (ts_us, rows),
-    };
-
-    let mut list = div().flex().flex_col().w_full();
-    list = list.child(
+/// One row of the table. Single-line and uniform-height, which is what the
+/// [`uniform_list`] requires.
+///
+/// `use<>` (capture nothing) is load-bearing, as it is for the event log's row:
+/// every cell is *cloned* out of `row`, so the element holds no borrow of the
+/// view — but without precise capturing the opaque type would still carry
+/// `row`'s lifetime, and the `uniform_list` closure cannot return elements tied
+/// to the view it was handed.
+fn flow_row(row: &FlowRow, show_hosts: bool, theme: Theme) -> impl IntoElement + use<> {
+    // Test handle only: the selector carries the key, so a headless test can
+    // assert which groups were drawn.
+    let selector = format!("connections-row:{}", row.key);
+    let hosts = show_hosts.then(|| {
         div()
-            .flex()
-            .w_full()
-            .pb_1()
-            .text_size(px(10.0))
+            .flex_1()
+            .min_w(px(HOSTS_MIN_W))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
             .text_color(rgb(theme.muted))
-            .child(div().flex_1().min_w(px(80.0)).child("key"))
-            .child(div().w(px(40.0)).flex_shrink_0().child("flows"))
-            .child(div().w(px(56.0)).flex_shrink_0().child("up"))
-            .child(div().w(px(56.0)).flex_shrink_0().child("down"))
-            .child(div().flex_1().min_w(px(80.0)).child("hosts")),
-    );
-    list = list.child(separator(theme));
-    for row in &rows {
-        // Test handle only: the selector carries the key, so a headless test
-        // can assert which groups were drawn.
-        let selector = format!("connections-row:{}", row.key);
-        list = list.child(
+            .child(row.hosts.clone())
+    });
+    div()
+        .debug_selector(move || selector)
+        .flex()
+        .w_full()
+        .py_0p5()
+        .text_size(px(11.0))
+        .child(
             div()
-                .debug_selector(move || selector)
-                .flex()
-                .w_full()
-                .py_0p5()
-                .text_size(px(11.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(80.0))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(row.key.clone()),
-                )
-                .child(div().w(px(40.0)).flex_shrink_0().child(row.flows.clone()))
-                .child(div().w(px(56.0)).flex_shrink_0().child(row.up.clone()))
-                .child(div().w(px(56.0)).flex_shrink_0().child(row.down.clone()))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(80.0))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_color(rgb(theme.muted))
-                        .child(row.hosts.clone()),
-                ),
-        );
-    }
-
-    base.child(provenance_line(
-        caption(ts_us, now, group_by, rows.len()),
-        theme,
-    ))
-    .child(list)
-    .into_any_element()
+                .flex_1()
+                .min_w(px(KEY_MIN_W))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(row.key.clone()),
+        )
+        .child(
+            div()
+                .w(px(FLOWS_W))
+                .flex_shrink_0()
+                .child(row.flows.clone()),
+        )
+        .child(div().w(px(BYTES_W)).flex_shrink_0().child(row.up.clone()))
+        .child(div().w(px(BYTES_W)).flex_shrink_0().child(row.down.clone()))
+        .children(hosts)
 }
 
 /// The root view of the **connections window**. Holds a handle to the shared
@@ -373,11 +353,16 @@ pub(crate) struct ConnectionsView {
     /// How the daemon is asked to fold the tick. Set by the toolbar; every
     /// switch refetches.
     group_by: ConnectionsGroupBy,
-    /// The daemon's last answer to `DiagnosticQuery::Connections`: `None`
-    /// until the first read returns (and again while a switched grouping is
-    /// being read), then the table or the daemon's words for why there is
-    /// none.
-    table: Option<Result<Table, String>>,
+    /// The daemon's last answer to `DiagnosticQuery::Connections`, already
+    /// reduced to what the window draws ([`reduce`]): `None` until the first
+    /// read returns (and again while a switched grouping is being read), then
+    /// the tick or the words for why there is none. Reduced once on arrival,
+    /// not per frame, because the list renders rows by index on every scroll.
+    reading: Option<Result<Tick, String>>,
+    /// The list's scroll state — the event log's shape. Held so a switch of
+    /// the grouping can put the new table at its top rather than at wherever
+    /// the old one was scrolled to.
+    scroll: UniformListScrollHandle,
 }
 
 impl ConnectionsView {
@@ -385,7 +370,8 @@ impl ConnectionsView {
         Self {
             model,
             group_by: ConnectionsGroupBy::Host,
-            table: None,
+            reading: None,
+            scroll: UniformListScrollHandle::new(),
         }
     }
 
@@ -399,17 +385,17 @@ impl ConnectionsView {
     ///
     /// Not part of [`ConnectionsView::new`]: the open path ([`open_window`])
     /// calls it, so a headless test can build the view with an injected
-    /// `table` state that no socket read then races to overwrite.
+    /// `reading` that no socket read then races to overwrite.
     fn spawn_fetch(&self, cx: &mut Context<Self>) {
         let socket = self.model.read(cx).socket_path.clone();
         let group_by = self.group_by;
         cx.spawn(async move |view, acx: &mut AsyncApp| {
-            let table = acx
+            let answer = acx
                 .background_spawn(async move { crate::ui::fetch_connections(&socket, group_by) })
                 .await;
             view.update(acx, |v, cx| {
                 if v.group_by == group_by {
-                    v.table = Some(table);
+                    v.reading = Some(reduce(answer));
                     cx.notify();
                 }
             })
@@ -418,16 +404,19 @@ impl ConnectionsView {
         .detach();
     }
 
-    /// Switch the grouping and read the tick again under it. The old table is
-    /// dropped first: rows folded by host must not stand under the `process`
-    /// label while the new answer is on its way. A click on the grouping
-    /// already selected is not a switch; `refresh` is the button for that.
+    /// Switch the grouping and read the tick again under it. The old reading
+    /// is dropped first: rows folded by host must not stand under the `process`
+    /// label while the new answer is on its way — and the list goes back to
+    /// its top, because a scroll position into the old table means nothing in
+    /// the new one. A click on the grouping already selected is not a switch;
+    /// `refresh` is the button for that.
     fn set_group_by(&mut self, group_by: ConnectionsGroupBy, cx: &mut Context<Self>) {
         if self.group_by == group_by {
             return;
         }
         self.group_by = group_by;
-        self.table = None;
+        self.reading = None;
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.spawn_fetch(cx);
         cx.notify();
     }
@@ -437,7 +426,80 @@ impl Render for ConnectionsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
         let group_by = self.group_by;
-        let body = body(self.table.as_ref(), group_by, theme);
+        let show_hosts = shows_hosts(group_by);
+        let now = crate::ui::now_us();
+
+        // What stands above the rows — a state in words, or the caption and
+        // the header — and how many rows the list below it has. `flex_none`,
+        // because the list is the one child allowed to take the slack.
+        let head = div().flex().flex_col().flex_none().px_3().py_2();
+        let (head, count) = match &self.reading {
+            None => (
+                head.child(note("connections-pending", PENDING, theme.muted)),
+                0,
+            ),
+            Some(Err(why)) => (
+                head.child(note(
+                    "connections-error",
+                    format!("connections unavailable: {why}"),
+                    theme.warn,
+                )),
+                0,
+            ),
+            Some(Ok(Tick::Absent)) => (
+                head.child(note("connections-empty", NO_TICK, theme.muted)),
+                0,
+            ),
+            Some(Ok(Tick::Empty { ts_us, verdict })) => (
+                head.child(note(
+                    "connections-caption",
+                    tick_line(*ts_us, now),
+                    theme.muted,
+                ))
+                .child(note(
+                    "connections-empty",
+                    empty_line(verdict),
+                    theme.muted,
+                )),
+                0,
+            ),
+            Some(Ok(Tick::Flows { ts_us, rows })) => (
+                head.child(note(
+                    "connections-caption",
+                    caption(*ts_us, now, group_by, rows.len()),
+                    theme.muted,
+                ))
+                .child(header_row(show_hosts, theme))
+                .child(separator(theme)),
+                rows.len(),
+            ),
+        };
+
+        // Only the rows in `range` are ever built, from the reading the view
+        // holds — the event log's shape. No list at all when there is no row:
+        // the words above already say why.
+        let list = (count > 0).then(|| {
+            uniform_list(
+                "connections-list",
+                count,
+                cx.processor(move |this, range: Range<usize>, _window, _cx| {
+                    let Some(Ok(Tick::Flows { rows, .. })) = &this.reading else {
+                        return Vec::new();
+                    };
+                    range
+                        .filter_map(|i| rows.get(i))
+                        .map(|row| flow_row(row, show_hosts, theme))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            // Test handle only: the rows past the viewport are never built, so
+            // the list itself is what a headless test can find.
+            .debug_selector(|| "connections-list".into())
+            .track_scroll(self.scroll.clone())
+            .flex_1()
+            .px_3()
+        });
+
         div()
             .flex()
             .flex_col()
@@ -448,7 +510,8 @@ impl Render for ConnectionsView {
             .text_size(px(13.0))
             .child(toolbar(group_by, theme, cx))
             .child(separator(theme))
-            .child(body)
+            .child(head)
+            .children(list)
     }
 }
 
@@ -623,16 +686,21 @@ mod tests {
     }
 
     /// Bytes are spelled for a reader: whole bytes below a thousand, one
-    /// decimal above, decimal units.
+    /// decimal above, decimal units — and the unit is picked after rounding,
+    /// so no figure ever reads `1000.0` of anything with a unit above it.
     #[test]
     fn bytes_are_spelled_for_a_reader() {
         assert_eq!(human_bytes(0), "0 B");
         assert_eq!(human_bytes(999), "999 B");
         assert_eq!(human_bytes(1_000), "1.0 KB");
         assert_eq!(human_bytes(12_300), "12.3 KB");
+        assert_eq!(human_bytes(999_949), "999.9 KB");
+        assert_eq!(human_bytes(999_950), "1.0 MB");
         assert_eq!(human_bytes(4_000_000), "4.0 MB");
+        assert_eq!(human_bytes(999_950_000), "1.0 GB");
         assert_eq!(human_bytes(2_500_000_000), "2.5 GB");
         assert_eq!(human_bytes(7_000_000_000_000), "7.0 TB");
+        // The last unit has nothing above it to round into.
         assert_eq!(human_bytes(1_500_000_000_000_000), "1500.0 TB");
         assert_eq!(bytes_cell("5006"), "5.0 KB");
         assert_eq!(bytes_cell(""), "-");
@@ -650,6 +718,16 @@ mod tests {
         assert_eq!(hosts_cell("a,b,c,d,e,f"), "a, b, c +3");
         // A stray separator is not a name.
         assert_eq!(hosts_cell("a,,b"), "a, b");
+    }
+
+    /// The hosts column repeats the key under `host` and is dropped there;
+    /// every other grouping keeps it.
+    #[test]
+    fn the_hosts_column_is_dropped_only_under_host() {
+        assert!(!shows_hosts(ConnectionsGroupBy::Host));
+        assert!(shows_hosts(ConnectionsGroupBy::Ip));
+        assert!(shows_hosts(ConnectionsGroupBy::IpPort));
+        assert!(shows_hosts(ConnectionsGroupBy::Process));
     }
 
     /// A tick with flows becomes one worded row per group, in the daemon's
@@ -725,7 +803,8 @@ mod tests {
         assert_eq!(empty_line("SKIP"), "no flows in the last tick (SKIP)");
     }
 
-    /// A table missing a column is named, not misread by position.
+    /// A table missing a column is named, not misread by position — and the
+    /// daemon's own words pass through [`reduce`] untouched.
     #[test]
     fn a_table_missing_a_column_is_named_not_misread() {
         let table = Table {
@@ -735,6 +814,14 @@ mod tests {
         assert_eq!(
             tick_rows(&table),
             Err("connections table has no `count` column".to_string())
+        );
+        assert_eq!(
+            reduce(Ok(table)),
+            Err("connections table has no `count` column".to_string())
+        );
+        assert_eq!(
+            reduce(Err("no socket".to_string())),
+            Err("no socket".to_string())
         );
     }
 
@@ -753,6 +840,10 @@ mod tests {
         assert!(
             caption(1_700_000_000_000_000, now, ConnectionsGroupBy::Host, 1)
                 .ends_with(" \u{00b7} 1 group by host")
+        );
+        assert!(
+            caption(1_700_000_000_000_000, now, ConnectionsGroupBy::Host, 40)
+                .ends_with(" \u{00b7} 40 groups by host")
         );
         assert_eq!(tick_line(0, now), "tick at an unreported moment");
     }
@@ -779,6 +870,9 @@ mod headless_tests {
     use gpui::{Modifiers, Size, TestAppContext, VisualTestContext};
     use net_observer_ipc::StatusSnapshot;
 
+    /// The tick every drawn-rows test dates its rows with.
+    const TS_US: i64 = 1_700_000_000_000_000;
+
     /// `inner` lies wholly inside a viewport of `outer` anchored at the origin.
     fn contains(outer: Size<gpui::Pixels>, inner: gpui::Bounds<gpui::Pixels>) -> bool {
         inner.origin.x >= px(0.0)
@@ -787,15 +881,21 @@ mod headless_tests {
             && inner.origin.y + inner.size.height <= outer.height
     }
 
-    /// A fresh window over an injected table state — set before the first
-    /// paint, like the map's findings window, and for the same reason: gpui's
-    /// debug-bounds map only grows over a window's life, so only a window that
-    /// never drew a row can say there is none. The socket is never driven:
-    /// `ConnectionsView::new` fetches nothing (the open path does), so what
-    /// the window draws is exactly what was injected.
+    /// A selector built at run time, in the shape `debug_bounds` takes.
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
+    /// A fresh window over an injected answer, grouped as `group_by` — both set
+    /// before the first paint, like the map's findings window, and for the
+    /// same reason: gpui's debug-bounds map only grows over a window's life, so
+    /// only a window that never drew a row can say there is none. The socket
+    /// is never driven: `ConnectionsView::new` fetches nothing (the open path
+    /// does), so what the window draws is exactly what was injected.
     fn connections_window(
         cx: &mut TestAppContext,
-        table: Option<Result<Table, String>>,
+        answer: Option<Result<Table, String>>,
+        group_by: ConnectionsGroupBy,
     ) -> (WindowHandle<ConnectionsView>, VisualTestContext) {
         let model = cx.update(|cx| {
             cx.new(|_| {
@@ -808,7 +908,8 @@ mod headless_tests {
         });
         let window = cx.add_window(|_, _| {
             let mut view = ConnectionsView::new(model);
-            view.table = table;
+            view.group_by = group_by;
+            view.reading = answer.map(reduce);
             view
         });
         let vcx = VisualTestContext::from_window(window.into(), cx);
@@ -855,7 +956,7 @@ mod headless_tests {
     #[gpui::test]
     fn the_four_group_buttons_and_refresh_are_drawn(cx: &mut TestAppContext) {
         let viewport = size(px(WIN_W), px(WIN_H));
-        let (_window, mut vcx) = connections_window(cx, None);
+        let (_window, mut vcx) = connections_window(cx, None, ConnectionsGroupBy::Host);
         for control in [
             "connections-group-host",
             "connections-group-ip",
@@ -872,39 +973,57 @@ mod headless_tests {
             );
         }
         assert!(
-            vcx.debug_bounds("connections-pending").is_some(),
+            vcx.debug_bounds(leak(format!("connections-pending:{PENDING}")))
+                .is_some(),
             "before the first read the window must say it has not read yet"
         );
     }
 
-    /// A tick with two groups draws two rows, each under its key.
+    /// A tick with two groups draws two rows, each under its key, inside the
+    /// list, and the caption counts them.
     #[gpui::test]
     fn a_table_with_two_groups_draws_two_rows(cx: &mut TestAppContext) {
         let (table, rows) = two_groups();
-        let (_window, mut vcx) = connections_window(cx, Some(Ok(table)));
+        let (_window, mut vcx) = connections_window(cx, Some(Ok(table)), ConnectionsGroupBy::Ip);
+        assert!(
+            vcx.debug_bounds("connections-list").is_some(),
+            "the rows must be drawn by the list"
+        );
         for row in rows {
             assert!(
                 vcx.debug_bounds(row).is_some(),
                 "the window did not draw `{row}`"
             );
         }
+        let caption = leak(format!(
+            "connections-caption:{}",
+            caption(TS_US, 0, ConnectionsGroupBy::Ip, 2)
+        ));
         assert!(
-            vcx.debug_bounds("connections-empty").is_none(),
-            "a tick with flows must not also say there are none"
+            vcx.debug_bounds(caption).is_some(),
+            "the caption must count the two groups: `{caption}`"
+        );
+        assert!(
+            vcx.debug_bounds(leak(format!("connections-empty:{NO_TICK}")))
+                .is_none(),
+            "a tick with flows must not also say there is no tick"
         );
     }
 
-    /// The daemon's one-row `SKIP` tick says so, in a FRESH window — gpui's
-    /// debug-bounds map only grows over a window's life, so only a window
-    /// that never drew a row can say there is none — and draws no row.
+    /// The daemon's one-row `SKIP` tick says so — the exact sentence, with the
+    /// verdict — in a FRESH window (gpui's debug-bounds map only grows over a
+    /// window's life, so only a window that never drew a row can say there is
+    /// none), and draws no row and no list.
     #[gpui::test]
     fn a_skip_tick_says_no_flows_and_draws_no_row(cx: &mut TestAppContext) {
         let (_table, rows) = two_groups();
         let skipped = connections_table(vec![["7", "SKIP", "", "", "", "", ""]]);
-        let (_window, mut vcx) = connections_window(cx, Some(Ok(skipped)));
+        let (_window, mut vcx) =
+            connections_window(cx, Some(Ok(skipped)), ConnectionsGroupBy::Host);
         assert!(
-            vcx.debug_bounds("connections-empty").is_some(),
-            "a SKIP tick must say there are no flows rather than leave a blank area"
+            vcx.debug_bounds("connections-empty:no flows in the last tick (SKIP)")
+                .is_some(),
+            "a SKIP tick must say `no flows in the last tick (SKIP)`"
         );
         for row in rows {
             assert!(
@@ -912,6 +1031,31 @@ mod headless_tests {
                 "a SKIP tick drew a row: `{row}`"
             );
         }
+        assert!(
+            vcx.debug_bounds("connections-list").is_none(),
+            "a SKIP tick has no rows to list"
+        );
+    }
+
+    /// A record with no connections tick at all is a third state, and its own
+    /// sentence — in a fresh window, for the reason above.
+    #[gpui::test]
+    fn an_absent_tick_says_so(cx: &mut TestAppContext) {
+        let (_window, mut vcx) = connections_window(
+            cx,
+            Some(Ok(connections_table(vec![]))),
+            ConnectionsGroupBy::Host,
+        );
+        assert!(
+            vcx.debug_bounds(leak(format!("connections-empty:{NO_TICK}")))
+                .is_some(),
+            "an empty table must say `{NO_TICK}`"
+        );
+        assert!(
+            vcx.debug_bounds("connections-empty:no flows in the last tick (SKIP)")
+                .is_none(),
+            "an absent tick is not a skipped one"
+        );
     }
 
     /// A read the daemon could not answer shows the daemon's own words, never
@@ -919,12 +1063,85 @@ mod headless_tests {
     #[gpui::test]
     fn a_failed_read_shows_the_daemons_words(cx: &mut TestAppContext) {
         let why = "daemon cannot answer Connections (older daemon): bad request: unknown variant";
-        let (_window, mut vcx) = connections_window(cx, Some(Err(why.to_string())));
-        let selector: &'static str = Box::leak(format!("connections-error:{why}").into_boxed_str());
+        let (_window, mut vcx) =
+            connections_window(cx, Some(Err(why.to_string())), ConnectionsGroupBy::Host);
+        let selector = leak(format!("connections-error:connections unavailable: {why}"));
         assert!(
             vcx.debug_bounds(selector).is_some(),
             "the window did not show the daemon's words: `{why}`"
         );
+    }
+
+    /// Forty groups: the list is drawn and the caption counts all forty, while
+    /// the rows are built lazily — the first is on screen; whether the fortieth
+    /// is depends on the viewport, and a plain column would have laid it out
+    /// past the bottom edge where nothing is painted.
+    #[gpui::test]
+    fn forty_groups_are_listed_and_counted(cx: &mut TestAppContext) {
+        let ts = TS_US.to_string();
+        let keys: Vec<String> = (1..=40).map(|i| format!("10.0.0.{i}:443")).collect();
+        let rows: Vec<[&str; 7]> = keys
+            .iter()
+            .map(|key| [ts.as_str(), "OK", key.as_str(), "1", "10", "20", ""])
+            .collect();
+        let (_window, mut vcx) = connections_window(
+            cx,
+            Some(Ok(connections_table(rows))),
+            ConnectionsGroupBy::IpPort,
+        );
+        let list = vcx
+            .debug_bounds("connections-list")
+            .expect("forty groups must be drawn as a list");
+        assert!(
+            contains(size(px(WIN_W), px(WIN_H)), list),
+            "the list must lie inside the window: {list:?}"
+        );
+        assert!(
+            vcx.debug_bounds("connections-row:10.0.0.1:443").is_some(),
+            "the first row must be on screen"
+        );
+        let caption = leak(format!(
+            "connections-caption:{}",
+            caption(TS_US, 0, ConnectionsGroupBy::IpPort, 40)
+        ));
+        assert!(
+            vcx.debug_bounds(caption).is_some(),
+            "the caption must say 40 groups: `{caption}`"
+        );
+    }
+
+    /// The key column keeps its floor at the window's default width, in every
+    /// grouping — an `ip:port` key ellipsised at its tail would lose the port,
+    /// the one thing that grouping shows — and under `host` the hosts column,
+    /// which would repeat the key, is not drawn at all. Each grouping gets a
+    /// fresh window, because a window that once drew the hosts cell can never
+    /// say it is gone.
+    #[gpui::test]
+    fn the_key_keeps_its_width_and_hosts_hides_under_host(cx: &mut TestAppContext) {
+        let viewport = size(px(WIN_W), px(WIN_H));
+        let (table, _rows) = two_groups();
+        for (group_by, hosts_drawn) in [
+            (ConnectionsGroupBy::Host, false),
+            (ConnectionsGroupBy::IpPort, true),
+        ] {
+            let (_window, mut vcx) = connections_window(cx, Some(Ok(table.clone())), group_by);
+            let key = vcx
+                .debug_bounds("connections-col-key")
+                .unwrap_or_else(|| panic!("no key column under {group_by:?}"));
+            assert!(
+                key.size.width >= px(KEY_MIN_W),
+                "the key column gave way under {group_by:?}: {key:?}"
+            );
+            assert!(
+                contains(viewport, key),
+                "the key column leaves the window under {group_by:?}: {key:?}"
+            );
+            assert_eq!(
+                vcx.debug_bounds("connections-col-hosts").is_some(),
+                hosts_drawn,
+                "the hosts column under {group_by:?}"
+            );
+        }
     }
 
     /// Pressing a grouping toggle switches the view's grouping and reads the
@@ -932,7 +1149,7 @@ mod headless_tests {
     /// back as words, which is how a read that went out is observable at all.
     #[gpui::test]
     fn clicking_a_group_button_switches_the_grouping_and_refetches(cx: &mut TestAppContext) {
-        let (window, mut vcx) = connections_window(cx, None);
+        let (window, mut vcx) = connections_window(cx, None, ConnectionsGroupBy::Host);
         vcx.update(|window, _| window.activate_window());
         vcx.run_until_parked();
         assert_eq!(
@@ -949,9 +1166,9 @@ mod headless_tests {
         vcx.simulate_click(button.center(), Modifiers::none());
         vcx.run_until_parked();
 
-        let (group_by, table) = window
+        let (group_by, reading) = window
             .update(&mut vcx, |view, _window, _cx| {
-                (view.group_by, view.table.clone())
+                (view.group_by, view.reading.clone())
             })
             .expect("the window is open");
         assert_eq!(
@@ -960,8 +1177,8 @@ mod headless_tests {
             "the click must set the grouping"
         );
         assert!(
-            matches!(table, Some(Err(_))),
-            "the switch must read the tick again — with no daemon, as words: {table:?}"
+            matches!(reading, Some(Err(_))),
+            "the switch must read the tick again — with no daemon, as words: {reading:?}"
         );
     }
 }

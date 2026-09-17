@@ -57,7 +57,9 @@ use types::{
     TopologyLink,
 };
 
-use crate::ui::{Dating, Glance, PROVENANCE_TEXT, Theme, dated, hint, moments_diverge, separator};
+use crate::ui::{
+    Dating, Glance, PROVENANCE_TEXT, Theme, dated, hint, moments_diverge, note, separator,
+};
 
 /// Initial size of the network-map window (resizable afterwards), gpui logical px.
 const WIN_W: f32 = 360.0;
@@ -1362,36 +1364,41 @@ fn findings_section(findings: Option<&Result<Table, String>>, theme: Theme) -> g
     let base = div().flex().flex_col().px_3().py_2();
     let table = match findings {
         None => {
-            return findings_note(
-                base,
-                "map-findings-pending",
-                "findings not read yet",
-                theme.muted,
-            );
+            return base
+                .child(note(
+                    "map-findings-pending",
+                    "findings not read yet",
+                    theme.muted,
+                ))
+                .into_any_element();
         }
         Some(Err(why)) => {
-            return findings_note(
-                base,
-                "map-findings-error",
-                format!("findings unavailable: {why}"),
-                theme.warn,
-            );
+            return base
+                .child(note(
+                    "map-findings-error",
+                    format!("findings unavailable: {why}"),
+                    theme.warn,
+                ))
+                .into_any_element();
         }
         Some(Ok(table)) => table,
     };
     let hosts = match finding_lines(table) {
         Ok(hosts) => hosts,
         Err(why) => {
-            return findings_note(
-                base,
-                "map-findings-error",
-                format!("findings unavailable: {why}"),
-                theme.warn,
-            );
+            return base
+                .child(note(
+                    "map-findings-error",
+                    format!("findings unavailable: {why}"),
+                    theme.warn,
+                ))
+                .into_any_element();
         }
     };
     if hosts.is_empty() {
-        return findings_note(base, "map-findings-empty", "no findings", theme.muted);
+        return base
+            .child(note("map-findings-empty", "no findings", theme.muted))
+            .into_any_element();
     }
 
     let total: usize = hosts.iter().map(|h| h.lines.len()).sum();
@@ -1435,29 +1442,6 @@ fn findings_section(findings: Option<&Result<Table, String>>, theme: Theme) -> g
             )),
     )
     .child(rows)
-    .into_any_element()
-}
-
-/// A one-line findings state under a selector that carries the words shown, so
-/// a headless test asserts what the section says rather than only that it said
-/// something. The caller picks the ink: warn for an absence the daemon caused,
-/// muted for one that is simply the state of the record.
-fn findings_note(
-    base: gpui::Div,
-    kind: &'static str,
-    message: impl Into<String>,
-    color: u32,
-) -> gpui::AnyElement {
-    let message: String = message.into();
-    let selector = format!("{kind}:{message}");
-    base.child(
-        div()
-            .debug_selector(move || selector)
-            .py_1()
-            .text_size(px(11.0))
-            .text_color(rgb(color))
-            .child(message),
-    )
     .into_any_element()
 }
 
