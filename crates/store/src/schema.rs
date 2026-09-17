@@ -241,4 +241,20 @@ ALTER TABLE observing_edge ADD COLUMN IF NOT EXISTS cause VARCHAR;
 -- an older DB file gains the table on open like `topology_link` above.
 CREATE TABLE IF NOT EXISTS probing_edge (
   ts_us BIGINT, tier VARCHAR, peer_uid BIGINT);
+-- `reason` names what produced the edge ('control' | 'startup' | 'experiment'
+-- | 'experiment-end'), added when the experiment window landed (realm
+-- net-observer, node #61): a passive stretch the operator asked for as a
+-- measurement is told apart from one asked for as a state. Rows written
+-- before it read back NULL, which the reader treats as 'control' — what
+-- they in fact were. Same migration treatment as `observing_edge.cause`.
+ALTER TABLE probing_edge ADD COLUMN IF NOT EXISTS reason VARCHAR;
+-- One row per finished experiment window (realm net-observer, node #61):
+-- its bounds, the tier it restored, and the whole report as JSON — the
+-- same `ExperimentReport` the daemon answers `Query(Experiment { id })`
+-- with, kept here so a report outlives the daemon process that computed
+-- it. A window the daemon was restarted under leaves no row: its opening
+-- `probing_edge` (reason 'experiment') without a closing one is the trace.
+CREATE TABLE IF NOT EXISTS experiment (
+  id VARCHAR PRIMARY KEY, start_us BIGINT, end_us BIGINT, tier_before VARCHAR,
+  report_json VARCHAR);
 "#;

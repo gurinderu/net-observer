@@ -146,6 +146,16 @@ impl PreparedSql {
         }
     }
 
+    /// A statement with its `?` values bound in order — for a builder outside
+    /// this module (the experiment window's counts) that binds the same way
+    /// the builders here do.
+    pub(crate) fn bound(sql: &str, params: Vec<Value>) -> Self {
+        Self {
+            sql: sql.to_string(),
+            params,
+        }
+    }
+
     pub(crate) fn sql(&self) -> &str {
         &self.sql
     }
@@ -1404,6 +1414,11 @@ mod tests {
             ts_us,
             tier,
             peer_uid: peer,
+            reason: if peer.is_some() {
+                types::ProbingReason::Control
+            } else {
+                types::ProbingReason::Startup
+            },
         })
         .unwrap();
     }

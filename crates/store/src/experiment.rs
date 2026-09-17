@@ -1,0 +1,372 @@
+//! The "network without us" half of an experiment report (realm
+//! net-observer, node #61): what the record says the network did inside the
+//! window, counted from the rows the passive collectors kept writing while
+//! the daemon's own probes were withheld.
+//!
+//! Every count is a bounded `WHERE ts_us BETWEEN ? AND ?` over one table —
+//! no `ASOF JOIN`, no whole-record sort — and the two flow-table readings
+//! are "the newest tick at or before" each bound. The values are bound, never
+//! interpolated, like every builder in [`crate::diagnosis`]; the daemon runs
+//! them on its blocking pool under the same deadline it gives a diagnosis.
+
+use std::time::Duration;
+
+use duckdb::types::Value;
+use types::{FlowTotals, NetworkFacts};
+
+use crate::diagnosis::PreparedSql;
+use crate::{QueryTable, Store, StoreError};
+
+/// The newest flow-table tick at or before a moment, its rows summed. A
+/// `SKIP` tick (the API did not answer) is one row with NULL counts, so the
+/// sums are `0` and the verdict says why.
+const FLOWS_AT_SQL: &str = "\
+SELECT ts_us, max(verdict) AS verdict,
+       coalesce(sum(count), 0) AS flows,
+       coalesce(sum(upload), 0) AS upload,
+       coalesce(sum(download), 0) AS download
+FROM connection_sample
+WHERE ts_us = (SELECT max(ts_us) FROM connection_sample WHERE ts_us <= ?)
+GROUP BY ts_us";
+
+/// Count what the record holds inside `[start_us, end_us]`.
+///
+/// Each statement runs within `budget` through
+/// [`Store::query_prepared_within`]; the first failure is returned as is —
+/// a half-counted window would read as a quieter network than the record
+/// shows, so the caller reports the network as unread rather than partial.
+pub fn window_facts(
+    store: &dyn Store,
+    start_us: i64,
+    end_us: i64,
+    budget: Duration,
+) -> Result<NetworkFacts, StoreError> {
+    let between = || vec![Value::BigInt(start_us), Value::BigInt(end_us)];
+    let run = |sql: &str, params: Vec<Value>| {
+        store.query_prepared_within(&PreparedSql::bound(sql, params), budget)
+    };
+
+    let route = run(
+        "SELECT count(*) FROM route_event WHERE ts_us BETWEEN ? AND ?",
+        between(),
+    )?;
+    let incidents = run(
+        "SELECT id, trigger_id FROM incident
+         WHERE opened_us BETWEEN ? AND ? ORDER BY opened_us, id",
+        between(),
+    )?;
+    let gw = run(
+        "SELECT gw, count(*) FROM link_sample
+         WHERE ts_us BETWEEN ? AND ? GROUP BY gw ORDER BY gw",
+        between(),
+    )?;
+    let announce = run(
+        "SELECT count(*), coalesce(sum(heard_frames), 0) FROM neighbor_sample
+         WHERE ts_us BETWEEN ? AND ? AND heard_frames IS NOT NULL",
+        between(),
+    )?;
+    let flows_at_start = run(FLOWS_AT_SQL, vec![Value::BigInt(start_us)])?;
+    let flows_at_end = run(FLOWS_AT_SQL, vec![Value::BigInt(end_us)])?;
+    let rssi = run(
+        "SELECT min(rssi_dbm), max(rssi_dbm) FROM wifi_sample WHERE ts_us BETWEEN ? AND ?",
+        between(),
+    )?;
+
+    Ok(NetworkFacts {
+        route_events: cell_u64(&route, 0, 0)?,
+        incidents: incidents
+            .rows
+            .iter()
+            .map(|r| (cell(r, 0).to_string(), cell(r, 1).to_string()))
+            .collect(),
+        gw_verdicts: gw
+            .rows
+            .iter()
+            .map(|r| Ok((cell(r, 0).to_string(), parse_u64(cell(r, 1), 1)?)))
+            .collect::<Result<_, StoreError>>()?,
+        announce_flushes: cell_u64(&announce, 0, 0)?,
+        announce_heard_frames: cell_u64(&announce, 0, 1)?,
+        flows_at_start: flows(&flows_at_start)?,
+        flows_at_end: flows(&flows_at_end)?,
+        rssi_min_dbm: cell_opt_i64(&rssi, 0, 0)?,
+        rssi_max_dbm: cell_opt_i64(&rssi, 0, 1)?,
+    })
+}
+
+/// The one row [`FLOWS_AT_SQL`] yields, or `None` when no tick lies at or
+/// before the moment.
+fn flows(t: &QueryTable) -> Result<Option<FlowTotals>, StoreError> {
+    let Some(r) = t.rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(FlowTotals {
+        ts_us: parse_i64(cell(r, 0), 0)?,
+        verdict: cell(r, 1).to_string(),
+        flows: parse_u64(cell(r, 2), 2)?,
+        upload: parse_u64(cell(r, 3), 3)?,
+        download: parse_u64(cell(r, 4), 4)?,
+    }))
+}
+
+/// One cell of a row, the empty string (SQL `NULL`) when the row is short.
+fn cell(row: &[String], col: usize) -> &str {
+    row.get(col).map_or("", String::as_str)
+}
+
+fn cell_u64(t: &QueryTable, row: usize, col: usize) -> Result<u64, StoreError> {
+    parse_u64(t.rows.get(row).map_or("", |r| cell(r, col)), col)
+}
+
+fn cell_opt_i64(t: &QueryTable, row: usize, col: usize) -> Result<Option<i64>, StoreError> {
+    let text = t.rows.get(row).map_or("", |r| cell(r, col));
+    if text.is_empty() {
+        return Ok(None);
+    }
+    parse_i64(text, col).map(Some)
+}
+
+/// A count cell as a number. An empty cell is an aggregate over no rows
+/// (`count(*)` never is, but `sum` can be) and reads as zero; a cell that is
+/// not a number is the driver's own conversion failure, column named.
+fn parse_u64(text: &str, col: usize) -> Result<u64, StoreError> {
+    if text.is_empty() {
+        return Ok(0);
+    }
+    text.parse::<u64>().map_err(|e| conversion(col, e))
+}
+
+fn parse_i64(text: &str, col: usize) -> Result<i64, StoreError> {
+    text.parse::<i64>().map_err(|e| conversion(col, e))
+}
+
+fn conversion(col: usize, e: std::num::ParseIntError) -> StoreError {
+    StoreError::Duckdb(duckdb::Error::FromSqlConversionFailure(
+        col,
+        duckdb::types::Type::Text,
+        Box::new(e),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DuckdbStore;
+    use types::{
+        ConnectionRow, ConnectionsSample, ConnectionsVerdict, GwVerdict, HeardFrames, Incident,
+        LinkSample, NeighborsSample, NeighborsVerdict, RouteEvent, Sample, TcpVerdict, WifiSample,
+        WifiVerdict,
+    };
+
+    const BUDGET: Duration = Duration::from_secs(30);
+    const START: i64 = 1_000_000;
+    const END: i64 = 5_000_000;
+
+    fn link(s: &DuckdbStore, ts_us: i64, gw: GwVerdict) {
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us,
+            gw,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Skip,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            bssid: None,
+            if_mac: None,
+            medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        }))
+        .unwrap();
+    }
+
+    fn route(s: &DuckdbStore, ts_us: i64) {
+        s.write_sample(&Sample::Route(RouteEvent {
+            ts_us,
+            kind: "route".into(),
+            iface: Some("en0".into()),
+            detail: "default route changed".into(),
+        }))
+        .unwrap();
+    }
+
+    fn incident(s: &DuckdbStore, id: &str, trigger_id: &str, opened_us: i64) {
+        s.open_incident(&Incident {
+            id: id.into(),
+            opened_us,
+            closed_us: None,
+            trigger_id: trigger_id.into(),
+            signature: String::new(),
+        })
+        .unwrap();
+    }
+
+    fn wifi(s: &DuckdbStore, ts_us: i64, rssi_dbm: Option<i32>) {
+        s.write_sample(&Sample::Wifi(WifiSample {
+            ts_us,
+            wifi: if rssi_dbm.is_some() {
+                WifiVerdict::Ok
+            } else {
+                WifiVerdict::Skip
+            },
+            reason: rssi_dbm.is_none().then(|| "not associated".to_string()),
+            rssi_dbm,
+            noise_dbm: None,
+            snr_db: None,
+            tx_rate_mbps: None,
+            phy_mode: None,
+            channel: None,
+            channel_width_mhz: None,
+            channel_band: None,
+        }))
+        .unwrap();
+    }
+
+    fn flush(s: &DuckdbStore, ts_us: i64, heard: Option<u32>) {
+        s.write_sample(&Sample::Neighbors(NeighborsSample {
+            ts_us,
+            verdict: NeighborsVerdict::Ok,
+            reason: None,
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            iface: Some("en0".into()),
+            neighbors: Vec::new(),
+            services: Vec::new(),
+            heard: heard.map(|total| HeardFrames {
+                total,
+                own: Some(0),
+                dropped: 0,
+            }),
+        }))
+        .unwrap();
+    }
+
+    fn connections(s: &DuckdbStore, ts_us: i64, counts: Option<&[(u32, u64, u64)]>) {
+        s.write_sample(&Sample::Connections(ConnectionsSample {
+            ts_us,
+            verdict: if counts.is_some() {
+                ConnectionsVerdict::Ok
+            } else {
+                ConnectionsVerdict::Skip
+            },
+            rows: counts
+                .unwrap_or(&[])
+                .iter()
+                .map(|&(count, upload, download)| ConnectionRow {
+                    host: Some("example.org".into()),
+                    dst_ip: None,
+                    dst_port: Some(443),
+                    process: None,
+                    network: "tcp".into(),
+                    chain: None,
+                    count,
+                    upload,
+                    download,
+                })
+                .collect(),
+        }))
+        .unwrap();
+    }
+
+    /// An empty record counts to nothing and names every absence as `None`
+    /// — never a fabricated tick or signal.
+    #[test]
+    fn an_empty_record_counts_to_nothing() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let f = window_facts(&s, START, END, BUDGET).unwrap();
+        assert_eq!(f, NetworkFacts::default());
+        assert_eq!(f.flows_at_start, None);
+        assert_eq!(f.rssi_min_dbm, None);
+    }
+
+    /// Every count is bounded to the window on both ends, inclusive, and the
+    /// rows outside it — before and after — are not in it.
+    #[test]
+    fn counts_are_bounded_to_the_window() {
+        let s = DuckdbStore::in_memory().unwrap();
+        for ts in [START - 1, START, 2_000_000, END, END + 1] {
+            route(&s, ts);
+            link(&s, ts, GwVerdict::Skip);
+            wifi(&s, ts, Some(if ts == 2_000_000 { -80 } else { -50 }));
+            flush(&s, ts, Some(7));
+        }
+        link(&s, 3_000_000, GwVerdict::Ok);
+        flush(&s, 3_500_000, None); // a neighbour-cache tick, not a flush
+        incident(&s, "gw-drop-a", "gw-drop", START - 1);
+        incident(&s, "roam-b", "roam", 2_500_000);
+        incident(&s, "gw-drop-c", "gw-drop", END);
+        incident(&s, "wedge-d", "wedge", END + 1);
+        wifi(&s, 2_200_000, None); // a SKIP row carries no rssi
+
+        let f = window_facts(&s, START, END, BUDGET).unwrap();
+        assert_eq!(f.route_events, 3);
+        assert_eq!(
+            f.incidents,
+            vec![
+                ("roam-b".to_string(), "roam".to_string()),
+                ("gw-drop-c".to_string(), "gw-drop".to_string()),
+            ]
+        );
+        assert_eq!(f.incidents_by("roam"), 1);
+        assert_eq!(
+            f.gw_verdicts,
+            vec![("OK".to_string(), 1), ("SKIP".to_string(), 3)]
+        );
+        assert!(!f.gw_all_skip());
+        assert_eq!(f.announce_flushes, 3);
+        assert_eq!(f.announce_heard_frames, 21);
+        assert_eq!(f.rssi_min_dbm, Some(-80));
+        assert_eq!(f.rssi_max_dbm, Some(-50));
+    }
+
+    /// Under passive every gateway verdict is `SKIP`, and the facts say so
+    /// outright.
+    #[test]
+    fn a_passive_window_is_all_skip() {
+        let s = DuckdbStore::in_memory().unwrap();
+        for ts in [START, 2_000_000, 3_000_000] {
+            link(&s, ts, GwVerdict::Skip);
+        }
+        let f = window_facts(&s, START, END, BUDGET).unwrap();
+        assert_eq!(f.gw_verdicts, vec![("SKIP".to_string(), 3)]);
+        assert!(f.gw_all_skip());
+    }
+
+    /// The flow readings are the newest tick at or before each bound — a
+    /// tick before the window serves the start, and a SKIP tick reads as
+    /// SKIP with zero sums, never as zero flows.
+    #[test]
+    fn flows_are_the_newest_tick_at_or_before_each_bound() {
+        let s = DuckdbStore::in_memory().unwrap();
+        connections(&s, START - 10, Some(&[(3, 100, 200), (2, 10, 20)]));
+        connections(&s, 2_000_000, None);
+        connections(&s, END + 1, Some(&[(9, 9, 9)]));
+        let f = window_facts(&s, START, END, BUDGET).unwrap();
+        assert_eq!(
+            f.flows_at_start,
+            Some(FlowTotals {
+                ts_us: START - 10,
+                verdict: "OK".into(),
+                flows: 5,
+                upload: 110,
+                download: 220,
+            })
+        );
+        assert_eq!(
+            f.flows_at_end,
+            Some(FlowTotals {
+                ts_us: 2_000_000,
+                verdict: "SKIP".into(),
+                flows: 0,
+                upload: 0,
+                download: 0,
+            })
+        );
+    }
+}

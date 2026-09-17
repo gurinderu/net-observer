@@ -5,14 +5,32 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use types::{
-    BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, TopologyLifetime,
-    TopologyLink, TriggerFired,
+    BlobRef, Incident, NeighborLifetime, ObservingEdge, ParseVerdictError, ProbingEdge,
+    ProbingTier, Sample, TopologyLifetime, TopologyLink, TriggerFired,
 };
 
 /// `network_key` for a segment whose gateway MAC could not be read. Neighbours
 /// still get recorded — under a key that says plainly the network was not
 /// identified, rather than being silently merged into someone else's.
 const UNKNOWN_NETWORK: &str = "unknown";
+
+/// One finished experiment window, as written to `experiment` (realm
+/// net-observer, node #61).
+///
+/// The report itself travels as the JSON `net_observer_ipc` renders from a
+/// `types::ExperimentReport` — this crate stores the text and never reads
+/// inside it, so it needs no JSON dependency of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExperimentRecord {
+    /// `experiment-<start_us>`.
+    pub id: String,
+    pub start_us: i64,
+    pub end_us: i64,
+    /// The tier the window restored when it closed.
+    pub tier_before: ProbingTier,
+    /// The `ExperimentReport`, serialised.
+    pub report_json: String,
+}
 
 /// One open port found on a neighbour, as written to `neighbor_port`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -708,10 +726,54 @@ impl Store for DuckdbStore {
     }
     fn write_probing_edge(&self, e: &ProbingEdge) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO probing_edge (ts_us, tier, peer_uid) VALUES (?,?,?)",
-            params![e.ts_us, e.tier.as_str(), e.peer_uid.map(i64::from)],
+            "INSERT INTO probing_edge (ts_us, tier, peer_uid, reason) VALUES (?,?,?,?)",
+            params![
+                e.ts_us,
+                e.tier.as_str(),
+                e.peer_uid.map(i64::from),
+                e.reason.as_str()
+            ],
         )?;
         Ok(())
+    }
+    fn write_experiment(&self, x: &ExperimentRecord) -> Result<(), StoreError> {
+        self.conn.lock().unwrap().execute(
+            // An id is one window's start instant; a second write of the same
+            // id is the same window reported again (a retry), so it replaces.
+            "INSERT OR REPLACE INTO experiment
+               (id, start_us, end_us, tier_before, report_json)
+             VALUES (?,?,?,?,?)",
+            params![
+                x.id,
+                x.start_us,
+                x.end_us,
+                x.tier_before.as_str(),
+                x.report_json
+            ],
+        )?;
+        Ok(())
+    }
+    fn experiment(&self, id: &str) -> Result<Option<ExperimentRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, start_us, end_us, tier_before, report_json FROM experiment WHERE id = ?",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        let Some(r) = rows.next()? else {
+            return Ok(None);
+        };
+        let tier: String = r.get(3)?;
+        Ok(Some(ExperimentRecord {
+            id: r.get(0)?,
+            start_us: r.get(1)?,
+            end_us: r.get(2)?,
+            // A token this build cannot name is the driver's own conversion
+            // failure, column named — never a silently substituted tier.
+            tier_before: tier.parse().map_err(|e: ParseVerdictError| {
+                duckdb::Error::FromSqlConversionFailure(3, duckdb::types::Type::Text, Box::new(e))
+            })?,
+            report_json: r.get(4)?,
+        }))
     }
     fn neighbor_lifetimes(
         &self,
@@ -2383,12 +2445,21 @@ mod tests {
             ts_us: 100,
             tier: ProbingTier::Passive,
             peer_uid: None,
+            reason: types::ProbingReason::Startup,
         })
         .unwrap();
         s.write_probing_edge(&ProbingEdge {
             ts_us: 200,
             tier: ProbingTier::Active,
             peer_uid: Some(501),
+            reason: types::ProbingReason::Control,
+        })
+        .unwrap();
+        s.write_probing_edge(&ProbingEdge {
+            ts_us: 300,
+            tier: ProbingTier::Passive,
+            peer_uid: Some(501),
+            reason: types::ProbingReason::Experiment,
         })
         .unwrap();
         assert_eq!(
@@ -2400,15 +2471,62 @@ mod tests {
             "the startup default is a peerless edge"
         );
         let t = s
-            .query_table("SELECT ts_us, tier, peer_uid FROM probing_edge ORDER BY ts_us")
+            .query_table("SELECT ts_us, tier, peer_uid, reason FROM probing_edge ORDER BY ts_us")
             .unwrap();
         assert_eq!(
             t.rows,
             vec![
-                vec!["100".to_string(), "passive".to_string(), String::new()],
-                vec!["200".to_string(), "active".to_string(), "501".to_string()],
+                vec![
+                    "100".to_string(),
+                    "passive".to_string(),
+                    String::new(),
+                    "startup".to_string()
+                ],
+                vec![
+                    "200".to_string(),
+                    "active".to_string(),
+                    "501".to_string(),
+                    "control".to_string()
+                ],
+                vec![
+                    "300".to_string(),
+                    "passive".to_string(),
+                    "501".to_string(),
+                    "experiment".to_string()
+                ],
             ]
         );
+    }
+
+    /// A finished window's record survives a round trip whole — the JSON is
+    /// stored as text and read back byte for byte — a second write of the
+    /// same id replaces, and an id never written is `None`, never an error.
+    #[test]
+    fn write_experiment_round_trips_and_replaces() {
+        let s = DuckdbStore::in_memory().unwrap();
+        assert_eq!(s.experiment("experiment-1").unwrap(), None);
+        let first = ExperimentRecord {
+            id: "experiment-1".into(),
+            start_us: 1,
+            end_us: 300_000_001,
+            tier_before: ProbingTier::Active,
+            report_json: r#"{"id":"experiment-1","notes":[]}"#.into(),
+        };
+        s.write_experiment(&first).unwrap();
+        assert_eq!(s.experiment("experiment-1").unwrap(), Some(first.clone()));
+        let again = ExperimentRecord {
+            report_json: r#"{"id":"experiment-1","notes":["retried"]}"#.into(),
+            tier_before: ProbingTier::Passive,
+            ..first
+        };
+        s.write_experiment(&again).unwrap();
+        assert_eq!(s.experiment("experiment-1").unwrap(), Some(again));
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM experiment")
+                .unwrap(),
+            1
+        );
+        assert_eq!(s.experiment("experiment-2").unwrap(), None);
     }
 
     #[test]
