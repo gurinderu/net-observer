@@ -61,7 +61,15 @@ token_enum!(ConnectionsVerdict { Ok => "OK", Skip => "SKIP" });
 // How one neighbour came to be known. `Arp`/`Ndp` are the passive kernel caches
 // read every tick; `Sweep` and `Mdns` only ever appear from an operator-pressed
 // scan, so a row's source says whether the daemon merely listened or spoke.
-token_enum!(NeighborSource { Arp => "arp", Ndp => "ndp", Sweep => "sweep", Mdns => "mdns" });
+// `Announce` is the third way: the device itself said so — an ARP, mDNS, SSDP
+// or DHCP frame it put on the segment, heard by the passive `announce`
+// listener with no packet of ours (realm net-observer, node #92).
+token_enum!(NeighborSource {
+    Arp => "arp", Ndp => "ndp", Sweep => "sweep", Mdns => "mdns", Announce => "announce",
+});
+// Which protocol carried an announced service (`types::AnnouncedService`):
+// the lowercase token is what the `neighbor_service.kind` column holds.
+token_enum!(AnnounceKind { Mdns => "mdns", Ssdp => "ssdp", Dhcp => "dhcp" });
 token_enum!(DnsVerdict {
     Ok => "OK", FakeIp => "FAKEIP", Empty => "EMPTY", ServFail => "SERVFAIL",
     NxDomain => "NXDOMAIN", Timeout => "TIMEOUT", Skip => "SKIP",
@@ -118,6 +126,25 @@ mod tests {
         ] {
             assert_eq!(v.to_string(), s);
             assert_eq!(DnsVerdict::from_str(s).unwrap(), v);
+        }
+    }
+
+    /// The listener's provenance and the service kinds travel as lowercase
+    /// tokens into the `neighbor` and `neighbor_service` tables.
+    #[test]
+    fn announce_tokens_roundtrip() {
+        assert_eq!(NeighborSource::Announce.to_string(), "announce");
+        assert_eq!(
+            NeighborSource::from_str("announce").unwrap(),
+            NeighborSource::Announce
+        );
+        for (v, s) in [
+            (AnnounceKind::Mdns, "mdns"),
+            (AnnounceKind::Ssdp, "ssdp"),
+            (AnnounceKind::Dhcp, "dhcp"),
+        ] {
+            assert_eq!(v.to_string(), s);
+            assert_eq!(AnnounceKind::from_str(s).unwrap(), v);
         }
     }
 

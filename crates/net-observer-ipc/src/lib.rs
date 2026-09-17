@@ -506,17 +506,34 @@ impl Event {
                     )
                 }
             },
-            Event::Neighbors(n) => match n.verdict {
-                types::NeighborsVerdict::Skip => {
-                    format!("SKIP {}", n.reason.as_deref().unwrap_or("-"))
+            // A listener flush carries its frame counts after the reading:
+            // `heard=<n> own=<m>`, with `own=?` when the window had no own
+            // MAC to tell its frames by, and ` dropped=<k>` only when the window's
+            // caps refused something (realm net-observer, node #92).
+            Event::Neighbors(n) => {
+                let mut line = match n.verdict {
+                    types::NeighborsVerdict::Skip => {
+                        format!("SKIP {}", n.reason.as_deref().unwrap_or("-"))
+                    }
+                    types::NeighborsVerdict::Ok => format!(
+                        "{} on {} net={}",
+                        n.neighbors.len(),
+                        n.iface.as_deref().unwrap_or("-"),
+                        n.network_key.as_deref().unwrap_or("-")
+                    ),
+                };
+                if let Some(heard) = n.heard {
+                    let own = heard
+                        .own
+                        .map(|o| o.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    line.push_str(&format!(" heard={} own={own}", heard.total));
+                    if heard.dropped > 0 {
+                        line.push_str(&format!(" dropped={}", heard.dropped));
+                    }
                 }
-                types::NeighborsVerdict::Ok => format!(
-                    "{} on {} net={}",
-                    n.neighbors.len(),
-                    n.iface.as_deref().unwrap_or("-"),
-                    n.network_key.as_deref().unwrap_or("-")
-                ),
-            },
+                line
+            }
             // The line says how many access points were HEARD, never anything
             // about interference: no channel-occupancy figure exists on this
             // platform, so the overlap with our own band is computed by a reader
@@ -2310,6 +2327,74 @@ mod tests {
         assert_eq!(
             host.detail(),
             "load 1.00/2.00/3.00; disk 100.0% used, - free; swap 0 MiB"
+        );
+
+        // A neighbours reading is its count; a listener flush adds the frame
+        // counts, with `own=?` when the window could not tell its own frames.
+        let reading = |heard: Option<types::HeardFrames>, verdict: types::NeighborsVerdict| {
+            Event::Neighbors(types::NeighborsSample {
+                ts_us: 0,
+                verdict,
+                reason: (verdict == types::NeighborsVerdict::Skip)
+                    .then(|| "announce listener stopped: capture stream ended".to_string()),
+                network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+                iface: Some("en0".into()),
+                neighbors: Vec::new(),
+                services: Vec::new(),
+                heard,
+            })
+        };
+        assert_eq!(
+            reading(None, types::NeighborsVerdict::Ok).detail(),
+            "0 on en0 net=aa:bb:cc:dd:ee:ff"
+        );
+        assert_eq!(
+            reading(
+                Some(types::HeardFrames {
+                    total: 7,
+                    own: Some(2),
+                    dropped: 0
+                }),
+                types::NeighborsVerdict::Ok
+            )
+            .detail(),
+            "0 on en0 net=aa:bb:cc:dd:ee:ff heard=7 own=2"
+        );
+        assert_eq!(
+            reading(
+                Some(types::HeardFrames {
+                    total: 7,
+                    own: None,
+                    dropped: 0
+                }),
+                types::NeighborsVerdict::Ok
+            )
+            .detail(),
+            "0 on en0 net=aa:bb:cc:dd:ee:ff heard=7 own=?"
+        );
+        assert_eq!(
+            reading(
+                Some(types::HeardFrames {
+                    total: 1000,
+                    own: Some(0),
+                    dropped: 488
+                }),
+                types::NeighborsVerdict::Ok
+            )
+            .detail(),
+            "0 on en0 net=aa:bb:cc:dd:ee:ff heard=1000 own=0 dropped=488"
+        );
+        assert_eq!(
+            reading(
+                Some(types::HeardFrames {
+                    total: 0,
+                    own: Some(0),
+                    dropped: 0
+                }),
+                types::NeighborsVerdict::Skip
+            )
+            .detail(),
+            "SKIP announce listener stopped: capture stream ended heard=0 own=0"
         );
 
         // A connections tick is its size, and a SKIP names the one thing it

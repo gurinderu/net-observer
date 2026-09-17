@@ -620,7 +620,9 @@ ORDER BY ts_us";
 /// device per segment. `network` filters to one segment by its `network_key`.
 ///
 /// `source` is the honest part: `arp`/`ndp` means the daemon merely read a cache
-/// the OS had filled, `sweep`/`mdns` that an operator sent it looking.
+/// the OS had filled, `sweep`/`mdns` that an operator sent it looking, and
+/// `announce` that the device said so itself — a frame it put on the segment,
+/// heard by the passive listener (realm net-observer, node #92).
 ///
 /// Returns `Err` for a key that cannot exist rather than a query that matches
 /// nothing: an empty table is the answer to "this segment has no neighbours",
@@ -2212,6 +2214,8 @@ mod tests {
                 hostname: None,
                 role: NeighborRole::Unknown,
             }],
+            services: Vec::new(),
+            heard: None,
         }))
         .unwrap();
     }

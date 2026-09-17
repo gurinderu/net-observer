@@ -1369,6 +1369,8 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
         network_key: report.network_key.clone(),
         iface: report.iface.clone(),
         neighbors: report.found.clone(),
+        services: Vec::new(),
+        heard: None,
     });
     if let Err(e) = cx.store.write_sample(&sample) {
         tracing::error!(error = %e, "store write failed; scan findings not recorded (gap logged)");

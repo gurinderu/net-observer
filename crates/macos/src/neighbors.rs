@@ -48,13 +48,9 @@ impl SystemNeighbors {
 impl NeighborFacts for SystemNeighbors {
     async fn read(&self) -> Option<NeighborReading> {
         let iface = self.facts.phys_iface().await;
-        // The segment's identity: the gateway's own MAC. `None` when there is no
-        // default route or no ARP entry for it — the sample then records the
-        // neighbours under the "unknown network" key rather than under a wrong one.
-        let network_key = match self.facts.default_gw().await {
-            Some(gw) => self.facts.gw_arp_mac(&gw).await,
-            None => None,
-        };
+        // The segment's identity: the gateway's own MAC, by the one derivation
+        // every neighbour writer shares (`SystemFacts::network_key`).
+        let network_key = self.facts.network_key().await;
 
         let arp = run("arp", &["-an"]).await;
         let ndp = run("ndp", &["-an"]).await;

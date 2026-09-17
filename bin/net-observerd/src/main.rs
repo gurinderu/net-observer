@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use collector_air::AirCollector;
+use collector_announce::{AnnounceCollector, AnnounceSource};
 use collector_connections::ConnectionsCollector;
 use collector_core::{Collector, CollectorMeta, EventSource, Os, ProbingState, Readiness, Source};
 use collector_dns::DnsCollector;
@@ -34,9 +35,9 @@ use collector_wifi::WifiCollector;
 use config::Config;
 use macos::LldpCapture;
 use macos::{
-    BoundTcpProber, ConnectionSystemFacts, CoreWlanFacts, DnsResolver, HeldReferenceStreams,
-    HostLoad, IcmpPinger, PcapRing, PfRouteSource, ProxySystemFacts, SystemFacts, SystemNeighbors,
-    SystemProfilerAir, TcpdumpLldpCapture,
+    AnnounceCapture, BoundTcpProber, ConnectionSystemFacts, CoreWlanFacts, DnsResolver,
+    HeldReferenceStreams, HostLoad, IcmpPinger, PcapRing, PfRouteSource, ProxySystemFacts,
+    SystemFacts, SystemNeighbors, SystemProfilerAir, SystemSegment, TcpdumpLldpCapture,
 };
 use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
@@ -659,6 +660,52 @@ async fn run_daemon() -> anyhow::Result<()> {
         };
         collectors.push(AnyCollector::Route(RouteCollector::new(source, ready)));
     }
+    if cfg.collectors.neighbors.enabled && cfg.collectors.neighbors.announce {
+        // The passive announce listener: Event-cadence like `route`, over a
+        // second `tcpdump` child's pcap stream. Readiness is decided here —
+        // an interface to listen on and a child that proved it captures by
+        // writing an Ethernet pcap header (`AnnounceCapture::start`) — and,
+        // like `route`, not retried: an Unavailable event collector is
+        // logged and skipped for the life of the process. The probing tier
+        // does not gate it: a tier withholds emissions and this collector
+        // has none (realm net-observer, nodes #88, #92). Shares the link
+        // collector's `SystemFacts`, so the segment it keys every window by
+        // is the same key the neighbour cache and the scan write under, and
+        // the interface's own MAC — what it drops our own frames by — is
+        // read afresh for every window through the same `SystemSegment`,
+        // since a Private Wi-Fi Address rotates it per network.
+        let (source, ready): (Box<dyn EventSource>, Readiness) = match &phys_iface {
+            None => (
+                Box::new(NullEventSource),
+                Readiness::Unavailable("no physical interface resolved".into()),
+            ),
+            Some(iface) => match AnnounceCapture::start(iface) {
+                Ok(capture) => (
+                    Box::new(AnnounceSource::new(
+                        capture,
+                        Some(iface.clone()),
+                        SystemSegment::new(
+                            SystemFacts::new(
+                                cfg.collectors.link.gw.clone(),
+                                cfg.collectors.link.phys_iface.clone(),
+                            ),
+                            iface.clone(),
+                            tokio::runtime::Handle::current(),
+                        ),
+                        collector_announce::FLUSH_EVERY,
+                    )),
+                    Readiness::Ready,
+                ),
+                Err(e) => (
+                    Box::new(NullEventSource),
+                    Readiness::Unavailable(format!("tcpdump announce listener on {iface}: {e}")),
+                ),
+            },
+        };
+        collectors.push(AnyCollector::Announce(AnnounceCollector::new(
+            source, ready,
+        )));
+    }
 
     // Filter by OS meta + preflight, then spawn survivors with one uniform loop.
     let os = Os::current();
@@ -880,6 +927,9 @@ pub(crate) enum AnyCollector {
     Proxy(Box<ProxyCollector<BoundTcpProber, ProxySystemFacts, HeldReferenceStreams>>),
     Dns(DnsCollector<DnsResolver>),
     Route(RouteCollector),
+    /// The passive announce listener: Event-cadence over a second `tcpdump`
+    /// child, its samples `Sample::Neighbors` like the cache reading's.
+    Announce(AnnounceCollector),
     Host(HostCollector<HostLoad>),
     Wifi(WifiCollector<CoreWlanFacts>),
     Neighbors(NeighborsCollector<SystemNeighbors>),
@@ -899,6 +949,7 @@ impl AnyCollector {
             Self::Proxy(c) => c.meta(),
             Self::Dns(c) => c.meta(),
             Self::Route(c) => c.meta(),
+            Self::Announce(c) => c.meta(),
             Self::Host(c) => c.meta(),
             Self::Wifi(c) => c.meta(),
             Self::Neighbors(c) => c.meta(),
@@ -916,6 +967,7 @@ impl AnyCollector {
             Self::Proxy(c) => c.source(),
             Self::Dns(c) => c.source(),
             Self::Route(c) => c.source(),
+            Self::Announce(c) => c.source(),
             Self::Host(c) => c.source(),
             Self::Wifi(c) => c.source(),
             Self::Neighbors(c) => c.source(),
@@ -933,6 +985,7 @@ impl AnyCollector {
             Self::Proxy(c) => c.preflight().await,
             Self::Dns(c) => c.preflight().await,
             Self::Route(c) => c.preflight().await,
+            Self::Announce(c) => c.preflight().await,
             Self::Host(c) => c.preflight().await,
             Self::Wifi(c) => c.preflight().await,
             Self::Neighbors(c) => c.preflight().await,
@@ -952,6 +1005,7 @@ impl AnyCollector {
             Self::Proxy(c) => c.collect(ts_us).await,
             Self::Dns(c) => c.collect(ts_us).await,
             Self::Route(c) => c.collect(ts_us).await,
+            Self::Announce(c) => c.collect(ts_us).await,
             Self::Host(c) => c.collect(ts_us).await,
             Self::Wifi(c) => c.collect(ts_us).await,
             Self::Neighbors(c) => c.collect(ts_us).await,
@@ -970,6 +1024,7 @@ impl AnyCollector {
             Self::Proxy(c) => c.skip(ts_us),
             Self::Dns(c) => c.skip(ts_us),
             Self::Route(c) => c.skip(ts_us),
+            Self::Announce(c) => c.skip(ts_us),
             Self::Host(c) => c.skip(ts_us),
             Self::Wifi(c) => c.skip(ts_us),
             Self::Neighbors(c) => c.skip(ts_us),
@@ -990,6 +1045,7 @@ impl AnyCollector {
             Self::Proxy(c) => c.into_event_source(),
             Self::Dns(c) => Box::new(c).into_event_source(),
             Self::Route(c) => Box::new(c).into_event_source(),
+            Self::Announce(c) => Box::new(c).into_event_source(),
             Self::Host(c) => Box::new(c).into_event_source(),
             Self::Wifi(c) => Box::new(c).into_event_source(),
             Self::Neighbors(c) => Box::new(c).into_event_source(),
@@ -1048,12 +1104,7 @@ impl NeighborScanner for SystemScanner {
             let rt = tokio::runtime::Handle::current();
             let iface = rt.block_on(self.facts.phys_iface())?;
             let ipv4 = rt.block_on(neighbor_scan::iface_ipv4(&iface))?;
-            let network_key = rt.block_on(async {
-                match self.facts.default_gw().await {
-                    Some(gw) => self.facts.gw_arp_mac(&gw).await,
-                    None => None,
-                }
-            });
+            let network_key = rt.block_on(self.facts.network_key());
 
             let sweep = neighbor_scan::sweep_probe_blocking(&ipv4, &iface);
             // Read the cache the sweep just filled. Everything it now holds for

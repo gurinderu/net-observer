@@ -17,7 +17,8 @@ pub use connection::{ConnectionRow, ConnectionsGroupBy, ConnectionsSample, LiveC
 pub use incident::{BlobRef, Incident, TriggerFired};
 pub use mac::{mac_is_private, normalize_mac};
 pub use neighbor::{
-    HistoryWindow, NeighborLifetime, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence,
+    AnnouncedService, HeardFrames, HistoryWindow, NeighborLifetime, NeighborObs, NeighborRole,
+    NeighborsSample, RoleConfidence,
 };
 pub use observing::{ObservingCause, ObservingEdge};
 pub use probing::{EmissionClass, ProbingEdge, ProbingTier};
@@ -28,6 +29,6 @@ pub use topology::{
     LearnedVia, TopologyLifetime, TopologyLink, link_from_cdp, link_from_frame, link_from_lldp,
 };
 pub use verdict::{
-    AirVerdict, ConnectionsVerdict, DnsVerdict, GwVerdict, LinkMedium, NeighborSource,
-    NeighborsVerdict, ParseVerdictError, TcpVerdict, WifiVerdict,
+    AirVerdict, AnnounceKind, ConnectionsVerdict, DnsVerdict, GwVerdict, LinkMedium,
+    NeighborSource, NeighborsVerdict, ParseVerdictError, TcpVerdict, WifiVerdict,
 };

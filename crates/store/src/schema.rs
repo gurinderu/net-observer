@@ -111,17 +111,58 @@ CREATE TABLE IF NOT EXISTS air_ap (
 -- `network_key` is the gateway's MAC: it tells the coworking 192.168.1.0/24 from
 -- the home one, which neither the subnet nor the SSID does.
 -- `source` is how the device was LAST seen: 'arp'/'ndp' means the daemon merely
--- read a cache, 'sweep'/'mdns' that an operator scan found it. A passive tick
--- after a scan therefore sets it back to 'arp' — the authoritative record of the
--- daemon ever having spoken is `neighbor_scan`, not this column. A hostname a
--- scan learned survives, because the upsert coalesces it.
+-- read a cache, 'sweep'/'mdns' that an operator scan found it, 'announce' that
+-- the device said so itself — an ARP, mDNS, SSDP or DHCP frame it put on the
+-- segment, heard by the passive listener (realm net-observer, node #92). A
+-- passive tick after a scan therefore sets it back to 'arp' — the authoritative
+-- record of the daemon ever having spoken is `neighbor_scan`, not this column.
+-- A hostname a scan or an announcement learned survives, because the upsert
+-- coalesces it.
 CREATE TABLE IF NOT EXISTS neighbor_sample (
   ts_us BIGINT, network_key VARCHAR, iface VARCHAR, verdict VARCHAR, reason VARCHAR,
   neighbor_count INTEGER);
+-- The announce listener's frame counts for the window this reading flushed:
+-- `heard_frames` is every frame the capture delivered; `own_frames` is, of
+-- those, the frames this machine itself sent that match the capture filter —
+-- the OS's own traffic and, during an operator-pressed scan, the sweep's
+-- ARP and the mDNS browse; never the periodic probes (ICMP, TCP and DNS do
+-- not pass the filter) — recognised by the interface's own MAC as read at
+-- that window's start, counted and dropped from the neighbour map. It says the listener saw itself and ignored it, nothing
+-- more: the passivity proof stays the frozen pcap slice (realm net-observer,
+-- node #88). Both NULL on a neighbour-cache tick and on a scan (they count no
+-- frames), never a zero; `heard_frames = 0` is a window in which the segment
+-- said nothing, and `own_frames` NULL under a non-NULL `heard_frames` is a
+-- window whose own MAC could not be read, so nothing was dropped as ours
+-- (realm net-observer, node #92). Added after the table first shipped — same
+-- migration treatment as link_sample.
+ALTER TABLE neighbor_sample ADD COLUMN IF NOT EXISTS heard_frames UINTEGER;
+ALTER TABLE neighbor_sample ADD COLUMN IF NOT EXISTS own_frames UINTEGER;
+-- Observations the window's caps refused (a sighting past the device cap, an
+-- address or service past its per-device cap, a DHCP name past the pending
+-- cap, a service announced on another host's behalf): how much a flush lost.
+-- NULL exactly when heard_frames is (not a listener flush); 0 when nothing
+-- was refused. Same migration treatment.
+ALTER TABLE neighbor_sample ADD COLUMN IF NOT EXISTS dropped_obs UINTEGER;
 CREATE TABLE IF NOT EXISTS neighbor (
   network_key VARCHAR, mac VARCHAR, ip VARCHAR, iface VARCHAR, oui VARCHAR,
   hostname VARCHAR, source VARCHAR, first_seen_us BIGINT, last_seen_us BIGINT,
   PRIMARY KEY (network_key, mac));
+-- A service a neighbour announced, heard passively by the announce listener.
+-- Keyed by (network_key, mac, service) with first/last seen, like
+-- `neighbor_port`: "this device has been announcing _companion-link._tcp since
+-- X" is the queryable fact, and an announcement repeated every few seconds is
+-- one row. `service` is WHAT was announced (an mDNS service type, an SSDP
+-- notification type, a DHCP role such as 'dhcp-server' or 'vendor-class'),
+-- `kind` which protocol carried it ('mdns' | 'ssdp' | 'dhcp'), `detail` the
+-- specifics that came with it (the mDNS instance name, the SSDP SERVER string,
+-- the DHCP message type or vendor class), `ip` the address it was announced
+-- from (NULL for a DHCP client still without one). A later sighting that
+-- carries no ip or detail keeps the ones already learned. (realm net-observer,
+-- node #92)
+CREATE TABLE IF NOT EXISTS neighbor_service (
+  network_key VARCHAR, mac VARCHAR, ip VARCHAR, service VARCHAR, kind VARCHAR,
+  detail VARCHAR, first_seen_us BIGINT, last_seen_us BIGINT,
+  PRIMARY KEY (network_key, mac, service));
 -- One row per operator-pressed scan: what was asked for, how far it reached and
 -- what came back. Without it, "these hosts accumulated passively" and "I went and
 -- probed the segment" become indistinguishable after the fact.

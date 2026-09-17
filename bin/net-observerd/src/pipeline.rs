@@ -300,6 +300,14 @@ pub(crate) fn neighbor_lifetimes_for(
     }
 }
 
+/// The samples the trigger window never holds: the flow table and every
+/// sample of the announce listener (a flush or its end bracket). Stored and
+/// published like any other; only the rules never see them.
+fn stays_out_of_the_window(sample: &Sample) -> bool {
+    matches!(sample, Sample::Connections(_))
+        || matches!(sample, Sample::Neighbors(n) if n.is_listener_flush())
+}
+
 pub async fn run(
     store: Arc<DuckdbStore>,
     mut engine: TriggerEngine,
@@ -339,7 +347,9 @@ pub async fn run(
         // lock is taken — a DB read must never happen under the mutex the socket
         // path also waits on.
         let lifetimes = match &sample {
-            Sample::Neighbors(n) => Some(neighbor_lifetimes_for(store.as_ref(), n)),
+            Sample::Neighbors(n) if !n.is_listener_flush() => {
+                Some(neighbor_lifetimes_for(store.as_ref(), n))
+            }
             _ => None,
         };
         // Mirror the latest sample into the in-memory snapshot the socket serves.
@@ -352,6 +362,13 @@ pub async fn run(
                 Sample::Dns(d) => snap.dns = Some(d.clone()),
                 Sample::Host(h) => snap.host = Some(h.clone()),
                 Sample::Wifi(w) => snap.wifi = Some(w.clone()),
+                // A listener flush is the segment's last window of
+                // announcements, not the whole neighbour table: it is written
+                // and published above and below, but it never replaces the
+                // cache reading the snapshot holds — the live map would
+                // otherwise flicker between the table and the last 15 s
+                // (realm net-observer, node #92).
+                Sample::Neighbors(n) if n.is_listener_flush() => {}
                 Sample::Neighbors(n) => {
                     snap.neighbors = Some(n.clone());
                     snap.neighbor_lifetimes = lifetimes.unwrap_or_default();
@@ -448,7 +465,13 @@ pub async fn run(
         // it is the heaviest sample in the process — a tick of it would take a
         // slot from every count-bounded rule the window was sized for. It is
         // already stored and published above (realm net-observer, node #75).
-        if matches!(sample, Sample::Connections(_)) {
+        // The announce listener's samples stay out the same way: a flush every
+        // 15 s is the last window's announcements, not the neighbour table the
+        // rules read, and its bracket is a row about the listener, not about
+        // the segment — both would only take slots (realm net-observer, node
+        // #92). `RecentWindow::last_neighbors` skips a flush as well, belt and
+        // braces.
+        if stays_out_of_the_window(&sample) {
             continue;
         }
         window.push(sample);
@@ -587,8 +610,9 @@ pub(crate) fn spawn_interval_collector(
 /// thread (`std::thread`, never the interval path), forwarding via the channel's
 /// `blocking_send`.
 ///
-/// The `route` collector (persistent PF_ROUTE socket) is the live Event-cadence
-/// consumer: its `next()` is a blocking `read(2)` driven here on a dedicated
+/// The `route` collector (persistent PF_ROUTE socket) and the `announce`
+/// listener (a `tcpdump` child's pcap pipe) are the live Event-cadence
+/// consumers: each `next()` is a blocking read driven here on a dedicated
 /// thread. Because that `read(2)` cannot be interrupted, a `next()` parked on an
 /// idle socket keeps its stream sender alive through `abort_all`; the daemon
 /// therefore bounds its shutdown drain (see `net-observerd::main`) and the OS reaps
@@ -628,25 +652,35 @@ pub(crate) fn spawn_event_collector(
         // Batches dropped since the current pause began; the pause edge is derived
         // from the flag itself, so no extra shared state is needed.
         let mut dropped_while_paused: u64 = 0;
-        while let Some(samples) = src.next() {
-            // Paused: drop this batch (still drained from the source above).
-            if !observing.load(Ordering::Acquire) {
-                if dropped_while_paused == 0 {
-                    tracing::debug!(
-                        collector = name,
-                        dropped = samples.len(),
-                        "paused: dropping route batch"
-                    );
+        while let Some(mut samples) = src.next() {
+            // Paused: drop this batch (still drained from the source above) —
+            // all but a listener's end bracket, which is not an observation
+            // but the row that says the listener stopped, and the record
+            // needs it whether or not the operator was collecting at the
+            // time (realm net-observer, node #92).
+            let paused = !observing.load(Ordering::Acquire);
+            if paused {
+                let before = samples.len();
+                samples.retain(|s| matches!(s, Sample::Neighbors(n) if n.is_listener_bracket()));
+                // A batch that lost anything counts as dropped — also one whose
+                // bracket goes on, since the flush beside it did not.
+                if samples.len() < before {
+                    if dropped_while_paused == 0 {
+                        tracing::debug!(collector = name, "paused: dropping event batch");
+                    }
+                    dropped_while_paused += 1;
                 }
-                dropped_while_paused += 1;
-                continue;
+                if samples.is_empty() {
+                    continue;
+                }
             }
-            // Resume edge: report what the pause cost, once, then re-arm.
-            if dropped_while_paused > 0 {
+            // Resume edge: report what the pause cost, once, then re-arm. A
+            // bracket let through mid-pause is not a resume.
+            if !paused && dropped_while_paused > 0 {
                 tracing::info!(
                     collector = name,
                     dropped = dropped_while_paused,
-                    "resumed: route batches dropped while paused"
+                    "resumed: event batches dropped while paused"
                 );
                 dropped_while_paused = 0;
             }
@@ -1904,6 +1938,117 @@ mod tests {
         );
     }
 
+    /// A listener flush is written and published like any reading, but it
+    /// never replaces the cache reading the snapshot holds: the live map keeps
+    /// the neighbour table, not the last window's announcements (realm
+    /// net-observer, node #92).
+    #[tokio::test]
+    async fn a_listener_flush_is_recorded_but_leaves_the_snapshot_reading_alone() {
+        use types::{
+            AnnounceKind, AnnouncedService, HeardFrames, NeighborObs, NeighborRole, NeighborSource,
+            NeighborsVerdict,
+        };
+        let obs = |mac: &str, source: NeighborSource| NeighborObs {
+            mac: mac.into(),
+            ip: "192.168.1.6".into(),
+            source,
+            hostname: None,
+            role: NeighborRole::Unknown,
+        };
+        let cache_tick = Sample::Neighbors(NeighborsSample {
+            ts_us: 1,
+            verdict: NeighborsVerdict::Ok,
+            reason: None,
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            iface: Some("en0".into()),
+            neighbors: vec![obs("11:22:33:44:55:66", NeighborSource::Arp)],
+            services: Vec::new(),
+            heard: None,
+        });
+        let flush = Sample::Neighbors(NeighborsSample {
+            ts_us: 2,
+            verdict: NeighborsVerdict::Ok,
+            reason: None,
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            iface: Some("en0".into()),
+            neighbors: vec![obs("a4:83:e7:1b:2c:3d", NeighborSource::Announce)],
+            services: vec![AnnouncedService {
+                mac: "a4:83:e7:1b:2c:3d".into(),
+                ip: Some("192.168.1.6".into()),
+                service: "_companion-link._tcp".into(),
+                kind: AnnounceKind::Mdns,
+                detail: None,
+            }],
+            heard: Some(HeardFrames {
+                total: 5,
+                own: Some(1),
+                dropped: 0,
+            }),
+        });
+
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let eng = TriggerEngine::new(vec![]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, mut events_rx) = broadcast::channel(16);
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            no_resume(),
+            no_session_end(),
+        ));
+        tx.send(cache_tick).await.unwrap();
+        tx.send(flush).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        // The snapshot still holds the cache reading, lifetimes included.
+        let snap = snapshot.lock().unwrap();
+        let held = snap.neighbors.as_ref().expect("the cache reading");
+        assert_eq!(held.ts_us, 1);
+        assert_eq!(held.neighbors[0].source, NeighborSource::Arp);
+        assert_eq!(snap.neighbor_lifetimes.len(), 1);
+        assert_eq!(snap.generated_us, 2, "the flush still bumps generated_us");
+        drop(snap);
+
+        // Both readings were written, the flush with its counts and service.
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM neighbor_sample")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT own_frames FROM neighbor_sample WHERE ts_us = 2")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM neighbor_service")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM neighbor WHERE source = 'announce'")
+                .unwrap(),
+            1
+        );
+        // And both were published on the bus.
+        let mut published = 0;
+        while let Ok(frame) = events_rx.try_recv() {
+            if matches!(decode(&frame), StreamFrame::Event(Event::Neighbors(_))) {
+                published += 1;
+            }
+        }
+        assert_eq!(published, 2);
+    }
+
     /// The interval spawner ticks its collector, `await`s `collect()` directly on
     /// the runtime (off the blocking pool), forwards every sample, and exits cleanly
     /// once the receiver is dropped. Uses a real `host` collector: `getloadavg` is
@@ -2336,6 +2481,118 @@ mod tests {
 
         // Dropping the sender makes `next()` return `None`, so the detached thread
         // ends with the test rather than outliving it.
+        drop(batch_tx);
+        drop(rx);
+    }
+
+    /// The trigger window never holds a listener sample: a flush or its end
+    /// bracket is refused the way the flow table is, while a cache tick, a
+    /// scan and every other kind pass.
+    #[test]
+    fn listener_samples_stay_out_of_the_trigger_window() {
+        use types::{HeardFrames, NeighborsSample, NeighborsVerdict};
+        let neighbours = |verdict: NeighborsVerdict, heard: Option<HeardFrames>| {
+            Sample::Neighbors(NeighborsSample {
+                ts_us: 1,
+                verdict,
+                reason: None,
+                network_key: None,
+                iface: None,
+                neighbors: Vec::new(),
+                services: Vec::new(),
+                heard,
+            })
+        };
+        let counted = HeardFrames {
+            total: 3,
+            own: Some(0),
+            dropped: 0,
+        };
+        assert!(stays_out_of_the_window(&neighbours(
+            NeighborsVerdict::Ok,
+            Some(counted)
+        )));
+        assert!(stays_out_of_the_window(&neighbours(
+            NeighborsVerdict::Skip,
+            Some(counted)
+        )));
+        assert!(!stays_out_of_the_window(&neighbours(
+            NeighborsVerdict::Ok,
+            None
+        )));
+        assert!(!stays_out_of_the_window(&neighbours(
+            NeighborsVerdict::Skip,
+            None
+        )));
+        assert!(!stays_out_of_the_window(&link(1, GwVerdict::Ok)));
+        assert!(!stays_out_of_the_window(&route(1)));
+    }
+
+    /// The one batch a pause does not swallow: the listener's end bracket.
+    /// A paused daemon drops a listener flush like any event batch, but the
+    /// SKIP row that says the listener stopped is the bracket the record
+    /// needs, so it passes — alone, without the flush beside it, and
+    /// without counting as a resume.
+    #[tokio::test]
+    async fn a_paused_event_collector_still_forwards_the_listener_bracket() {
+        use collector_announce::AnnounceCollector;
+        use types::{HeardFrames, NeighborsSample, NeighborsVerdict};
+        let listener = |ts_us: i64, verdict: NeighborsVerdict| {
+            Sample::Neighbors(NeighborsSample {
+                ts_us,
+                verdict,
+                reason: (verdict == NeighborsVerdict::Skip)
+                    .then(|| "announce listener stopped: capture stream ended".to_string()),
+                network_key: None,
+                iface: Some("en0".into()),
+                neighbors: Vec::new(),
+                services: Vec::new(),
+                heard: Some(HeardFrames {
+                    total: 0,
+                    own: Some(0),
+                    dropped: 0,
+                }),
+            })
+        };
+        let (batch_tx, batches) = std::sync::mpsc::channel::<Vec<Sample>>();
+        let drained = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = AnyCollector::Announce(AnnounceCollector::new(
+            Box::new(FakeRouteSource {
+                batches,
+                drained: drained.clone(),
+            }),
+            Readiness::Ready,
+        ));
+        let (tx, mut rx) = mpsc::channel(16);
+        let observing = Arc::new(AtomicBool::new(false));
+        let _handle = spawn_event_collector(c, tx, observing.clone());
+
+        // Paused: a flush is dropped; the final batch's flush is dropped too
+        // and only its bracket comes through.
+        batch_tx
+            .send(vec![listener(1, NeighborsVerdict::Ok)])
+            .unwrap();
+        batch_tx
+            .send(vec![
+                listener(2, NeighborsVerdict::Ok),
+                listener(2, NeighborsVerdict::Skip),
+            ])
+            .unwrap();
+        let got = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the bracket must pass a pause within 5s")
+            .expect("channel open");
+        let Sample::Neighbors(n) = &got else {
+            panic!("expected the bracket, got {got:?}")
+        };
+        assert!(n.is_listener_bracket());
+        assert_eq!(n.ts_us, 2);
+        assert!(
+            time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "nothing but the bracket passes a pause"
+        );
         drop(batch_tx);
         drop(rx);
     }

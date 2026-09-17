@@ -457,18 +457,24 @@ impl Store for DuckdbStore {
                 }
                 0
             }
-            // Two writes, not one: the tick's own row (so a SKIP leaves a trace)
-            // and an upsert per neighbour into the long-lived entity table.
+            // Three writes, not one: the tick's own row (so a SKIP leaves a
+            // trace, and a listener flush its frame counts), an upsert per
+            // neighbour into the long-lived entity table, and an upsert per
+            // announced service — the last only ever non-empty on a listener
+            // flush (realm net-observer, node #92).
             Sample::Neighbors(n) => {
                 c.execute(
-                    "INSERT INTO neighbor_sample VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO neighbor_sample VALUES (?,?,?,?,?,?,?,?,?)",
                     params![
                         n.ts_us,
                         n.network_key,
                         n.iface,
                         n.verdict.to_string(),
                         n.reason,
-                        i32::try_from(n.neighbors.len()).unwrap_or(i32::MAX)
+                        i32::try_from(n.neighbors.len()).unwrap_or(i32::MAX),
+                        n.heard.map(|h| h.total),
+                        n.heard.and_then(|h| h.own),
+                        n.heard.map(|h| h.dropped)
                     ],
                 )?;
                 let key = n.network_key.as_deref().unwrap_or(UNKNOWN_NETWORK);
@@ -493,6 +499,34 @@ impl Store for DuckdbStore {
                             nb.oui(),
                             nb.hostname,
                             nb.source.to_string(),
+                            n.ts_us,
+                            n.ts_us
+                        ],
+                    )?;
+                }
+                for svc in &n.services {
+                    c.execute(
+                        // `first_seen_us` preserved, like `neighbor`: the point of
+                        // the row is since-when this device has announced this.
+                        // A repeat that carries no address or detail (a DHCP
+                        // client still without a lease, an SSDP notify without a
+                        // SERVER line) keeps what an earlier sighting learned.
+                        "INSERT INTO neighbor_service
+                           (network_key, mac, ip, service, kind, detail,
+                            first_seen_us, last_seen_us)
+                         VALUES (?,?,?,?,?,?,?,?)
+                         ON CONFLICT (network_key, mac, service) DO UPDATE SET
+                           ip = COALESCE(excluded.ip, neighbor_service.ip),
+                           kind = excluded.kind,
+                           detail = COALESCE(excluded.detail, neighbor_service.detail),
+                           last_seen_us = excluded.last_seen_us",
+                        params![
+                            key,
+                            svc.mac,
+                            svc.ip,
+                            svc.service,
+                            svc.kind.to_string(),
+                            svc.detail,
                             n.ts_us,
                             n.ts_us
                         ],
@@ -785,6 +819,8 @@ mod tests {
                 hostname: hostname.map(str::to_string),
                 role: NeighborRole::Unknown,
             }],
+            services: Vec::new(),
+            heard: None,
         })
     }
 
@@ -845,6 +881,8 @@ mod tests {
                 hostname: None,
                 role: NeighborRole::Unknown,
             }],
+            services: Vec::new(),
+            heard: None,
         }))
         .unwrap();
         let lts = s.neighbor_lifetimes(None).unwrap();
@@ -950,6 +988,130 @@ mod tests {
         assert_eq!(t.rows[0], vec!["printer.local", "arp"]);
     }
 
+    /// A listener flush for one announcer, so the service upsert can be driven.
+    fn listener_flush(
+        ts_us: i64,
+        ip: Option<&str>,
+        detail: Option<&str>,
+        heard: (u32, Option<u32>, u32),
+    ) -> Sample {
+        use types::{AnnounceKind, AnnouncedService, HeardFrames};
+        Sample::Neighbors(NeighborsSample {
+            ts_us,
+            verdict: NeighborsVerdict::Ok,
+            reason: None,
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            iface: Some("en0".into()),
+            neighbors: vec![NeighborObs {
+                mac: "11:22:33:44:55:66".into(),
+                ip: "192.168.1.6".into(),
+                source: NeighborSource::Announce,
+                hostname: Some("0xFF.local".into()),
+                role: NeighborRole::Unknown,
+            }],
+            services: vec![AnnouncedService {
+                mac: "11:22:33:44:55:66".into(),
+                ip: ip.map(str::to_string),
+                service: "_companion-link._tcp".into(),
+                kind: AnnounceKind::Mdns,
+                detail: detail.map(str::to_string),
+            }],
+            heard: Some(HeardFrames {
+                total: heard.0,
+                own: heard.1,
+                dropped: heard.2,
+            }),
+        })
+    }
+
+    /// A listener flush lands in all three tables: its frame counts on the
+    /// reading, the announcer as a neighbour with the `announce` provenance,
+    /// and the service as one row per (network, mac, service) that keeps its
+    /// first sighting and what an earlier repeat learned (realm net-observer,
+    /// node #92).
+    #[test]
+    fn a_listener_flush_records_its_counts_the_announcer_and_the_service_once() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&listener_flush(
+            1000,
+            Some("192.168.1.6"),
+            Some("0xFF"),
+            (7, Some(2), 0),
+        ))
+        .unwrap();
+        // The repeat: no address, no detail, more frames, no own MAC to tell
+        // our frames by, and five observations its caps refused.
+        s.write_sample(&listener_flush(2000, None, None, (3, None, 5)))
+            .unwrap();
+
+        let t = s
+            .query_table(
+                "SELECT ts_us, heard_frames, own_frames, dropped_obs, neighbor_count \
+                 FROM neighbor_sample ORDER BY ts_us",
+            )
+            .unwrap();
+        assert_eq!(t.rows[0], vec!["1000", "7", "2", "0", "1"]);
+        // A window with no readable own MAC: heard counted, own NULL — not 0.
+        assert_eq!(t.rows[1], vec!["2000", "3", "", "5", "1"]);
+
+        let t = s
+            .query_table("SELECT source, hostname, ip FROM neighbor")
+            .unwrap();
+        assert_eq!(t.rows[0], vec!["announce", "0xFF.local", "192.168.1.6"]);
+
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM neighbor_service")
+                .unwrap(),
+            1
+        );
+        let t = s
+            .query_table(
+                "SELECT network_key, mac, ip, service, kind, detail, first_seen_us, last_seen_us \
+                 FROM neighbor_service",
+            )
+            .unwrap();
+        assert_eq!(
+            t.rows[0],
+            vec![
+                "aa:bb:cc:dd:ee:ff",
+                "11:22:33:44:55:66",
+                "192.168.1.6",
+                "_companion-link._tcp",
+                "mdns",
+                "0xFF",
+                "1000",
+                "2000"
+            ]
+        );
+    }
+
+    /// A cache tick counts no frames: NULL, never a zero — so "the listener
+    /// heard nothing" and "this reading is not the listener's" stay apart.
+    #[test]
+    fn a_cache_tick_leaves_the_frame_counts_null() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&neighbors_tick(
+            1000,
+            "11:22:33:44:55:66",
+            "192.168.1.5",
+            None,
+            NeighborSource::Arp,
+        ))
+        .unwrap();
+        let t = s
+            .query_table(
+                "SELECT heard_frames IS NULL, own_frames IS NULL, dropped_obs IS NULL \
+                 FROM neighbor_sample",
+            )
+            .unwrap();
+        assert_eq!(t.rows[0], vec!["true", "true", "true"]);
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM neighbor_service")
+                .unwrap(),
+            0
+        );
+    }
+
     /// A SKIP tick writes its row and no neighbours — the gap stays visible.
     #[test]
     fn a_skip_tick_records_the_reading_without_neighbours() {
@@ -961,6 +1123,8 @@ mod tests {
             network_key: None,
             iface: None,
             neighbors: Vec::new(),
+            services: Vec::new(),
+            heard: None,
         }))
         .unwrap();
         assert_eq!(

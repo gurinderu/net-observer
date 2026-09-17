@@ -1,0 +1,13 @@
+[package]
+name = "collector-announce"
+edition.workspace = true
+
+[dependencies]
+types.workspace = true
+collector-core.workspace = true
+etherparse.workspace = true
+simple-dns.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
