@@ -3,7 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
-use gpui::{IntoElement, RenderOnce, Rgba, SharedString, div, px, rgb};
+use gpui::{AnyElement, IntoElement, RenderOnce, Rgba, SharedString, div, px, rgb};
 
 use super::theme::{MENU_SEPARATOR_H, Theme};
 
@@ -277,6 +277,31 @@ pub(crate) fn moments_diverge(a_us: i64, b_us: i64) -> Option<String> {
 /// window dates its picture at the same size, or the same fact reads as two
 /// different kinds of fact.
 pub(crate) const PROVENANCE_TEXT: f32 = 11.0;
+
+// ---- a state, in words, under a selector that carries them -----------------
+
+/// A one-line state under a selector that carries the words shown, so a
+/// headless test asserts what a window says rather than only that it said
+/// something: the selector is `{kind}:{message}`. The caller picks the ink —
+/// warn for an absence the daemon caused, muted for one that is simply the
+/// state of the record.
+///
+/// One line for every window. A state that is not drawn is a blank area, and a
+/// blank area is exactly what these lines exist to prevent — so the map's
+/// findings, the connections table and any later reading say "not read yet",
+/// "nothing", or the daemon's words through this one element rather than each
+/// through a retyped copy.
+pub(crate) fn note(kind: &str, message: impl Into<String>, color: u32) -> AnyElement {
+    let message: String = message.into();
+    let selector = format!("{kind}:{message}");
+    div()
+        .debug_selector(move || selector)
+        .py_1()
+        .text_size(px(11.0))
+        .text_color(rgb(color))
+        .child(message)
+        .into_any_element()
+}
 
 // ---- markers whose explanation is a hover hint ------------------------------
 

@@ -33,11 +33,15 @@
 //!   `WindowKind::Normal`): opened from the panel footer, fed by one held-open
 //!   `Subscribe` stream over the socket (pub/sub, push not poll), with a type
 //!   selector over a live autoscrolling list.
+//! - [`connections`] — the **connections window**: what this machine talks
+//!   to right now, one read-only `Query(Connections { group_by })` per open,
+//!   refresh or grouping switch, drawn as a table.
 //!
 //! The GUI cannot run headlessly, so it is verified by compiling + clippy; the
 //! tested surface stays the data/render layer.
 
 mod air;
+mod connections;
 mod events;
 mod map;
 mod menu;

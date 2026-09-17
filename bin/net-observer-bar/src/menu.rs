@@ -66,9 +66,10 @@ const MENU_PAD: f32 = 4.0;
 /// The `gap_0p5` between two stacked children of the flyout's root.
 const MENU_GAP: f32 = 2.0;
 
-/// The rows every daemon gets, whatever it can collect: events, map, freeze,
-/// probe, scan, refresh, quit. Only the collector rows come and go.
-const FIXED_ROWS: usize = 7;
+/// The rows every daemon gets, whatever it can collect: events, map,
+/// connections, freeze, probe, scan, refresh, quit. Only the collector rows
+/// come and go.
+const FIXED_ROWS: usize = 8;
 /// The group headings ("windows", "daemon", "panel") and the two rules between
 /// the three groups.
 const HEADINGS: usize = 3;
@@ -235,6 +236,19 @@ impl Render for MenuView {
             let model = this.model.clone();
             crate::map::open_or_focus(cx, &model);
         });
+        // A fixed row like Map: the window asks the daemon itself and shows
+        // the daemon's own words when it cannot answer.
+        let connections = self.entry(
+            "connections",
+            "Connections",
+            theme.accent,
+            theme,
+            cx,
+            |this, cx| {
+                let model = this.model.clone();
+                crate::connections::open_or_focus(cx, &model);
+            },
+        );
         // The air row exists only when the daemon can produce air at all.
         //
         // Three states, kept apart on purpose (realm net-observer, shared surface
@@ -325,6 +339,7 @@ impl Render for MenuView {
             .child(Self::heading("windows", theme))
             .child(events)
             .child(map)
+            .child(connections)
             .children(air)
             .child(separator(theme))
             .child(Self::heading("daemon", theme))
@@ -801,9 +816,10 @@ mod headless_tests {
 
         // Every action the panel's footer used to carry, in flyout order. The air
         // row is the only one a daemon can be without.
-        let rows: [&'static str; 8] = [
+        let rows: [&'static str; 9] = [
             "menu-row:events",
             "menu-row:map",
+            "menu-row:connections",
             "menu-row:air",
             "menu-row:freeze",
             "menu-row:probe",
