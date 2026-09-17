@@ -1060,7 +1060,7 @@ and the CLI `events` tail.
   `Event` is the live sibling of a `Sample`:
   `Event::{Link,Proxy,Dns,Route,Host}(sample)` plus
   `Event::Incident(IncidentSummary)` and its close,
-  `Event::IncidentClosed { id, trigger_id, closed_us }`, each carrying its own
+  `Event::IncidentClosed { id, trigger_id, opened_us, closed_us }`, each carrying its own
   `kind()` and `ts_us()` (defined in `crates/net-observer-ipc`); `StreamFrame`
   wraps it alongside the stream-integrity frames. The close is a frame of its
   own (`EventKind::IncidentClosed`, label `incident-closed`) rather than a
@@ -1087,9 +1087,15 @@ and the CLI `events` tail.
   `Event::Incident` in addition to mirroring it into the snapshot ring, and on
   each clear an `Event::IncidentClosed` alongside stamping `closed_us` on the
   ring entry — one site, since a session-ending edge (`TriggerEngine::close_all`
-  at a pause or tier switch) closes through the same `on_clear`. The close is
-  published whether or not the ring still holds the id: what the bus opened,
-  the bus closes (realm net-observer, node #135). Sample
+  at a pause or tier switch) closes through the same `on_clear`. That edge-time
+  close is *stamped* with the pause's (or the switch's) own instant but
+  *published* only when the first sample after the edge reaches the consumer,
+  because `close_all` runs from `pipeline::run` on that sample: a subscriber
+  sees the frame late, with a `closed_us` earlier than the frames around it.
+  The close carries the opening instant too, read back from the id the engine
+  minted (`triggers::engine::incident_id_parts`), so the line can say how long
+  the incident lasted. It is published whether or not the ring still holds the
+  id: what the bus opened, the bus closes (realm net-observer, node #135). Sample
   publishers first check `events_tx.receiver_count()` and skip building and
   sending the frame entirely while nobody is subscribed, so the bus costs nothing
   until someone watches (the check/subscribe race is benign — a receiver that
@@ -1174,7 +1180,9 @@ and the CLI `events` tail.
 - **CLI** (`net-observer-cli events [--kind K]`) — the pub/sub smoke test and a
   terminal tail: one `Subscribe`, print the `Ready` ack (so the tail opens by
   stating the collection state) and then each frame live until Ctrl-C; `--kind`
-  filters server-side, and stream-integrity frames arrive regardless of it. Every
+  filters server-side (`--kind incident` subscribes to `incident-closed` too, by
+  `EventKind::admits` — the one rule the bar's chips also apply), and
+  stream-integrity frames arrive regardless of it. Every
   ending is reported on stderr with its reason, but only a genuine failure (a
   daemon-side `StreamFrame::Error`, a decode/read failure) exits non-zero — an
   orderly daemon close or a closed output pipe is not a failure of the tail.
