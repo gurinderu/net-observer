@@ -223,6 +223,17 @@ pub struct NeighborsCfg {
     /// that and records no links, never a pretence of a clean topology.
     #[serde(default = "default_true")]
     pub topology: bool,
+    /// Passive announcement listening: a second `tcpdump` child hears what
+    /// the segment says about itself (ARP, mDNS, SSDP, DHCP) and keeps the
+    /// neighbour map alive with no packet of ours (realm net-observer, node
+    /// #92). On by default like the other passive collectors — it emits
+    /// NOTHING on the wire, and the probing tier does not gate it, since a
+    /// tier withholds emissions and this has none. Like the topology capture
+    /// it needs root and a BPF read, and it degrades HONESTLY: when the child
+    /// cannot start the daemon logs why and runs without the listener, and
+    /// the neighbour-cache ticks keep saying who is on the segment.
+    #[serde(default = "default_true")]
+    pub announce: bool,
     /// Directory holding the local CVE snapshot the `cve` rung matches banners
     /// against (a cvelistV5 tree under `cves/` plus an optional `kev.json`).
     /// `None` by default, and the operator provisions the data out-of-band. The
@@ -313,6 +324,7 @@ impl Default for Config {
                     enabled: true,
                     interval: Duration::from_secs(120),
                     topology: true,
+                    announce: true,
                     cve_snapshot_dir: None,
                     oui_snapshot_dir: None,
                 },
@@ -545,6 +557,12 @@ mod tests {
         let c = Config::load(Some(p.to_str().unwrap())).unwrap();
         assert!(!c.collectors.neighbors.enabled);
         assert_eq!(c.collectors.neighbors.interval.as_secs(), 300);
+        // The listener is on by default, tolerated absent, and its own switch.
+        assert!(c.collectors.neighbors.announce);
+        std::fs::write(&p, "[collectors.neighbors]\nannounce = false\n").unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert!(c.collectors.neighbors.enabled);
+        assert!(!c.collectors.neighbors.announce);
     }
     #[test]
     fn toml_overrides_defaults() {

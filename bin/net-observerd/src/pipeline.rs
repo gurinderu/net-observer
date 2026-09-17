@@ -339,7 +339,9 @@ pub async fn run(
         // lock is taken — a DB read must never happen under the mutex the socket
         // path also waits on.
         let lifetimes = match &sample {
-            Sample::Neighbors(n) => Some(neighbor_lifetimes_for(store.as_ref(), n)),
+            Sample::Neighbors(n) if !n.is_listener_flush() => {
+                Some(neighbor_lifetimes_for(store.as_ref(), n))
+            }
             _ => None,
         };
         // Mirror the latest sample into the in-memory snapshot the socket serves.
@@ -352,6 +354,13 @@ pub async fn run(
                 Sample::Dns(d) => snap.dns = Some(d.clone()),
                 Sample::Host(h) => snap.host = Some(h.clone()),
                 Sample::Wifi(w) => snap.wifi = Some(w.clone()),
+                // A listener flush is the segment's last window of
+                // announcements, not the whole neighbour table: it is written
+                // and published above and below, but it never replaces the
+                // cache reading the snapshot holds — the live map would
+                // otherwise flicker between the table and the last 15 s
+                // (realm net-observer, node #92).
+                Sample::Neighbors(n) if n.is_listener_flush() => {}
                 Sample::Neighbors(n) => {
                     snap.neighbors = Some(n.clone());
                     snap.neighbor_lifetimes = lifetimes.unwrap_or_default();
@@ -587,8 +596,9 @@ pub(crate) fn spawn_interval_collector(
 /// thread (`std::thread`, never the interval path), forwarding via the channel's
 /// `blocking_send`.
 ///
-/// The `route` collector (persistent PF_ROUTE socket) is the live Event-cadence
-/// consumer: its `next()` is a blocking `read(2)` driven here on a dedicated
+/// The `route` collector (persistent PF_ROUTE socket) and the `announce`
+/// listener (a `tcpdump` child's pcap pipe) are the live Event-cadence
+/// consumers: each `next()` is a blocking read driven here on a dedicated
 /// thread. Because that `read(2)` cannot be interrupted, a `next()` parked on an
 /// idle socket keeps its stream sender alive through `abort_all`; the daemon
 /// therefore bounds its shutdown drain (see `net-observerd::main`) and the OS reaps
@@ -635,7 +645,7 @@ pub(crate) fn spawn_event_collector(
                     tracing::debug!(
                         collector = name,
                         dropped = samples.len(),
-                        "paused: dropping route batch"
+                        "paused: dropping event batch"
                     );
                 }
                 dropped_while_paused += 1;
@@ -646,7 +656,7 @@ pub(crate) fn spawn_event_collector(
                 tracing::info!(
                     collector = name,
                     dropped = dropped_while_paused,
-                    "resumed: route batches dropped while paused"
+                    "resumed: event batches dropped while paused"
                 );
                 dropped_while_paused = 0;
             }
@@ -1902,6 +1912,113 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    /// A listener flush is written and published like any reading, but it
+    /// never replaces the cache reading the snapshot holds: the live map keeps
+    /// the neighbour table, not the last window's announcements (realm
+    /// net-observer, node #92).
+    #[tokio::test]
+    async fn a_listener_flush_is_recorded_but_leaves_the_snapshot_reading_alone() {
+        use types::{
+            AnnounceKind, AnnouncedService, HeardFrames, NeighborObs, NeighborRole, NeighborSource,
+            NeighborsVerdict,
+        };
+        let obs = |mac: &str, source: NeighborSource| NeighborObs {
+            mac: mac.into(),
+            ip: "192.168.1.6".into(),
+            source,
+            hostname: None,
+            role: NeighborRole::Unknown,
+        };
+        let cache_tick = Sample::Neighbors(NeighborsSample {
+            ts_us: 1,
+            verdict: NeighborsVerdict::Ok,
+            reason: None,
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            iface: Some("en0".into()),
+            neighbors: vec![obs("11:22:33:44:55:66", NeighborSource::Arp)],
+            services: Vec::new(),
+            heard: None,
+        });
+        let flush = Sample::Neighbors(NeighborsSample {
+            ts_us: 2,
+            verdict: NeighborsVerdict::Ok,
+            reason: None,
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            iface: Some("en0".into()),
+            neighbors: vec![obs("a4:83:e7:1b:2c:3d", NeighborSource::Announce)],
+            services: vec![AnnouncedService {
+                mac: "a4:83:e7:1b:2c:3d".into(),
+                ip: Some("192.168.1.6".into()),
+                service: "_companion-link._tcp".into(),
+                kind: AnnounceKind::Mdns,
+                detail: None,
+            }],
+            heard: Some(HeardFrames { total: 5, own: 1 }),
+        });
+
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let eng = TriggerEngine::new(vec![]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, mut events_rx) = broadcast::channel(16);
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            no_resume(),
+            no_session_end(),
+        ));
+        tx.send(cache_tick).await.unwrap();
+        tx.send(flush).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        // The snapshot still holds the cache reading, lifetimes included.
+        let snap = snapshot.lock().unwrap();
+        let held = snap.neighbors.as_ref().expect("the cache reading");
+        assert_eq!(held.ts_us, 1);
+        assert_eq!(held.neighbors[0].source, NeighborSource::Arp);
+        assert_eq!(snap.neighbor_lifetimes.len(), 1);
+        assert_eq!(snap.generated_us, 2, "the flush still bumps generated_us");
+        drop(snap);
+
+        // Both readings were written, the flush with its counts and service.
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM neighbor_sample")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT own_frames FROM neighbor_sample WHERE ts_us = 2")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM neighbor_service")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM neighbor WHERE source = 'announce'")
+                .unwrap(),
+            1
+        );
+        // And both were published on the bus.
+        let mut published = 0;
+        while let Ok(frame) = events_rx.try_recv() {
+            if matches!(decode(&frame), StreamFrame::Event(Event::Neighbors(_))) {
+                published += 1;
+            }
+        }
+        assert_eq!(published, 2);
     }
 
     /// The interval spawner ticks its collector, `await`s `collect()` directly on
