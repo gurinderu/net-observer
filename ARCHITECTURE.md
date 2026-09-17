@@ -700,6 +700,30 @@ CLI's offline `query` opens whatever file it is handed); rows written by that
 daemon read back with a `NULL` cause, which the gap derivation treats as
 `control` — which is what they in fact were.
 
+**Retention.** Nothing in the record is pruned unless config says so: the
+policy (how long to keep) is the owner's decision, and the shipped default is
+keep-forever — `[record] retention_days = 0` (realm net-observer, node #130).
+The mechanism is `Store::prune_older_than(table, cutoff_us)`: `DELETE FROM
+<table> WHERE ts_us < cutoff`, returning the deleted count, followed by a
+`CHECKPOINT` when anything went (DuckDB frees a deleted row's blocks for reuse
+only at a checkpoint; the file does not shrink, it stops growing). With a
+window set, the daemon runs one sweep at startup — after the store opens and
+the stale incidents close, before any collector writes — and then one every
+24 h, each table's prune on the blocking pool the way a diagnosis runs, each
+result logged (`pruned <n> rows older than <days> d from <table>`, `debug` when
+nothing went) and each failure logged as a gap and skipped, never fatal. The
+table names come from `[record] retention_tables` and are checked against
+`store::SAMPLE_TABLES` — the per-tick tables above (`link_sample` …
+`connection_sample`, plus `air_ap`) — so config can name nothing else: the
+evidence (`incident`, `blob_ref`, `trigger_fired`), the brackets
+(`observing_edge`, `probing_edge`), the record of the daemon having spoken
+(`neighbor_scan`), the experiments and the keyed entity tables are outside the
+list and are never pruned. The default list is `["connection_sample"]` alone:
+one row per flow key per 15 s tick, measured on the owner's Mac on 2026-09-17
+at ~3.3 k rows/hour (~80 k rows/day) — the whole file grew ~1.3 MB/day before
+that collector, ~8 MB/day is the estimate with it — an order of magnitude more
+than any other table; the owner widens the list by config.
+
 ### Diagnosis queries
 
 `crates/store/src/diagnosis.rs` is the read side: the canned SQL that turns the
