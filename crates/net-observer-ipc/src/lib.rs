@@ -468,6 +468,10 @@ event_kinds! {
     /// What this machine talks to: one tick of the proxy's live flow table.
     Connections => "connections",
     Incident => "incident",
+    /// An incident's close: the condition that opened it stopped asserting, or
+    /// a pause / tier edge ended its observation session (realm net-observer,
+    /// node #135).
+    IncidentClosed => "incident-closed",
 }
 
 /// The live [`Event`] a connections tick publishes: the tick's verdict and
@@ -497,9 +501,10 @@ impl ConnectionsSummary {
     }
 }
 
-/// One live event pushed over a [`Request::Subscribe`] stream: either a fresh
-/// collector [`Sample`](types::Sample) or a newly recorded incident. Each frame
-/// carries its own payload so subscribers can render it without a second lookup.
+/// One live event pushed over a [`Request::Subscribe`] stream: a fresh
+/// collector [`Sample`](types::Sample), a newly recorded incident, or the close
+/// of one. Each frame carries its own payload so subscribers can render it
+/// without a second lookup.
 ///
 /// Sized like [`Response`]: the `Link` variant dominates, but this is the shared
 /// wire type the daemon constructs directly and boxing would add an allocation on
@@ -518,6 +523,20 @@ pub enum Event {
     /// A connections tick, as its summary only (see [`ConnectionsSummary`]).
     Connections(ConnectionsSummary),
     Incident(IncidentSummary),
+    /// The close of an incident an earlier [`Event::Incident`] opened, a frame
+    /// of its own: a repeated `Incident` carrying `closed_us` would read as a
+    /// second firing to a reader that never learnt to look at that field. A
+    /// reader built before this variant sees one [`StreamFrame::Unrecognized`]
+    /// and keeps its stream (realm net-observer, node #135).
+    IncidentClosed {
+        /// The incident's id — the same `id` the opening [`Event::Incident`]
+        /// carried, so a reader can find the entry it opened.
+        id: String,
+        trigger_id: String,
+        /// When it closed (epoch microseconds): the tick whose condition
+        /// stopped asserting, or the edge that ended the observation session.
+        closed_us: i64,
+    },
 }
 
 impl Event {
@@ -535,11 +554,12 @@ impl Event {
             Event::Air(_) => EventKind::Air,
             Event::Connections(_) => EventKind::Connections,
             Event::Incident(_) => EventKind::Incident,
+            Event::IncidentClosed { .. } => EventKind::IncidentClosed,
         }
     }
 
     /// The event's timestamp in epoch microseconds. Samples expose their own
-    /// `ts_us`; an incident uses its `opened_us`.
+    /// `ts_us`; an incident uses its `opened_us`, its close its `closed_us`.
     pub fn ts_us(&self) -> i64 {
         match self {
             Event::Link(l) => l.ts_us,
@@ -552,6 +572,7 @@ impl Event {
             Event::Air(a) => a.ts_us,
             Event::Connections(c) => c.ts_us,
             Event::Incident(i) => i.opened_us,
+            Event::IncidentClosed { closed_us, .. } => *closed_us,
         }
     }
 
@@ -669,6 +690,11 @@ impl Event {
                 ConnectionsVerdict::Ok => format!("{} flows, {} hosts", c.flows, c.hosts),
             },
             Event::Incident(i) => format!("{} {}", i.trigger_id, i.signature),
+            // The instant is the frame's own `ts_us`, which every renderer
+            // already prints as the line's clock; the duration is not here
+            // because the frame does not carry the opening instant (realm
+            // net-observer, node #135).
+            Event::IncidentClosed { id, trigger_id, .. } => format!("{id} ({trigger_id})"),
         }
     }
 }
@@ -1754,6 +1780,7 @@ mod tests {
             EventKind::Neighbors,
             EventKind::Air,
             EventKind::Incident,
+            EventKind::IncidentClosed,
         ];
         let req = Request::Subscribe {
             kinds: Some(all.to_vec()),
@@ -2486,6 +2513,16 @@ mod tests {
         });
         assert_eq!(inc.kind(), EventKind::Incident);
         assert_eq!(inc.ts_us(), 42);
+
+        // The close borrows its timestamp from `closed_us` — the instant the
+        // frame is about, not the opening it refers back to.
+        let closed = Event::IncidentClosed {
+            id: "inc-1".into(),
+            trigger_id: "t".into(),
+            closed_us: 57,
+        };
+        assert_eq!(closed.kind(), EventKind::IncidentClosed);
+        assert_eq!(closed.ts_us(), 57);
     }
 
     #[test]
@@ -2498,6 +2535,7 @@ mod tests {
             (EventKind::Host, "host"),
             (EventKind::Connections, "connections"),
             (EventKind::Incident, "incident"),
+            (EventKind::IncidentClosed, "incident-closed"),
         ] {
             assert_eq!(kind.as_str(), label);
         }
@@ -2722,6 +2760,15 @@ mod tests {
             signature: "sig".into(),
         });
         assert_eq!(inc.detail(), "fakeip sig");
+
+        // The close names the incident it ends and the rule that opened it;
+        // the instant is the frame's `ts_us`, so it is not repeated here.
+        let closed = Event::IncidentClosed {
+            id: "fakeip-100".into(),
+            trigger_id: "fakeip".into(),
+            closed_us: 115,
+        };
+        assert_eq!(closed.detail(), "fakeip-100 (fakeip)");
     }
 
     /// The bus carries a connections tick as its summary — the counts of the
@@ -2829,6 +2876,96 @@ mod tests {
             }
             other => panic!("unexpected frame variant: {other:?}"),
         }
+    }
+
+    /// The close travels as its own frame and comes back whole: the id that
+    /// ties it to the opening, the rule, and the closing instant (realm
+    /// net-observer, node #135).
+    #[test]
+    fn frame_round_trip_stream_frame_incident_closed() {
+        let frame = StreamFrame::Event(Event::IncidentClosed {
+            id: "gw-drop-5000".into(),
+            trigger_id: "gw-drop".into(),
+            closed_us: 5015,
+        });
+        match round_trip_frame(&frame) {
+            StreamFrame::Event(Event::IncidentClosed {
+                id,
+                trigger_id,
+                closed_us,
+            }) => {
+                assert_eq!(id, "gw-drop-5000");
+                assert_eq!(trigger_id, "gw-drop");
+                assert_eq!(closed_us, 5015);
+            }
+            other => panic!("unexpected frame variant: {other:?}"),
+        }
+        assert_eq!(frame.label(), "incident-closed");
+        assert_eq!(frame.event_kind(), Some(EventKind::IncidentClosed));
+    }
+
+    /// A reader built before the close existed sees ONE `Unrecognized` frame,
+    /// not a dead stream: the same forward-compatibility rule the probing
+    /// frame relies on, exercised for an `Event` variant. The pre-close
+    /// vocabulary is spelled out locally, the way the pre-tier one is below
+    /// (realm net-observer, node #135).
+    #[test]
+    fn an_incident_closed_frame_costs_a_pre_close_reader_one_frame_not_the_stream() {
+        /// The event vocabulary as a pre-close reader decodes it: it knows an
+        /// opening, and nothing else about incidents.
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        enum OldEvent {
+            Incident(IncidentSummary),
+        }
+        /// The stream vocabulary of that reader.
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        enum OldStreamFrame {
+            Ready(Ready),
+            Event(OldEvent),
+            Gap(Gap),
+            Observing(ObservingEdge),
+            Probing(ProbingEdge),
+            Error(StreamError),
+        }
+        let line = String::from_utf8(
+            encode_frame(&StreamFrame::Event(Event::IncidentClosed {
+                id: "gw-drop-1".into(),
+                trigger_id: "gw-drop".into(),
+                closed_us: 2,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let e = serde_json::from_str::<OldStreamFrame>(&line)
+            .expect_err("a pre-close reader cannot name the frame");
+        assert_eq!(
+            e.classify(),
+            serde_json::error::Category::Data,
+            "an unknown variant is a data error, which `decode_stream_frame` \
+             turns into one Unrecognized frame rather than a dead stream"
+        );
+        assert!(e.to_string().contains("IncidentClosed"), "{e}");
+        // The opening that reader DOES know still decodes on the same stream.
+        let opening = String::from_utf8(
+            encode_frame(&StreamFrame::Event(Event::Incident(IncidentSummary {
+                id: "gw-drop-1".into(),
+                opened_us: 1,
+                closed_us: None,
+                trigger_id: "gw-drop".into(),
+                signature: "sig".into(),
+            })))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                serde_json::from_str::<OldStreamFrame>(&opening).unwrap(),
+                OldStreamFrame::Event(OldEvent::Incident(_))
+            ),
+            "the frame after the one lost must still decode"
+        );
     }
 
     #[test]
@@ -3117,6 +3254,15 @@ mod tests {
         assert_eq!(event.label(), "incident");
         assert_eq!(event.detail(), "fakeip sig");
         assert_eq!(event.ts_us(), 42);
+
+        let closed = StreamFrame::Event(Event::IncidentClosed {
+            id: "fakeip-42".into(),
+            trigger_id: "fakeip".into(),
+            closed_us: 57,
+        });
+        assert_eq!(closed.label(), "incident-closed");
+        assert_eq!(closed.detail(), "fakeip-42 (fakeip)");
+        assert_eq!(closed.ts_us(), 57);
 
         let gap = StreamFrame::Gap(Gap {
             ts_us: 9,
