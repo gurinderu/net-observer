@@ -998,8 +998,8 @@ impl DuckdbStore {
 /// **The latest air scan itself** — when it ran, its verdict, why it was skipped
 /// if it was, and how many access points it heard.
 ///
-/// Read alongside [`AIR_LATEST_APS_SQL`], and read FIRST: a `SKIP` row means the
-/// scan could not look, and its empty AP list must never be presented as an
+/// Read FIRST, its `ts_us` then pinning [`air_aps_at_sql`]: a `SKIP` row means
+/// the scan could not look, and its empty AP list must never be presented as an
 /// empty air (realm net-observer, node #48).
 pub const AIR_LATEST_SCAN_SQL: &str = "\
 SELECT ts_us, air, reason, ap_count
@@ -1007,17 +1007,28 @@ FROM air_sample
 ORDER BY ts_us DESC
 LIMIT 1";
 
-/// **The access points the latest air scan heard** — one row each, as reported.
+/// **The access points one specific air scan heard** — one row each, as
+/// reported, filtered to the scan the caller already read
+/// (`WHERE ts_us = ?`, bound rather than re-selected as `max(ts_us)`) so a
+/// scan the collector writes between two round trips over the live socket can
+/// never pair its header with a different scan's AP list (realm net-observer,
+/// node #99).
 ///
 /// A slice, not a history: the report carries no BSSID, so an AP here cannot be
 /// matched to one in any other scan (realm net-observer, node #47). Ordered
 /// loudest first as a stable fallback; the reader re-orders by the overlap
 /// hypothesis it computes against our own channel.
-pub const AIR_LATEST_APS_SQL: &str = "\
+pub fn air_aps_at_sql(scan_ts_us: i64) -> PreparedSql {
+    PreparedSql {
+        sql: "\
 SELECT channel, channel_band, channel_width_mhz, phy_mode, security, rssi_dbm, noise_dbm
 FROM air_ap
-WHERE ts_us = (SELECT max(ts_us) FROM air_sample)
-ORDER BY rssi_dbm DESC NULLS LAST, channel";
+WHERE ts_us = ?
+ORDER BY rssi_dbm DESC NULLS LAST, channel"
+            .to_string(),
+        params: vec![Value::BigInt(scan_ts_us)],
+    }
+}
 
 /// **Our own channel**, from the most recent `wifi_sample` that actually carried
 /// one — the band the overlap hypothesis is computed against.
@@ -2589,5 +2600,44 @@ mod tests {
         assert_eq!(t.rows.len(), 1);
         assert_eq!(cell(&t, 0, "verdict"), "OK");
         assert_eq!(cell(&t, 0, "key"), "");
+    }
+
+    // ---- air: pin the AP list to the scan the reader saw --------------------
+
+    fn air_scan(s: &DuckdbStore, ts_us: i64, channel: i32) {
+        use types::{AirObservation, AirSample, AirVerdict};
+        s.write_sample(&Sample::Air(AirSample {
+            ts_us,
+            air: AirVerdict::Ok,
+            reason: None,
+            aps: vec![AirObservation {
+                channel: Some(channel),
+                channel_band: Some("5ghz".into()),
+                channel_width_mhz: Some(80),
+                phy_mode: Some("802.11a/n/ac/ax".into()),
+                security: Some("wpa2_personal".into()),
+                rssi_dbm: Some(-60),
+                noise_dbm: Some(-90),
+            }],
+        }))
+        .unwrap();
+    }
+
+    /// Two scans in the record, each with its own AP: pinning by `ts_us`
+    /// returns only the named scan's row, never the other one's — the race
+    /// [`air_aps_at_sql`] exists to close (realm net-observer, node #99).
+    #[test]
+    fn air_aps_at_sql_returns_only_the_pinned_scans_rows() {
+        let s = DuckdbStore::in_memory().unwrap();
+        air_scan(&s, 10 * SEC, 36);
+        air_scan(&s, 20 * SEC, 149);
+
+        let older = s.query_prepared(&air_aps_at_sql(10 * SEC)).unwrap();
+        assert_eq!(older.rows.len(), 1);
+        assert_eq!(cell(&older, 0, "channel"), "36");
+
+        let newer = s.query_prepared(&air_aps_at_sql(20 * SEC)).unwrap();
+        assert_eq!(newer.rows.len(), 1);
+        assert_eq!(cell(&newer, 0, "channel"), "149");
     }
 }

@@ -17,7 +17,12 @@
 //!   DuckDB file itself only when no daemon answers on the socket — unless the
 //!   operator gave `--db`, which names the record and means the socket is not
 //!   asked at all. Every diagnosis prints which record answered (`source:` on
-//!   stderr). See [`route`] for the exact rule. (realm net-observer, node #58)
+//!   stderr). See [`route`] for the exact rule. `air` is three reads pinned to
+//!   one moment: [`route_air`] decides live-or-file once, from the scan, and
+//!   reuses that choice for the other two — a daemon that answers the scan
+//!   and then fails or cannot decode one of them is a hard error, never a
+//!   silent detour to the file, which would risk mixing a live table with a
+//!   stale one. (realm net-observer, node #58)
 //! - **OFFLINE** — `query <SQL>` opens the DuckDB file directly. This
 //!   only works while the daemon is stopped; if `net-observerd` is running it
 //!   holds the lock and the open fails with a clear message rather than a panic.
@@ -563,7 +568,10 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             // a refusal), what it heard, and our own channel to compare against.
             // Routed once, live first, like the other diagnoses (realm
             // net-observer, node #99); the choice is reused for all three so
-            // the operator sees one `source:` line, not three.
+            // the operator sees one `source:` line, not three. The AP list is
+            // pinned to the scan's own `ts_us` (`scan_ts_us`), never
+            // re-derived as "the newest" — the offline file can be rewritten
+            // between the two reads just as a live daemon's collector can.
             let record = Record::resolve(cli)?;
             let (scan, aps, own) =
                 match route_air(record.socket.as_deref(), net_observer_ipc::diagnose)? {
@@ -585,11 +593,18 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                             db_path: record.db_path,
                             locked,
                         };
-                        (
-                            table_from_query(run_query(&offline, diagnosis::AIR_LATEST_SCAN_SQL)?),
-                            table_from_query(run_query(&offline, diagnosis::AIR_LATEST_APS_SQL)?),
-                            table_from_query(run_query(&offline, diagnosis::AIR_SELF_CHANNEL_SQL)?),
-                        )
+                        let scan =
+                            table_from_query(run_query(&offline, diagnosis::AIR_LATEST_SCAN_SQL)?);
+                        let aps = match scan_ts_us(&scan) {
+                            Some(ts) => table_from_query(run_prepared(
+                                &offline,
+                                &diagnosis::air_aps_at_sql(ts),
+                            )?),
+                            None => Table::default(),
+                        };
+                        let own =
+                            table_from_query(run_query(&offline, diagnosis::AIR_SELF_CHANNEL_SQL)?);
+                        (scan, aps, own)
                     }
                 };
             print!("{}", diagnose::format_air(&scan, &aps, &own)?);
@@ -850,6 +865,18 @@ enum AirRoute {
     },
 }
 
+/// The `ts_us` of `AirScan`'s one row, read back from its own answer rather
+/// than re-derived as "the newest scan": the air collector can write a new
+/// scan between two round trips over a live socket, and re-deriving would pin
+/// `AirAps` to a different moment than the header just read — silent wrong
+/// data. `None` when the record has no scan at all, and then `AirAps` is not
+/// asked at all: `format_air` renders that absence without ever touching an
+/// AP list. (realm net-observer, node #99)
+fn scan_ts_us(scan: &Table) -> Option<i64> {
+    let i = scan.columns.iter().position(|c| c == "ts_us")?;
+    scan.rows.first()?.get(i)?.parse().ok()
+}
+
 /// [`route`] the `air` group of reads from ONE question — `AirScan` — and
 /// reuse that choice for `AirAps` and `AirSelfChannel`: a daemon or a file is
 /// decided once, not three times, so the operator sees one `source:` line for
@@ -860,7 +887,12 @@ fn route_air(
 ) -> Result<AirRoute> {
     match route(socket, |s| ask(s, DiagnosticQuery::AirScan))? {
         Route::Live { table: scan, via } => {
-            let aps = ask_air_table(&via, &ask, DiagnosticQuery::AirAps)?;
+            let aps = match scan_ts_us(&scan) {
+                Some(scan_ts_us) => {
+                    ask_air_table(&via, &ask, DiagnosticQuery::AirAps { scan_ts_us })?
+                }
+                None => Table::default(),
+            };
             let own = ask_air_table(&via, &ask, DiagnosticQuery::AirSelfChannel)?;
             Ok(AirRoute::Live {
                 scan,
@@ -1797,15 +1829,22 @@ mod tests {
     }
 
     /// `air` routes once, from `AirScan`, and reuses that choice for `AirAps`
-    /// and `AirSelfChannel`: a daemon answering all three is asked all three
-    /// (never re-routed), and an old daemon `Unsupported` on the first
-    /// question sends the whole group to the file without asking the other
-    /// two at all.
+    /// and `AirSelfChannel`: a daemon answering all three is asked all three,
+    /// `AirAps` pinned to the `ts_us` the scan itself answered with (never
+    /// re-routed); an old daemon `Unsupported` on the first question sends
+    /// the whole group to the file without asking the other two at all; and a
+    /// scan with no row at all — an empty record — is not a moment to pin
+    /// anything to, so `AirAps` is skipped rather than asked with a made-up
+    /// `ts_us`.
     #[test]
     fn air_asks_all_three_on_a_live_daemon_and_none_on_an_old_one() {
         use std::cell::RefCell;
         let asked: RefCell<Vec<DiagnosticQuery>> = RefCell::new(Vec::new());
 
+        let scan_at = |ts_us: &str| Table {
+            columns: vec!["ts_us".into()],
+            rows: vec![vec![ts_us.into()]],
+        };
         let t = |col: &str| Table {
             columns: vec![col.into()],
             rows: vec![],
@@ -1813,8 +1852,14 @@ mod tests {
         let r = route_air(Some("/run/observer.sock"), |_, q| {
             asked.borrow_mut().push(q.clone());
             Ok(QueryOutcome::Table(match q {
-                DiagnosticQuery::AirScan => t("ts_us"),
-                DiagnosticQuery::AirAps => t("channel"),
+                DiagnosticQuery::AirScan => scan_at("1000"),
+                DiagnosticQuery::AirAps { scan_ts_us } => {
+                    assert_eq!(
+                        scan_ts_us, 1000,
+                        "AirAps must be pinned to the scan's ts_us"
+                    );
+                    t("channel")
+                }
                 DiagnosticQuery::AirSelfChannel => t("channel_band"),
                 other => panic!("air must not ask {other:?}"),
             }))
@@ -1824,7 +1869,7 @@ mod tests {
             *asked.borrow(),
             vec![
                 DiagnosticQuery::AirScan,
-                DiagnosticQuery::AirAps,
+                DiagnosticQuery::AirAps { scan_ts_us: 1000 },
                 DiagnosticQuery::AirSelfChannel
             ]
         );
@@ -1835,7 +1880,7 @@ mod tests {
                 own,
                 via,
             } => {
-                assert_eq!(scan, t("ts_us"));
+                assert_eq!(scan, scan_at("1000"));
                 assert_eq!(aps, t("channel"));
                 assert_eq!(own, t("channel_band"));
                 assert_eq!(via, "/run/observer.sock");
@@ -1859,6 +1904,30 @@ mod tests {
                 assert!(why.contains("AirScan"), "{why}");
             }
             other => panic!("expected Offline with a reason, got {other:?}"),
+        }
+
+        // An empty record: the scan answers with no row, so there is nothing
+        // to pin `AirAps` to — it is asked `AirSelfChannel` only.
+        asked.borrow_mut().clear();
+        let r = route_air(Some("/run/observer.sock"), |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(QueryOutcome::Table(match q {
+                DiagnosticQuery::AirScan => Table {
+                    columns: vec!["ts_us".into()],
+                    rows: vec![],
+                },
+                DiagnosticQuery::AirSelfChannel => t("channel_band"),
+                other => panic!("air must not ask {other:?}"),
+            }))
+        })
+        .unwrap();
+        assert_eq!(
+            *asked.borrow(),
+            vec![DiagnosticQuery::AirScan, DiagnosticQuery::AirSelfChannel]
+        );
+        match r {
+            AirRoute::Live { aps, .. } => assert_eq!(aps, Table::default()),
+            other => panic!("expected Live, got {other:?}"),
         }
     }
 

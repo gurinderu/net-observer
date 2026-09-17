@@ -82,7 +82,7 @@ pub fn run_query(
             PreparedSql::plain(diagnosis::connections_sql(group_by))
         }
         DiagnosticQuery::AirScan => PreparedSql::plain(diagnosis::AIR_LATEST_SCAN_SQL.to_string()),
-        DiagnosticQuery::AirAps => PreparedSql::plain(diagnosis::AIR_LATEST_APS_SQL.to_string()),
+        DiagnosticQuery::AirAps { scan_ts_us } => diagnosis::air_aps_at_sql(scan_ts_us),
         DiagnosticQuery::AirSelfChannel => {
             PreparedSql::plain(diagnosis::AIR_SELF_CHANNEL_SQL.to_string())
         }
@@ -227,7 +227,7 @@ mod tests {
             &["ts_us", "air", "reason", "ap_count"],
         );
         expect(
-            DiagnosticQuery::AirAps,
+            DiagnosticQuery::AirAps { scan_ts_us: 1 },
             &[
                 "channel",
                 "channel_band",
