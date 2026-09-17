@@ -1258,6 +1258,13 @@ impl<S: Store + Send + Sync> Handler for FreezePcapHandler<S> {
 /// on the realtime bus so held-open `Subscribe` connections see it immediately.
 /// Newest first; the ring is truncated to `cap`. DuckDB (via [`RecordHandler`])
 /// remains the durable record — this ring is only the live view.
+///
+/// The close is mirrored too: `on_clear` stamps `closed_us` on the ring entry
+/// the firing opened, so the socket's `Incidents` and the status panel read
+/// the same open/closed state the record holds. Without it every incident
+/// stayed "open" in the live view for the life of the process while its row
+/// had long been closed — observed live: a `gw-drop` opened at boot still
+/// open on the socket an hour later (realm net-observer, node #124).
 pub struct SnapshotHandler {
     snapshot: Arc<Mutex<StatusSnapshot>>,
     cap: usize,
@@ -1308,6 +1315,15 @@ impl Handler for SnapshotHandler {
         let mut snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
         snap.incidents.insert(0, summary);
         snap.incidents.truncate(self.cap);
+    }
+
+    fn on_clear(&self, incident_id: &str, ts_us: i64) {
+        // An id the ring no longer holds (truncated by `cap`) has nothing to
+        // stamp: the durable row still closes through `RecordHandler`.
+        let mut snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(inc) = snap.incidents.iter_mut().find(|i| i.id == incident_id) {
+            inc.closed_us = Some(ts_us);
+        }
     }
 }
 
@@ -2192,7 +2208,7 @@ mod tests {
                 panic!("expected a link sample")
             };
             // The SKIP vocabulary, not a fabricated healthy value.
-            assert_eq!(l.gw, GwVerdict::NoGw);
+            assert_eq!(l.gw, GwVerdict::Skip);
             assert_eq!(l.direct, TcpVerdict::Skip);
             assert_eq!(l.gw_rtt_ms, None);
         }
@@ -2225,7 +2241,7 @@ mod tests {
                 .await
                 .expect("an unready collector must still emit every tick")
                 .expect("channel should stay open");
-            assert!(matches!(s, Sample::Link(ref l) if l.gw == GwVerdict::NoGw));
+            assert!(matches!(s, Sample::Link(ref l) if l.gw == GwVerdict::Skip));
         }
 
         // The prerequisite appears.
@@ -2820,6 +2836,87 @@ mod tests {
             }
             other => panic!("expected an Incident event frame, got {other:?}"),
         }
+    }
+
+    /// The ring mirrors the CLOSE: `on_clear` stamps `closed_us` on exactly
+    /// the entry the firing opened, leaves every other entry alone, and is a
+    /// no-op for an id the ring does not hold. Dies on `main` before the fix,
+    /// where `SnapshotHandler` took the trait's default `on_clear` and the
+    /// socket showed every incident open for the life of the process (realm
+    /// net-observer, node #124).
+    #[test]
+    fn snapshot_handler_on_clear_stamps_closed_us_on_the_ring_entry() {
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let handler = SnapshotHandler::new(snapshot.clone(), 8, events_tx);
+
+        handler.on_fire("gw-drop-100", 100, "gateway NOGW");
+        handler.on_fire("wedge-105", 105, "tun dead");
+        handler.on_clear("gw-drop-100", 115);
+        // Never mirrored (or already truncated): nothing to stamp, nothing added.
+        handler.on_clear("gw-drop-1", 120);
+
+        let snap = snapshot.lock().unwrap();
+        let closed = |id: &str| {
+            snap.incidents
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap_or_else(|| panic!("{id} must still be in the ring"))
+                .closed_us
+        };
+        assert_eq!(closed("gw-drop-100"), Some(115));
+        assert_eq!(
+            closed("wedge-105"),
+            None,
+            "an unrelated open incident is untouched"
+        );
+        assert_eq!(snap.incidents.len(), 2);
+    }
+
+    /// The sequence observed live, through the consumer loop with `gw-drop`
+    /// wired as `main` wires it (`record` + `snap`): a `NOGW` link tick
+    /// opens the incident, the next tick reads `SKIP` (the passive tier
+    /// withheld the echo), and BOTH views close it at that tick — the durable
+    /// row and the ring the socket's `Incidents` serves (realm net-observer,
+    /// node #124).
+    #[tokio::test]
+    async fn a_skip_tick_after_a_nogw_firing_closes_the_incident_in_both_views() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let snap: Arc<dyn Handler> =
+            Arc::new(SnapshotHandler::new(snapshot.clone(), 8, events_tx.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec, snap], 0)]);
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            no_resume(),
+            no_session_end(),
+        ));
+
+        tx.send(link(100, GwVerdict::NoGw)).await.unwrap();
+        tx.send(link(115, GwVerdict::Skip)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store.list_incidents().unwrap(),
+            vec![("gw-drop".to_string(), 100, Some(115))],
+            "the record closes the row at the SKIP tick"
+        );
+        let snap = snapshot.lock().unwrap();
+        assert_eq!(snap.incidents.len(), 1);
+        assert_eq!(snap.incidents[0].id, "gw-drop-100");
+        assert_eq!(
+            snap.incidents[0].closed_us,
+            Some(115),
+            "the live view closes the same incident at the same tick"
+        );
     }
 
     /// A wedge-shaped proxy tick: the tun is dead (`tun_code == 0`) while the

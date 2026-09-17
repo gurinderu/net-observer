@@ -174,10 +174,14 @@ where
         ))]
     }
 
+    /// The tick preflight could not run (no physical interface resolved):
+    /// nothing was measured, so every verdict is `SKIP` and every fact `None`.
+    /// Never `NOGW` — that is a MEASURED verdict, an interface with no default
+    /// route, and `gw-drop` fires on it (realm net-observer, node #25).
     fn skip(&self, ts_us: i64) -> Vec<Sample> {
         vec![Sample::Link(LinkSample {
             ts_us,
-            gw: GwVerdict::NoGw,
+            gw: GwVerdict::Skip,
             gw_rtt_ms: None,
             direct: TcpVerdict::Skip,
             direct_rtt_ms: None,
@@ -408,6 +412,37 @@ mod tests {
     #[tokio::test]
     async fn unavailable_preflight_is_not_ready() {
         assert!(!collector(false).preflight().await.is_ready());
+    }
+
+    /// The SKIP tick — preflight unavailable, no physical interface resolved
+    /// — measured nothing, so every verdict on it is `SKIP` and every fact
+    /// `None`. It must NOT read `NOGW`: that is a measured verdict ("an
+    /// interface with no default route") and `gw-drop` fires on it. Observed
+    /// live: a boot before any interface was up opened `gw-drop … gateway
+    /// NOGW` from a tick that never looked at the gateway (realm
+    /// net-observer, node #25).
+    #[test]
+    fn the_skip_tick_reads_skip_not_nogw() {
+        let samples = collector(false).skip(42);
+        assert_eq!(samples.len(), 1, "SKIP, never silence");
+        let Sample::Link(l) = &samples[0] else {
+            panic!("expected a link sample")
+        };
+        assert_eq!(l.ts_us, 42);
+        assert_eq!(
+            l.gw,
+            GwVerdict::Skip,
+            "a tick that measured nothing is not NOGW"
+        );
+        assert_eq!(l.gw_rtt_ms, None);
+        assert_eq!(l.direct, TcpVerdict::Skip);
+        assert_eq!(l.direct_rtt_ms, None);
+        // No interface: no lease, no ARP, no identity — absence, not a value.
+        assert_eq!(l.dhcp_router, None);
+        assert_eq!(l.gw_arp_mac, None);
+        assert_eq!(l.ssid, None);
+        assert_eq!(l.if_mac, None);
+        assert_eq!(l.medium, None);
     }
 
     #[tokio::test]
