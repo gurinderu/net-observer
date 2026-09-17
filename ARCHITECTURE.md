@@ -153,9 +153,12 @@ flowchart LR
   #127).
 - **TriggerEngine** — rules ported from the oracle and grown since: `wedge`,
   `gw-drop`, `gw-change` (unconditional pcap freeze on any gateway change),
-  `roam` (a BSSID hop or a new link address on Wi-Fi, classified by whether
-  the link address was kept), `wifi-churn` (four or more Wi-Fi identity
-  changes in a quarter hour read as one incident), `gw-mac-change` (pcap
+  `roam` (three identity axes — a BSSID hop, a Wi-Fi channel hop (the router
+  clause names a router change independently), or a new link address —
+  classified by whether the link address was kept, and naming whether the
+  DHCP lease was renewed; realm net-observer, node #126), `wifi-churn` (four
+  or more Wi-Fi identity changes — bssid, link address, or channel — in a
+  quarter hour read as one incident), `gw-mac-change` (pcap
   freeze too), `neighbor-mac-collision`, `per-client-block` (gateway silent
   while probed LAN neighbors answer), `ban-cycle` (three or more gateway bans
   in the window read as one cycling incident with a period), `fakeip`,

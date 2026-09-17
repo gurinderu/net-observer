@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use types::{DnsSample, HostSample, LinkSample, NeighborsSample, ProxySample, Sample};
+use types::{DnsSample, HostSample, LinkSample, NeighborsSample, ProxySample, Sample, WifiSample};
 
 /// Capacity of the recent-sample window the daemon hands to the trigger
 /// engine, in samples of every kind the daemon lets in — the conditions'
@@ -168,6 +168,27 @@ impl RecentWindow {
         })
     }
 
+    /// The newest wifi sample with `ts_us <= given` — the channel reading
+    /// that was current at that moment (typically a link sample's own
+    /// `ts_us`). A sample whose `channel` is unmeasured (`None`) is skipped,
+    /// the way the link-identity rules skip an unmeasured predecessor: an
+    /// unread channel is the absence of a measurement, never one half of a
+    /// channel comparison (realm net-observer, node #126).
+    pub fn wifi_at_or_before(&self, ts_us: i64) -> Option<&WifiSample> {
+        self.buf.iter().rev().find_map(|s| match s {
+            Sample::Wifi(w) if w.ts_us <= ts_us && w.channel.is_some() => Some(w),
+            Sample::Wifi(_)
+            | Sample::Link(_)
+            | Sample::Proxy(_)
+            | Sample::Dns(_)
+            | Sample::Route(_)
+            | Sample::Host(_)
+            | Sample::Neighbors(_)
+            | Sample::Air(_)
+            | Sample::Connections(_) => None,
+        })
+    }
+
     /// The newest proxy sample, if any.
     pub fn last_proxy(&self) -> Option<&ProxySample> {
         self.buf.iter().rev().find_map(|s| match s {
@@ -299,7 +320,7 @@ impl RecentWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{GwVerdict, TcpVerdict};
+    use types::{GwVerdict, TcpVerdict, WifiVerdict};
 
     fn link(ts: i64) -> Sample {
         Sample::Link(LinkSample {
@@ -342,6 +363,43 @@ mod tests {
             urltest_at_us: None,
             urltest_node: None,
         })
+    }
+
+    /// A wifi reading at `ts`, on the given channel — `None` reads as an
+    /// unmeasured tick (the probe ran but the channel could not be read).
+    fn wifi(ts: i64, channel: Option<i32>) -> Sample {
+        Sample::Wifi(WifiSample {
+            ts_us: ts,
+            wifi: WifiVerdict::Ok,
+            reason: None,
+            rssi_dbm: None,
+            noise_dbm: None,
+            snr_db: None,
+            tx_rate_mbps: None,
+            phy_mode: None,
+            channel,
+            channel_width_mhz: Some(20),
+            channel_band: Some("5ghz".into()),
+        })
+    }
+
+    #[test]
+    fn wifi_at_or_before_finds_the_newest_measured_reading_at_or_before_the_timestamp() {
+        let mut w = RecentWindow::new(16);
+        w.push(wifi(1, Some(48)));
+        w.push(wifi(2, None)); // unmeasured: skipped
+        w.push(wifi(5, Some(153)));
+        assert_eq!(w.wifi_at_or_before(5).map(|s| s.ts_us), Some(5));
+        assert_eq!(
+            w.wifi_at_or_before(4).map(|s| s.ts_us),
+            Some(1),
+            "the unmeasured reading at ts=2 must be skipped"
+        );
+        assert_eq!(
+            w.wifi_at_or_before(0),
+            None,
+            "nothing measured precedes ts=0"
+        );
     }
 
     #[test]
