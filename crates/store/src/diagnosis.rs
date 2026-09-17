@@ -91,6 +91,14 @@
 //! only `observation_gaps`/`silences`'s `kind` column tells the three apart
 //! (realm net-observer, node #109).
 //!
+//! **Cost.** The sleep opener sorts every point in the record — samples of
+//! every stream union recorded edges — on every `verdict_at`/
+//! `incident_context` call, not a window near the moment asked about:
+//! roughly 2 million points a month at the collectors' tick rates, one sort
+//! per query. Accepted for now because these are operator-invoked diagnoses,
+//! not the tick write path; a moment-bounded window is a later step (realm
+//! net-observer, node #109).
+//!
 //! ## Passive stretches
 //!
 //! The second bracket, and a different one: while the probing tier is
@@ -244,6 +252,14 @@ sample_ts AS (
 /// threshold as a SQL literal — no new `?` placeholder, so the four call
 /// sites keep their already-verified `params` order
 /// ([`DEFAULT_SLEEP_THRESHOLD_US`]).
+///
+/// **Cost.** The sleep opener's `lag()` runs over every point in the record
+/// on every `verdict_at`/`incident_context` call, not just the ones near the
+/// moment asked about — one sort of the whole `sample_ts ∪ observing_edge`
+/// set per query, ~2 million points a month at the collectors' tick rates.
+/// Accepted for now: these are operator-invoked diagnoses, not the tick
+/// write path, and a moment-bounded window is a later step (realm
+/// net-observer, node #109).
 /// Expands to several comma-joined sibling CTEs (`pauses`, `stops_raw`,
 /// `stops`, `closed_gap`, `sleeps`, `observation_gap`) — a fragment spliced
 /// into a caller's own `WITH` list right after [`SAMPLE_TS_CTE`], exactly
