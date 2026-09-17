@@ -699,7 +699,10 @@ the durable record; the socket is the live, low-latency read path.
     silence with a `kind` column, pauses and passive stretches; `Gaps` keeps
     its pauses-only shape because a reader built before the tier asks for it
     by that id and would print a stretch as a pause — `neighbors`, `vulns`,
-    `segments`, `history`, `topology`, `connections`), run by the daemon
+    `segments`, `history`, `topology`, `connections`, `air` (three variants —
+    `AirScan`, `AirAps`, `AirSelfChannel`, see [Air scan](#air-scan) — routed
+    from `AirScan` and reused for the other two, one `source:` line for the
+    group), run by the daemon
     against its **own** store while it keeps
     collecting — the only reader that can, since the daemon's per-process lock
     keeps every other opener out, and the moment of an incident is exactly when
