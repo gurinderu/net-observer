@@ -88,9 +88,11 @@ pub async fn summary(iface: &str) -> Summary {
 /// reader without Location Services (a root LaunchDaemon among them), which
 /// `normalize_mac` already answers `None` for, the same as any other
 /// non-MAC text — no separate sentinel needed (realm net-observer, node #93
-/// item 1). `gw_arp_mac` is stored raw from `arp -n` and is NOT comparable to
-/// this field as stored; the AP-is-the-gateway comparison is deferred to the
-/// roam step.
+/// item 1). `gw_arp_mac` is normalised through the same fold (realm
+/// net-observer, node #94), so a comparison to this field is a plain string
+/// comparison for a sample written after that fix; a row written before it
+/// may still carry `arp -n`'s raw, unpadded form. The AP-is-the-gateway
+/// comparison itself is deferred to the roam step.
 fn parse_bssid(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let value = line

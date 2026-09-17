@@ -712,6 +712,12 @@ cnt AS (
   SELECT network_key, count(*) AS neighbors FROM neighbor GROUP BY network_key
 )
 SELECT s.network_key,
+       -- `network_key` is the gateway's ARP-resolved MAC (realm net-observer,
+       -- node #94); this is a plain string comparison, so a `network_key`
+       -- written before the source-side normalisation (raw, unpadded octets)
+       -- will not join against `neighbor.mac`, which `parse_arp_table`
+       -- always normalises — form-sensitive for pre-fix rows, not rewritten
+       -- this round.
        (SELECT n.ip FROM neighbor n
         WHERE n.network_key = s.network_key AND n.mac = s.network_key
         LIMIT 1) AS gateway_ip,

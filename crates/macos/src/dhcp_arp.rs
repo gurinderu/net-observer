@@ -15,6 +15,7 @@ use collector_link::{LinkFacts, LinkSummary};
 use tokio::process::Command;
 use types::LinkMedium;
 
+use crate::neighbors::normalize_mac;
 use crate::wifi;
 
 /// Default look-back window for a "recent" CoreCapture Wi-Fi bundle.
@@ -240,15 +241,16 @@ fn iface_with_inet(ifconfig_out: &str, addr: &str) -> Option<String> {
     None
 }
 
-/// Parse the MAC (or the literal `incomplete`) for `gw` from `arp -n` output.
+/// Parse the MAC for `gw` from `arp -n` output, normalised through
+/// [`normalize_mac`] — the same fold `bssid`/`if_mac` go through, so
+/// `gw_arp_mac` lands in the same lowercase zero-padded form (realm
+/// net-observer, node #94). `None` for a token `normalize_mac` rejects,
+/// including a literal `(incomplete)` ARP entry.
 fn parse_arp_mac(output: &str, gw: &str) -> Option<String> {
     let line = output.lines().find(|l| l.contains(gw))?;
     let after = line.split(" at ").nth(1)?;
     let token = after.split_whitespace().next()?;
-    if token.starts_with("(incomplete") || token == "incomplete" {
-        return Some("incomplete".to_string());
-    }
-    Some(token.to_string())
+    normalize_mac(token)
 }
 
 #[cfg(test)]
@@ -347,13 +349,22 @@ mod tests {
         );
     }
 
+    /// BSD prints octets below `0x10` without the leading zero; the stored
+    /// form must still be zero-padded, or an unchanged gateway reads as a MAC
+    /// change on the very next tick (realm net-observer, node #94).
+    #[test]
+    fn parses_arp_mac_pads_short_octets() {
+        let out = "? (10.20.0.1) at 0:1e:6:ab:cd:ef on en0 ifscope [ethernet]\n";
+        assert_eq!(
+            parse_arp_mac(out, "10.20.0.1").as_deref(),
+            Some("00:1e:06:ab:cd:ef")
+        );
+    }
+
     #[test]
     fn parses_arp_incomplete() {
         let out = "? (10.20.0.1) at (incomplete) on en0 ifscope [ethernet]\n";
-        assert_eq!(
-            parse_arp_mac(out, "10.20.0.1").as_deref(),
-            Some("incomplete")
-        );
+        assert_eq!(parse_arp_mac(out, "10.20.0.1"), None);
     }
 
     #[test]

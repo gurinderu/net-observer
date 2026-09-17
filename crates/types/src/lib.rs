@@ -15,7 +15,7 @@ pub use air::{
 };
 pub use connection::{ConnectionRow, ConnectionsGroupBy, ConnectionsSample, LiveConnection};
 pub use incident::{BlobRef, Incident, TriggerFired};
-pub use mac::mac_is_private;
+pub use mac::{mac_is_private, normalize_mac};
 pub use neighbor::{
     HistoryWindow, NeighborLifetime, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence,
 };

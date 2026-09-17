@@ -172,35 +172,11 @@ pub fn parse_ndp_table(out: &str, iface: Option<&str>) -> Vec<NeighborObs> {
     v
 }
 
-/// Normalise a BSD-printed MAC to lowercase `aa:bb:cc:dd:ee:ff`, or `None` when
-/// it is not a usable neighbour address.
-///
-/// BSD prints octets without leading zeros (`0:1c:42:…`), so the padding matters:
-/// unpadded, the same device would key two different `neighbor` rows depending on
-/// which tool saw it. Rejected outright: `(incomplete)` placeholders, the
-/// broadcast address, and any multicast MAC (least-significant bit of the first
-/// octet set) — those are not devices on the segment.
-#[must_use]
-pub fn normalize_mac(raw: &str) -> Option<String> {
-    let parts: Vec<&str> = raw.split(':').collect();
-    if parts.len() != 6 {
-        return None;
-    }
-    let mut octets = Vec::with_capacity(6);
-    for p in parts {
-        octets.push(u8::from_str_radix(p, 16).ok()?);
-    }
-    if octets.iter().all(|&o| o == 0xff) || octets[0] & 1 == 1 {
-        return None;
-    }
-    Some(
-        octets
-            .iter()
-            .map(|o| format!("{o:02x}"))
-            .collect::<Vec<_>>()
-            .join(":"),
-    )
-}
+/// Re-exported so every existing `crate::neighbors::normalize_mac` caller
+/// (here and in `wifi.rs`) keeps compiling: the definition and its tests now
+/// live in `types::mac`, reachable from `triggers` without pulling the
+/// Apple-only `macos` crate into it (realm net-observer, node #94).
+pub use types::mac::normalize_mac;
 
 #[cfg(test)]
 mod tests {
@@ -251,17 +227,6 @@ fe80::5%en5                          12:22:33:44:55:66  en5   1m0s      S";
                 .all(|n| n.ip != "10.0.0.2")
         );
         assert_eq!(parse_ndp_table(NDP, Some("en5")).len(), 1);
-    }
-
-    #[test]
-    fn broadcast_and_multicast_are_not_neighbours() {
-        assert_eq!(normalize_mac("ff:ff:ff:ff:ff:ff"), None);
-        assert_eq!(normalize_mac("01:00:5e:00:00:fb"), None);
-        assert_eq!(normalize_mac("(incomplete)"), None);
-        assert_eq!(
-            normalize_mac("a4:83:E7:1b:2c:3d").as_deref(),
-            Some("a4:83:e7:1b:2c:3d")
-        );
     }
 
     /// The dual-stack rule the reading relies on: one row per MAC, and the v4
