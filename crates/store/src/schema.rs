@@ -356,7 +356,8 @@ pub const SAMPLE_TABLES: &[&str] = &[
 /// or sleep that poisons `verdict_at` and `incident_context` for the
 /// incidents the prune kept. So those five are never prunable, whatever
 /// config says. `air_sample` and `air_ap` are one scan slice joined by
-/// `ts_us`; the sweep prunes both or neither (see [`AIR_SLICE`]).
+/// `ts_us`; naming either prunes both halves, each in its own transaction and
+/// bracketed by its own `record_prune` row (see [`AIR_SLICE`]).
 pub const PRUNABLE_TABLES: &[&str] = &[
     "connection_sample",
     "air_sample",
@@ -367,7 +368,9 @@ pub const PRUNABLE_TABLES: &[&str] = &[
 ];
 
 /// The two halves of one air scan — the scan row and the access points it
-/// heard, joined by `ts_us`. A prune that cut one without the other would
-/// leave orphan `air_ap` rows or scans that read as having heard nobody, so
-/// naming either in config means both.
+/// heard, joined by `ts_us`. Cutting one without the other leaves orphan
+/// `air_ap` rows or scans that read as having heard nobody, so config naming
+/// either half makes the sweep prune both, each bracketed by its own
+/// `record_prune` row; a failure between the two leaves the slice half-pruned
+/// until the next sweep, which is what the two brackets then show.
 pub const AIR_SLICE: [&str; 2] = ["air_sample", "air_ap"];

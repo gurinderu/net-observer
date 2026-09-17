@@ -3599,4 +3599,65 @@ mod tests {
         }
         ids
     }
+
+    /// A `[record]` section as `retention_plan` reads it.
+    fn record(days: u32, tables: &[&str]) -> config::RecordCfg {
+        config::RecordCfg {
+            retention_days: days,
+            retention_tables: tables.iter().map(|t| (*t).to_string()).collect(),
+        }
+    }
+
+    /// A name outside `store::PRUNABLE_TABLES` — here one the gap derivation
+    /// reads, and one evidence table — is an error naming the table, and it
+    /// is one whether or not a window is set: an inert list is still a config
+    /// error, as an unknown probing tier is (realm net-observer, node #130).
+    #[test]
+    fn retention_plan_refuses_a_table_outside_the_prunable_list_and_names_it() {
+        let err = retention_plan(&record(7, &["link_sample"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`link_sample` is not a prunable table"),
+            "{err}"
+        );
+        let err = retention_plan(&record(0, &["incident"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`incident`"), "{err}");
+    }
+
+    /// Keep-forever (`retention_days = 0`) and a window over no tables are
+    /// both no plan at all: nothing is pruned and no sweep is spawned.
+    #[test]
+    fn retention_plan_is_none_for_keep_forever_and_for_an_empty_list() {
+        assert!(
+            retention_plan(&record(0, &["connection_sample"]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(retention_plan(&record(7, &[])).unwrap().is_none());
+    }
+
+    /// A table named twice is pruned once; naming either half of the air
+    /// slice names both, appended after the configured names; a list with
+    /// neither half gains nothing.
+    #[test]
+    fn retention_plan_folds_duplicates_and_makes_the_air_slice_whole() {
+        let plan = retention_plan(&record(
+            7,
+            &["air_ap", "connection_sample", "connection_sample"],
+        ))
+        .unwrap()
+        .expect("a window over a list is a plan");
+        assert_eq!(plan.retention_days, 7);
+        assert_eq!(
+            plan.retention_tables,
+            ["air_ap", "connection_sample", "air_sample"]
+        );
+        let plan = retention_plan(&record(7, &["wifi_sample"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.retention_tables, ["wifi_sample"]);
+    }
 }

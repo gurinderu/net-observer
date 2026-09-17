@@ -803,13 +803,15 @@ daemon was collecting at this instant", from which every stop and sleep is
 derived, so pruning any of them would fabricate stops and sleeps and poison
 `verdict_at` and `incident_context` for the very incidents the prune kept; they
 are never prunable, whatever config says. `air_sample` and `air_ap` are one
-scan slice joined by `ts_us`, pruned both or neither: config naming one of the
-pair prunes both, and the daemon says so at startup. Outside both lists and
-never pruned: the evidence (`incident`, `blob_ref`, `trigger_fired`), the
-brackets (`observing_edge`, `probing_edge`, `record_prune`), the record of the
-daemon having spoken (`neighbor_scan`), the experiments and the keyed entity
-tables. The default list is `["connection_sample"]` alone: one row per flow key
-per 15 s tick, measured on the owner's Mac 2026-09-17: ~3.3k rows/hour (~80k
+scan slice joined by `ts_us`: config naming one of the pair makes the sweep
+prune both halves (the daemon says so at startup), each bracketed by its own
+`record_prune` row; a failure between them leaves the slice half-pruned until
+the next sweep. Outside both lists and never pruned: the evidence
+(`incident`, `blob_ref`, `trigger_fired`), the brackets (`observing_edge`,
+`probing_edge`, `record_prune`), the record of the daemon having spoken
+(`neighbor_scan`), the experiments and the keyed entity tables. The default
+list is `["connection_sample"]` alone: one row per flow key per 15 s tick,
+measured on the owner's Mac 2026-09-17: ~3.3k rows/hour (~80k
 rows/day) — the whole file grew ~1.3 MB/day before that collector, ~8 MB/day
 is the estimate with it — an order of magnitude more than any other table; the
 owner widens the list by config.

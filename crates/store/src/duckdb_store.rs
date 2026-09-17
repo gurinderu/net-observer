@@ -3257,19 +3257,42 @@ mod tests {
         assert_eq!(s.latest_sample_ts_us().unwrap(), None);
     }
 
+    /// Whether `sql` reads `table` — a `FROM <table>` whose next character is
+    /// not part of an identifier, so `FROM air_sample` never matches
+    /// `air_sample_x`, and a `WHERE` clause or a trailing space after the
+    /// name is read the same as a newline.
+    fn reads_table(sql: &str, table: &str) -> bool {
+        let needle = format!("FROM {table}");
+        sql.match_indices(&needle).any(|(at, _)| {
+            sql[at + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        })
+    }
+
     /// The prunable set is the complement of what the gap derivation reads:
     /// every prunable table is a sample table, and none of them feeds
     /// `SAMPLE_TS_CTE` — the five that do are exactly the sample tables left
     /// out, so a table added to the CTE without leaving this list fails here.
     #[test]
     fn prunable_tables_are_the_sample_tables_the_gap_derivation_never_reads() {
+        // The matcher itself: a bare name, a name before a clause, and a
+        // name that is only a prefix of the one read.
+        assert!(reads_table(
+            "SELECT ts_us FROM link_sample\n",
+            "link_sample"
+        ));
+        assert!(reads_table("SELECT 1 FROM air_ap WHERE x", "air_ap"));
+        assert!(reads_table("SELECT 1 FROM air_ap", "air_ap"));
+        assert!(!reads_table("SELECT 1 FROM air_ap_extra\n", "air_ap"));
         for table in PRUNABLE_TABLES {
             assert!(
                 SAMPLE_TABLES.contains(table),
                 "{table} is not a sample table"
             );
             assert!(
-                !crate::diagnosis::SAMPLE_TS_CTE.contains(&format!("FROM {table}\n")),
+                !reads_table(crate::diagnosis::SAMPLE_TS_CTE, table),
                 "{table} feeds the gap derivation and must not be prunable"
             );
         }
@@ -3278,7 +3301,7 @@ mod tests {
             .filter(|t| !PRUNABLE_TABLES.contains(t))
         {
             assert!(
-                crate::diagnosis::SAMPLE_TS_CTE.contains(&format!("FROM {table}\n")),
+                reads_table(crate::diagnosis::SAMPLE_TS_CTE, table),
                 "{table} is neither prunable nor read by the gap derivation"
             );
         }

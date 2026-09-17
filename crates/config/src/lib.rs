@@ -44,10 +44,12 @@ pub struct Config {
 /// (how long to keep) is the owner's, and the default changes nothing (realm
 /// net-observer, node #130).
 ///
-/// The daemon prunes at startup and then once a day: every row of each named
-/// table whose `ts_us` is older than `retention_days` is deleted. The names
-/// are checked against the store's own list of sample tables, never
-/// interpolated as given, so config can name nothing else.
+/// The daemon prunes at startup and then once every 24 h of awake time: every
+/// row of each named table whose `ts_us` is older than `retention_days` is
+/// deleted. The names are checked at startup against `store::PRUNABLE_TABLES`
+/// — a strict subset of the sample tables, leaving out the five the gap
+/// derivation reads — and a name outside it refuses to start the daemon; the
+/// store never interpolates a name as given, so config can reach nothing else.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordCfg {
     /// Days of samples to keep; `0` (the default) keeps forever and runs no
@@ -849,8 +851,10 @@ mod tests {
     }
     /// Keep forever when nothing is configured — the default changes nothing
     /// — with `connection_sample` the one table a widening starts from; a
-    /// `[record]` section sets the days and may widen or replace the list
-    /// (realm net-observer, node #130).
+    /// `[record]` section sets the days and may widen or replace the list with
+    /// other prunable names (the daemon checks them against
+    /// `store::PRUNABLE_TABLES` at startup; this crate only carries them —
+    /// realm net-observer, node #130).
     #[test]
     fn record_retention_defaults_to_keep_forever_and_reads_from_toml() {
         let c = Config::load(None).unwrap();
@@ -869,14 +873,14 @@ mod tests {
         std::fs::write(
             &p,
             "[record]\nretention_days = 90\n\
-             retention_tables = [\"connection_sample\", \"proxy_sample\"]\n",
+             retention_tables = [\"connection_sample\", \"wifi_sample\"]\n",
         )
         .unwrap();
         let c = Config::load(Some(p.to_str().unwrap())).unwrap();
         assert_eq!(c.record.retention_days, 90);
         assert_eq!(
             c.record.retention_tables,
-            ["connection_sample", "proxy_sample"]
+            ["connection_sample", "wifi_sample"]
         );
 
         // A config from before the section keeps loading, on keep-forever.
