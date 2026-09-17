@@ -630,6 +630,13 @@ pub(crate) fn spawn_interval_collector(
 /// accumulate into a counter, and the resume edge logs the total at `info`. That
 /// keeps "paused" distinguishable from "the PF_ROUTE source wedged" without a
 /// line per batch.
+///
+/// The returned handle completes when the source thread returns — `next()` ran
+/// dry (the `tcpdump` child died, the pipe broke) or the consumer went away.
+/// That end is the one signal a supervisor has that a stream-backed collector
+/// must be started again (`net-observerd::main::supervise_on_iface`); aborting
+/// the handle (`abort_all`) only detaches the awaiter, since the thread itself
+/// cannot be aborted, as above (realm net-observer, node #134).
 pub(crate) fn spawn_event_collector(
     c: AnyCollector,
     tx: mpsc::Sender<Sample>,
@@ -643,12 +650,16 @@ pub(crate) fn spawn_event_collector(
         );
         return tokio::spawn(async {});
     };
+    // The thread's end, as a signal: the sender half rides on the thread and
+    // drops when it returns, whichever way it returns.
+    let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
     // Bridge the blocking source into async on a dedicated OS thread: PF_ROUTE's
     // `read(2)` is genuinely uninterruptible-blocking, so it lives off the async
     // runtime entirely and forwards via `blocking_send` (valid only outside a
     // runtime context). The thread is detached — it holds a stream sender until
     // `next()` ends or the consumer is gone, and the OS reaps it on process exit.
     std::thread::spawn(move || {
+        let _ended = ended_tx;
         // Batches dropped since the current pause began; the pause edge is derived
         // from the flag itself, so no extra shared state is needed.
         let mut dropped_while_paused: u64 = 0;
@@ -692,9 +703,13 @@ pub(crate) fn spawn_event_collector(
         }
         tracing::info!(collector = name, "event source ended");
     });
-    // Return a completed async handle so the caller's uniform `Vec<JoinHandle>`
-    // (and `abort_all`) is unaffected; the real work runs on the detached thread.
-    tokio::spawn(async {})
+    // An async handle that completes when the thread returns, so the caller's
+    // uniform `Vec<JoinHandle>` (and `abort_all`) is unaffected and a supervisor
+    // can still await the source's end; the real work runs on the detached
+    // thread.
+    tokio::spawn(async move {
+        let _ = ended_rx.await;
+    })
 }
 
 /// The pcap ring's freeze operation behind a trait, so [`FreezePcapHandler`] is
