@@ -52,6 +52,12 @@ token_enum!(NeighborsVerdict { Ok => "OK", Skip => "SKIP" });
 // a failed probe. SKIP exists so that "could not look" is never rendered as an
 // empty list, which would read as clear air.
 token_enum!(AirVerdict { Ok => "OK", Skip => "SKIP" });
+// The `connections` collector's verdict. `Ok` = the proxy's API answered and
+// `ConnectionsSample::rows` is what it listed (no rows under `Ok` is the real
+// reading "nothing is talking"); `Skip` = the API did not answer — unreachable,
+// a non-2xx status, an undecodable body — so the daemon could not look. There
+// is no `Fail`: a flow table is a reading, not a probe that can fail.
+token_enum!(ConnectionsVerdict { Ok => "OK", Skip => "SKIP" });
 // How one neighbour came to be known. `Arp`/`Ndp` are the passive kernel caches
 // read every tick; `Sweep` and `Mdns` only ever appear from an operator-pressed
 // scan, so a row's source says whether the daemon merely listened or spoke.

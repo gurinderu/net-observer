@@ -1,4 +1,5 @@
 pub mod air;
+pub mod connection;
 pub mod incident;
 pub mod mac;
 pub mod neighbor;
@@ -12,6 +13,7 @@ pub use air::{
     AirObservation, AirSample, ApGrade, Band, ChannelOverlapHypothesis, ChannelSpan, Confidence,
     FrequencyExtent, Grade, OverlapConfidence, Signal, overlap_hypothesis,
 };
+pub use connection::{ConnectionRow, ConnectionsGroupBy, ConnectionsSample, LiveConnection};
 pub use incident::{BlobRef, Incident, TriggerFired};
 pub use mac::mac_is_private;
 pub use neighbor::{
@@ -26,6 +28,6 @@ pub use topology::{
     LearnedVia, TopologyLifetime, TopologyLink, link_from_cdp, link_from_frame, link_from_lldp,
 };
 pub use verdict::{
-    AirVerdict, DnsVerdict, GwVerdict, LinkMedium, NeighborSource, NeighborsVerdict,
-    ParseVerdictError, TcpVerdict, WifiVerdict,
+    AirVerdict, ConnectionsVerdict, DnsVerdict, GwVerdict, LinkMedium, NeighborSource,
+    NeighborsVerdict, ParseVerdictError, TcpVerdict, WifiVerdict,
 };

@@ -1251,6 +1251,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "collector-connections"
+version = "0.0.0"
+dependencies = [
+ "collector-core",
+ "tokio",
+ "types",
+]
+
+[[package]]
 name = "collector-core"
 version = "0.0.0"
 dependencies = [
@@ -3846,6 +3855,7 @@ version = "0.0.0"
 dependencies = [
  "chrono",
  "collector-air",
+ "collector-connections",
  "collector-core",
  "collector-dns",
  "collector-host",
@@ -3859,6 +3869,7 @@ dependencies = [
  "objc2",
  "reqwest",
  "rustls-graviola",
+ "serde",
  "serde_json",
  "socket2 0.5.10",
  "surge-ping",
@@ -4102,6 +4113,7 @@ dependencies = [
  "anyhow",
  "clap",
  "collector-air",
+ "collector-connections",
  "collector-core",
  "collector-dns",
  "collector-host",

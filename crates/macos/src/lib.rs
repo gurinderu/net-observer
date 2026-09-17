@@ -31,7 +31,7 @@ pub mod tls;
 pub mod wifi;
 
 pub use air::SystemProfilerAir;
-pub use clash::{ClashClient, ProxySystemFacts};
+pub use clash::{ClashClient, ConnectionSystemFacts, ProxySystemFacts};
 pub use corewlan::CoreWlanFacts;
 pub use dhcp_arp::SystemFacts;
 pub use dns::DnsResolver;

@@ -92,7 +92,7 @@
 
 use crate::{DuckdbStore, QueryTable, Store, StoreError};
 use duckdb::types::{ToSql, Value};
-pub use types::HistoryWindow;
+pub use types::{ConnectionsGroupBy, HistoryWindow};
 
 /// A prepared query alongside the values bound to its `?` placeholders, in the
 /// order those placeholders appear in the SQL text.
@@ -805,6 +805,59 @@ ORDER BY last_seen_us DESC, iface, remote_chassis, remote_port"
     ))
 }
 
+/// **What this machine talks to** — the newest tick of the live flow table,
+/// grouped by `group_by` (realm net-observer, node #75).
+///
+/// Reads the newest `connection_sample` tick only: the table is a present-tense
+/// question ("what is talking right now"), and the per-tick rows are already
+/// the aggregate the collector folded. Columns: `ts_us` and `verdict` (the
+/// tick's, replicated on every row), `key` (the group), `count` (live flows in
+/// the group), `upload` / `download` (their bytes summed), and `hosts` — the
+/// distinct names seen in the group, so an address grouping still says which
+/// names sat behind the address. Ordered by `count DESC`.
+///
+/// The key of a flow with the grouped fact missing falls back to the next best
+/// (a bare-address flow is keyed by its address under `host`; a flow whose
+/// address the proxy never learned is keyed by its name under `ip`), and to
+/// `-` when nothing is known — never dropped, never a NULL group.
+///
+/// **The refusal is preserved.** A tick with no rows — the API did not answer
+/// (`SKIP`) or it listed nothing (`OK`) — answers ONE row carrying `ts_us`
+/// and `verdict` with every other column NULL, so a reader sees "could not
+/// look" and "nothing is talking" as different answers, and neither as an
+/// empty table indistinguishable from a record with no ticks at all.
+pub fn connections_sql(group_by: ConnectionsGroupBy) -> String {
+    let key = match group_by {
+        ConnectionsGroupBy::Host => "coalesce(host, dst_ip, '-')",
+        ConnectionsGroupBy::Ip => "coalesce(dst_ip, host, '-')",
+        // A v6 address carries colons of its own, so it is bracketed the way
+        // a socket address is written (`[2a00::1]:443`); a name never is.
+        ConnectionsGroupBy::IpPort => {
+            "CASE WHEN dst_ip LIKE '%:%' THEN '[' || dst_ip || ']' \
+             ELSE coalesce(dst_ip, host, '-') END \
+             || ':' || coalesce(CAST(dst_port AS VARCHAR), '-')"
+        }
+        ConnectionsGroupBy::Process => "coalesce(process, '-')",
+    };
+    format!(
+        "WITH tick AS (
+  SELECT * FROM connection_sample
+  WHERE ts_us = (SELECT max(ts_us) FROM connection_sample)
+)
+SELECT ts_us, verdict, {key} AS key,
+       sum(count) AS count, sum(upload) AS upload, sum(download) AS download,
+       string_agg(DISTINCT host, ',' ORDER BY host) AS hosts
+FROM tick
+WHERE network IS NOT NULL
+GROUP BY ts_us, verdict, key
+UNION ALL
+SELECT ts_us, verdict, NULL, NULL, NULL, NULL, NULL
+FROM tick
+WHERE network IS NULL
+ORDER BY count DESC NULLS LAST, key"
+    )
+}
+
 /// An interface name the store could never have written into `topology_link`.
 #[derive(Debug, thiserror::Error)]
 #[error("not an interface name: {0} (expected something like en0, en1 or utun3)")]
@@ -928,6 +981,11 @@ impl DuckdbStore {
     /// same idiom [`DuckdbStore::neighbors`] uses for its own always-valid input.
     pub fn history(&self, network: &str, window: HistoryWindow) -> Result<QueryTable, StoreError> {
         self.query_table(&history_sql(network, window).expect("network key must be pre-validated"))
+    }
+
+    /// Run [`connections_sql`] grouped by `group_by`.
+    pub fn connections(&self, group_by: ConnectionsGroupBy) -> Result<QueryTable, StoreError> {
+        self.query_table(&connections_sql(group_by))
     }
 }
 
@@ -2308,5 +2366,222 @@ mod tests {
                 "{bad:?} must be an error, not a query that matches nothing"
             );
         }
+    }
+
+    // ---- connections: what this machine talks to ---------------------------
+
+    fn conn_row(
+        host: Option<&str>,
+        dst_ip: Option<&str>,
+        dst_port: Option<u16>,
+        process: Option<&str>,
+        count: u32,
+        upload: u64,
+    ) -> types::ConnectionRow {
+        types::ConnectionRow {
+            host: host.map(str::to_string),
+            dst_ip: dst_ip.map(str::to_string),
+            dst_port,
+            process: process.map(str::to_string),
+            network: "tcp".into(),
+            chain: Some("vless-out-6".into()),
+            count,
+            upload,
+            download: 0,
+        }
+    }
+
+    fn connections(
+        s: &DuckdbStore,
+        ts_us: i64,
+        verdict: types::ConnectionsVerdict,
+        rows: Vec<types::ConnectionRow>,
+    ) {
+        s.write_sample(&Sample::Connections(types::ConnectionsSample {
+            ts_us,
+            verdict,
+            rows,
+        }))
+        .unwrap();
+    }
+
+    /// The fixture tick: two Telegram flows to one address (a spoofed
+    /// `www.google.com` SNI on one of them), a nameless direct flow, and two
+    /// flows to names the proxy resolves itself (no address known here).
+    fn fixture_tick(s: &DuckdbStore, ts_us: i64) {
+        connections(
+            s,
+            ts_us,
+            types::ConnectionsVerdict::Ok,
+            vec![
+                conn_row(
+                    Some("www.google.com"),
+                    Some("194.221.250.50"),
+                    Some(5222),
+                    Some("Telegram"),
+                    1,
+                    10,
+                ),
+                conn_row(
+                    None,
+                    Some("194.221.250.50"),
+                    Some(443),
+                    Some("Telegram"),
+                    1,
+                    20,
+                ),
+                conn_row(None, Some("149.154.167.41"), Some(80), None, 1, 1),
+                conn_row(Some("claude.ai"), None, Some(443), Some("stable"), 2, 100),
+                conn_row(
+                    Some("o540343.ingest.sentry.io"),
+                    None,
+                    Some(443),
+                    Some("stable"),
+                    1,
+                    4,
+                ),
+            ],
+        );
+    }
+
+    /// Only the newest tick answers, and by host the nameless flow is keyed by
+    /// its address rather than dropped.
+    #[test]
+    fn connections_by_host_read_the_newest_tick_and_key_nameless_flows_by_address() {
+        let s = DuckdbStore::in_memory().unwrap();
+        connections(
+            &s,
+            10 * SEC,
+            types::ConnectionsVerdict::Ok,
+            vec![conn_row(Some("stale.example"), None, Some(443), None, 9, 0)],
+        );
+        fixture_tick(&s, 20 * SEC);
+
+        let t = s.connections(ConnectionsGroupBy::Host).unwrap();
+        let keys: Vec<String> = (0..t.rows.len()).map(|i| cell(&t, i, "key")).collect();
+        assert!(!keys.iter().any(|k| k == "stale.example"), "{keys:?}");
+        assert_eq!(cell(&t, 0, "key"), "claude.ai");
+        assert_eq!(cell(&t, 0, "count"), "2");
+        assert_eq!(cell(&t, 0, "upload"), "100");
+        assert_eq!(cell(&t, 0, "ts_us"), (20 * SEC).to_string());
+        assert_eq!(cell(&t, 0, "verdict"), "OK");
+        assert!(keys.contains(&"149.154.167.41".to_string()), "{keys:?}");
+        assert!(keys.contains(&"194.221.250.50".to_string()), "{keys:?}");
+        assert_eq!(keys.len(), 5, "{keys:?}");
+    }
+
+    /// By address, the two Telegram flows fold into one row that still names
+    /// the SNI seen behind the address, and a flow with no address is keyed by
+    /// its name.
+    #[test]
+    fn connections_by_ip_fold_flows_and_list_the_names_behind_an_address() {
+        let s = DuckdbStore::in_memory().unwrap();
+        fixture_tick(&s, 20 * SEC);
+
+        let t = s.connections(ConnectionsGroupBy::Ip).unwrap();
+        let row = (0..t.rows.len())
+            .find(|&i| cell(&t, i, "key") == "194.221.250.50")
+            .expect("the Telegram address is a key");
+        assert_eq!(cell(&t, row, "count"), "2");
+        assert_eq!(cell(&t, row, "upload"), "30");
+        assert_eq!(cell(&t, row, "hosts"), "www.google.com");
+        let keys: Vec<String> = (0..t.rows.len()).map(|i| cell(&t, i, "key")).collect();
+        assert!(keys.contains(&"claude.ai".to_string()), "{keys:?}");
+        assert_eq!(keys.len(), 4, "{keys:?}");
+    }
+
+    /// By address and port the two Telegram flows are two rows again, and the
+    /// order is by flow count.
+    #[test]
+    fn connections_by_ip_port_split_the_ports_and_order_by_count() {
+        let s = DuckdbStore::in_memory().unwrap();
+        fixture_tick(&s, 20 * SEC);
+
+        let t = s.connections(ConnectionsGroupBy::IpPort).unwrap();
+        let keys: Vec<String> = (0..t.rows.len()).map(|i| cell(&t, i, "key")).collect();
+        assert_eq!(keys[0], "claude.ai:443", "{keys:?}");
+        assert!(
+            keys.contains(&"194.221.250.50:5222".to_string()),
+            "{keys:?}"
+        );
+        assert!(keys.contains(&"194.221.250.50:443".to_string()), "{keys:?}");
+        assert_eq!(keys.len(), 5, "{keys:?}");
+    }
+
+    /// A v6 destination is bracketed in the address:port key, so its own
+    /// colons cannot be read as the port separator.
+    #[test]
+    fn connections_by_ip_port_bracket_a_v6_address() {
+        let s = DuckdbStore::in_memory().unwrap();
+        connections(
+            &s,
+            20 * SEC,
+            types::ConnectionsVerdict::Ok,
+            vec![
+                conn_row(
+                    Some("claude.ai"),
+                    Some("2606:4700::6810:84e5"),
+                    Some(443),
+                    None,
+                    1,
+                    1,
+                ),
+                conn_row(None, Some("1.1.1.1"), Some(53), None, 1, 1),
+            ],
+        );
+        let t = s.connections(ConnectionsGroupBy::IpPort).unwrap();
+        let keys: Vec<String> = (0..t.rows.len()).map(|i| cell(&t, i, "key")).collect();
+        assert!(
+            keys.contains(&"[2606:4700::6810:84e5]:443".to_string()),
+            "{keys:?}"
+        );
+        assert!(keys.contains(&"1.1.1.1:53".to_string()), "{keys:?}");
+        assert_eq!(keys.len(), 2, "{keys:?}");
+    }
+
+    /// By process, the two `stable` flows fold with both their names listed,
+    /// and a flow the proxy could not attribute is keyed `-`, not dropped.
+    #[test]
+    fn connections_by_process_fold_flows_and_keep_the_unattributed() {
+        let s = DuckdbStore::in_memory().unwrap();
+        fixture_tick(&s, 20 * SEC);
+
+        let t = s.connections(ConnectionsGroupBy::Process).unwrap();
+        assert_eq!(cell(&t, 0, "key"), "stable");
+        assert_eq!(cell(&t, 0, "count"), "3");
+        assert_eq!(cell(&t, 0, "hosts"), "claude.ai,o540343.ingest.sentry.io");
+        let keys: Vec<String> = (0..t.rows.len()).map(|i| cell(&t, i, "key")).collect();
+        assert!(keys.contains(&"Telegram".to_string()), "{keys:?}");
+        assert!(keys.contains(&"-".to_string()), "{keys:?}");
+        assert_eq!(keys.len(), 3, "{keys:?}");
+    }
+
+    /// The refusal survives the read: a newest tick on which the API did not
+    /// answer is one row saying SKIP, a newest tick that listed nothing is one
+    /// row saying OK — and a record with no tick at all is no row. Three
+    /// different answers, none of them an empty table by accident.
+    #[test]
+    fn connections_keep_a_skip_and_an_empty_tick_apart_from_no_record() {
+        let s = DuckdbStore::in_memory().unwrap();
+        assert!(
+            s.connections(ConnectionsGroupBy::Host)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+
+        connections(&s, 10 * SEC, types::ConnectionsVerdict::Skip, Vec::new());
+        let t = s.connections(ConnectionsGroupBy::Host).unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "verdict"), "SKIP");
+        assert_eq!(cell(&t, 0, "ts_us"), (10 * SEC).to_string());
+        assert_eq!(cell(&t, 0, "key"), "");
+        assert_eq!(cell(&t, 0, "count"), "");
+
+        connections(&s, 20 * SEC, types::ConnectionsVerdict::Ok, Vec::new());
+        let t = s.connections(ConnectionsGroupBy::Process).unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "verdict"), "OK");
+        assert_eq!(cell(&t, 0, "key"), "");
     }
 }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::air::AirSample;
+use crate::connection::ConnectionsSample;
 use crate::neighbor::NeighborsSample;
 use crate::verdict::{DnsVerdict, GwVerdict, LinkMedium, TcpVerdict, WifiVerdict};
 
@@ -228,6 +229,10 @@ pub enum Sample {
     /// here. Its own slow period, not the tick: the scan costs seconds
     /// (realm net-observer, node #47).
     Air(AirSample),
+    /// One tick of the live flow table — what this machine talks to, as the
+    /// proxy's API lists it, aggregated per destination (realm net-observer,
+    /// node #75).
+    Connections(ConnectionsSample),
 }
 
 impl Sample {
@@ -241,6 +246,7 @@ impl Sample {
             Sample::Wifi(w) => w.ts_us,
             Sample::Neighbors(n) => n.ts_us,
             Sample::Air(a) => a.ts_us,
+            Sample::Connections(c) => c.ts_us,
         }
     }
 }
@@ -354,6 +360,13 @@ mod tests {
             }],
         });
         assert_eq!(a.ts_us(), 37);
+
+        let c = Sample::Connections(crate::ConnectionsSample {
+            ts_us: 41,
+            verdict: crate::ConnectionsVerdict::Skip,
+            rows: Vec::new(),
+        });
+        assert_eq!(c.ts_us(), 41);
     }
 
     /// A host sample written by a daemon that shipped before the disk and swap

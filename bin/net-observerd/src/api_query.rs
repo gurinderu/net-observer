@@ -78,6 +78,9 @@ pub fn run_query(
         DiagnosticQuery::Topology { iface } => {
             PreparedSql::plain(diagnosis::topology_sql(iface.as_deref()).map_err(|e| bad(&e))?)
         }
+        DiagnosticQuery::Connections { group_by } => {
+            PreparedSql::plain(diagnosis::connections_sql(group_by))
+        }
     };
     store
         .query_prepared_within(&statement, budget)
@@ -205,6 +208,14 @@ mod tests {
                 iface: Some("en0".into()),
             },
             &["remote_chassis", "learned_via"],
+        );
+        expect(
+            DiagnosticQuery::Connections {
+                group_by: types::ConnectionsGroupBy::IpPort,
+            },
+            &[
+                "ts_us", "verdict", "key", "count", "upload", "download", "hosts",
+            ],
         );
     }
 

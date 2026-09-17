@@ -53,6 +53,16 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "collector-connections" = rec {
+      packageId = "collector-connections";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "collector-connections";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "collector-core" = rec {
       packageId = "collector-core";
       build = internal.buildRustCrateWithFeatures {
@@ -4195,6 +4205,31 @@ rec {
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./crates/collector-air; };
         libName = "collector_air";
+        dependencies = [
+          {
+            name = "collector-core";
+            packageId = "collector-core";
+          }
+          {
+            name = "types";
+            packageId = "types";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "rt-multi-thread" "macros" "sync" "time" "signal" "process" ];
+          }
+        ];
+
+      };
+      "collector-connections" = rec {
+        crateName = "collector-connections";
+        version = "0.0.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ./crates/collector-connections; };
+        libName = "collector_connections";
         dependencies = [
           {
             name = "collector-core";
@@ -12327,6 +12362,10 @@ rec {
             packageId = "collector-air";
           }
           {
+            name = "collector-connections";
+            packageId = "collector-connections";
+          }
+          {
             name = "collector-core";
             packageId = "collector-core";
           }
@@ -12379,6 +12418,11 @@ rec {
           {
             name = "rustls-graviola";
             packageId = "rustls-graviola";
+          }
+          {
+            name = "serde";
+            packageId = "serde";
+            features = [ "derive" ];
           }
           {
             name = "serde_json";
@@ -13173,6 +13217,10 @@ rec {
           {
             name = "collector-air";
             packageId = "collector-air";
+          }
+          {
+            name = "collector-connections";
+            packageId = "collector-connections";
           }
           {
             name = "collector-core";

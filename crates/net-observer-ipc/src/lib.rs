@@ -39,9 +39,9 @@ use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
 use types::{
-    AirSample, DnsSample, HistoryWindow, HostSample, LinkSample, NeighborLifetime, NeighborsSample,
-    ObservingEdge, ProbingEdge, ProbingTier, ProxySample, RouteEvent, TopologyLifetime,
-    TopologyLink, WifiSample,
+    AirSample, ConnectionsGroupBy, ConnectionsSample, ConnectionsVerdict, DnsSample, HistoryWindow,
+    HostSample, LinkSample, NeighborLifetime, NeighborsSample, ObservingEdge, ProbingEdge,
+    ProbingTier, ProxySample, RouteEvent, TopologyLifetime, TopologyLink, WifiSample,
 };
 
 /// A request from a client (the bar or cli) to the daemon.
@@ -255,6 +255,13 @@ pub enum DiagnosticQuery {
     /// The switch-topology uplinks, on every interface or on `iface`
     /// (`topology_sql`).
     Topology { iface: Option<String> },
+    /// What this machine talks to — the newest tick of the live flow table,
+    /// grouped by `group_by` (`connections_sql`). `serde(default)` so a
+    /// sender that names no grouping asks by host.
+    Connections {
+        #[serde(default)]
+        group_by: ConnectionsGroupBy,
+    },
 }
 
 /// A result table: the daemon's answer to [`Request::Query`], and the shape the
@@ -321,7 +328,36 @@ event_kinds! {
     Neighbors => "neighbors",
     /// The radio environment: one scan of the foreign access points audible here.
     Air => "air",
+    /// What this machine talks to: one tick of the proxy's live flow table.
+    Connections => "connections",
     Incident => "incident",
+}
+
+/// The live [`Event`] a connections tick publishes: the tick's verdict and
+/// its size, NOT its rows. A tick can carry hundreds of flows, and the bus
+/// fans every frame out to every subscriber; the table itself is read on
+/// demand through [`DiagnosticQuery::Connections`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConnectionsSummary {
+    pub ts_us: i64,
+    pub verdict: ConnectionsVerdict,
+    /// Live flows the tick saw.
+    pub flows: u32,
+    /// Distinct names the flows were opened to.
+    pub hosts: u32,
+}
+
+impl ConnectionsSummary {
+    /// The summary of one tick's sample.
+    #[must_use]
+    pub fn of(sample: &ConnectionsSample) -> Self {
+        Self {
+            ts_us: sample.ts_us,
+            verdict: sample.verdict,
+            flows: sample.flows(),
+            hosts: sample.hosts(),
+        }
+    }
 }
 
 /// One live event pushed over a [`Request::Subscribe`] stream: either a fresh
@@ -342,6 +378,8 @@ pub enum Event {
     Wifi(WifiSample),
     Neighbors(NeighborsSample),
     Air(AirSample),
+    /// A connections tick, as its summary only (see [`ConnectionsSummary`]).
+    Connections(ConnectionsSummary),
     Incident(IncidentSummary),
 }
 
@@ -358,6 +396,7 @@ impl Event {
             Event::Wifi(_) => EventKind::Wifi,
             Event::Neighbors(_) => EventKind::Neighbors,
             Event::Air(_) => EventKind::Air,
+            Event::Connections(_) => EventKind::Connections,
             Event::Incident(_) => EventKind::Incident,
         }
     }
@@ -374,6 +413,7 @@ impl Event {
             Event::Wifi(w) => w.ts_us,
             Event::Neighbors(n) => n.ts_us,
             Event::Air(a) => a.ts_us,
+            Event::Connections(c) => c.ts_us,
             Event::Incident(i) => i.opened_us,
         }
     }
@@ -467,6 +507,12 @@ impl Event {
                     format!("SKIP {}", a.reason.as_deref().unwrap_or("-"))
                 }
                 types::AirVerdict::Ok => format!("{} AP heard", a.aps.len()),
+            },
+            // The one SKIP whose reason is fixed: the proxy's API did not
+            // answer, which is the whole of what "could not look" means here.
+            Event::Connections(c) => match c.verdict {
+                ConnectionsVerdict::Skip => "SKIP clash api did not answer".to_string(),
+                ConnectionsVerdict::Ok => format!("{} flows, {} hosts", c.flows, c.hosts),
             },
             Event::Incident(i) => format!("{} {}", i.trigger_id, i.signature),
         }
@@ -1688,7 +1734,34 @@ mod tests {
             DiagnosticQuery::Topology {
                 iface: Some("en0".into()),
             },
+            DiagnosticQuery::Connections {
+                group_by: ConnectionsGroupBy::Host,
+            },
+            DiagnosticQuery::Connections {
+                group_by: ConnectionsGroupBy::IpPort,
+            },
         ]
+    }
+
+    /// A sender built before the grouping existed names none, and the
+    /// question it asks is still well-formed: by host.
+    #[test]
+    fn a_connections_query_without_a_grouping_asks_by_host() {
+        let q: DiagnosticQuery = serde_json::from_str(r#"{"Connections":{}}"#).unwrap();
+        assert_eq!(
+            q,
+            DiagnosticQuery::Connections {
+                group_by: ConnectionsGroupBy::Host
+            }
+        );
+        let q: DiagnosticQuery =
+            serde_json::from_str(r#"{"Connections":{"group_by":"ip-port"}}"#).unwrap();
+        assert_eq!(
+            q,
+            DiagnosticQuery::Connections {
+                group_by: ConnectionsGroupBy::IpPort
+            }
+        );
     }
 
     /// Every diagnosis must survive the wire with its parameters intact — the
@@ -2091,6 +2164,7 @@ mod tests {
             (EventKind::Dns, "dns"),
             (EventKind::Route, "route"),
             (EventKind::Host, "host"),
+            (EventKind::Connections, "connections"),
             (EventKind::Incident, "incident"),
         ] {
             assert_eq!(kind.as_str(), label);
@@ -2214,6 +2288,24 @@ mod tests {
             "load 1.00/2.00/3.00; disk 100.0% used, - free; swap 0 MiB"
         );
 
+        // A connections tick is its size, and a SKIP names the one thing it
+        // can mean.
+        let conns = Event::Connections(ConnectionsSummary {
+            ts_us: 0,
+            verdict: ConnectionsVerdict::Ok,
+            flows: 37,
+            hosts: 12,
+        });
+        assert_eq!(conns.detail(), "37 flows, 12 hosts");
+        assert_eq!(conns.kind(), EventKind::Connections);
+        let conns = Event::Connections(ConnectionsSummary {
+            ts_us: 0,
+            verdict: ConnectionsVerdict::Skip,
+            flows: 0,
+            hosts: 0,
+        });
+        assert_eq!(conns.detail(), "SKIP clash api did not answer");
+
         let inc = Event::Incident(IncidentSummary {
             id: "inc-1".into(),
             opened_us: 0,
@@ -2222,6 +2314,41 @@ mod tests {
             signature: "sig".into(),
         });
         assert_eq!(inc.detail(), "fakeip sig");
+    }
+
+    /// The bus carries a connections tick as its summary — the counts of the
+    /// sample, never its rows.
+    #[test]
+    fn a_connections_summary_is_the_samples_counts() {
+        let row = |host: Option<&str>, count: u32| types::ConnectionRow {
+            host: host.map(str::to_string),
+            dst_ip: None,
+            dst_port: Some(443),
+            process: None,
+            network: "tcp".into(),
+            chain: None,
+            count,
+            upload: 0,
+            download: 0,
+        };
+        let sample = ConnectionsSample {
+            ts_us: 99,
+            verdict: ConnectionsVerdict::Ok,
+            rows: vec![
+                row(Some("claude.ai"), 3),
+                row(None, 1),
+                row(Some("claude.ai"), 1),
+            ],
+        };
+        assert_eq!(
+            ConnectionsSummary::of(&sample),
+            ConnectionsSummary {
+                ts_us: 99,
+                verdict: ConnectionsVerdict::Ok,
+                flows: 5,
+                hosts: 1,
+            }
+        );
     }
 
     #[test]

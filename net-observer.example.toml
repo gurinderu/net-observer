@@ -97,6 +97,14 @@ enabled = true
 enabled = true
 interval = "15s"
 
+# The `connections` collector: what this machine talks to -- the live flows
+# sing-box carries, read from its Clash API (the `clash_api` of
+# [collectors.proxy]) and folded per destination each tick. Reads a loopback
+# API, sends nothing. Read back with `net-observer-cli connections --by host`.
+[collectors.connections]
+enabled = true
+interval = "15s"
+
 # The `pcap_ring` collector keeps a rolling in-memory capture (via tcpdump) so a
 # passive incident trigger can freeze the last few MB to disk for forensics.
 [collectors.pcap_ring]
@@ -109,11 +117,11 @@ filter = "arp or icmp or udp port 67 or udp port 68 or ether broadcast"
 # The probing tier the daemon boots into. "passive" (the default): nothing on
 # the wire — the link, proxy and dns probes are withheld and land as SKIP every
 # tick, the held reference streams stay closed, and only the passive collectors
-# (routes, host, wifi, air, neighbours, pcap ring, the link's local reads)
-# measure anything. "active": every probe runs. The tier is process-scoped:
-# `net-observer-cli probe active|passive` or the bar's "Probe network" row
-# moves it, every switch lands as a `probing_edge` row, and a restart returns
-# to this value.
+# (routes, host, wifi, air, neighbours, connections, pcap ring, the link's
+# local reads) measure anything. "active": every probe runs. The tier is
+# process-scoped: `net-observer-cli probe active|passive` or the bar's "Probe
+# network" row moves it, every switch lands as a `probing_edge` row, and a
+# restart returns to this value.
 [probing]
 default = "passive"
 

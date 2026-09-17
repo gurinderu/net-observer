@@ -121,7 +121,8 @@ impl RecentWindow {
                 | Sample::Host(_)
                 | Sample::Wifi(_)
                 | Sample::Neighbors(_)
-                | Sample::Air(_) => None,
+                | Sample::Air(_)
+                | Sample::Connections(_) => None,
             })
             .take(n)
             .collect()
@@ -140,7 +141,8 @@ impl RecentWindow {
                 | Sample::Host(_)
                 | Sample::Wifi(_)
                 | Sample::Neighbors(_)
-                | Sample::Air(_) => None,
+                | Sample::Air(_)
+                | Sample::Connections(_) => None,
             })
             .take(n)
             .collect()
@@ -156,7 +158,8 @@ impl RecentWindow {
             | Sample::Host(_)
             | Sample::Wifi(_)
             | Sample::Neighbors(_)
-            | Sample::Air(_) => None,
+            | Sample::Air(_)
+            | Sample::Connections(_) => None,
         })
     }
 
@@ -170,7 +173,8 @@ impl RecentWindow {
             | Sample::Host(_)
             | Sample::Wifi(_)
             | Sample::Neighbors(_)
-            | Sample::Air(_) => None,
+            | Sample::Air(_)
+            | Sample::Connections(_) => None,
         })
     }
 
@@ -187,7 +191,8 @@ impl RecentWindow {
                 | Sample::Host(_)
                 | Sample::Wifi(_)
                 | Sample::Neighbors(_)
-                | Sample::Air(_) => None,
+                | Sample::Air(_)
+                | Sample::Connections(_) => None,
             })
             .take(n)
             .collect()
@@ -203,7 +208,8 @@ impl RecentWindow {
             | Sample::Host(_)
             | Sample::Wifi(_)
             | Sample::Neighbors(_)
-            | Sample::Air(_) => None,
+            | Sample::Air(_)
+            | Sample::Connections(_) => None,
         })
     }
 
@@ -217,7 +223,8 @@ impl RecentWindow {
             | Sample::Route(_)
             | Sample::Wifi(_)
             | Sample::Neighbors(_)
-            | Sample::Air(_) => None,
+            | Sample::Air(_)
+            | Sample::Connections(_) => None,
         })
     }
 
@@ -231,7 +238,8 @@ impl RecentWindow {
             | Sample::Route(_)
             | Sample::Host(_)
             | Sample::Wifi(_)
-            | Sample::Air(_) => None,
+            | Sample::Air(_)
+            | Sample::Connections(_) => None,
         })
     }
 
@@ -255,7 +263,8 @@ impl RecentWindow {
             | Sample::Host(_)
             | Sample::Wifi(_)
             | Sample::Neighbors(_)
-            | Sample::Air(_) => None,
+            | Sample::Air(_)
+            | Sample::Connections(_) => None,
         });
         links.next()?;
         match links.next() {
