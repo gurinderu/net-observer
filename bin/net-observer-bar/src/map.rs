@@ -48,22 +48,25 @@
 //! passive `announce` listener deliberately does not replace it — so a device
 //! the record knows only because it announced itself never reaches
 //! `snapshot.neighbors`. The window reads the record's `neighbor` table for
-//! itself (`DiagnosticQuery::Neighbors`, beside the findings read, at the same
-//! two moments) and folds the `announce`-sourced rows of the segment the star is
-//! drawing out of it ([`announced_neighbors`]). A device the reading already
-//! carries keeps its scanned node; one the record knows *only* from its
-//! announcements is drawn as an extra ring node in the announce ink and listed
-//! with `announce` in the `via` column. The record keeps history, the map shows
-//! presence: an announcement older than [`ANNOUNCE_STALE_US`] against the
-//! snapshot's clock is not drawn. (realm net-observer, node #92)
+//! itself (`DiagnosticQuery::Neighbors`: on open, after each rung, and every
+//! [`ANNOUNCE_REFRESH`] while it is open) and folds the `announce`-sourced rows
+//! of the segment the star is drawing out of it ([`announced_neighbors`]). A
+//! device the reading already carries keeps its scanned node; one the record
+//! knows *only* from its announcements is drawn as an extra ring node in the
+//! announce ink and listed with `announce` in the `via` column — or, when its
+//! MAC is the segment key, takes the centre as the gateway heard on the
+//! segment. The record keeps history, the map shows presence: an announcement
+//! older than [`ANNOUNCE_STALE_US`] against the snapshot's clock is not drawn.
+//! (realm net-observer, node #92)
 
 use std::f32::consts::PI;
+use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
     AnyWindowHandle, App, AsyncApp, Bounds, Context, Entity, Pixels, Rgba, SharedString,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions,
-    canvas, div, point, px, rgb, rgba, size,
+    Subscription, Timer, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions, canvas, div, point, px, rgb, rgba, size,
 };
 
 use net_observer_ipc::{StatusSnapshot, Table};
@@ -226,9 +229,20 @@ impl MapNode {
 /// announced device whose last sighting is older than this against the
 /// snapshot's `generated_us` is not drawn. Ten minutes covers a device that
 /// announces only on a change (a DHCP renewal, an mDNS probe) without keeping
-/// one that left on the star for the rest of the day. (realm net-observer,
-/// node #92)
+/// one that left on the star for the rest of the day. Honest only because the
+/// table the bound is read from is at most [`ANNOUNCE_REFRESH`] old while the
+/// window is open: aged against a live clock from a table read once, every
+/// announced node would vanish after ten minutes while its device kept
+/// announcing. (realm net-observer, node #92)
 const ANNOUNCE_STALE_US: i64 = 600_000_000;
+
+/// How often an open map window re-reads the record's neighbour table for the
+/// announce overlay ([`MapView::spawn_announced_refresh`]). The listener
+/// flushes every 15 s; twice that keeps the overlay within one window of the
+/// record without a socket read per paint. Well inside [`ANNOUNCE_STALE_US`],
+/// which is what makes that bound a statement about the device rather than
+/// about when the window last looked.
+const ANNOUNCE_REFRESH: Duration = Duration::from_secs(30);
 
 /// The glyph of an announced-only node: a dotted circle, "heard but not
 /// seen" — deliberately not the `?` of an unknown role, which would say the
@@ -452,23 +466,35 @@ fn short_mac(mac: &str) -> String {
 /// `announced` — the announce overlay ([`announced_overlay`]), already reduced
 /// to devices the sample does not carry — joins the ring AFTER the reading's
 /// own neighbours, so the one cap governs both and a scanned device is never
-/// the one summarised away to make room for an announced one.
+/// the one summarised away to make room for an announced one. The same key
+/// rule applies to it: an announced device whose MAC is the segment key IS the
+/// gateway, heard on the segment rather than listed by the caches, and takes
+/// the centre with its announce provenance — never a seat on the ring beside
+/// a "gateway ?" placeholder standing for itself (realm net-observer, node
+/// #92).
 fn partition(
     sample: &NeighborsSample,
     announced: &[AnnouncedNeighbor],
     capacity: usize,
 ) -> (Option<MapNode>, Vec<MapNode>, usize) {
     let key = sample.network_key.as_deref();
+    let is_key = |mac: &str| key.is_some_and(|k| k.eq_ignore_ascii_case(mac));
     let mut gateway = None;
     let mut ring = Vec::new();
     for obs in &sample.neighbors {
-        if gateway.is_none() && key.is_some_and(|k| k.eq_ignore_ascii_case(&obs.mac)) {
+        if gateway.is_none() && is_key(&obs.mac) {
             gateway = Some(MapNode::from_obs(obs));
         } else {
             ring.push(MapNode::from_obs(obs));
         }
     }
-    ring.extend(announced.iter().map(MapNode::from_announced));
+    for a in announced {
+        if gateway.is_none() && is_key(&a.mac) {
+            gateway = Some(MapNode::from_announced(a));
+        } else {
+            ring.push(MapNode::from_announced(a));
+        }
+    }
     // Cap by what the ring at THIS window's radius can hold without overlap,
     // never above the first-version ceiling; the remainder is summarised as
     // "+N more" — and is always fully visible in the list view, which has no
@@ -600,10 +626,20 @@ fn role_basis(role: NeighborRole, is_gateway: bool) -> &'static str {
     }
 }
 
+/// The words an announced gateway carries: its MAC is the segment key, which
+/// is the one near-certain classification, and it is known from its own
+/// announcements rather than from the caches — both facts, in the label and
+/// in the grounds.
+const ANNOUNCED_GATEWAY_LABEL: &str = "gateway, heard on the segment";
+const ANNOUNCED_GATEWAY_BASIS: &str =
+    "its MAC is the segment key; it announced itself where the caches never listed it";
+
 /// The glyph, the words and the grounds for one node — its role's, unless the
 /// node is announced-only, whose provenance outranks a role it does not have.
 /// The three are decided together so a chip and a list row can never pair an
-/// announce glyph with a role's words, or the reverse.
+/// announce glyph with a role's words, or the reverse. An announced gateway
+/// keeps the gateway glyph — the segment key is its identity — and says in
+/// its words that it was heard, not listed.
 fn node_glyph(node: &MapNode, is_gateway: bool) -> &'static str {
     if node.announced && !is_gateway {
         ANNOUNCE_GLYPH
@@ -613,18 +649,18 @@ fn node_glyph(node: &MapNode, is_gateway: bool) -> &'static str {
 }
 
 fn node_role_label(node: &MapNode, is_gateway: bool) -> String {
-    if node.announced && !is_gateway {
-        "announced".to_string()
-    } else {
-        role_label(node.role, is_gateway)
+    match (node.announced, is_gateway) {
+        (true, true) => ANNOUNCED_GATEWAY_LABEL.to_string(),
+        (true, false) => "announced".to_string(),
+        (false, _) => role_label(node.role, is_gateway),
     }
 }
 
 fn node_role_basis(node: &MapNode, is_gateway: bool) -> &'static str {
-    if node.announced && !is_gateway {
-        ANNOUNCE_BASIS
-    } else {
-        role_basis(node.role, is_gateway)
+    match (node.announced, is_gateway) {
+        (true, true) => ANNOUNCED_GATEWAY_BASIS,
+        (true, false) => ANNOUNCE_BASIS,
+        (false, _) => role_basis(node.role, is_gateway),
     }
 }
 
@@ -1236,7 +1272,16 @@ pub(crate) fn network_map_section(
     if has_uplinks {
         section = section.child(uplink_strip(&uplink_nodes_v, uplink_dropped, theme));
     }
-    section = section.child(caption(sample, ring.len(), gateway.is_some(), theme));
+    // The ring's count, split as the list splits it: the reading's devices and
+    // the record's announced ones.
+    let shown_announced = ring.iter().filter(|n| n.announced).count();
+    section = section.child(caption(
+        sample,
+        gateway.as_ref(),
+        ring.len() - shown_announced,
+        shown_announced,
+        theme,
+    ));
     // Named, not implied: a picture assembled from readings that are not one
     // moment must say so, in the same voice the air map uses.
     if let Some(skew) = map_skew_line(sample, &uplink_nodes_v) {
@@ -1258,9 +1303,9 @@ pub(crate) fn network_map_section(
             "map-dropped",
             format!("+{dropped} not drawn"),
             format!(
-                "{dropped} further neighbour(s) were read but the ring has no room for \
-                     them. They are missing from this drawing only — the list view shows \
-                     every one."
+                "{dropped} further neighbour(s) were read or heard but the ring has no \
+                     room for them. They are missing from this drawing only — the list \
+                     view shows every one."
             ),
             rgb(theme.muted),
         ));
@@ -1275,41 +1320,37 @@ pub(crate) fn network_map_section(
 /// measured fact about a device. The roles are inferred from the OUI vendor and
 /// from behaviour, never measured. (realm net-observer, node #36)
 ///
-/// The `announced` entry is the one drawn in its own ink, so the key names the
-/// colour as well as the glyph: a node in that ink is a device the record heard
-/// announce itself and the reading did not list (realm net-observer, node #92).
+/// The `announced` entry names the glyph a node in the announce ink carries: a
+/// device the record heard announce itself and the reading did not list (realm
+/// net-observer, node #92). One line through [`join_parts`] like the other
+/// entries, so a wrap never starts a line with a bare separator; the selector
+/// carries the line's words, so a test asserts the entry, not merely a line.
 fn role_legend(theme: Theme) -> impl IntoElement {
+    let key = legend_line();
+    let selector = format!("map-legend:{key}");
     div()
         .flex()
         .flex_col()
         .pt_1()
         .text_size(px(10.0))
         .text_color(rgb(theme.muted))
-        .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_1()
-                .child(div().child(join_parts(&[
-                    "\u{21C5} gateway",
-                    "\u{25A3} infra?",
-                    "\u{25CF} host",
-                    "? unknown",
-                ])))
-                .child(
-                    div()
-                        // Test handle only: the legend entry is what names the
-                        // announce ink, so a headless test must find it.
-                        .debug_selector(|| "map-legend-announced".into())
-                        .text_color(rgb(theme.announce))
-                        .child(format!("\u{00b7} {ANNOUNCE_GLYPH} announced")),
-                ),
-        )
+        .child(div().debug_selector(move || selector).child(key))
         .child(div().child(
             "role is inferred from vendor OUI and behaviour, not measured \u{00b7} \
                  the list gives the grounds for each",
         ))
+}
+
+/// The glyph key's one line: every glyph the star can draw, the announce glyph
+/// last.
+fn legend_line() -> String {
+    join_parts(&[
+        "\u{21C5} gateway",
+        "\u{25A3} infra?",
+        "\u{25CF} host",
+        "? unknown",
+        &format!("{ANNOUNCE_GLYPH} announced"),
+    ])
 }
 
 /// The one-line caption above the star: the interface and how many devices the
@@ -1352,17 +1393,37 @@ fn map_skew_line(sample: &NeighborsSample, uplink_nodes: &[UplinkNode]) -> Optio
     ))
 }
 
+/// The count clause the star's caption and the list's header share:
+/// `N neighbours` from the reading, then `+M announced` from the record when
+/// there are any — the split, so the two readings of one segment never
+/// disagree about what a "neighbour" counts.
+fn neighbour_count_line(scanned: usize, announced: usize) -> String {
+    let announced_clause = if announced == 0 {
+        String::new()
+    } else {
+        format!("+{announced} announced")
+    };
+    join_parts(&[
+        &format!("{scanned} neighbour{}", if scanned == 1 { "" } else { "s" }),
+        &announced_clause,
+    ])
+}
+
+/// `gateway` is the centre node, when there is one: absent, the caption says
+/// so; announced, it says the gateway was heard on the segment rather than
+/// listed by the caches, since the filled centre chip alone does not.
 fn caption(
     sample: &NeighborsSample,
-    shown: usize,
-    has_gateway: bool,
+    gateway: Option<&MapNode>,
+    shown_scanned: usize,
+    shown_announced: usize,
     theme: Theme,
 ) -> impl IntoElement {
     let iface = sample.iface.as_deref().unwrap_or("segment");
-    let gw = if has_gateway {
-        ""
-    } else {
-        " \u{00b7} gateway not seen"
+    let gw = match gateway {
+        None => " \u{00b7} gateway not seen",
+        Some(node) if node.announced => " \u{00b7} gateway heard, not listed",
+        Some(_) => "",
     };
     let read_at = read_at_line(sample, crate::ui::now_us());
     div()
@@ -1381,10 +1442,7 @@ fn caption(
             div()
                 .text_size(px(PROVENANCE_TEXT))
                 .text_color(rgb(theme.muted))
-                .child(format!(
-                    "{shown} neighbour{}",
-                    if shown == 1 { "" } else { "s" }
-                )),
+                .child(neighbour_count_line(shown_scanned, shown_announced)),
         )
 }
 
@@ -1509,14 +1567,16 @@ fn neighbour_list(
         ));
     }
     for a in &tail {
-        rows = rows.child(list_row(&ListRow::from_announced(a), now, theme));
+        // The key rule the star applies: an announced device whose MAC is the
+        // segment key is the gateway, heard rather than listed.
+        let is_gateway = key.is_some_and(|k| k.eq_ignore_ascii_case(&a.mac));
+        rows = rows.child(list_row(
+            &ListRow::from_announced(a, is_gateway),
+            now,
+            theme,
+        ));
     }
 
-    let announced_clause = if tail.is_empty() {
-        String::new()
-    } else {
-        format!("+{} announced", tail.len())
-    };
     base.child(
         div()
             .pb_1()
@@ -1524,12 +1584,7 @@ fn neighbour_list(
             .text_color(rgb(theme.muted))
             .child(join_parts(&[
                 sample.iface.as_deref().unwrap_or("segment"),
-                &format!(
-                    "{} neighbour{}",
-                    sample.neighbors.len(),
-                    if sample.neighbors.len() == 1 { "" } else { "s" }
-                ),
-                &announced_clause,
+                &neighbour_count_line(sample.neighbors.len(), tail.len()),
                 &lifetime_caption(sample, snapshot),
             ])),
     )
@@ -1575,10 +1630,10 @@ impl ListRow {
         }
     }
 
-    /// A row of the announced tail: never the gateway (the segment key is the
-    /// reading's, and a device the reading carries is not in the tail), with
-    /// the record row's own bounds.
-    fn from_announced(a: &AnnouncedNeighbor) -> Self {
+    /// A row of the announced tail, with the record row's own bounds.
+    /// `is_gateway` when its MAC is the segment key — the gateway heard on the
+    /// segment, which the caches did not list.
+    fn from_announced(a: &AnnouncedNeighbor, is_gateway: bool) -> Self {
         let node = MapNode::from_announced(a);
         let name = a
             .hostname
@@ -1587,7 +1642,7 @@ impl ListRow {
             .map_or_else(|| node.label.clone(), str::to_string);
         Self {
             node,
-            is_gateway: false,
+            is_gateway,
             name,
             via: NeighborSource::Announce.to_string(),
             first_seen_us: Some(a.first_seen_us),
@@ -1929,9 +1984,11 @@ fn offline_note(reason: &str, theme: Theme) -> impl IntoElement + use<> {
 /// [`crate::menubar`]). The star and the list are reshaped from
 /// `snapshot.neighbors` on that model (see [`network_map_section`]); the
 /// findings and the record's neighbour table are what this window asks the
-/// daemon for itself — once per open and once per completed rung
+/// daemon for itself — both once per open and once per completed rung
 /// ([`MapView::spawn_findings_fetch`], [`MapView::spawn_announced_fetch`]),
-/// never on a timer. It still holds no subscription of its own.
+/// and the neighbour table every [`ANNOUNCE_REFRESH`] besides
+/// ([`MapView::spawn_announced_refresh`]), because the listener grows it with
+/// no scan to hang a read on. It still holds no subscription of its own.
 pub(crate) struct MapView {
     model: Entity<Glance>,
     /// Which reading is on screen. The star is the shape of the segment; the
@@ -1959,11 +2016,14 @@ pub(crate) struct MapView {
     /// fold the announced devices of the segment they are drawing out of it
     /// at each paint ([`announced_for`]) — kept as the table, not as the
     /// fold, because the fold's inputs (the segment key, the snapshot's
-    /// clock) are live. Fetched beside the findings, at the same two moments
-    /// ([`MapView::spawn_announced_fetch`]); between them the overlay ages
-    /// against the live clock until the staleness rule withdraws it, so a
-    /// device that kept announcing is withdrawn too until the next read —
-    /// an absence, never a stale presence. (realm net-observer, node #92)
+    /// clock) are live. Fetched when the window opens, after each rung, and
+    /// every [`ANNOUNCE_REFRESH`] while the window is open
+    /// ([`MapView::spawn_announced_fetch`], [`MapView::spawn_announced_refresh`])
+    /// — unlike the findings, this table grows without a scan, and a bound
+    /// read once and aged against the live clock would withdraw a device that
+    /// kept announcing. That the refresh fires at its cadence is a *Ceiling*
+    /// claim (no headless window observes a timer); the fold and the drawing
+    /// are what the tests hold. (realm net-observer, node #92)
     announced: Option<Result<Table, String>>,
     _observe: Subscription,
 }
@@ -1987,6 +2047,13 @@ enum MapMode {
 /// line, captions, legend and the uplink tree) takes before the star gets any,
 /// in gpui logical px. Subtracted from the viewport so the plot is sized to
 /// what is actually left rather than to the whole window.
+///
+/// An estimate, not a measurement: the conditional lines (the skew line, the
+/// announce overlay's error line) and the legend's key line — five entries
+/// now, which wrap onto a second line in a window narrower than about 400 px
+/// — each add a line the estimate does not hold, and the legend then sits that
+/// much lower. Tolerated rather than measured, the way the skew line always
+/// was.
 const MAP_CHROME_H: f32 = 174.0;
 
 /// Horizontal padding the section applies (`px_3` on both sides).
@@ -2010,7 +2077,8 @@ impl MapView {
     /// Ask the daemon for its findings on the background executor and keep the
     /// answer (see [`crate::ui::fetch_findings`]) — the same shape as a control
     /// round-trip: never on the gpui main thread, written back through a weak
-    /// handle so a closed window just drops it.
+    /// handle so a closed window just drops it. On open and after each rung,
+    /// never on a timer — the record's findings change only when a scan runs.
     ///
     /// Not part of [`MapView::new`]: the open path ([`open_window`]) calls it,
     /// so a headless test can build the view with an injected `findings` state
@@ -2030,12 +2098,14 @@ impl MapView {
         .detach();
     }
 
-    /// Ask the daemon for the record's neighbour table on the background
-    /// executor and keep the answer (see [`crate::ui::fetch_neighbors`]) —
-    /// [`MapView::spawn_findings_fetch`] to the letter, for the announce
-    /// overlay, and called at the same two moments. Not part of
-    /// [`MapView::new`] for the same reason: a headless test injects the
-    /// `announced` state and no socket read then races to overwrite it.
+    /// Read the record's neighbour table for the announce overlay (see
+    /// [`crate::ui::fetch_neighbors`]) — [`MapView::spawn_findings_fetch`] to
+    /// the letter: on open, after each rung, and every [`ANNOUNCE_REFRESH`]
+    /// while the window is open ([`MapView::spawn_announced_refresh`]) — the
+    /// listener grows this table on its own cadence, with no scan to hang a
+    /// read on. Not part of [`MapView::new`] for the same reason: a headless
+    /// test injects the `announced` state and no socket read then races to
+    /// overwrite it.
     fn spawn_announced_fetch(&self, cx: &mut Context<Self>) {
         let socket = self.model.read(cx).socket_path.clone();
         cx.spawn(async move |view, acx: &mut AsyncApp| {
@@ -2047,6 +2117,33 @@ impl MapView {
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Re-read the announced table every [`ANNOUNCE_REFRESH`] for as long as
+    /// this window lives: a detached loop on the foreground, written the way
+    /// the panel's refresh tick is (see [`crate::menubar`]) — sleep on the
+    /// executor's timer, then start one read through the weak handle; the
+    /// first tick that finds the view gone ends the loop. Started by the open
+    /// path beside the first read, not by [`MapView::new`], for the reason
+    /// given on [`MapView::spawn_findings_fetch`].
+    ///
+    /// That the loop fires at the cadence is a *Ceiling* claim: a headless
+    /// window cannot observe a timer, so what the tests hold is the fold and
+    /// the drawing, and what this doc holds is the wiring.
+    fn spawn_announced_refresh(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |view, acx: &mut AsyncApp| {
+            loop {
+                Timer::after(ANNOUNCE_REFRESH).await;
+                // The window is closed; stop the loop.
+                if view
+                    .update(acx, |v, cx| v.spawn_announced_fetch(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
         })
         .detach();
     }
@@ -2309,10 +2406,12 @@ fn open_window(cx: &mut App, model: Entity<Glance>) -> Option<WindowHandle<MapVi
     match cx.open_window(options, move |_window, cx| {
         cx.new(|cx| {
             let view = MapView::new(model, cx);
-            // The first findings and neighbour-table reads belong to the open,
-            // not to the constructor (see `MapView::spawn_findings_fetch`).
+            // The first findings and neighbour-table reads, and the
+            // neighbour-table refresh loop, belong to the open, not to the
+            // constructor (see `MapView::spawn_findings_fetch`).
             view.spawn_findings_fetch(cx);
             view.spawn_announced_fetch(cx);
+            view.spawn_announced_refresh(cx);
             view
         })
     }) {
@@ -2965,6 +3064,101 @@ mod tests {
         assert_eq!(ring.len(), MAX_RING);
         assert!(!ring[0].announced, "the scanned device keeps its seat");
         assert_eq!(dropped, 1 + many.len() - MAX_RING);
+    }
+
+    /// An announced device whose MAC is the segment key is the gateway, heard
+    /// on the segment: it takes the centre with its announce provenance and
+    /// never sits on the ring beside a placeholder standing for itself. The
+    /// reading's own gateway, when the caches did list it, still wins.
+    #[test]
+    fn an_announced_gateway_takes_the_centre() {
+        // The caches did not list the gateway; the record heard it announce.
+        let s = sample(
+            Some(SEG_A),
+            vec![obs(
+                "aa:bb:cc:dd:ee:20",
+                "192.168.1.20",
+                NeighborSource::Arp,
+                None,
+            )],
+        );
+        let heard = vec![
+            announced(&SEG_A.to_ascii_uppercase(), 1),
+            announced("aa:bb:cc:dd:ee:30", 1),
+        ];
+        let (gateway, ring, dropped) = partition(&s, &heard, test_plot().capacity);
+        let gateway = gateway.expect("the announced gateway takes the centre");
+        assert!(gateway.announced, "with its announce provenance");
+        assert_eq!(gateway.mac, SEG_A.to_ascii_uppercase());
+        let macs: Vec<&str> = ring.iter().map(|n| n.mac.as_str()).collect();
+        assert_eq!(
+            macs,
+            vec!["aa:bb:cc:dd:ee:20", "aa:bb:cc:dd:ee:30"],
+            "the gateway is not also on the ring"
+        );
+        assert_eq!(dropped, 0);
+        // Its words say both facts: the key, and how it was known.
+        assert_eq!(
+            node_glyph(&gateway, true),
+            role_glyph(NeighborRole::Gateway, true)
+        );
+        assert_eq!(node_role_label(&gateway, true), ANNOUNCED_GATEWAY_LABEL);
+        assert!(node_role_label(&gateway, true).starts_with("gateway"));
+        assert!(node_role_basis(&gateway, true).contains("segment key"));
+        assert!(node_role_basis(&gateway, true).contains("announced itself"));
+        let row = ListRow::from_announced(&heard[0], true);
+        assert!(row.is_gateway && row.node.announced);
+
+        // The caches listed the gateway too: the reading's node is the centre
+        // and the record's row is not in the overlay at all.
+        let listed = sample(
+            Some(SEG_A),
+            vec![obs(SEG_A, "192.168.1.1", NeighborSource::Arp, None)],
+        );
+        let overlay = announced_overlay(&heard, &listed, 1);
+        assert_eq!(overlay.len(), 1);
+        let (gateway, ring, _) = partition(&listed, &overlay, test_plot().capacity);
+        assert!(
+            !gateway.unwrap().announced,
+            "the reading outranks the record"
+        );
+        assert_eq!(ring.len(), 1);
+    }
+
+    /// Both readings count the same way: the reading's neighbours, then the
+    /// record's announced ones as `+M announced`, and no clause for none.
+    #[test]
+    fn the_star_and_the_list_count_neighbours_alike() {
+        assert_eq!(neighbour_count_line(1, 0), "1 neighbour");
+        assert_eq!(neighbour_count_line(3, 0), "3 neighbours");
+        assert_eq!(
+            neighbour_count_line(3, 2),
+            "3 neighbours \u{00b7} +2 announced"
+        );
+        assert_eq!(
+            neighbour_count_line(0, 1),
+            "0 neighbours \u{00b7} +1 announced"
+        );
+    }
+
+    /// The legend is one line through [`join_parts`], the announce glyph
+    /// last, so a wrap can never start a line with a bare separator.
+    #[test]
+    fn the_legend_names_the_announce_glyph_in_one_line() {
+        let line = legend_line();
+        assert!(
+            line.ends_with(&format!("{ANNOUNCE_GLYPH} announced")),
+            "got {line}"
+        );
+        assert!(
+            !line.contains("\u{00b7} \u{00b7}") && !line.starts_with('\u{00b7}'),
+            "got {line}"
+        );
+        assert_eq!(
+            line.matches('\u{00b7}').count(),
+            4,
+            "five entries, four separators"
+        );
     }
 
     /// The whole fold for one snapshot: nothing before the first read and
@@ -3802,9 +3996,18 @@ mod headless_tests {
     const ECHO_NODE: &str = "map-node-announce:aa:bb:cc:dd:ee:30";
     const ECHO_ROW: &str = "map-list-announce:aa:bb:cc:dd:ee:30";
 
+    /// The legend's selector carries its words, so this names the line with
+    /// the announce entry in it — a legend without the entry is a different
+    /// selector, not found.
+    fn legend_selector() -> &'static str {
+        let line = legend_line();
+        assert!(line.contains("announced"), "precondition: {line}");
+        Box::leak(format!("map-legend:{line}").into_boxed_str())
+    }
+
     /// A device the record knows only from its announcements is drawn on the
     /// star as its own node in the announce ink — under the announce
-    /// selector, with its chip — and the legend names that ink.
+    /// selector, with its chip — and the legend names its glyph.
     #[gpui::test]
     fn an_announced_only_device_is_drawn_apart_and_named_in_the_legend(cx: &mut TestAppContext) {
         let table = neighbors_table(vec![announce_row(ECHO_MAC, "echo.local")]);
@@ -3822,8 +4025,59 @@ mod headless_tests {
             "the scanned neighbour must still be drawn beside it"
         );
         assert!(
-            vcx.debug_bounds("map-legend-announced").is_some(),
-            "the legend must name the announce ink"
+            vcx.debug_bounds(legend_selector()).is_some(),
+            "the legend must name the announce glyph"
+        );
+    }
+
+    /// An announced device whose MAC is the segment key is the gateway heard
+    /// on the segment: drawn once, at the centre, under the announce selector
+    /// — no "gateway ?" placeholder, and no second node of it on the ring.
+    #[gpui::test]
+    fn an_announced_gateway_is_drawn_at_the_centre_and_not_on_the_ring(cx: &mut TestAppContext) {
+        // The caches list `alpha` only; the record heard the gateway itself.
+        let mut snapshot = scanned_reading();
+        let sample = snapshot.neighbors.as_mut().expect("the fixture's reading");
+        sample
+            .neighbors
+            .retain(|n| n.hostname.as_deref() != Some("gw"));
+        let gateway_mac = sample.network_key.clone().expect("the fixture's key");
+        let gateway_selector: &'static str =
+            Box::leak(format!("map-node-announce:{gateway_mac}").into_boxed_str());
+        let table = neighbors_table(vec![announce_row("aa:bb:cc:dd:ee:01", "router.local")]);
+        assert_eq!(
+            gateway_mac, "aa:bb:cc:dd:ee:01",
+            "precondition: the row is the key"
+        );
+
+        let (w, h) = (900.0_f32, 700.0_f32);
+        let mut vcx = announced_window(cx, snapshot, Some(Ok(table)), MapMode::Graph);
+        let gateway = vcx
+            .debug_bounds(gateway_selector)
+            .expect("the announced gateway is drawn under the announce selector");
+        assert!(
+            vcx.debug_bounds("map-chip:gateway ?").is_none(),
+            "a placeholder was drawn for a gateway the record heard"
+        );
+        // At the centre, not on the ring: the one ring node (`alpha`) sits at
+        // twelve o'clock, so the gateway is one radius straight below it.
+        let alpha = vcx
+            .debug_bounds("map-chip:alpha")
+            .expect("the scanned neighbour is on the ring");
+        let plot = plot_for(w - MAP_SIDE_PAD, h - MAP_CHROME_H);
+        let centre_x = |b: Bounds<Pixels>| f32::from(b.origin.x) + f32::from(b.size.width) / 2.0;
+        let centre_y = |b: Bounds<Pixels>| f32::from(b.origin.y) + f32::from(b.size.height) / 2.0;
+        assert!(
+            (centre_x(gateway) - w / 2.0).abs() < 1.0,
+            "the announced gateway is not horizontally centred: {gateway:?}"
+        );
+        // Two pixels of slack: the two chips are laid out at the same height
+        // but a bold label may round its line box differently.
+        assert!(
+            (centre_y(gateway) - centre_y(alpha) - plot.r).abs() < 2.0,
+            "the announced gateway is not one radius below the ring's top node: \
+             gateway {gateway:?}, alpha {alpha:?}, r {}",
+            plot.r
         );
     }
 
@@ -3848,8 +4102,8 @@ mod headless_tests {
             "precondition: the star itself is drawn"
         );
         assert!(
-            vcx.debug_bounds("map-legend-announced").is_some(),
-            "the legend is a key and names the ink whether or not it is used"
+            vcx.debug_bounds(legend_selector()).is_some(),
+            "the legend is a key and names the glyph whether or not it is used"
         );
     }
 
