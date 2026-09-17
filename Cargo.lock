@@ -1251,6 +1251,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "collector-announce"
+version = "0.0.0"
+dependencies = [
+ "collector-core",
+ "etherparse",
+ "simple-dns",
+ "tokio",
+ "tracing",
+ "types",
+]
+
+[[package]]
 name = "collector-connections"
 version = "0.0.0"
 dependencies = [
@@ -2043,6 +2055,15 @@ checksum = "fc89bf99e5dc15954a60f707c1e09d7540e5cd9af85fa75caa0b510bc08c5342"
 dependencies = [
  "euclid",
  "svg_fmt",
+]
+
+[[package]]
+name = "etherparse"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17304d06addb3283cdc4bd528e42dd95e73c8ee2d6492ffce415e93660885449"
+dependencies = [
+ "arrayvec",
 ]
 
 [[package]]
@@ -6059,6 +6080,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95890f873bec569a0362c235787f3aca6e1e887302ba4840839bcc6459c42da6"
 dependencies = [
  "quote",
+]
+
+[[package]]
+name = "simple-dns"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b6f884fa9a8d48101774bfbd3aeb81e968dd22cffd19a372da69f183db22c1a"
+dependencies = [
+ "bitflags 2.13.1",
 ]
 
 [[package]]
