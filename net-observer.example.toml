@@ -105,6 +105,21 @@ interval = "15s"
 enabled = true
 interval = "15s"
 
+# The `singbox-log` collector: sing-box's own log, tailed each tick and its
+# ERROR/WARN lines classed and counted -- the one place its dial failures and
+# its "missing default interface" are written, and the only evidence of WHY the
+# network died through sing-box that the passive tier can have (realm
+# net-observer, node #140 for the log's format and rotation, #141 for the
+# decision). Reads a world-readable local file, sends nothing; runs under both
+# probing tiers. A tick with no such line writes nothing; a tick on which the
+# log could not be read writes an `unreadable` row.
+[collectors.singbox_log]
+enabled = true
+# The file launchd points sing-box's stdout/stderr at (rotated in place by a
+# launchd agent; the reader follows the rotation).
+path = "/var/log/sing-box.log"
+interval = "15s"
+
 # The `pcap_ring` collector keeps a rolling in-memory capture (via tcpdump) so a
 # passive incident trigger can freeze the last few MB to disk for forensics.
 [collectors.pcap_ring]
@@ -117,8 +132,9 @@ filter = "arp or icmp or udp port 67 or udp port 68 or ether broadcast"
 # The probing tier the daemon boots into. "passive" (the default): nothing on
 # the wire — the link, proxy and dns probes are withheld and land as SKIP every
 # tick, the held reference streams stay closed, and only the passive collectors
-# (routes, host, wifi, air, neighbours, connections, pcap ring, the link's
-# local reads) measure anything. "active": every probe runs. The tier is
+# (routes, host, wifi, air, neighbours, connections, the sing-box log reader,
+# pcap ring, the link's local reads) measure anything. "active": every probe
+# runs. The tier is
 # process-scoped: `net-observer-cli probe active|passive` or the bar's "Probe
 # network" row moves it, every switch lands as a `probing_edge` row, and a
 # restart returns to this value.

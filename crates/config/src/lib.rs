@@ -3,6 +3,7 @@ use figment::{
     providers::{Env, Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::time::Duration;
 use types::ProbingTier;
 
@@ -74,6 +75,9 @@ pub struct Collectors {
     /// loading, with the collector on.
     #[serde(default)]
     pub connections: ConnectionsCfg,
+    /// Tolerated absent, like `connections`.
+    #[serde(default)]
+    pub singbox_log: SingboxLogCfg,
     pub pcap_ring: PcapCfg,
 }
 
@@ -186,6 +190,32 @@ impl Default for ConnectionsCfg {
     fn default() -> Self {
         ConnectionsCfg {
             enabled: true,
+            interval: Duration::from_secs(15),
+        }
+    }
+}
+
+/// The `singbox-log` collector: sing-box's own log, tailed and its ERROR/WARN
+/// lines classed — the one place its dial failures and its "missing default
+/// interface" are written, and the only evidence of why the network died
+/// through sing-box that the passive tier can have (realm net-observer,
+/// nodes #140, #141). Reads a world-readable local file and sends nothing, so
+/// it is on by default like the other passive collectors, at the link
+/// collector's cadence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SingboxLogCfg {
+    pub enabled: bool,
+    /// The log file launchd points sing-box's stdout/stderr at.
+    pub path: PathBuf,
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+}
+
+impl Default for SingboxLogCfg {
+    fn default() -> Self {
+        SingboxLogCfg {
+            enabled: true,
+            path: PathBuf::from("/var/log/sing-box.log"),
             interval: Duration::from_secs(15),
         }
     }
@@ -329,6 +359,7 @@ impl Default for Config {
                     oui_snapshot_dir: None,
                 },
                 connections: ConnectionsCfg::default(),
+                singbox_log: SingboxLogCfg::default(),
                 pcap_ring: PcapCfg {
                     enabled: true,
                     ring_mb: 8,
@@ -460,6 +491,38 @@ mod tests {
         let c = Config::load(Some(p.to_str().unwrap())).unwrap();
         assert!(!c.collectors.connections.enabled);
         assert_eq!(c.collectors.connections.interval.as_secs(), 60);
+    }
+    /// On by default at the link cadence, reading launchd's log path; a file
+    /// that never names the section loads with the reader on, and one that
+    /// names it can switch it off or point it elsewhere.
+    #[test]
+    fn singbox_log_default_on_and_the_section_is_optional() {
+        let c = Config::load(None).unwrap();
+        assert!(c.collectors.singbox_log.enabled);
+        assert_eq!(
+            c.collectors.singbox_log.path,
+            PathBuf::from("/var/log/sing-box.log")
+        );
+        assert_eq!(
+            c.collectors.singbox_log.interval,
+            c.collectors.link.interval
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        std::fs::write(&p, "[collectors.host]\nenabled = false\n").unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert!(c.collectors.singbox_log.enabled);
+
+        std::fs::write(
+            &p,
+            "[collectors.singbox_log]\nenabled = false\npath = \"/tmp/sb.log\"\ninterval = \"30s\"\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert!(!c.collectors.singbox_log.enabled);
+        assert_eq!(c.collectors.singbox_log.path, PathBuf::from("/tmp/sb.log"));
+        assert_eq!(c.collectors.singbox_log.interval.as_secs(), 30);
     }
     /// The gates this section used to carry (`acting.enabled`, the
     /// `collectors.neighbors.scan.*` rung permissions) are gone, but the owner's

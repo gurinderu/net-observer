@@ -31,6 +31,7 @@ use collector_link::{LinkCollector, LinkFacts};
 use collector_neighbors::NeighborsCollector;
 use collector_proxy::ProxyCollector;
 use collector_route::RouteCollector;
+use collector_singbox_log::SingboxLogCollector;
 use collector_wifi::WifiCollector;
 use config::Config;
 use macos::LldpCapture;
@@ -44,7 +45,8 @@ use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
     BanCycle, EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, Gated, GwChange, GwDrop,
-    GwMacChange, NeighborMacCollision, PerClientBlock, Roam, Starvation, Wedge, WifiChurn,
+    GwMacChange, NeighborMacCollision, PerClientBlock, Roam, SingboxDialTimeout, SingboxNoRoute,
+    Starvation, Wedge, WifiChurn,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -649,6 +651,16 @@ async fn run_daemon() -> anyhow::Result<()> {
             cfg.collectors.connections.interval,
         )));
     }
+    if cfg.collectors.singbox_log.enabled {
+        // sing-box's own log, tailed from its current end: a world-readable
+        // local file, read under both probing tiers and sending nothing. A
+        // log that is not there yet is retried every tick, each such tick an
+        // `unreadable` row (realm net-observer, nodes #140, #141).
+        collectors.push(AnyCollector::SingboxLog(SingboxLogCollector::new(
+            cfg.collectors.singbox_log.path.clone(),
+            cfg.collectors.singbox_log.interval,
+        )));
+    }
     if cfg.collectors.route.enabled {
         // The route collector is Event-cadence, driven by a persistent PF_ROUTE
         // socket. Opening it here decides its readiness; if it cannot open, the
@@ -972,6 +984,8 @@ pub(crate) enum AnyCollector {
     Neighbors(NeighborsCollector<SystemNeighbors>),
     Air(AirCollector<SystemProfilerAir>),
     Connections(ConnectionsCollector<ConnectionSystemFacts>),
+    /// The passive reader of sing-box's own log, over the real file tail.
+    SingboxLog(SingboxLogCollector),
     /// Test-only: an interval collector with a flippable preflight (see
     /// [`FakeCollector`]).
     #[cfg(test)]
@@ -992,6 +1006,7 @@ impl AnyCollector {
             Self::Neighbors(c) => c.meta(),
             Self::Air(c) => c.meta(),
             Self::Connections(c) => c.meta(),
+            Self::SingboxLog(c) => c.meta(),
             #[cfg(test)]
             Self::Fake(c) => c.meta(),
         }
@@ -1010,6 +1025,7 @@ impl AnyCollector {
             Self::Neighbors(c) => c.source(),
             Self::Air(c) => c.source(),
             Self::Connections(c) => c.source(),
+            Self::SingboxLog(c) => c.source(),
             #[cfg(test)]
             Self::Fake(c) => c.source(),
         }
@@ -1028,6 +1044,7 @@ impl AnyCollector {
             Self::Neighbors(c) => c.preflight().await,
             Self::Air(c) => c.preflight().await,
             Self::Connections(c) => c.preflight().await,
+            Self::SingboxLog(c) => c.preflight().await,
             #[cfg(test)]
             Self::Fake(c) => c.preflight().await,
         }
@@ -1048,6 +1065,7 @@ impl AnyCollector {
             Self::Neighbors(c) => c.collect(ts_us).await,
             Self::Air(c) => c.collect(ts_us).await,
             Self::Connections(c) => c.collect(ts_us).await,
+            Self::SingboxLog(c) => c.collect(ts_us).await,
             #[cfg(test)]
             Self::Fake(c) => c.collect(ts_us).await,
         }
@@ -1067,6 +1085,7 @@ impl AnyCollector {
             Self::Neighbors(c) => c.skip(ts_us),
             Self::Air(c) => c.skip(ts_us),
             Self::Connections(c) => c.skip(ts_us),
+            Self::SingboxLog(c) => c.skip(ts_us),
             #[cfg(test)]
             Self::Fake(c) => c.skip(ts_us),
         }
@@ -1088,6 +1107,7 @@ impl AnyCollector {
             Self::Neighbors(c) => Box::new(c).into_event_source(),
             Self::Air(c) => Box::new(c).into_event_source(),
             Self::Connections(c) => Box::new(c).into_event_source(),
+            Self::SingboxLog(c) => Box::new(c).into_event_source(),
             #[cfg(test)]
             Self::Fake(c) => Box::new(c).into_event_source(),
         }
@@ -1309,6 +1329,7 @@ fn collector_switch(kind: EventKind, c: &config::Collectors) -> Option<bool> {
         EventKind::Air => c.air.enabled,
         EventKind::Neighbors => c.neighbors.enabled,
         EventKind::Connections => c.connections.enabled,
+        EventKind::SingboxLog => c.singbox_log.enabled,
         // Not a collector: incidents are what the triggers write about the
         // collectors' samples. `pcap_ring` is absent for the same reason from the
         // other side — it produces no event kind at all.
@@ -1765,9 +1786,10 @@ fn build_api_server(
 /// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
 /// roam, wifi-churn, gw-mac-change, neighbor-mac-collision, per-client-block,
 /// ban-cycle, fakeip, fakeip-hijack, endpoint-block, established-stall,
-/// starvation). Every rule records an incident (durable, in DuckDB) and
-/// mirrors it into the live snapshot's ring for the socket API; gw-change and
-/// gw-mac-change additionally freeze the pcap ring when one is available.
+/// singbox-no-route, singbox-dial-timeout, starvation). Every rule records an
+/// incident (durable, in DuckDB) and mirrors it into the live snapshot's ring
+/// for the socket API; gw-change and gw-mac-change additionally freeze the
+/// pcap ring when one is available.
 fn build_engine(
     store: Arc<DuckdbStore>,
     cfg: &Config,
@@ -1922,6 +1944,35 @@ fn build_engine(
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
+        // The two signatures read from sing-box's own log (realm net-observer,
+        // node #141). No direct-path gate on either: the point of the first is
+        // to name the fault under the passive tier, where the direct probe is
+        // withheld, and its own context is the held router; the second reads
+        // its context — the underlay reaching every endpoint — off the proxy
+        // tick itself. Both hold their fire under host starvation and inside
+        // the settle window after a network move, when sing-box legitimately
+        // has no route for a while. No pcap freeze: the evidence is the
+        // recorded log rows.
+        Trigger::new(
+            Box::new(Gated {
+                inner: SingboxNoRoute,
+                require_direct: false,
+                load_below: Some(STARVATION_LOAD),
+                settle_us: Some(SETTLE_US),
+            }),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        Trigger::new(
+            Box::new(Gated {
+                inner: SingboxDialTimeout,
+                require_direct: false,
+                load_below: Some(STARVATION_LOAD),
+                settle_us: Some(SETTLE_US),
+            }),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
         Trigger::new(
             Box::new(Starvation {
                 load_threshold: STARVATION_LOAD,
@@ -1967,6 +2018,7 @@ mod tests {
             collector_neighbors::META.name,
             collector_air::META.name,
             collector_connections::META.name,
+            collector_singbox_log::META.name,
         ];
 
         let cfg = config::Config::default();
@@ -3085,6 +3137,41 @@ mod tests {
             incidents_for(&fx.store, "established-stall"),
             1,
             "a stalled tunnel stream with fresh probes OK must be recorded as established-stall"
+        );
+    }
+
+    /// The `singbox-no-route` rule is installed with the production handlers,
+    /// and without a direct-path gate: the passive tier's shape — the echo
+    /// withheld (`Skip`), the DHCP router held — plus three `no route` lines
+    /// from sing-box's log records the incident. Nothing else in the rule set
+    /// fires on this stream: the gateway is `Skip` throughout (no drop, no
+    /// change), and there is no proxy, DNS or neighbours sample.
+    #[test]
+    fn build_engine_registers_the_singbox_no_route_rule() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(8);
+
+        let Sample::Link(mut l) = link(1, GwVerdict::Skip) else {
+            unreachable!("link() builds a link sample")
+        };
+        l.direct = TcpVerdict::Skip;
+        l.dhcp_router = Some("10.20.0.1".into());
+        feed(&mut fx.engine, &mut w, Sample::Link(l));
+        feed(
+            &mut fx.engine,
+            &mut w,
+            Sample::SingboxLog(types::SingboxLogSample {
+                ts_us: 2,
+                class: types::SingboxLogClass::NoRoute,
+                count: 3,
+                node: Some("vless-out-6".into()),
+                sample_message: None,
+            }),
+        );
+        assert_eq!(
+            incidents_for(&fx.store, "singbox-no-route"),
+            1,
+            "sing-box reporting no route while the link holds a router must be recorded as singbox-no-route"
         );
     }
 

@@ -41,7 +41,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use types::{
     AirSample, ConnectionsGroupBy, ConnectionsSample, ConnectionsVerdict, DnsSample, HistoryWindow,
     HostSample, LinkSample, NeighborLifetime, NeighborsSample, ObservingEdge, ProbingEdge,
-    ProbingTier, ProxySample, RouteEvent, TopologyLifetime, TopologyLink, WifiSample,
+    ProbingTier, ProxySample, RouteEvent, SingboxLogClass, SingboxLogSample, TopologyLifetime,
+    TopologyLink, WifiSample,
 };
 
 /// A request from a client (the bar or cli) to the daemon.
@@ -352,6 +353,9 @@ event_kinds! {
     Air => "air",
     /// What this machine talks to: one tick of the proxy's live flow table.
     Connections => "connections",
+    /// What sing-box's own log says: one `(class, node)` of its ERROR/WARN
+    /// lines per tick of the passive log reader (realm net-observer, node #141).
+    SingboxLog => "singbox-log",
     Incident => "incident",
 }
 
@@ -402,6 +406,9 @@ pub enum Event {
     Air(AirSample),
     /// A connections tick, as its summary only (see [`ConnectionsSummary`]).
     Connections(ConnectionsSummary),
+    /// One `(class, node)` row of sing-box's own log for a tick — several
+    /// frames per tick when several classes were seen, none on a quiet tick.
+    SingboxLog(SingboxLogSample),
     Incident(IncidentSummary),
 }
 
@@ -419,6 +426,7 @@ impl Event {
             Event::Neighbors(_) => EventKind::Neighbors,
             Event::Air(_) => EventKind::Air,
             Event::Connections(_) => EventKind::Connections,
+            Event::SingboxLog(_) => EventKind::SingboxLog,
             Event::Incident(_) => EventKind::Incident,
         }
     }
@@ -436,6 +444,7 @@ impl Event {
             Event::Neighbors(n) => n.ts_us,
             Event::Air(a) => a.ts_us,
             Event::Connections(c) => c.ts_us,
+            Event::SingboxLog(s) => s.ts_us,
             Event::Incident(i) => i.opened_us,
         }
     }
@@ -553,6 +562,18 @@ impl Event {
                 ConnectionsVerdict::Skip => "SKIP clash api did not answer".to_string(),
                 ConnectionsVerdict::Ok => format!("{} flows, {} hosts", c.flows, c.hosts),
             },
+            // `<class> ×<count> via <node>: <message>`; an unreadable log is
+            // its error, the way a SKIP renders as its reason.
+            Event::SingboxLog(s) => {
+                let message = s.sample_message.as_deref().unwrap_or("-");
+                match s.class {
+                    SingboxLogClass::Unreadable => format!("SKIP {message}"),
+                    class => match s.node.as_deref() {
+                        Some(node) => format!("{class} ×{} via {node}: {message}", s.count),
+                        None => format!("{class} ×{}: {message}", s.count),
+                    },
+                }
+            }
             Event::Incident(i) => format!("{} {}", i.trigger_id, i.signature),
         }
     }
@@ -2209,6 +2230,7 @@ mod tests {
             (EventKind::Route, "route"),
             (EventKind::Host, "host"),
             (EventKind::Connections, "connections"),
+            (EventKind::SingboxLog, "singbox-log"),
             (EventKind::Incident, "incident"),
         ] {
             assert_eq!(kind.as_str(), label);
@@ -2417,6 +2439,47 @@ mod tests {
             hosts: 0,
         });
         assert_eq!(conns.detail(), "SKIP clash api did not answer");
+
+        // A sing-box log row is its class, count and node with the message;
+        // the unreadable row renders as a SKIP with its error.
+        let row = |class, node: Option<&str>, message: &str| {
+            Event::SingboxLog(SingboxLogSample {
+                ts_us: 5,
+                class,
+                count: 3,
+                node: node.map(str::to_string),
+                sample_message: Some(message.into()),
+            })
+        };
+        let no_route = row(
+            SingboxLogClass::NoRoute,
+            Some("vless-out-6"),
+            "connection: open connection …",
+        );
+        assert_eq!(no_route.kind(), EventKind::SingboxLog);
+        assert_eq!(no_route.ts_us(), 5);
+        assert_eq!(
+            no_route.detail(),
+            "no-route ×3 via vless-out-6: connection: open connection …"
+        );
+        assert_eq!(
+            row(
+                SingboxLogClass::NoDefaultIface,
+                None,
+                "network: missing default interface"
+            )
+            .detail(),
+            "no-default-iface ×3: network: missing default interface"
+        );
+        assert_eq!(
+            row(
+                SingboxLogClass::Unreadable,
+                None,
+                "/var/log/sing-box.log: No such file"
+            )
+            .detail(),
+            "SKIP /var/log/sing-box.log: No such file"
+        );
 
         let inc = Event::Incident(IncidentSummary {
             id: "inc-1".into(),

@@ -383,6 +383,10 @@ pub async fn run(
                 // is many rows, read on demand through `DiagnosticQuery::
                 // Connections`. Published live below as its summary.
                 Sample::Connections(_) => {}
+                // sing-box's log rows are a stream like route events — several
+                // per tick, none on a quiet one — read back through `why`;
+                // published live below, and they bump `generated_us` above.
+                Sample::SingboxLog(_) => {}
                 // Route events are a stream, not a "latest sample" field of the
                 // snapshot; they still bump `generated_us` above.
                 Sample::Route(_) => {}
@@ -405,6 +409,7 @@ pub async fn run(
                 // The summary only — a tick can be hundreds of rows and the
                 // bus fans every frame out to every subscriber.
                 Sample::Connections(c) => Event::Connections(ConnectionsSummary::of(c)),
+                Sample::SingboxLog(s) => Event::SingboxLog(s.clone()),
                 Sample::Route(r) => Event::Route(r.clone()),
             };
             // Serialise ONCE here; every subscriber then clones an Arc, not a
