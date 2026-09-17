@@ -3332,7 +3332,7 @@ mod tests {
     /// reads. The non-vacuity control — nothing open at the edge still
     /// respects the old budget — is the next test.
     #[tokio::test]
-    async fn run_does_not_refire_within_the_backoff_after_a_resume() {
+    async fn run_refires_a_persistent_fault_at_once_after_a_resume_that_closed_it() {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
         let eng = TriggerEngine::new(vec![Trigger::new(
@@ -3461,20 +3461,28 @@ mod tests {
         );
     }
 
-    /// The other direction of that same boundary: once the production budget HAS
-    /// elapsed, a fault still present at resume is recorded again. The post-resume
-    /// link is stamped at exactly `1 + crate::BACKOFF_US` — the FIRST microsecond
-    /// the budget is available, since the pre-pause fire was at ts 1 and the
-    /// engine's guard is `>=`.
+    /// The boundary of the budget `close_all` does NOT touch: nothing is open
+    /// when the pause/resume edge lands here (the ts-1 firing RECOVERED live —
+    /// an ordinary healthy tick at ts 2, not `close_all` — before the pause),
+    /// so the ORIGINAL, untouched backoff from ts 1 is what decides whether
+    /// the post-resume reassertion fires. The post-resume link is stamped at
+    /// exactly `1 + crate::BACKOFF_US` — the FIRST microsecond that budget is
+    /// available, since the engine's guard is `>=`.
     ///
     /// Two mutations die here, one from each side: `>=` -> `>` in
     /// `TriggerEngine::on_sample` (2 -> 1) and `BACKOFF_US = i64::MAX` (2 -> 1).
     /// `saturating_add`, not `+`, precisely because of the second: a plain `+` would
     /// panic on overflow under it and mask the assertion behind an arithmetic error.
+    /// Neither mutant would die if anything were still open at the edge —
+    /// `close_all` would release the budget regardless of either mutation — so
+    /// this fixture is deliberately the "nothing open" case, not the
+    /// "something open" one the tests above already cover.
     ///
     /// The post-resume sample is deliberately a LINK, so `GwDrop::eval` never
-    /// returns `None` after the clear and the latch cannot re-arm by accident — only
-    /// `TriggerEngine::rearm_all` can have produced the second incident.
+    /// returns `None` after the clear and the latch cannot re-arm by accident —
+    /// and `close_all` found nothing open here, so `TriggerEngine::rearm_all`
+    /// really is the ONLY thing that re-armed this trigger for the second
+    /// incident (realm net-observer, node #124).
     #[tokio::test]
     async fn run_refires_a_persistent_fault_once_the_production_backoff_has_elapsed() {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
@@ -3498,9 +3506,11 @@ mod tests {
             no_session_end(),
         ));
 
-        // Fires once at ts 1, then stays latched while the fault persists.
+        // Fires once at ts 1, then RECOVERS live at ts 2 (an ordinary healthy
+        // tick — GwDrop::eval returns None — not `close_all`): armed, but
+        // `last_fire_us` stays at 1, untouched.
         tx.send(link(1, GwVerdict::Fail)).await.unwrap();
-        tx.send(link(2, GwVerdict::Fail)).await.unwrap();
+        tx.send(link(2, GwVerdict::Ok)).await.unwrap();
         tx.send(Sample::Host(HostSample {
             ts_us: 3,
             load1: 0.0,
@@ -3514,8 +3524,10 @@ mod tests {
         .unwrap();
         wait_for_generated(&snapshot, 3).await;
 
+        // Nothing is open at this edge, so `close_all` has nothing to release:
+        // the budget from the ts-1 firing survives untouched into the resume.
         resume_at_us.store(10, Ordering::Release);
-        // The first microsecond at which the production budget is spent.
+        // The first microsecond at which that untouched budget is spent.
         let refire_us = 1i64.saturating_add(crate::BACKOFF_US);
         tx.send(link(refire_us, GwVerdict::Fail)).await.unwrap();
         drop(tx);

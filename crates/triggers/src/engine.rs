@@ -119,9 +119,13 @@ impl TriggerEngine {
     /// which made "does a persistent fault re-fire across a pause?" depend on
     /// collector arrival order. This makes it a decision.
     ///
-    /// `last_fire_us` and `backoff_us` are deliberately NOT reset: a pause
-    /// neither shortens nor extends a trigger's firing budget, so a toggled
-    /// switch cannot storm the incident log.
+    /// `rearm_all` ITSELF never touches `last_fire_us` or `backoff_us`. The
+    /// budget release lives in [`TriggerEngine::close_all`], called
+    /// immediately before this at the same edge: it resets the budget of the
+    /// rules it actually closed — and only those — so a fault or change still
+    /// present after the edge is recorded AT ONCE, while a rule with nothing
+    /// open there keeps its budget exactly as before (realm net-observer,
+    /// node #124).
     pub fn rearm_all(&mut self) {
         for trig in &mut self.triggers {
             trig.armed = true;
@@ -278,10 +282,14 @@ mod tests {
         assert_eq!(h.0.load(Ordering::SeqCst), 2);
     }
 
-    /// A resume starts a new observation session: the latch re-arms, the backoff
-    /// does not. Both halves are load-bearing — dropping `rearm_all` loses the
-    /// fresh record, resetting `last_fire_us` inside it lets a toggled switch
-    /// write an incident per click.
+    /// `rearm_all` ALONE never touches the backoff. Called here WITHOUT
+    /// `close_all`, isolating that function's own contract from the real edge
+    /// sequence `pipeline::run` performs (`close_all`, then `rearm_all`) —
+    /// where a rule's budget releases if and only if `close_all` found
+    /// something open on it. Both halves pinned here are load-bearing for
+    /// `rearm_all` itself: dropping it loses the fresh re-arm; resetting
+    /// `last_fire_us` inside it would let a toggled switch write an incident
+    /// per click, whether or not anything was ever open.
     #[test]
     fn rearm_all_rearms_without_resetting_the_backoff() {
         let h = Arc::new(CountHandler(AtomicUsize::new(0)));
@@ -346,7 +354,9 @@ mod tests {
             "close_all must take the id, leaving nothing for a later close_all to re-clear"
         );
 
-        // Armed: the very next sample, past the untouched backoff, fires again.
+        // Armed: the very next sample fires again. ts 1_001 is past
+        // backoff=1_000 whether or not `close_all` released it, so this only
+        // re-confirms armed — test (b) below is what actually needs the release.
         w.push(link(1_001, GwVerdict::Fail));
         eng.on_sample(&w, 1_001);
         assert_eq!(

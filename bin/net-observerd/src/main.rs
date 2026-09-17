@@ -396,8 +396,12 @@ async fn run_daemon() -> anyhow::Result<()> {
     // again — the closing edge lived in its memory. Stamp them closed at the
     // observation bound: the record's own newest sample, not this new
     // process's start time, which is always later and would make a crashed
-    // run's incidents read as though they had lasted until now (realm
-    // net-observer, node #124).
+    // run's incidents read as though they had lasted until now. A crash WHILE
+    // PAUSED closes at the last sample before the pause — earlier than the
+    // pause's own `observing_edge` row — which is an accepted asymmetry: the
+    // incident closes at the last thing this record actually observed, not
+    // at a boundary row a paused process wrote about observing nothing
+    // (realm net-observer, node #124).
     let stale_close_ts = match store.latest_sample_ts_us() {
         Ok(Some(ts)) => ts,
         Ok(None) => types::now_us(),

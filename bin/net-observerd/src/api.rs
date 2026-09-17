@@ -428,7 +428,14 @@ pub struct ApiServer {
     /// cannot be read again by a later edge — and closes
     /// (`TriggerEngine::close_all`) at that value if it was `> 0`, or at the
     /// edge's own `ts_us` otherwise: `0` means no end was ever recorded for
-    /// this edge (realm net-observer, node #124).
+    /// this edge. The one residual: a pause whose `compare_exchange` lands
+    /// between the consumer's `resume_at_us` load and its `swap` FOR THE
+    /// PREVIOUS edge loses the race to that still-unconsumed value and is
+    /// silently dropped, so the later resume that ends ITS session falls back
+    /// to its own `ts_us` instead of this pause's — accepted, since closing
+    /// that gap needs an operator toggle inside the consumer's own
+    /// load-to-swap window, sub-millisecond and far tighter than a human
+    /// hand on the control (realm net-observer, node #124).
     pub session_end_us: Arc<AtomicI64>,
     pub snapshot: Arc<Mutex<StatusSnapshot>>,
     /// Durable sink for pause/resume boundary records.
