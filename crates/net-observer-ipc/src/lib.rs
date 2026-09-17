@@ -2255,6 +2255,7 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         });
         assert_eq!(proxy.detail(), "tun=204 sel=auto");
 
@@ -2273,6 +2274,7 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         });
         assert_eq!(proxy_bare.detail(), "tun=- sel=-");
 

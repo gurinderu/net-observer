@@ -16,7 +16,7 @@ use crate::probes::{StallReading, UrlTest};
 /// `tun_code` (`None` sides = no measurement).
 ///
 /// `urltests` are the tick's readings of sing-box's own URL-test history
-/// (realm net-observer, node #62), one per member of the selector group,
+/// (realm net-observer, node #62), one per leaf under the selector group,
 /// selected node first. Each rides the row of the endpoint its node tests
 /// through, so `tcp` beside it is the raw reachability of that very
 /// listener. A reading with no free row of its own — its node names no
@@ -55,6 +55,7 @@ pub fn build_proxy_samples(
         urltest_ms: None,
         urltest_at_us: None,
         urltest_node: None,
+        urltest_absent_since_us: None,
     };
     let mut rows: Vec<ProxySample> = probed
         .into_iter()
@@ -87,6 +88,7 @@ pub fn build_proxy_samples(
         row.urltest_ms = test.entry.map(|e| e.ms);
         row.urltest_at_us = test.entry.map(|e| e.at_us);
         row.urltest_node = Some(test.node);
+        row.urltest_absent_since_us = test.absent_since_us;
     }
     // Stable: only the selected node's row moves, to the end.
     rows.sort_by_key(|r| r.urltest_node.is_some() && r.urltest_node == r.selector);
@@ -147,6 +149,7 @@ mod tests {
             node: node.into(),
             endpoint: endpoint.map(str::to_string),
             entry: entry.map(|(at_us, ms)| UrlTestEntry { at_us, ms }),
+            absent_since_us: None,
         }
     }
 
@@ -187,7 +190,7 @@ mod tests {
         assert_eq!(
             c.urltest_ms,
             Some(0),
-            "sing-box's failed test is the record's 0"
+            "a 0 ms answer is an answer, kept as it is"
         );
         assert_eq!(c.urltest_at_us, Some(900));
         let b = by_ip("2.2.2.2:2053");
@@ -204,6 +207,32 @@ mod tests {
             "the rest keep probe order"
         );
         assert_eq!(rows[1].server_ip, "3.3.3.3:443");
+    }
+
+    /// The collector's absence memory reaches the row beside the (empty)
+    /// reading: a node whose entry sing-box deleted carries the tick it went
+    /// missing, on its endpoint's row, with `urltest_ms` `None`.
+    #[test]
+    fn the_absence_since_reaches_the_row() {
+        let probed = vec![("1.1.1.1:443".to_string(), ok(9.0))];
+        let urltests = vec![UrlTest {
+            absent_since_us: Some(5),
+            ..test("node-a", Some("1.1.1.1:443"), None)
+        }];
+        let rows = build_proxy_samples(
+            7,
+            Some(204),
+            None,
+            StallReading::default(),
+            probed,
+            urltests,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].urltest_node.as_deref(), Some("node-a"));
+        assert_eq!(rows[0].urltest_ms, None);
+        assert_eq!(rows[0].urltest_at_us, None);
+        assert_eq!(rows[0].urltest_absent_since_us, Some(5));
+        assert_eq!(rows[0].tcp, TcpVerdict::Ok);
     }
 
     /// Two nodes on one endpoint: the selected node (first in the list)

@@ -1,12 +1,24 @@
 //! Clash/Mihomo RESTful API client and the proxy-side facts adapters.
 //!
-//! [`ClashClient`] reads a proxy *group* — its selected node and its members
-//! — via `GET /proxies/<group>`, one node's own URL-test history via
-//! `GET /proxies/<node>` (`history: [{time, delay}]`, Clash-compatible;
-//! `delay` 0 = a failed test; an empty list = not tested yet, observed on
-//! every node at 18:23 on 2026-09-17), and the live flow list via
-//! `GET /connections` (the surface as observed on sing-box: realm
-//! net-observer, nodes #127 and #62).
+//! [`ClashClient`] reads one proxy — a group (`type` `Selector` / `URLTest`
+//! / `Fallback`: its selected member `now` and its members `all`) or a
+//! single node (`type` `VLESS`, `Direct`, …), the same `GET /proxies/<name>`
+//! endpoint either way — together with its own URL-test history
+//! (`history: [{time, delay}]`, Clash-compatible in shape), and the live
+//! flow list via `GET /connections` (the surface as observed on sing-box:
+//! realm net-observer, nodes #127, #62 and #139).
+//!
+//! The history's semantics are sing-box's, not Clash's
+//! (`protocol/group/urltest.go` v1.12, `outbound/urltest.go` v1.8): the
+//! URLTest group tests every member on its `interval`; a SUCCESSFUL test
+//! stores one entry `{time, delay}` — `delay` in milliseconds, and `0` a
+//! real sub-millisecond answer — while a FAILED test DELETES the node's
+//! entry, so `/proxies/<node>` then renders `"history": []`. `delay: 0` as
+//! a failure marker is Clash/mihomo's convention and never appears here.
+//! An empty list therefore means "not tested yet" (observed on every node at
+//! 18:23 on 2026-09-17, before the group's first round) OR "the last test
+//! failed" — told apart only by whether an entry was seen before, which is
+//! the collector's memory, not this surface (realm net-observer, node #62).
 //!
 //! It deliberately does NOT call `GET /proxies/<node>/delay`, for two facts
 //! observed on the owner's Mac (realm net-observer, node #62): sing-box's
@@ -33,7 +45,7 @@ use std::time::Duration;
 
 use collector_connections::ConnectionFacts;
 use collector_core::Readiness;
-use collector_proxy::{ProxyFacts, ProxyGroup, TunProbe, UrlTestEntry};
+use collector_proxy::{ProxyFacts, ProxyInfo, TunProbe, UrlTestEntry};
 use serde::Deserialize;
 use types::LiveConnection;
 
@@ -60,34 +72,12 @@ impl ClashClient {
         }
     }
 
-    /// The node currently selected in the top-level `GLOBAL` group, if the API
-    /// is reachable.
-    pub async fn now(&self) -> Option<String> {
-        self.selected("GLOBAL").await
-    }
-
-    /// The node currently selected in proxy `group`, via `GET /proxies/<group>`.
-    pub async fn selected(&self, group: &str) -> Option<String> {
-        self.group(group).await?.now
-    }
-
-    /// Proxy `group` as the API describes it, via `GET /proxies/<group>`:
-    /// `None` when the API did not answer or the body does not decode.
-    pub async fn group(&self, group: &str) -> Option<ProxyGroup> {
-        parse_clash_group(&self.proxy_body(group).await?)
-    }
-
-    /// The newest entry of `node`'s own URL-test history, via
-    /// `GET /proxies/<node>` (realm net-observer, node #62): `None` when the
-    /// API did not answer, the body does not decode, or the history is empty
-    /// — sing-box has not tested the node yet, which is no measurement.
-    pub async fn history(&self, node: &str) -> Option<UrlTestEntry> {
-        parse_newest_history(&self.proxy_body(node).await?)
-    }
-
-    /// The body of `GET /proxies/<name>` — a group's or a single node's, the
-    /// same endpoint — or `None` when the API did not answer.
-    async fn proxy_body(&self, name: &str) -> Option<String> {
+    /// One proxy as the API describes it, via `GET /proxies/<name>` — a
+    /// group or a single node, the same endpoint: its type, its selection
+    /// and members (a group's), and the newest entry of its own URL-test
+    /// history (realm net-observer, nodes #62, #139). `None` when the API
+    /// did not answer or the body does not decode.
+    pub async fn proxy(&self, name: &str) -> Option<ProxyInfo> {
         let url = format!("{}/proxies/{}", self.base.trim_end_matches('/'), name);
         let resp = match self.http.get(&url).send().await {
             Ok(resp) => resp,
@@ -96,13 +86,18 @@ impl ClashClient {
                 return None;
             }
         };
-        match resp.text().await {
-            Ok(b) => Some(b),
+        let body = match resp.text().await {
+            Ok(b) => b,
             Err(e) => {
                 tracing::debug!(url, error = %e, "clash proxies query failed");
-                None
+                return None;
             }
+        };
+        let parsed = parse_proxy(&body, name);
+        if parsed.is_none() {
+            tracing::debug!(url, "clash proxies body did not decode");
         }
+        parsed
     }
 
     /// Every live flow the proxy carries right now, via `GET /connections`.
@@ -246,39 +241,27 @@ fn build_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-/// The `GET /proxies/<group>` body, as far as the daemon reads it: the
-/// selected node and the members. `type`, `history`, `udp` and whatever else
+/// The `GET /proxies/<name>` body, as far as the daemon reads it — a
+/// group's and a single node's alike: the type, the name, a group's
+/// selection and members, and the URL-test history. `udp` and whatever else
 /// sing-box adds are ignored by serde's default.
 #[derive(Deserialize)]
-struct GroupBody {
+struct ProxyBody {
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     now: Option<String>,
     #[serde(default)]
     all: Vec<String>,
-}
-
-/// Parse a Clash `/proxies/<group>` body into its selection and members.
-/// `None` when the body is not JSON at all; a body without `now` (a plain
-/// proxy, not a group) is `Some` with `now: None`.
-fn parse_clash_group(body: &str) -> Option<ProxyGroup> {
-    let body: GroupBody = serde_json::from_str(body).ok()?;
-    Some(ProxyGroup {
-        now: body.now,
-        all: body.all,
-    })
-}
-
-/// The `GET /proxies/<node>` body, as far as the history reading goes: the
-/// node's own URL-test entries. `type`, `name`, `udp` and whatever else
-/// sing-box adds are ignored by serde's default.
-#[derive(Deserialize)]
-struct NodeBody {
     #[serde(default)]
     history: Vec<HistoryEntry>,
 }
 
-/// One URL-test entry, Clash-compatible: `time` RFC 3339, `delay` in
-/// milliseconds with `0` for a failed test.
+/// One URL-test entry as sing-box renders it: `time` RFC 3339, `delay` in
+/// milliseconds — a real measurement, since sing-box stores an entry only
+/// for a successful test (see the module doc).
 #[derive(Deserialize)]
 struct HistoryEntry {
     #[serde(default)]
@@ -287,16 +270,16 @@ struct HistoryEntry {
     delay: u64,
 }
 
-/// Parse a `/proxies/<node>` body into the NEWEST entry of its URL-test
-/// history (realm net-observer, node #62) — newest by the entries' own
-/// times, not by position, so a reordered list still reads right. `None`
-/// when the body is not that shape, the history is empty (not tested yet:
-/// no measurement, never a failure), or no entry carries a parseable time.
-/// `delay` 0 is sing-box's failed test and stays `0`; a delay past `u32`
-/// saturates rather than wraps.
-fn parse_newest_history(body: &str) -> Option<UrlTestEntry> {
-    let body: NodeBody = serde_json::from_str(body).ok()?;
-    body.history
+/// Parse a `/proxies/<name>` body (realm net-observer, nodes #62, #139).
+/// `None` when the body is not JSON of that shape at all. The name is the
+/// body's own, falling back to `requested`; the URL-test entry is the
+/// NEWEST by the entries' own times, not by position, so a reordered list
+/// still reads right, and `None` when the history is empty or no entry
+/// carries a parseable time. A delay past `u32` saturates rather than wraps.
+fn parse_proxy(body: &str, requested: &str) -> Option<ProxyInfo> {
+    let body: ProxyBody = serde_json::from_str(body).ok()?;
+    let urltest = body
+        .history
         .iter()
         .filter_map(|e| {
             let at_us = chrono::DateTime::parse_from_rfc3339(&e.time)
@@ -307,7 +290,17 @@ fn parse_newest_history(body: &str) -> Option<UrlTestEntry> {
                 ms: u32::try_from(e.delay).unwrap_or(u32::MAX),
             })
         })
-        .max_by_key(|e| e.at_us)
+        .max_by_key(|e| e.at_us);
+    Some(ProxyInfo {
+        name: body
+            .name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| requested.to_string()),
+        kind: body.kind,
+        now: body.now,
+        all: body.all,
+        urltest,
+    })
 }
 
 /// macOS implementation of [`ProxyFacts`].
@@ -374,12 +367,30 @@ impl ProxyFacts for ProxySystemFacts {
         }
     }
 
-    async fn group(&self) -> Option<ProxyGroup> {
-        self.clash.group(&self.selector_group).await
+    async fn group(&self) -> Option<ProxyInfo> {
+        self.clash.proxy(&self.selector_group).await
     }
 
-    async fn urltest(&self, node: &str) -> Option<UrlTestEntry> {
-        self.clash.history(node).await
+    /// Every name read at once, one task each on the daemon's runtime, so a
+    /// stalled API costs the one [`HTTP_TIMEOUT`], not one per name. The
+    /// client is cloned into each task (its connection pool is shared
+    /// behind an `Arc`); a task that panicked answers `None` like a read
+    /// that failed.
+    async fn proxies(&self, names: &[String]) -> Vec<Option<ProxyInfo>> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (i, name) in names.iter().enumerate() {
+            let clash = self.clash.clone();
+            let name = name.clone();
+            tasks.spawn(async move { (i, clash.proxy(&name).await) });
+        }
+        let mut out = vec![None; names.len()];
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((i, info)) => out[i] = info,
+                Err(e) => tracing::debug!(error = %e, "clash proxies read task failed"),
+            }
+        }
+        out
     }
 
     async fn preflight(&self) -> Readiness {
@@ -507,94 +518,133 @@ pub(crate) fn singbox_tun_addr(config_json: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// `GET /proxies/<group>` as observed on the owner's Mac on 2026-09-17
-    /// (realm net-observer, node #62): the selection and the members, in
-    /// the group's order, with the fields this build does not read ignored.
+    /// The three `GET /proxies/<name>` bodies observed on the owner's Mac on
+    /// 2026-09-17 (realm net-observer, nodes #62, #139), each read as the
+    /// collector needs it: the top Selector with its selection and members
+    /// (a group, so it carries no test of its own that matters), the nested
+    /// URLTest group the same way, and a node with its newest history entry
+    /// — its time as epoch microseconds, its delay as measured — with the
+    /// fields this build does not read (`udp`) ignored.
     #[test]
-    fn parses_the_groups_selection_and_members() {
-        let body = r#"{"type":"URLTest","now":"vless-out-6","all":["vless-out-6","vless-out-5","vless-out-2","vless-out-3"],"history":[]}"#;
-        let g = parse_clash_group(body).expect("the observed body decodes");
-        assert_eq!(g.now.as_deref(), Some("vless-out-6"));
+    fn parses_the_observed_selector_urltest_and_node_bodies() {
+        let main = parse_proxy(
+            r#"{"type":"Selector","name":"vless-main","udp":true,"history":[],"now":"vless-out-8","all":["vless-auto","vless-out-8","vless-out-4","vless-out-1","block-out"]}"#,
+            "vless-main",
+        )
+        .expect("the observed Selector body decodes");
+        assert_eq!(main.name, "vless-main");
+        assert_eq!(main.kind, "Selector");
+        assert!(main.is_group());
+        assert!(!main.is_untestable());
+        assert_eq!(main.now.as_deref(), Some("vless-out-8"));
         assert_eq!(
-            g.all,
-            vec!["vless-out-6", "vless-out-5", "vless-out-2", "vless-out-3"]
+            main.all,
+            vec![
+                "vless-auto",
+                "vless-out-8",
+                "vless-out-4",
+                "vless-out-1",
+                "block-out"
+            ]
         );
-        let body =
-            r#"{"name":"GLOBAL","type":"Selector","now":"node-a","all":["node-a","node-b"]}"#;
+        assert_eq!(main.urltest, None);
+
+        let auto = parse_proxy(
+            r#"{"type":"URLTest","name":"vless-auto","udp":true,"history":[],"now":"vless-out-6","all":["vless-out-6","vless-out-5","vless-out-2","vless-out-3"]}"#,
+            "vless-auto",
+        )
+        .expect("the observed URLTest body decodes");
+        assert!(auto.is_group());
+        assert_eq!(auto.now.as_deref(), Some("vless-out-6"));
+        assert_eq!(auto.all.len(), 4);
+
+        let node = parse_proxy(
+            r#"{"type":"VLESS","name":"vless-out-8","udp":true,"history":[{"time":"2026-09-17T20:55:29.874142+03:00","delay":186}]}"#,
+            "vless-out-8",
+        )
+        .expect("the observed node body decodes");
+        assert_eq!(node.name, "vless-out-8");
+        assert_eq!(node.kind, "VLESS");
+        assert!(!node.is_group());
+        assert!(!node.is_untestable());
+        assert_eq!(node.now, None);
+        assert!(node.all.is_empty());
         assert_eq!(
-            parse_clash_group(body).and_then(|g| g.now).as_deref(),
-            Some("node-a")
+            node.urltest,
+            Some(UrlTestEntry {
+                at_us: 1_789_667_729_874_142,
+                ms: 186,
+            })
         );
     }
 
-    /// A body without `now` (a plain proxy, not a group) has no selection and
-    /// no members — never an invented one.
+    /// The outbounds sing-box never tests are told by their type, whatever
+    /// its case; a body without a name takes the name asked for.
     #[test]
-    fn no_now_field_is_no_selection() {
-        let body = r#"{"name":"GLOBAL","type":"Selector"}"#;
-        let g = parse_clash_group(body).unwrap();
-        assert_eq!(g.now, None);
-        assert!(g.all.is_empty());
+    fn direct_block_and_dns_are_untestable_and_the_name_falls_back() {
+        for kind in ["Direct", "Block", "DNS", "direct"] {
+            let info = parse_proxy(&format!(r#"{{"type":"{kind}","history":[]}}"#), "x").unwrap();
+            assert!(info.is_untestable(), "{kind}");
+            assert!(!info.is_group(), "{kind}");
+            assert_eq!(info.name, "x");
+        }
+        assert!(
+            parse_proxy(r#"{"type":"Fallback","now":"a","all":["a"]}"#, "f")
+                .unwrap()
+                .is_group()
+        );
     }
 
+    /// The newest entry is the newest by its own time, not by position, so
+    /// a reordered list still reads right; `delay` 0 is a real answer.
     #[test]
-    fn malformed_json_is_none() {
-        assert_eq!(parse_clash_group("not json"), None);
-    }
-
-    /// A node body as sing-box's Clash API answers it (`GET /proxies/<node>`,
-    /// the Clash-compatible shape; realm net-observer, node #62): the NEWEST
-    /// history entry by its own time — here listed first, so position is not
-    /// what decides — with `delay` 0 kept as sing-box's failed test, the
-    /// entry's time as epoch microseconds, and the fields this build does
-    /// not read ignored.
-    #[test]
-    fn parses_the_newest_history_entry_by_time() {
-        let body = r#"{"type":"VLESS","name":"vless-out-6","udp":true,"history":[
+    fn the_newest_history_entry_is_by_time() {
+        let body = r#"{"type":"VLESS","name":"vless-out-6","history":[
             {"time":"2026-09-17T18:40:00+03:00","delay":0},
             {"time":"2026-09-17T18:30:00+03:00","delay":352},
             {"time":"2026-09-17T18:35:00+03:00","delay":202}
         ]}"#;
         assert_eq!(
-            parse_newest_history(body),
+            parse_proxy(body, "vless-out-6").unwrap().urltest,
             Some(UrlTestEntry {
                 at_us: 1_789_659_600_000_000,
                 ms: 0,
             }),
-            "the newest test failed: sing-box's 0 stays 0"
-        );
-        let body = r#"{"type":"VLESS","name":"vless-out-6","history":[
-            {"time":"2026-09-17T15:30:00Z","delay":352}
-        ]}"#;
-        assert_eq!(
-            parse_newest_history(body),
-            Some(UrlTestEntry {
-                at_us: 1_789_659_000_000_000,
-                ms: 352,
-            })
+            "a sub-millisecond answer is the answer it is"
         );
     }
 
     /// The empty history observed on every node at 18:23 on 2026-09-17 is
-    /// "not tested yet" — no measurement, never a failure — and so is a body
-    /// without a history, an entry whose time does not parse, or no body of
-    /// that shape at all. A delay past `u32` saturates rather than wraps.
+    /// no entry — untested yet, or the last test failed; this surface cannot
+    /// tell — and so is a body without a history or an entry whose time
+    /// does not parse. No body of that shape at all is `None`; a delay past
+    /// `u32` saturates rather than wraps.
     #[test]
-    fn an_empty_or_unreadable_history_is_no_measurement() {
+    fn an_empty_or_unreadable_history_is_no_entry() {
+        let empty = parse_proxy(
+            r#"{"type":"VLESS","name":"vless-out-6","history":[]}"#,
+            "vless-out-6",
+        )
+        .unwrap();
+        assert_eq!(empty.urltest, None);
         assert_eq!(
-            parse_newest_history(r#"{"type":"VLESS","name":"vless-out-6","history":[]}"#),
+            parse_proxy(r#"{"type":"VLESS"}"#, "n").unwrap().urltest,
             None
         );
-        assert_eq!(parse_newest_history(r#"{"type":"VLESS"}"#), None);
         assert_eq!(
-            parse_newest_history(r#"{"history":[{"time":"yesterday","delay":5}]}"#),
+            parse_proxy(r#"{"history":[{"time":"yesterday","delay":5}]}"#, "n")
+                .unwrap()
+                .urltest,
             None
         );
-        assert_eq!(parse_newest_history("not json"), None);
+        assert_eq!(parse_proxy("not json", "n"), None);
         assert_eq!(
-            parse_newest_history(
-                r#"{"history":[{"time":"2026-09-17T15:30:00Z","delay":4294967296}]}"#
+            parse_proxy(
+                r#"{"history":[{"time":"2026-09-17T15:30:00Z","delay":4294967296}]}"#,
+                "n"
             )
+            .unwrap()
+            .urltest
             .map(|e| e.ms),
             Some(u32::MAX)
         );

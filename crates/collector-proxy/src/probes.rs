@@ -68,43 +68,78 @@ impl TunProbe {
     }
 }
 
-/// The selector group as sing-box's Clash API describes it
-/// (`GET /proxies/<group>`): the node it selects right now and every member
-/// it can select. One read per tick serves both.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProxyGroup {
-    /// The selected node (`now`); absent on a body that is not a group's.
-    pub now: Option<String>,
-    /// The members (`all`), in the order the group lists them.
-    pub all: Vec<String>,
-}
-
 /// The newest entry of one node's URL-test history as sing-box keeps it
 /// (`GET /proxies/<node>` → `history[]`): when sing-box ran the test and
-/// what it measured — `0` ms is sing-box's spelling of a failed test, kept
-/// as the record's `0` (realm net-observer, node #62).
+/// what it measured. A history is written only by a SUCCESSFUL test —
+/// sing-box's URLTest group deletes the node's entry on a failed one — so
+/// `0` ms here is a real sub-millisecond answer, never a failure (realm
+/// net-observer, node #62).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UrlTestEntry {
     /// The entry's `time`, epoch microseconds.
     pub at_us: i64,
-    /// The entry's `delay`, milliseconds; `0` = the test failed.
+    /// The entry's `delay`, milliseconds.
     pub ms: u32,
+}
+
+/// One proxy as sing-box's Clash API describes it (`GET /proxies/<name>` —
+/// a group and a single node answer on the same endpoint, told apart by
+/// `type`): what it is, what it selects, what it contains, and its own
+/// URL-test history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyInfo {
+    /// The name the API reports (`name`), falling back to the name asked for.
+    pub name: String,
+    /// The `type` as the API spells it: `Selector` / `URLTest` / `Fallback`
+    /// for a group, `VLESS`, `Direct`, `Block`, `DNS`, … for a node.
+    pub kind: String,
+    /// The selected member (`now`); absent on a node.
+    pub now: Option<String>,
+    /// The members (`all`), in the order the group lists them; empty on a
+    /// node.
+    pub all: Vec<String>,
+    /// The newest history entry; `None` = the history is empty.
+    pub urltest: Option<UrlTestEntry>,
+}
+
+impl ProxyInfo {
+    /// Whether this is a group — one that selects among members — rather
+    /// than a node that carries traffic itself.
+    #[must_use]
+    pub fn is_group(&self) -> bool {
+        ["selector", "urltest", "fallback"]
+            .iter()
+            .any(|k| self.kind.eq_ignore_ascii_case(k))
+    }
+
+    /// Whether this is a node sing-box never URL-tests: the direct, block
+    /// and DNS outbounds have no upstream to test through.
+    #[must_use]
+    pub fn is_untestable(&self) -> bool {
+        ["direct", "block", "dns"]
+            .iter()
+            .any(|k| self.kind.eq_ignore_ascii_case(k))
+    }
 }
 
 /// One node's URL-test reading on one tick, ready for the mapping: the
 /// node, the endpoint it tests through (so the reading can ride that
-/// endpoint's row; `None` when the config names none for it) and the newest
-/// history entry (`None` = sing-box has not tested the node, or the API did
-/// not answer — not measured).
+/// endpoint's row; `None` when the config names none for it), the newest
+/// history entry the API showed this tick (`None` = no entry now), and —
+/// from the collector's memory — since when that history has been empty
+/// after having carried an entry (`None` = it has an entry, or never had
+/// one) (realm net-observer, node #62).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrlTest {
     pub node: String,
     pub endpoint: Option<String>,
     pub entry: Option<UrlTestEntry>,
+    pub absent_since_us: Option<i64>,
 }
 
 /// Proxy facts: the upstream nodes and their endpoints, the TUN HTTP 204
-/// probe, the selector group, and sing-box's own URL-test history per node.
+/// probe, and sing-box's Clash API view of the selector group, its members
+/// and each node's own URL-test history.
 ///
 /// Reads of the Clash API and of the rendered config are LOCAL and emit
 /// nothing on the wire, so they belong to no emission class and run under
@@ -122,13 +157,13 @@ pub trait ProxyFacts: Send + Sync {
     /// attempt: whether to send it at all is the collector's decision (the
     /// probing tier), taken before this is called.
     async fn tun_probe(&self, url: &str) -> TunProbe;
-    /// The selector group — its selection and its members — from one API
-    /// read. `None` when the API did not answer.
-    async fn group(&self) -> Option<ProxyGroup>;
-    /// The newest entry of `node`'s URL-test history. `None` = no entry
-    /// (an empty history: sing-box has not tested it yet; or the API did not
-    /// answer) — never a failure.
-    async fn urltest(&self, node: &str) -> Option<UrlTestEntry>;
+    /// The configured selector group, from one API read: the root the
+    /// collector descends from. `None` when the API did not answer.
+    async fn group(&self) -> Option<ProxyInfo>;
+    /// Every named proxy from one API read each, issued together so a
+    /// stalled API costs one timeout, not one per name; `None` in a slot =
+    /// that read did not answer or did not decode. Same order as `names`.
+    async fn proxies(&self, names: &[String]) -> Vec<Option<ProxyInfo>>;
     /// Runtime capability probe: can the proxy collector work here/now?
     async fn preflight(&self) -> Readiness;
 }
