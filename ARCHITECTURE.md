@@ -112,9 +112,22 @@ flowchart LR
   frozen pcap slice (realm net-observer, node #88). A window whose own MAC
   could not be read drops nothing as ours and says so (`own` NULL / `?`).
   Not the pcap ring: the ring's filter carries no multicast and its files are
-  read only on a freeze. The listener's end (child died, pipe broke) is
-  bracketed by a `SKIP` row naming why — the one event batch that passes an
-  operator pause, since it is the bracket and not an observation. A flush
+  read only on a freeze. The listener is **supervised, not started once**:
+  its child needs the physical interface, which a `RunAtLoad` daemon boots
+  without, so `supervise_on_iface` starts it when an interface resolves and
+  again whenever its stream ends (realm net-observer, node #134). What ends
+  a stream is the child dying: a running listener stays on the interface it
+  started on, and a default route moving to another interface is not a
+  restart trigger yet (it needs a stop path into the child inside the reader
+  thread — a follow-up), so until the child dies, windows keyed by the
+  current gateway may carry the old interface's hearing. The listener's end
+  (child died, pipe broke) is bracketed by a `SKIP` row naming why — the one
+  event batch that passes an operator pause, since it is the bracket and not
+  an observation — and the next listener follows after the supervisor's
+  interval, so the gap between them is named at its start by the `SKIP`
+  bracket and closed by the next flush; while no interface resolves or
+  `tcpdump` keeps failing, the record holds that one bracket and the log
+  names the continuing gap by change of reason. A flush
   never replaces the snapshot's cache reading (it is the last window, not
   the table) and never fills the trigger window's neighbour slot
   (`RecentWindow::last_neighbors` skips it); it is written and published
@@ -210,32 +223,46 @@ collector, whether to run it at all:
   every **change** of reason log at `warn`, the rest at `debug`, and the
   recovery logs the number of skipped ticks — the `SKIP` samples are the record,
   the log is only its narration.
-- **Two things stay one-shot, both deliberately.** The **event** cadence: the
-  `route` collector's PF_ROUTE socket is opened by `PfRouteSource::open()`
-  *before* construction and moved into the collector, so there is nothing left
-  to re-probe per tick and no tick to re-probe on — an `Unavailable` event
-  collector is logged and skipped for the life of the process ("event cadence:
-  not retried"), and retrying it means a supervisor around
-  `spawn_event_collector` that reopens the socket. The `announce` listener is
-  the same shape: its `tcpdump` child is started before construction, and
-  what separates `Unavailable` from a running listener is not the spawn —
-  a spawn proves only that a binary exists — but the child's pcap global
-  header: `AnnounceCapture::start` returns `Ok` only once the child has
-  written one (which `-U` flushes at open, before any frame) declaring an
-  Ethernet link layer, waiting at most 2 s; a child that exits first (no
-  BPF device, no permission, an interface that is not configured), writes
-  nothing in time, or writes something else is killed and the reason
-  carries the child's last stderr words. That verdict is logged and holds
-  for the life of the process; a child that dies later ends the source with
-  its exit status and stderr tail as the reason on the `SKIP` row that
-  brackets the end. And the **pcap ring**: it is
-  a `tcpdump` child started once by `maybe_start_pcap_ring` and handed to the
-  API server, so `FreezePcap` can answer about the ring that is actually
-  running; a boot that resolves no physical interface leaves the daemon with no
-  ring for its lifetime, logged as `"no physical interface resolved; pcap ring
-  disabled (not retried)"` and marked in the source as a known gap. Both are
-  named here rather than papered over: they are the two places where a missing
-  prerequisite is still permanent.
+- **The event cadence has no tick to re-probe on, so what needs an interface
+  is supervised instead.** An event collector's source is opened *before*
+  construction and moved into the collector, so there is nothing left to
+  re-probe per tick. `route` needs no interface — its PF_ROUTE socket
+  (`PfRouteSource::open()`) opens at boot or never — so it is the one event
+  collector that stays one-shot: an `Unavailable` `route` is logged and
+  skipped for the life of the process. The `announce` listener is a `tcpdump`
+  child on the physical interface, which a `RunAtLoad` daemon boots without
+  (observed: `preflight failed; skipping … collector="announce" reason=no
+  physical interface resolved`, one second after `darwin-rebuild switch`, and
+  no listener for the life of that process — realm net-observer, node #134).
+  So it is not constructed at startup at all: `supervise_on_iface` re-resolves
+  the interface every 30 s (the pcap ring's own retry interval, one number for
+  every `tcpdump` supervisor), and once there is one, `AnnounceCapture::start`
+  decides whether a child captures — not by the spawn, which proves only that
+  a binary exists, but by the child's pcap global header: `Ok` only once the
+  child has written one (which `-U` flushes at open, before any frame)
+  declaring an Ethernet link layer, within its header bound; a child that
+  exits first (no BPF device, no permission, an interface that is not
+  configured), writes nothing in time, or writes something else is killed and
+  the reason carries the child's last stderr words. Only then is the collector
+  built, always `Ready`, and driven by `spawn_event_collector` like `route`.
+  When the stream ends — the child died, the pipe broke — the source's final
+  batch carries the `SKIP` row that brackets the end (its exit status and
+  stderr tail as the reason), the spawner's handle completes (it completes
+  when the source thread returns, which is the one signal a supervisor has),
+  and the supervisor starts a new listener after the same interval. Failures
+  are logged by *change of reason*, never per attempt, as for the ring. The
+  **pcap ring** is supervised the same way (`supervise_pcap_ring`: the slot
+  every reader consults, re-filled when empty or when its child died), and so
+  is the **topology patrol** — it too needs an interface to open its bounded
+  LLDP/CDP capture on, so it waits under `supervise_on_iface` for one rather
+  than being skipped for the life of a process that booted without one; once
+  started it runs on that interface, and its own capture is bounded per run.
+  On shutdown, aborting a supervisor aborts the tokio task it awaits — the
+  patrol's task, or for the listener only the oneshot bridge in front of its
+  event thread: that thread, the reader thread holding the `AnnounceCapture`
+  and the `tcpdump` child run until process exit (EPIPE on the next frame,
+  launchd's process group), exactly as `route`'s uninterruptible `read(2)`
+  thread does.
 
 ### Async collectors
 
@@ -1448,7 +1475,11 @@ The flake ships all three binaries and owns the launchd job that runs the daemon
   reuses. `net-observerd`, `net-observer-cli` and `net-observer-bar` are the
   `build` outputs of the three workspace members; `net-observer` (also
   `default`) is a `symlinkJoin` of the daemon and the CLI, the shape the old
-  single `buildRustPackage` derivation had. The derivations come out of
+  single `buildRustPackage` derivation had — and the darwin module's
+  `services.net-observer.package` defaults to it, so a host that lists that
+  option in `environment.systemPackages` keeps the operator's CLI (the
+  daemon-only `net-observerd` once stood there and the CLI vanished from the
+  owner's Mac on the first crate2nix switch). The derivations come out of
   `buildRustCrateForPkgs`: `buildRustCrate` overridden to compile with the
   channel `rust-toolchain.toml` pins — otherwise it would take nixpkgs' rustc
   and "works in the dev shell" would stop meaning anything — and to merge the
