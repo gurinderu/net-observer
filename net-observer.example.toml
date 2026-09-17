@@ -51,11 +51,11 @@ socket_mode = 0o666
 # (link_sample, proxy_sample, dns_sample, route_event, host_sample) are what
 # the diagnoses read as "the daemon was collecting", so they are never
 # prunable; air_sample and air_ap are one scan slice, so naming either
-# prunes both. connection_sample is the one table pruned by default: one row
-# per flow key per 15 s tick, measured on the owner's Mac 2026-09-17: ~3.3k
-# rows/hour (~80k rows/day) — the whole file grew ~1.3 MB/day before that
-# collector and ~8 MB/day is the estimate with it. Widen the list here if the
-# rest should follow.
+# prunes both. connection_sample is the one table pruned by default — one row
+# per flow key per 15 s tick,
+# measured on the owner's Mac 2026-09-17: ~3.3k rows/hour (~80k rows/day);
+# the whole file grew ~1.3 MB/day before that collector and ~8 MB/day is the
+# estimate with it. Widen the list here if the rest should follow.
 [record]
 retention_days = 0
 retention_tables = ["connection_sample"]
