@@ -74,22 +74,26 @@
 //!   which is the truth: the record ends there.
 //!
 //! An operator pause is not the only hole the record can name this way. A
-//! **stop** is a startup edge with no preceding pause: the daemon died or was
-//! killed outright, so the record simply stops, and the gap runs from the
-//! newest sample before that edge to the edge itself — unless a pause gap
-//! already closes at that same edge, in which case the pause already names
-//! the hole (and two startups sharing the same anchor sample, a
-//! boot-crash-boot with nothing written between them, share one `stop`: only
-//! the earlier startup closes it). A **sleep** is two consecutive POINTS —
-//! a sample of any stream, or a recorded pause/resume/startup edge — further
-//! apart than [`DEFAULT_SLEEP_THRESHOLD_US`] and not both inside one
-//! recorded pause/stop gap: the machine slept while the daemon kept running.
-//! Edges count as points so a stride can never straddle a gap's own boundary,
-//! which is what lets the residual after a short pause still surface as its
-//! own sleep instead of being swallowed whole. Both are derived the same
-//! way as a pause — in SQL, never stored — and read as `gap` identically;
-//! only `observation_gaps`/`silences`'s `kind` column tells the three apart
-//! (realm net-observer, node #109).
+//! **stop** is a startup edge anchored on the newest POINT before it (a
+//! sample or an edge, not just a sample — two startups either side of a
+//! pause used to anchor on the SAME sample and lose the hole after the pause
+//! entirely): if that point is a pause edge, the startup closes the pause and
+//! opens no stop of its own; otherwise a stop runs from that point to the
+//! startup, so a startup that itself opened nothing (its own anchor was a
+//! pause) still leaves the NEXT startup free to open its own — a daemon that
+//! resumes after a pause and then crashes again gets that second silence
+//! named too, not merged into the first. A **sleep** is two consecutive
+//! POINTS — a sample of any stream, or a recorded pause/resume/startup edge
+//! — further apart than [`DEFAULT_SLEEP_THRESHOLD_US`] and not both inside
+//! one recorded pause/stop gap: the machine slept while the daemon kept
+//! running. Edges count as points so a stride can never straddle a gap's own
+//! boundary, which is what lets the residual after a short pause still
+//! surface as its own sleep instead of being swallowed whole, and a sleep's
+//! `gap_closed_by` names the KIND of point that ended it (`sample`, but
+//! `pause`/`resume`/`startup` when the record's next instant was an edge
+//! instead). Both are derived the same way as a pause — in SQL, never stored
+//! — and read as `gap` identically; only `observation_gaps`/`silences`'s
+//! `kind` column tells the three apart (realm net-observer, node #109).
 //!
 //! **Cost.** The sleep opener sorts every point in the record — samples of
 //! every stream union recorded edges — on every `verdict_at`/
@@ -222,17 +226,21 @@ sample_ts AS (
 ///   A recorded edge WINS a tie with a sample at the same instant, because it
 ///   is the fact and the sample is only evidence of it.
 /// - **`stop`** — a recorded startup edge (`observing_edge` with
-///   `observing AND cause = 'startup'`) that no `pause` gap already explains:
-///   the daemon died or was killed with no pause edge, so the record simply
-///   stops, and the startup edge is the next fact it carries. Opens at the
-///   newest sample strictly before that edge (`gap_closed_by` always
-///   `startup`, closing at the edge itself); a startup edge that already
-///   closes an open `pause` gap opens nothing here (the pause already names
-///   the hole), and neither does the very first startup a record ever sees —
-///   no earlier sample means no "before" to bound. Two startups sharing the
-///   same anchor sample (a boot-crash-boot with nothing written between them)
-///   share one `stop` too: only the earlier startup closes it, so the two
-///   edges never produce two overlapping rows over the same hole.
+///   `observing AND cause = 'startup'`) anchored on the newest POINT before
+///   it (sample or edge, from the `points` CTE below — not just a sample,
+///   which used to anchor two startups either side of a pause at the SAME
+///   sample and lose the hole after the pause entirely, realm net-observer,
+///   node #109). If that point is a `pause` edge, this startup
+///   closes the pause and opens no stop of its own (today's exclusion,
+///   expressed through the anchor's kind); otherwise (sample, resume, or
+///   another startup) a stop opens there, `gap_closed_by` always `startup`.
+///   The very first startup a record ever sees opens nothing — no earlier
+///   point means no "before" to bound — and a startup that itself opened no
+///   stop (because its own anchor was a pause) leaves the NEXT startup free
+///   to open its own, anchored on it: a daemon that resumes after a pause and
+///   then crashes again still gets that second silence named, not merged
+///   into the first. `rn = 1` only guards two startup edges recorded at the
+///   exact same instant from sharing an anchor and double-reporting it.
 /// - **`sleep`** — two consecutive POINTS more than `sleep_threshold_us`
 ///   apart and not both inside one recorded `pause`/`stop` gap, where a point
 ///   is a sample of any stream OR a recorded `observing_edge` (pause, resume,
@@ -243,10 +251,11 @@ sample_ts AS (
 ///   exclusion is containment (`gap.opened <= a AND gap.closed >= b`), not
 ///   mere overlap: a 185 s residual right after a 5 s pause is still a sleep
 ///   of its own, not swallowed by the pause that happens to sit inside the
-///   same wider stride between two real samples. Always closes `sample` at
-///   the later of the pair — even when that point happens to be an edge, the
-///   sleep itself has no dedicated closing edge, only the record's next
-///   instant.
+///   same wider stride between two real samples. `gap_closed_by` is the KIND
+///   of the point that ended it — `sample` when it truly is one, but `pause`,
+///   `resume` or `startup` when the record's next instant happened to be an
+///   edge instead: the sleep has no dedicated closing edge of its own, only
+///   whichever point the record actually carries next.
 ///
 /// A function rather than a `const`, because the sleep opener embeds its
 /// threshold as a SQL literal — no new `?` placeholder, so the four call
@@ -260,13 +269,13 @@ sample_ts AS (
 /// Accepted for now: these are operator-invoked diagnoses, not the tick
 /// write path, and a moment-bounded window is a later step (realm
 /// net-observer, node #109).
-/// Expands to several comma-joined sibling CTEs (`pauses`, `stops_raw`,
-/// `stops`, `closed_gap`, `sleeps`, `observation_gap`) — a fragment spliced
-/// into a caller's own `WITH` list right after [`SAMPLE_TS_CTE`], exactly
-/// where the single `observation_gap` CTE used to sit. Each later CTE only
-/// references sibling CTEs already defined earlier in the same list (the
-/// pattern [`SAMPLE_TS_CTE`] itself already relies on), so no nested `WITH`
-/// is needed.
+/// Expands to several comma-joined sibling CTEs (`pauses`, `points`,
+/// `stops_raw`, `stops`, `closed_gap`, `sleeps`, `observation_gap`) — a
+/// fragment spliced into a caller's own `WITH` list right after
+/// [`SAMPLE_TS_CTE`], exactly where the single `observation_gap` CTE used to
+/// sit. Each later CTE only references sibling CTEs already defined earlier
+/// in the same list (the pattern [`SAMPLE_TS_CTE`] itself already relies on),
+/// so no nested `WITH` is needed.
 fn observation_gap_cte(sleep_threshold_us: i64) -> String {
     format!(
         "\
@@ -288,15 +297,49 @@ pauses AS (
   )
   WHERE rn = 1
 ),
--- Every recorded startup edge, opened at the newest earlier sample. Two
--- startups sharing the same anchor (no sample fell between them — a
--- boot-crash-boot) share one hole: only the earlier one, `rn = 1`, closes it;
--- the later startup is inside no gap at all, the same as today's rule that a
--- startup with no sample before it opens nothing.
+-- Every instant the record can anchor a stride to: a sample OF ANY STREAM, or
+-- a recorded pause/resume/startup edge — with `kind` saying which, so both
+-- the stop and the sleep opener below can name what they actually landed on
+-- rather than guessing 'sample' for every closing point (realm net-observer,
+-- node #109). An edge wins a tie with a sample at the same instant (`prio`),
+-- the same rule `pauses` already used for its own closing candidates.
+points AS (
+  SELECT ts_us, kind
+  FROM (
+    SELECT ts_us, kind,
+           row_number() OVER (PARTITION BY ts_us ORDER BY prio) AS rn
+    FROM (
+      SELECT ts_us, 'sample' AS kind, 1 AS prio FROM sample_ts
+      UNION ALL
+      SELECT ts_us,
+             CASE WHEN NOT observing THEN 'pause'
+                  WHEN cause = 'startup' THEN 'startup'
+                  ELSE 'resume' END AS kind,
+             0 AS prio
+      FROM observing_edge
+    )
+  )
+  WHERE rn = 1
+),
+-- Every recorded startup edge, opened at the newest POINT before it (sample
+-- or edge — not just the newest sample, which used to anchor two startups
+-- with a pause between them at the SAME sample and lose the hole after the
+-- pause entirely). If that point is a pause edge, this startup closes the
+-- pause and opens no stop of its own — today's exclusion, expressed through
+-- the anchor's kind instead of a separate lookup into `pauses`. Otherwise
+-- (sample, resume, or another startup) a stop opens there: a startup that
+-- itself opened nothing (because ITS anchor was a pause) leaves the next
+-- startup free to open its own stop anchored on it, so a resumed-then-
+-- crashed-again daemon still gets its silence named. `rn = 1` only guards
+-- the degenerate case of two startup edges recorded at the exact same
+-- instant, which would otherwise share an anchor and double-report it.
 stops_raw AS (
   SELECT
     su.ts_us AS gap_closed_us,
-    (SELECT max(t.ts_us) FROM sample_ts t WHERE t.ts_us < su.ts_us) AS gap_opened_us
+    (SELECT p.ts_us FROM points p WHERE p.ts_us < su.ts_us
+     ORDER BY p.ts_us DESC LIMIT 1) AS gap_opened_us,
+    (SELECT p.kind FROM points p WHERE p.ts_us < su.ts_us
+     ORDER BY p.ts_us DESC LIMIT 1) AS anchor_kind
   FROM (SELECT ts_us FROM observing_edge WHERE observing AND cause = 'startup') su
 ),
 stops AS (
@@ -305,35 +348,28 @@ stops AS (
     SELECT gap_opened_us, gap_closed_us,
            row_number() OVER (PARTITION BY gap_opened_us ORDER BY gap_closed_us) AS rn
     FROM stops_raw
-    WHERE gap_opened_us IS NOT NULL
+    WHERE gap_opened_us IS NOT NULL AND anchor_kind <> 'pause'
   )
   WHERE rn = 1
-    AND NOT EXISTS (
-      SELECT 1 FROM pauses p
-      WHERE p.gap_closed_by = 'startup' AND p.gap_closed_us = gap_closed_us
-    )
 ),
 -- The finished pause/stop intervals, for the sleep opener to stay clear of.
 closed_gap AS (
   SELECT gap_opened_us, gap_closed_us FROM pauses
   UNION ALL SELECT gap_opened_us, gap_closed_us FROM stops
 ),
--- Every instant the record can anchor a stride to: a sample OF ANY STREAM,
--- or a recorded pause/resume/startup edge. Edges are points too (not just
--- interval endpoints elsewhere), so a stride between two consecutive points
--- can never straddle a gap's own boundary — it either sits entirely inside
--- one recorded pause/stop gap, or entirely outside every one (realm
--- net-observer, node #109): excluding only the strides fully CONTAINED by a
--- gap, rather than merely overlapping one, is what lets the residual after a
--- pause or a stop still surface as its own sleep.
-points AS (
-  SELECT ts_us FROM sample_ts
-  UNION SELECT ts_us FROM observing_edge
-),
+-- A stride between two consecutive points can never straddle a gap's own
+-- boundary — it either sits entirely inside one recorded pause/stop gap, or
+-- entirely outside every one: excluding only the strides fully CONTAINED by
+-- a gap, rather than merely overlapping one, is what lets the residual after
+-- a pause or a stop still surface as its own sleep. `gap_closed_by` is the
+-- KIND of the point that ended the stride — `pause`/`resume`/`startup` when
+-- that point happens to be an edge, `sample` only when it truly is one: the
+-- sleep itself has no dedicated closing edge, just whatever the record's
+-- next instant turned out to be.
 sleeps AS (
-  SELECT a AS gap_opened_us, b AS gap_closed_us, 'sample' AS gap_closed_by, 'sleep' AS cause
+  SELECT a AS gap_opened_us, b AS gap_closed_us, b_kind AS gap_closed_by, 'sleep' AS cause
   FROM (
-    SELECT ts_us AS b, lag(ts_us) OVER (ORDER BY ts_us) AS a
+    SELECT ts_us AS b, kind AS b_kind, lag(ts_us) OVER (ORDER BY ts_us) AS a
     FROM points
   ) stride
   WHERE a IS NOT NULL AND b - a > {sleep_threshold_us}
@@ -2168,11 +2204,13 @@ mod tests {
     }
 
     /// Back-to-back startups with no sample between them — a boot, a crash,
-    /// and another boot — share one hole rather than opening two overlapping
-    /// ones: only the earlier startup closes it, and the later startup (whose
-    /// "newest sample before it" is the very same one) opens nothing at all.
+    /// and another boot — each anchor on the newest POINT before them, and
+    /// the other startup counts as a point: the second startup anchors on
+    /// the first (not on the sample the first one already used), so the two
+    /// hops are named separately rather than the second vanishing into the
+    /// first's shadow.
     #[test]
-    fn back_to_back_startups_with_no_sample_between_them_share_one_stop() {
+    fn back_to_back_startups_with_no_sample_between_them_name_each_hop() {
         let s = DuckdbStore::in_memory().unwrap();
         healthy_tick(&s, 10 * SEC);
         healthy_tick(&s, 20 * SEC);
@@ -2180,12 +2218,53 @@ mod tests {
         startup_edge(&s, 130 * SEC);
         healthy_tick(&s, 140 * SEC);
 
+        // The anchor is the newest POINT before each startup, and the other
+        // startup is itself a point: the second startup anchors on the
+        // first, not on the sample the first one already used, so each
+        // unbridged hop is its own stop rather than the second vanishing
+        // into the first's shadow (realm net-observer, node #109).
         let g = s.observation_gaps().unwrap();
-        assert_eq!(g.rows.len(), 1, "one stop, not two: {:?}", g.rows);
+        assert_eq!(g.rows.len(), 2, "{:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "stop");
         assert_eq!(cell(&g, 0, "gap_opened_us"), (20 * SEC).to_string());
         assert_eq!(cell(&g, 0, "gap_closed_us"), (100 * SEC).to_string());
         assert_eq!(cell(&g, 0, "gap_closed_by"), "startup");
+        assert_eq!(cell(&g, 1, "kind"), "stop");
+        assert_eq!(cell(&g, 1, "gap_opened_us"), (100 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "gap_closed_us"), (130 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "gap_closed_by"), "startup");
+    }
+
+    /// A daemon that resumes from a pause and then crashes again before
+    /// writing anything gets BOTH silences named: the pause (closed by the
+    /// first startup), and a fresh stop for the second startup, anchored on
+    /// the first — not swallowed by it. The old sample-only anchor put both
+    /// startups on the SAME (sample) anchor, so the row_number dedup picked
+    /// only the first, and the pause-override excluded even that one,
+    /// leaving the 100-130 s hole completely unnamed and `verdict_at(115 s)`
+    /// serving the 20 s reading as current (realm net-observer, node #109).
+    #[test]
+    fn a_startup_after_a_resumed_pause_that_crashes_again_names_its_own_stop() {
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, 20 * SEC);
+        edge(&s, 50 * SEC, false);
+        startup_edge(&s, 100 * SEC);
+        startup_edge(&s, 130 * SEC);
+        healthy_tick(&s, 140 * SEC);
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(g.rows.len(), 2, "{:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "pause");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (50 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (100 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "startup");
+        assert_eq!(cell(&g, 1, "kind"), "stop");
+        assert_eq!(cell(&g, 1, "gap_opened_us"), (100 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "gap_closed_us"), (130 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "gap_closed_by"), "startup");
+
+        // Squarely inside the new stop: no longer a stale pre-pause reading.
+        assert_eq!(cell(&s.verdict_at(115 * SEC).unwrap(), 0, "layer"), "gap");
     }
 
     /// Two consecutive samples further apart than the sleep threshold, with
@@ -2227,6 +2306,28 @@ mod tests {
         assert_eq!(cell(&g, 0, "kind"), "pause");
         assert_eq!(cell(&g, 0, "gap_opened_us"), (20 * SEC).to_string());
         assert_eq!(cell(&g, 0, "gap_closed_us"), "100000000");
+    }
+
+    /// A sleep's closing point can be an edge, not just a sample: the
+    /// residual right before a pause opens reads `closed_by = pause`, naming
+    /// what the record actually carries next rather than the always-'sample'
+    /// label the mechanism used to print (realm net-observer, node #109).
+    #[test]
+    fn a_sleep_closed_by_a_pause_edge_names_the_pause_not_a_sample() {
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, 0);
+        edge(&s, 1000 * SEC, false);
+        startup_edge(&s, 2000 * SEC);
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(g.rows.len(), 2, "{:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "sleep");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), "0");
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (1000 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "pause");
+        assert_eq!(cell(&g, 1, "kind"), "pause");
+        assert_eq!(cell(&g, 1, "gap_opened_us"), (1000 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "gap_closed_us"), (2000 * SEC).to_string());
     }
 
     /// A pause does not swallow the whole stride it happens to sit inside:
