@@ -53,6 +53,18 @@ jobs:
       # v31 enables the flakes and nix-command experimental features by
       # default, so no extra_nix_config is needed here.
       - uses: cachix/install-nix-action@v31
+      # Binary cache the owner's Mac pulls from: this runner is aarch64-darwin
+      # like the Mac, and nix-config keeps the net-observer input on its own
+      # nixpkgs, so the store paths built here are the ones `darwin-rebuild`
+      # would otherwise build for an hour. Every ref pulls; only `main` pushes,
+      # and a repository without the token pulls only (realm net-observer,
+      # node #133).
+      - uses: cachix/cachix-action@v17
+        with:
+          name: net-observer
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: ${{ github.ref != 'refs/heads/main' }}
+          pushFilter: "(-source$|\\.tar\\.gz$)"
 
       # Store cache keyed on the job and on both lockfiles: a crate2nix
       # rebuild is driven by Cargo.lock, a flake input bump by flake.lock.
@@ -97,6 +109,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: cachix/install-nix-action@v31
+      # The same binary cache as the daemon job (realm net-observer, node #133).
+      - uses: cachix/cachix-action@v17
+        with:
+          name: net-observer
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: ${{ github.ref != 'refs/heads/main' }}
+          pushFilter: "(-source$|\\.tar\\.gz$)"
 
       # Same layout as the daemon job's cache, under its own key.
       - uses: nix-community/cache-nix-action@v7
@@ -125,6 +144,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: cachix/install-nix-action@v31
+      # The same binary cache as the daemon job (realm net-observer, node #133).
+      - uses: cachix/cachix-action@v17
+        with:
+          name: net-observer
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: ${{ github.ref != 'refs/heads/main' }}
+          pushFilter: "(-source$|\\.tar\\.gz$)"
 
       # Same layout as the daemon job's cache, under its own key.
       - uses: nix-community/cache-nix-action@v7
