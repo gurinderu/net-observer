@@ -34,7 +34,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
-use triggers::engine::TriggerEngine;
+use triggers::engine::{TriggerEngine, incident_id_parts};
 use triggers::handlers::Handler;
 use triggers::window::RecentWindow;
 use types::{BlobRef, NeighborLifetime, NeighborsSample, Sample};
@@ -1279,7 +1279,11 @@ impl<S: Store + Send + Sync> Handler for FreezePcapHandler<S> {
 /// the same open/closed state the record holds. Without it every incident
 /// stayed "open" in the live view for the life of the process while its row
 /// had long been closed — observed live: a `gw-drop` opened at boot still
-/// open on the socket an hour later (realm net-observer, node #124).
+/// open on the socket an hour later (realm net-observer, node #124). The
+/// same `on_clear` publishes an [`Event::IncidentClosed`] on the bus, so a
+/// held-open subscriber sees the close the way it saw the opening — and
+/// since a session-ending edge (`TriggerEngine::close_all`) closes through
+/// the same `on_clear`, one site covers both (realm net-observer, node #135).
 pub struct SnapshotHandler {
     snapshot: Arc<Mutex<StatusSnapshot>>,
     cap: usize,
@@ -1288,7 +1292,8 @@ pub struct SnapshotHandler {
 
 impl SnapshotHandler {
     /// Build a handler that pushes onto `snapshot`'s incident ring, capped to
-    /// `cap`, and publishes each firing as an [`Event::Incident`] on `events_tx`.
+    /// `cap`, and publishes each firing as an [`Event::Incident`] — and each
+    /// close as an [`Event::IncidentClosed`] — on `events_tx`.
     pub fn new(
         snapshot: Arc<Mutex<StatusSnapshot>>,
         cap: usize,
@@ -1300,16 +1305,26 @@ impl SnapshotHandler {
             events_tx,
         }
     }
+
+    /// Publish one event on the realtime bus (push, not poll), serialised once
+    /// for every subscriber. Ignore the send error: it only means no client is
+    /// subscribed right now.
+    fn publish(&self, event: Event) {
+        match EncodedFrame::encode(&StreamFrame::Event(event)) {
+            Ok(frame) => {
+                let _ = self.events_tx.send(frame);
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to encode event frame; not published"),
+        }
+    }
 }
 
 impl Handler for SnapshotHandler {
     fn on_fire(&self, incident_id: &str, ts_us: i64, detail: &str) {
-        // `incident_id` is `"{trigger_id}-{now_us}"`; recover the trigger id from
-        // the prefix before the final `-` (matching `RecordHandler`).
-        let trigger_id = incident_id
-            .rsplit_once('-')
-            .map(|(prefix, _)| prefix)
-            .unwrap_or(incident_id)
+        // The rule's id, read back from the minted incident id; an id not in
+        // the minted shape is kept whole rather than guessed at.
+        let trigger_id = incident_id_parts(incident_id)
+            .map_or(incident_id, |(trigger_id, _)| trigger_id)
             .to_string();
         let summary = IncidentSummary {
             id: incident_id.to_string(),
@@ -1318,21 +1333,29 @@ impl Handler for SnapshotHandler {
             trigger_id,
             signature: detail.to_string(),
         };
-        // Publish the incident on the realtime bus (push, not poll), serialised
-        // once for every subscriber. Ignore the send error: it only means no
-        // client is subscribed right now.
-        match EncodedFrame::encode(&StreamFrame::Event(Event::Incident(summary.clone()))) {
-            Ok(frame) => {
-                let _ = self.events_tx.send(frame);
-            }
-            Err(e) => tracing::warn!(error = %e, "failed to encode event frame; not published"),
-        }
+        self.publish(Event::Incident(summary.clone()));
         let mut snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
         snap.incidents.insert(0, summary);
         snap.incidents.truncate(self.cap);
     }
 
     fn on_clear(&self, incident_id: &str, ts_us: i64) {
+        // The opening instant rides in the id the engine minted, so the frame
+        // can say how long the incident lasted without the ring: published
+        // whether or not the ring still holds the id, because a subscriber
+        // that saw the opening on the bus must see its close there too, and
+        // the ring's cap says nothing about what the bus carried (realm
+        // net-observer, node #135).
+        let (trigger_id, opened_us) = incident_id_parts(incident_id)
+            .map_or((incident_id, None), |(trigger_id, opened_us)| {
+                (trigger_id, Some(opened_us))
+            });
+        self.publish(Event::IncidentClosed {
+            id: incident_id.to_string(),
+            trigger_id: trigger_id.to_string(),
+            opened_us,
+            closed_us: ts_us,
+        });
         // An id the ring no longer holds (truncated by `cap`) has nothing to
         // stamp: the durable row still closes through `RecordHandler`.
         let mut snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
@@ -2857,6 +2880,61 @@ mod tests {
         }
     }
 
+    /// On clear the `SnapshotHandler` publishes an `Event::IncidentClosed` on
+    /// the bus — a frame of its own, never a second `Incident` — carrying the
+    /// id the opening carried, the rule, and both instants (the opening read
+    /// back from the id the engine minted). It is published even for an id
+    /// the ring no longer holds: what the bus carried, the bus closes (realm
+    /// net-observer, node #135).
+    #[test]
+    fn snapshot_handler_publishes_incident_closed_event() {
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, mut events_rx) = broadcast::channel(16);
+        let handler = SnapshotHandler::new(snapshot.clone(), 8, events_tx);
+
+        handler.on_fire("gw-drop-42", 42, "sig");
+        handler.on_clear("gw-drop-42", 57);
+        // No longer in the ring (truncated past its cap): still published.
+        handler.on_clear("wedge-7", 58);
+
+        // The opening, then the close of the same id.
+        match decode(&events_rx.try_recv().unwrap()) {
+            StreamFrame::Event(Event::Incident(inc)) => assert_eq!(inc.id, "gw-drop-42"),
+            other => panic!("expected an Incident event frame, got {other:?}"),
+        }
+        match decode(&events_rx.try_recv().unwrap()) {
+            StreamFrame::Event(Event::IncidentClosed {
+                id,
+                trigger_id,
+                opened_us,
+                closed_us,
+            }) => {
+                assert_eq!(id, "gw-drop-42");
+                assert_eq!(trigger_id, "gw-drop");
+                assert_eq!(opened_us, Some(42), "the opening, read back from the id");
+                assert_eq!(closed_us, 57);
+            }
+            other => panic!("expected an IncidentClosed event frame, got {other:?}"),
+        }
+        match decode(&events_rx.try_recv().unwrap()) {
+            StreamFrame::Event(Event::IncidentClosed {
+                id,
+                opened_us,
+                closed_us,
+                ..
+            }) => {
+                assert_eq!(id, "wedge-7");
+                assert_eq!(opened_us, Some(7));
+                assert_eq!(closed_us, 58);
+            }
+            other => panic!("expected an IncidentClosed event frame, got {other:?}"),
+        }
+        // The ring agrees with the frame it published.
+        let snap = snapshot.lock().unwrap();
+        assert_eq!(snap.incidents.len(), 1, "an unknown id adds nothing");
+        assert_eq!(snap.incidents[0].closed_us, Some(57));
+    }
+
     /// The ring mirrors the CLOSE: `on_clear` stamps `closed_us` on exactly
     /// the entry the firing opened, leaves every other entry alone, and is a
     /// no-op for an id the ring does not hold. Dies on `main` before the fix,
@@ -2902,7 +2980,7 @@ mod tests {
     async fn a_skip_tick_after_a_nogw_firing_closes_the_incident_in_both_views() {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
-        let (events_tx, _events_rx) = broadcast::channel(16);
+        let (events_tx, mut events_rx) = broadcast::channel(16);
         let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
         let snap: Arc<dyn Handler> =
             Arc::new(SnapshotHandler::new(snapshot.clone(), 8, events_tx.clone()));
@@ -2935,6 +3013,29 @@ mod tests {
             snap.incidents[0].closed_us,
             Some(115),
             "the live view closes the same incident at the same tick"
+        );
+        // ...and the bus carries the close as its own frame, after the
+        // opening, through the engine's Some→None edge (realm net-observer,
+        // node #135).
+        let mut incident_frames = Vec::new();
+        while let Ok(frame) = events_rx.try_recv() {
+            match decode(&frame) {
+                StreamFrame::Event(Event::Incident(inc)) => {
+                    incident_frames.push(("opened", inc.id, inc.opened_us));
+                }
+                StreamFrame::Event(Event::IncidentClosed { id, closed_us, .. }) => {
+                    incident_frames.push(("closed", id, closed_us));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            incident_frames,
+            vec![
+                ("opened", "gw-drop-100".to_string(), 100),
+                ("closed", "gw-drop-100".to_string(), 115),
+            ],
+            "the bus closes the same incident it opened, at the same tick"
         );
     }
 

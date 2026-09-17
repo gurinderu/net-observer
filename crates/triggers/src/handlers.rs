@@ -5,6 +5,8 @@ use std::sync::Arc;
 use store::Store;
 use types::{Incident, TriggerFired};
 
+use crate::engine::incident_id_parts;
+
 /// Reacts to a fired trigger. Handlers are passive in v1 (record only, no acting).
 ///
 /// `Send + Sync` so an [`Arc<dyn Handler>`] can be shared across tokio tasks in the
@@ -41,12 +43,10 @@ impl<S: Store> RecordHandler<S> {
 
 impl<S: Store + Send + Sync> Handler for RecordHandler<S> {
     fn on_fire(&self, incident_id: &str, ts_us: i64, detail: &str) {
-        // `incident_id` is `"{trigger_id}-{now_us}"`; recover the trigger id from the
-        // prefix before the final `-`.
-        let trigger_id = incident_id
-            .rsplit_once('-')
-            .map(|(prefix, _)| prefix)
-            .unwrap_or(incident_id)
+        // The rule's id, read back from the minted incident id; an id not in
+        // the minted shape is kept whole rather than guessed at.
+        let trigger_id = incident_id_parts(incident_id)
+            .map_or(incident_id, |(trigger_id, _)| trigger_id)
             .to_string();
         let incident = Incident {
             id: incident_id.to_string(),
