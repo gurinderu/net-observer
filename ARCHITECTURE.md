@@ -675,7 +675,8 @@ carries, lives in `types` for the same reason.
 | `gw_drops()` | the first link sample of each run of `FAIL`/`NOGW` (`SKIP` ticks removed first, so a quiet run cannot manufacture an edge) |
 | `gateway_ramp(drop_ts_us)` | gateway RTT over the window before a drop, with a least-squares `slope_ms_per_s` over the answered ticks — the ~40 s coworking climb as data |
 | `fakeip_bugs()` | `FAKEIP` on a `.ru` name, which is always a bug |
-| `observation_gaps()` | one row per interval the daemon deliberately collected nothing |
+| `observation_gaps()` | one row per operator pause — frozen shape, pauses only, no `kind` column |
+| `silences()` | every pause, stop, and sleep, plus every stretch the daemon spent withholding its probes, all told apart by `kind` |
 | `connections(group_by)` | the newest `connection_sample` tick, grouped by `host` / `ip` / `ip-port` / `process` (`ConnectionsGroupBy`, in `types` like `HistoryWindow`): `ts_us, verdict, key, count, upload, download, hosts`, ordered by `count DESC`, `hosts` the distinct names seen behind the key; a tick with no rows answers one row carrying only `ts_us` and `verdict`, so a `SKIP` is never an empty table |
 
 The `layer` vocabulary is `link` / `vless` / `proxy` / `host` / `healthy` /
@@ -714,20 +715,43 @@ answer:
   built from ticks that exist, so it never passes off a pre-pause reading as a
   measurement.
 
-**Gaps are derived, not stored.** `observation_gap` opens a half-open interval
-`[gap_opened_us, gap_closed_us)` at each `observing = false` edge and closes it at
-the earliest of three candidates, with `gap_closed_by` naming which one it took:
-`resume` (an operator `observing = true` edge), `startup` (a recorded startup
-edge — this process began collecting), or `sample` (no edge at all: the first
-sample of any stream, `SAMPLE_TS_CTE` over every table, an inference). A recorded
-edge **wins a tie** with a sample at the same instant, because it is the fact and
-the sample is only evidence of it. `gap_closed_us` is `NULL` only when nothing at
-all follows the pause — the record ends inside it, which is the truth. The edge
-sequence is not assumed to be well-formed pairs: a resume with no preceding pause
-opens no gap, and databases written before the startup edge existed still close
-their gaps by the `sample` inference.
+**Gaps are derived, not stored.** `observation_gap` names three kinds of hole
+the record cannot vouch for, each opened its own way but sharing the same
+half-open `[gap_opened_us, gap_closed_us)` shape and a `cause`/`kind` column
+(realm net-observer, node #109):
 
-**Passive stretches are the second bracket, derived the same way but kept
+- **`pause`** opens at each `observing = false` edge and closes at the
+  earliest of three candidates, with `gap_closed_by` naming which one it
+  took: `resume` (an operator `observing = true` edge), `startup` (a recorded
+  startup edge — this process began collecting), or `sample` (no edge at
+  all: the first sample of any stream, `SAMPLE_TS_CTE` over every table, an
+  inference). A recorded edge **wins a tie** with a sample at the same
+  instant, because it is the fact and the sample is only evidence of it. The
+  edge sequence is not assumed to be well-formed pairs: a resume with no
+  preceding pause opens no gap, and databases written before the startup edge
+  existed still close their gaps by the `sample` inference.
+- **`stop`** opens at a recorded startup edge that no `pause` gap already
+  closes: the daemon died or was killed with no pause edge at all, so the
+  record simply stops, and the startup edge is the next fact it carries. It
+  opens at the newest sample strictly before that edge and always closes
+  `startup` at the edge itself; the very first startup a record ever sees (no
+  earlier sample) opens nothing, and a startup that already closes an open
+  `pause` gap opens nothing either — the pause already names the hole.
+- **`sleep`** opens between two consecutive samples of any stream further
+  apart than `DEFAULT_SLEEP_THRESHOLD_US` (3x the link collector's default 15
+  s interval, a literal embedded in the query text rather than a bind
+  parameter — a config knob is a later step), outside every `pause`/`stop`
+  gap: nothing paused or stopped the daemon, but the clock between two ticks
+  jumped further than a lost tick explains — the machine slept. Always closes
+  `sample` at the later of the pair.
+
+`gap_closed_us` (and `gap_closed_by`) is `NULL` only when nothing at all
+follows the opener — the record simply ends inside it, which is the truth.
+`verdict_at`/`incident_context`/`gateway_ramp` read `observation_gap`
+generically: any cause answers `gap` (or refuses a slope) exactly alike, so a
+stop or a sleep is withheld the same way a pause is.
+
+**Passive stretches are a separate bracket, derived the same way but kept
 apart.** `probing_stretch` opens at a `passive` edge whose predecessor is not
 `passive` (a passive startup edge after a crash continues a stretch rather than
 opening a second one) and closes at the first later `active` edge —
@@ -735,8 +759,11 @@ opening a second one) and closes at the first later `active` edge —
 active) — never at a sample, because samples keep landing under passive. It is
 deliberately not folded into `observation_gap`: a moment inside a stretch has a
 row and reads `unknown` from its `SKIP`s, never `gap`. `silences_sql` lists
-both brackets under a `kind` column (`pause` | `passive`); `observation_gaps_sql`
-stays pauses-only. (realm net-observer, node #88)
+every bracket under a `kind` column (`pause` | `stop` | `sleep` | `passive`);
+`observation_gaps_sql` keeps the frozen, pauses-only shape it shipped with —
+three columns, no `kind`, `WHERE cause = 'pause'` — so a stop, a sleep, or a
+passive stretch never rides along there, only in `silences_sql`. (realm
+net-observer, node #88, node #109)
 
 ### Air scan
 
@@ -811,9 +838,10 @@ the durable record; the socket is the live, low-latency read path.
     named diagnoses of [Diagnosis queries](#diagnosis-queries) (`why`,
     `incident-context`, `wedge-or-starvation`, `gateway-ramp` and the drop list
     it defaults from, `gaps` and `silences` — the latter every bracketed
-    silence with a `kind` column, pauses and passive stretches; `Gaps` keeps
-    its pauses-only shape because a reader built before the tier asks for it
-    by that id and would print a stretch as a pause — `neighbors`, `vulns`,
+    silence with a `kind` column: pause, stop, sleep, and passive stretches;
+    `Gaps` keeps its frozen, pauses-only shape (no `kind` column at all),
+    because a reader built before the tier asks for it by that id and would
+    print a stop, a sleep, or a stretch as a pause — `neighbors`, `vulns`,
     `segments`, `history`, `topology`, `connections`, `air` (three variants —
     `AirScan`, `AirAps`, `AirSelfChannel`, see [Air scan](#air-scan) — routed
     from `AirScan` and reused for the other two, one `source:` line for the
@@ -1246,9 +1274,10 @@ already-authorised command:
    after it. Clients: the bar menu's **Probe network**/**Stop probing**
    row and `net-observer-cli probe passive|active`; `gaps` asks the `Silences`
    diagnosis, which lists passive stretches as `kind = passive` next to the
-   pauses (`Gaps` itself stays pauses-only for readers built before the tier;
-   when an older daemon answers `Gaps` the CLI says so on stderr, and when it
-   reads the file it runs `silences_sql` and prints only its usual source line).
+   pause/stop/sleep gaps (`Gaps` itself stays frozen and pauses-only, for
+   readers built before the tier; when an older daemon answers `Gaps` the CLI
+   says so on stderr, and when it reads the file it runs `silences_sql` and
+   prints only its usual source line).
 
    Passive is deliberately **not** a refusal on a manual scan. Passive
    promises **no emission the daemon makes on its own** — nothing on a timer;

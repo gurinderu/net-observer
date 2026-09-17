@@ -227,18 +227,21 @@ pub enum DiagnosticQuery {
     /// live answer from silently plotting a different interval than the one
     /// asked for.
     GatewayRamp { drop_ts_us: i64, window_us: i64 },
-    /// Every observation gap the record contains (`observation_gaps_sql`) —
-    /// pauses only, in the shape this variant has had since it shipped. A
-    /// reader built before the probing tier asks for this and prints every
-    /// row as a pause, so the rows must stay pauses; the passive stretches
-    /// live under [`DiagnosticQuery::Silences`], a variant that reader has
-    /// never heard of.
+    /// Every operator pause the record contains (`observation_gaps_sql`) —
+    /// pauses only, frozen shape: three columns (`gap_opened_us`,
+    /// `gap_closed_us`, `gap_closed_by`), no `kind`. Frozen because a reader
+    /// built before the probing tier landed asks for this and prints every
+    /// row as a pause (realm net-observer, node #88); a stop or a sleep
+    /// (realm net-observer, node #109) is just as unlisted here as a passive
+    /// stretch always was — all three live under [`DiagnosticQuery::Silences`]
+    /// instead, a variant that reader has never heard of.
     Gaps,
     /// Every bracketed silence the record contains (`silences_sql`): the
-    /// pauses of `Gaps` plus the stretches the probing tier was passive for,
-    /// told apart by a `kind` column (`pause` | `passive`). A daemon built
-    /// before it answers `Unsupported`, and the CLI's `gaps` command then asks
-    /// `Gaps` instead, saying so. (realm net-observer, node #88)
+    /// pauses of `Gaps` plus stops, sleeps, and the stretches the probing
+    /// tier was passive for, told apart by a `kind` column (`pause` | `stop`
+    /// | `sleep` | `passive`). A daemon built before it answers
+    /// `Unsupported`, and the CLI's `gaps` command then asks `Gaps` instead,
+    /// saying so. (realm net-observer, node #88, node #109)
     Silences,
     /// The neighbours on every segment, or on `network` (`neighbors_sql`).
     Neighbors { network: Option<String> },
