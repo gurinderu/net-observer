@@ -119,6 +119,43 @@ pub struct ProxySample {
     /// Age of the tunnel held stream at the check, seconds.
     #[serde(default)]
     pub est_tun_age_s: Option<u32>,
+    /// The dial probe (realm net-observer, node #62): sing-box's OWN dial
+    /// through one node of the selector group, asked of its Clash API, by IP
+    /// — transport through the node. `None` = not dialled (the passive tier,
+    /// or not this node's turn: the selected node is dialled every tick, the
+    /// rest of the group one per tick round-robin; also a dial the API could
+    /// not run at all, under a `Some` `dial_target`); `Some(0)` = attempted,
+    /// no answer (a timeout or a delay-test error — the record's `0`, like
+    /// `tun_code`); `Some(ms)` = answered in that many milliseconds. Rides
+    /// the row of the node's own endpoint (`server_ip`), so `tcp` on the same
+    /// row is the raw TCP reachability of the listener the dial went through.
+    /// `serde(default)` so a pre-field daemon's samples still decode.
+    #[serde(default)]
+    pub dial_ip_ms: Option<u32>,
+    /// The same dial by NAME — transport through the node plus sing-box's own
+    /// DNS path. Same vocabulary as `dial_ip_ms`; a `0` here beside an
+    /// answered `dial_ip_ms` is the dead-DNS-path signature.
+    #[serde(default)]
+    pub dial_name_ms: Option<u32>,
+    /// The node this row's dial went through; `None` = no dial on this row.
+    #[serde(default)]
+    pub dial_target: Option<String>,
+}
+
+impl ProxySample {
+    /// The dial reading as `<node>:<ip>/<name>ms`, an unmeasured side as
+    /// `-`; `None` when this row carries no dial. One rendering for the CLI's
+    /// `status` line and the bar's, so the two cannot drift.
+    #[must_use]
+    pub fn dial_label(&self) -> Option<String> {
+        let node = self.dial_target.as_deref()?;
+        let side = |ms: Option<u32>| ms.map_or_else(|| "-".to_string(), |ms| ms.to_string());
+        Some(format!(
+            "{node}:{}/{}ms",
+            side(self.dial_ip_ms),
+            side(self.dial_name_ms)
+        ))
+    }
 }
 
 /// One resolver probe. `probe` is the queried name label (e.g. "nks"), `server`
@@ -298,6 +335,9 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            dial_ip_ms: None,
+            dial_name_ms: None,
+            dial_target: None,
         });
         assert_eq!(p.ts_us(), 99);
 
@@ -388,6 +428,36 @@ mod tests {
                 swap_used_mb: None,
             }
         );
+    }
+
+    /// A proxy sample written by a daemon that shipped before the dial probe
+    /// carries no dial fields; it must still decode, with the dial reading as
+    /// "not dialled" rather than failing — and a row without a dial has no
+    /// label, while one with a dial spells every side, an unmeasured one as
+    /// `-`.
+    #[test]
+    fn pre_dial_proxy_sample_decodes_as_not_dialled_and_labels_follow() {
+        let older = r#"{"ts_us":1,"server_ip":"1.1.1.1:443","tcp":"Ok","rtt_ms":null,"tun_code":204,"selector":null}"#;
+        let p: ProxySample = serde_json::from_str(older).expect("older proxy sample must decode");
+        assert_eq!(p.dial_ip_ms, None);
+        assert_eq!(p.dial_name_ms, None);
+        assert_eq!(p.dial_target, None);
+        assert_eq!(p.dial_label(), None);
+
+        let dialled = ProxySample {
+            dial_ip_ms: Some(202),
+            dial_name_ms: Some(0),
+            dial_target: Some("vless-out-6".into()),
+            ..p.clone()
+        };
+        assert_eq!(dialled.dial_label().as_deref(), Some("vless-out-6:202/0ms"));
+        let half = ProxySample {
+            dial_ip_ms: Some(202),
+            dial_name_ms: None,
+            dial_target: Some("vless-out-6".into()),
+            ..p
+        };
+        assert_eq!(half.dial_label().as_deref(), Some("vless-out-6:202/-ms"));
     }
 
     #[test]

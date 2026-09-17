@@ -31,6 +31,12 @@ pub enum EmissionClass {
     /// `proxy`: the two held HTTPS reference streams and the request each
     /// carries every tick.
     HeldStream,
+    /// `proxy`: the dial probe — sing-box's own dial through a node of the
+    /// selector group, by IP and by name, asked of its Clash API
+    /// (`GET /proxies/<node>/delay`). The packets are sing-box's, but they go
+    /// out on the daemon's request and on its timer, so they are the daemon's
+    /// emission (realm net-observer, node #62).
+    DialProbe,
     /// `dns`: the resolver queries.
     DnsQuery,
 }
@@ -134,13 +140,14 @@ pub struct ProbingEdge {
 mod tests {
     use super::*;
 
-    const EVERY_CLASS: [EmissionClass; 7] = [
+    const EVERY_CLASS: [EmissionClass; 8] = [
         EmissionClass::GatewayEcho,
         EmissionClass::DirectProbe,
         EmissionClass::LanProbe,
         EmissionClass::TunProbe,
         EmissionClass::EndpointProbe,
         EmissionClass::HeldStream,
+        EmissionClass::DialProbe,
         EmissionClass::DnsQuery,
     ];
 
