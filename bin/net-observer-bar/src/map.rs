@@ -3964,7 +3964,7 @@ mod headless_tests {
 
     /// One `announce` row of the record on the fixture's segment, for the
     /// device with this MAC and name.
-    fn announce_row(mac: &'static str, hostname: &'static str) -> [&'static str; 9] {
+    fn announce_row<'a>(mac: &'a str, hostname: &'a str) -> [&'a str; 9] {
         [
             "aa:bb:cc:dd:ee:01",
             mac,
@@ -4103,17 +4103,35 @@ mod headless_tests {
     fn an_announced_device_also_in_the_reading_draws_its_ordinary_node_only(
         cx: &mut TestAppContext,
     ) {
-        // `alpha` is `aa:bb:cc:dd:ee:20` in the reading; the record heard it
-        // announce itself too.
-        let table = neighbors_table(vec![announce_row("aa:bb:cc:dd:ee:20", "alpha")]);
-        let mut vcx = announced_window(cx, scanned_reading(), Some(Ok(table)), MapMode::Graph);
+        // The record heard `alpha` announce itself too. Its MAC is taken FROM
+        // the reading, never retyped: `obs` spells the octet in hex, so
+        // `obs("alpha", 20)` is `…:14`, and a row retyped as `…:20` named a
+        // device the reading does not carry — which the star then rightly
+        // drew as announced, and this test once read as a duplicate.
+        let reading = scanned_reading();
+        let alpha_mac = reading
+            .neighbors
+            .as_ref()
+            .and_then(|s| {
+                s.neighbors
+                    .iter()
+                    .find(|n| n.hostname.as_deref() == Some("alpha"))
+            })
+            .map(|n| n.mac.clone())
+            .expect("the fixture's reading carries alpha");
+        // The premise, pinned before the claim: the row is the reading's device.
+        assert_eq!(alpha_mac, "aa:bb:cc:dd:ee:14");
+        let table = neighbors_table(vec![announce_row(&alpha_mac, "alpha")]);
+        let announce_selector: &'static str =
+            Box::leak(format!("map-node-announce:{alpha_mac}").into_boxed_str());
+
+        let mut vcx = announced_window(cx, reading, Some(Ok(table)), MapMode::Graph);
         assert!(
             vcx.debug_bounds("map-chip:alpha").is_some(),
             "the scanned node must be drawn"
         );
         assert!(
-            vcx.debug_bounds("map-node-announce:aa:bb:cc:dd:ee:20")
-                .is_none(),
+            vcx.debug_bounds(announce_selector).is_none(),
             "a device the reading carries was drawn a second time as announced"
         );
     }
