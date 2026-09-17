@@ -23,7 +23,8 @@ pub use neighbor::{
 pub use observing::{ObservingCause, ObservingEdge};
 pub use probing::{EmissionClass, ProbingEdge, ProbingTier};
 pub use sample::{
-    DnsSample, HostSample, LinkSample, ProxySample, RouteEvent, Sample, WifiSample, now_us,
+    DnsSample, HostSample, LinkSample, ProxySample, RouteEvent, Sample, WifiSample,
+    instant_rfc3339, now_us,
 };
 pub use topology::{
     LearnedVia, TopologyLifetime, TopologyLink, link_from_cdp, link_from_frame, link_from_lldp,

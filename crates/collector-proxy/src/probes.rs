@@ -68,75 +68,67 @@ impl TunProbe {
     }
 }
 
-/// The outcome of one ATTEMPTED dial: sing-box was asked, through its Clash
-/// API, to fetch a URL through one node (realm net-observer, node #62).
-///
-/// Three outcomes, because the record keeps three facts apart: an answer is
-/// stored as its latency, [`DialOutcome::NoAnswer`] as `0` — the same `0`
-/// `tun_code` uses for "attempted, nothing came back" — and
-/// [`DialOutcome::Unknown`] as `NULL` under a named `dial_target`: the API
-/// could not run the test at all (it does not know the node, or it did not
-/// answer), which is no measurement, never a dead dial.
+/// The selector group as sing-box's Clash API describes it
+/// (`GET /proxies/<group>`): the node it selects right now and every member
+/// it can select. One read per tick serves both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyGroup {
+    /// The selected node (`now`); absent on a body that is not a group's.
+    pub now: Option<String>,
+    /// The members (`all`), in the order the group lists them.
+    pub all: Vec<String>,
+}
+
+/// The newest entry of one node's URL-test history as sing-box keeps it
+/// (`GET /proxies/<node>` → `history[]`): when sing-box ran the test and
+/// what it measured — `0` ms is sing-box's spelling of a failed test, kept
+/// as the record's `0` (realm net-observer, node #62).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DialOutcome {
-    /// sing-box fetched the URL through the node in this many milliseconds.
-    Ok(u32),
-    /// sing-box tried and nothing came back within its timeout, or the delay
-    /// test reported an error: the record's `0`.
-    NoAnswer,
-    /// The API does not know the node, or did not answer the request: no
-    /// measurement.
-    Unknown,
+pub struct UrlTestEntry {
+    /// The entry's `time`, epoch microseconds.
+    pub at_us: i64,
+    /// The entry's `delay`, milliseconds; `0` = the test failed.
+    pub ms: u32,
 }
 
-impl DialOutcome {
-    /// The value that lands in the sample's `dial_*_ms` column: the latency,
-    /// `0` for no answer, `None` for no measurement.
-    #[must_use]
-    pub fn ms(self) -> Option<u32> {
-        match self {
-            Self::Ok(ms) => Some(ms),
-            Self::NoAnswer => Some(0),
-            Self::Unknown => None,
-        }
-    }
-}
-
-/// One node's dial on one tick, ready for the mapping: the node, the
-/// endpoint its dial went through (so the reading can ride that endpoint's
-/// row; `None` when the config names none for it) and the two outcomes.
+/// One node's URL-test reading on one tick, ready for the mapping: the
+/// node, the endpoint it tests through (so the reading can ride that
+/// endpoint's row; `None` when the config names none for it) and the newest
+/// history entry (`None` = sing-box has not tested the node, or the API did
+/// not answer — not measured).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dial {
+pub struct UrlTest {
     pub node: String,
     pub endpoint: Option<String>,
-    pub ip: DialOutcome,
-    pub name: DialOutcome,
+    pub entry: Option<UrlTestEntry>,
 }
 
-/// Proxy facts: the upstream proxy endpoints, the TUN HTTP 204 probe, the
-/// active upstream node selection, and the dial probe through the selector
-/// group's nodes.
+/// Proxy facts: the upstream nodes and their endpoints, the TUN HTTP 204
+/// probe, the selector group, and sing-box's own URL-test history per node.
+///
+/// Reads of the Clash API and of the rendered config are LOCAL and emit
+/// nothing on the wire, so they belong to no emission class and run under
+/// every probing tier. The daemon never asks sing-box to test — its delay
+/// endpoint writes into the group's history and steers the selection
+/// (realm net-observer, node #62).
 #[allow(async_fn_in_trait)] // internal workspace port, not a published API
 pub trait ProxyFacts: Send + Sync {
-    /// The upstream proxy endpoints to TCP-probe, as `"host:port"` strings.
-    async fn server_endpoints(&self) -> Vec<String>;
     /// Every upstream node the config declares, as `(node, "host:port")`
-    /// pairs — the map from a dialled node to the endpoint row its reading
-    /// rides. Nodes may share an endpoint.
+    /// pairs, in config order — one read per tick: the collector derives
+    /// the endpoints to TCP-probe (deduplicated: nodes may share one) and
+    /// the row a node's reading rides from the same list.
     async fn node_endpoints(&self) -> Vec<(String, String)>;
     /// Attempt the HTTP 204 probe through the TUN at `url`. Always an
     /// attempt: whether to send it at all is the collector's decision (the
     /// probing tier), taken before this is called.
     async fn tun_probe(&self, url: &str) -> TunProbe;
-    async fn selector(&self) -> Option<String>;
-    /// The members of the selector group (`all` of `GET /proxies/<group>`):
-    /// the nodes the dial probe walks. Empty when the API did not answer.
-    async fn group_members(&self) -> Vec<String>;
-    /// Ask sing-box to fetch `url` through `node` and report how long it
-    /// took (`GET /proxies/<node>/delay`). Always an attempt, like
-    /// [`ProxyFacts::tun_probe`]: the probing tier is decided before this is
-    /// called (realm net-observer, node #62).
-    async fn dial(&self, node: &str, url: &str) -> DialOutcome;
+    /// The selector group — its selection and its members — from one API
+    /// read. `None` when the API did not answer.
+    async fn group(&self) -> Option<ProxyGroup>;
+    /// The newest entry of `node`'s URL-test history. `None` = no entry
+    /// (an empty history: sing-box has not tested it yet; or the API did not
+    /// answer) — never a failure.
+    async fn urltest(&self, node: &str) -> Option<UrlTestEntry>;
     /// Runtime capability probe: can the proxy collector work here/now?
     async fn preflight(&self) -> Readiness;
 }

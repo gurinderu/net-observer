@@ -101,30 +101,10 @@ pub struct ProxyCfg {
     /// Point it at the deployment's selector/urltest group.
     #[serde(default = "default_selector_group")]
     pub selector_group: String,
-    /// The dial probe's target by IP: sing-box fetches it through each node
-    /// of the selector group (`GET /proxies/<node>/delay`), proving the
-    /// transport through that node with no name to resolve (realm
-    /// net-observer, node #62). A plain-HTTP URL on a bare address.
-    #[serde(default = "default_dial_url_ip")]
-    pub dial_url_ip: String,
-    /// The dial probe's target by NAME: the same fetch, through the same
-    /// node, but sing-box must resolve the name first — transport plus its
-    /// own DNS path. The pair told transport from DNS on 2026-09-17: every
-    /// node timed out by name and answered by IP.
-    #[serde(default = "default_dial_url_name")]
-    pub dial_url_name: String,
 }
 
 fn default_selector_group() -> String {
     "GLOBAL".into()
-}
-
-fn default_dial_url_ip() -> String {
-    "http://1.1.1.1/cdn-cgi/trace".into()
-}
-
-fn default_dial_url_name() -> String {
-    "http://cp.cloudflare.com/generate_204".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,8 +302,6 @@ impl Default for Config {
                     tun_probe_url: "http://connectivitycheck.gstatic.com/generate_204".into(),
                     clash_api: "http://127.0.0.1:9090".into(),
                     selector_group: default_selector_group(),
-                    dial_url_ip: default_dial_url_ip(),
-                    dial_url_name: default_dial_url_name(),
                 },
                 dns: DnsCfg {
                     enabled: true,
@@ -439,47 +417,6 @@ mod tests {
         assert!(c.collectors.route.enabled);
         assert!(c.collectors.host.enabled);
         assert_eq!(c.collectors.host.interval.as_secs(), 15);
-    }
-    /// The dial probe's two targets default to the pair observed on
-    /// 2026-09-17 (realm net-observer, node #62); a proxy section written
-    /// before the field existed loads with the defaults, and a section that
-    /// names them overrides both.
-    #[test]
-    fn dial_urls_default_and_can_be_overridden() {
-        let c = Config::load(None).unwrap();
-        assert_eq!(
-            c.collectors.proxy.dial_url_ip,
-            "http://1.1.1.1/cdn-cgi/trace"
-        );
-        assert_eq!(
-            c.collectors.proxy.dial_url_name,
-            "http://cp.cloudflare.com/generate_204"
-        );
-
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("o.toml");
-        std::fs::write(
-            &p,
-            "[collectors.proxy]\nenabled = true\ninterval = \"15s\"\n\
-             tun_probe_url = \"http://x/204\"\nclash_api = \"http://127.0.0.1:9090\"\n",
-        )
-        .unwrap();
-        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
-        assert_eq!(
-            c.collectors.proxy.dial_url_ip,
-            "http://1.1.1.1/cdn-cgi/trace"
-        );
-
-        std::fs::write(
-            &p,
-            "[collectors.proxy]\nenabled = true\ninterval = \"15s\"\n\
-             tun_probe_url = \"http://x/204\"\nclash_api = \"http://127.0.0.1:9090\"\n\
-             dial_url_ip = \"http://9.9.9.9/\"\ndial_url_name = \"http://example.org/\"\n",
-        )
-        .unwrap();
-        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
-        assert_eq!(c.collectors.proxy.dial_url_ip, "http://9.9.9.9/");
-        assert_eq!(c.collectors.proxy.dial_url_name, "http://example.org/");
     }
     #[test]
     fn wifi_defaults_apply_and_can_be_disabled() {

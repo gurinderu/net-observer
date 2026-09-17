@@ -64,16 +64,12 @@ clash_api = "http://127.0.0.1:9090"
 # declares -- against such a config GLOBAL 404s and the selector column reads
 # "-" forever. Point this at the deployment selector/urltest group.
 selector_group = "GLOBAL"
-# The dial probe: sing-box's OWN dial through each node of that group, asked
-# of its Clash API (`GET /proxies/<node>/delay`, 5 s timeout) -- the selected
-# node every tick, the other members one per tick in turn. Two targets: by IP
-# (a bare address -- transport through the node) and by name (the same fetch,
-# but sing-box must resolve the name -- transport plus its own DNS path). The
-# pair tells a dead DNS path from a dead transport; both land on the proxy
-# sample as `dial_ip_ms` / `dial_name_ms` (0 = no answer). An active-tier
-# emission; withheld under `passive`.
-dial_url_ip = "http://1.1.1.1/cdn-cgi/trace"
-dial_url_name = "http://cp.cloudflare.com/generate_204"
+# Each tick the collector also READS sing-box's own URL-test history for every
+# member of that group (`GET /proxies/<node>`, a loopback read that emits
+# nothing, so it runs under `passive` too) and lands the newest entry on the
+# proxy sample as `urltest_ms` (0 = sing-box's test failed; NULL = not tested
+# yet) with `urltest_at_us`. It never asks sing-box to test: the API's delay
+# endpoint writes into the group's history and steers its selection.
 
 # The `dns` collector probes resolvers (sing-box TUN DNS, DHCP resolver, DoH) for
 # the monitored service domain plus a `.ru` control domain. A fakeip answer on a

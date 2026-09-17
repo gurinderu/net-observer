@@ -119,42 +119,59 @@ pub struct ProxySample {
     /// Age of the tunnel held stream at the check, seconds.
     #[serde(default)]
     pub est_tun_age_s: Option<u32>,
-    /// The dial probe (realm net-observer, node #62): sing-box's OWN dial
-    /// through one node of the selector group, asked of its Clash API, by IP
-    /// — transport through the node. `None` = not dialled (the passive tier,
-    /// or not this node's turn: the selected node is dialled every tick, the
-    /// rest of the group one per tick round-robin; also a dial the API could
-    /// not run at all, under a `Some` `dial_target`); `Some(0)` = attempted,
-    /// no answer (a timeout or a delay-test error — the record's `0`, like
-    /// `tun_code`); `Some(ms)` = answered in that many milliseconds. Rides
-    /// the row of the node's own endpoint (`server_ip`), so `tcp` on the same
-    /// row is the raw TCP reachability of the listener the dial went through.
+    /// sing-box's OWN URL test through one node of the selector group, as
+    /// its Clash API reports it (`GET /proxies/<node>` → `history`), read
+    /// each tick for every member and never triggered by this daemon: the
+    /// API's delay test writes into the group's history and steers its
+    /// selection, which "observe, never act" forbids (realm net-observer,
+    /// node #62). The NEWEST history entry's delay: `None` = no entry
+    /// (sing-box has not tested the node yet, or the API did not answer —
+    /// not measured, never a failure); `Some(0)` = sing-box's test failed;
+    /// `Some(ms)` = it answered in that many milliseconds. Rides the row of
+    /// the node's own endpoint (`server_ip`), so `tcp` on the same row is
+    /// the raw TCP reachability of the listener sing-box tested through.
+    /// A local read, so it is taken under every probing tier.
     /// `serde(default)` so a pre-field daemon's samples still decode.
     #[serde(default)]
-    pub dial_ip_ms: Option<u32>,
-    /// The same dial by NAME — transport through the node plus sing-box's own
-    /// DNS path. Same vocabulary as `dial_ip_ms`; a `0` here beside an
-    /// answered `dial_ip_ms` is the dead-DNS-path signature.
+    pub urltest_ms: Option<u32>,
+    /// When sing-box ran that newest test (its entry's `time`, epoch
+    /// microseconds). sing-box tests on its own interval, so consecutive
+    /// ticks may carry the same entry; readers that count tests count
+    /// DISTINCT times. `Some` exactly when `urltest_ms` is.
     #[serde(default)]
-    pub dial_name_ms: Option<u32>,
-    /// The node this row's dial went through; `None` = no dial on this row.
+    pub urltest_at_us: Option<i64>,
+    /// The node whose test this row carries; `None` = no reading on this
+    /// row. Named on the row because nodes may share an endpoint.
     #[serde(default)]
-    pub dial_target: Option<String>,
+    pub urltest_node: Option<String>,
 }
 
 impl ProxySample {
-    /// The dial reading as `<node>:<ip>/<name>ms`, an unmeasured side as
-    /// `-`; `None` when this row carries no dial. One rendering for the CLI's
-    /// `status` line and the bar's, so the two cannot drift.
+    /// The URL-test reading as `<node>:<ms>ms@<age>s` — the age of the entry
+    /// at `now_us`, never negative — or `<node>:-` for a node sing-box has
+    /// not tested; `None` when this row carries no reading. One rendering
+    /// for the CLI's `status` line and the bar's, so the two cannot drift.
     #[must_use]
-    pub fn dial_label(&self) -> Option<String> {
-        let node = self.dial_target.as_deref()?;
-        let side = |ms: Option<u32>| ms.map_or_else(|| "-".to_string(), |ms| ms.to_string());
-        Some(format!(
-            "{node}:{}/{}ms",
-            side(self.dial_ip_ms),
-            side(self.dial_name_ms)
-        ))
+    pub fn urltest_label(&self, now_us: i64) -> Option<String> {
+        let node = self.urltest_node.as_deref()?;
+        match (self.urltest_ms, self.urltest_at_us) {
+            (Some(ms), Some(at_us)) => {
+                let age_s = now_us.saturating_sub(at_us).max(0) / 1_000_000;
+                Some(format!("{node}:{ms}ms@{age_s}s"))
+            }
+            _ => Some(format!("{node}:-")),
+        }
+    }
+}
+
+/// An epoch-microsecond instant as RFC 3339 in UTC — for a daemon-side
+/// sentence (a trigger detail) that must name a moment without a local
+/// zone. Out of range never panics: the raw number is printed instead.
+#[must_use]
+pub fn instant_rfc3339(ts_us: i64) -> String {
+    match jiff::Timestamp::from_microsecond(ts_us) {
+        Ok(ts) => ts.to_string(),
+        Err(_) => format!("ts_us={ts_us}"),
     }
 }
 
@@ -335,9 +352,9 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
         });
         assert_eq!(p.ts_us(), 99);
 
@@ -430,34 +447,59 @@ mod tests {
         );
     }
 
-    /// A proxy sample written by a daemon that shipped before the dial probe
-    /// carries no dial fields; it must still decode, with the dial reading as
-    /// "not dialled" rather than failing — and a row without a dial has no
-    /// label, while one with a dial spells every side, an unmeasured one as
-    /// `-`.
+    /// A proxy sample written by a daemon that shipped before the URL-test
+    /// reading carries no `urltest_*` fields; it must still decode, with the
+    /// reading as "no entry" rather than failing — and a row without a
+    /// reading has no label, while one with a reading spells the node, the
+    /// delay and the entry's age, and an untested node spells `-`.
     #[test]
-    fn pre_dial_proxy_sample_decodes_as_not_dialled_and_labels_follow() {
+    fn pre_urltest_proxy_sample_decodes_as_unread_and_labels_follow() {
         let older = r#"{"ts_us":1,"server_ip":"1.1.1.1:443","tcp":"Ok","rtt_ms":null,"tun_code":204,"selector":null}"#;
         let p: ProxySample = serde_json::from_str(older).expect("older proxy sample must decode");
-        assert_eq!(p.dial_ip_ms, None);
-        assert_eq!(p.dial_name_ms, None);
-        assert_eq!(p.dial_target, None);
-        assert_eq!(p.dial_label(), None);
+        assert_eq!(p.urltest_ms, None);
+        assert_eq!(p.urltest_at_us, None);
+        assert_eq!(p.urltest_node, None);
+        assert_eq!(p.urltest_label(1), None);
 
-        let dialled = ProxySample {
-            dial_ip_ms: Some(202),
-            dial_name_ms: Some(0),
-            dial_target: Some("vless-out-6".into()),
+        let tested = ProxySample {
+            urltest_ms: Some(202),
+            urltest_at_us: Some(10_000_000),
+            urltest_node: Some("vless-out-6".into()),
             ..p.clone()
         };
-        assert_eq!(dialled.dial_label().as_deref(), Some("vless-out-6:202/0ms"));
-        let half = ProxySample {
-            dial_ip_ms: Some(202),
-            dial_name_ms: None,
-            dial_target: Some("vless-out-6".into()),
+        assert_eq!(
+            tested.urltest_label(55_500_000).as_deref(),
+            Some("vless-out-6:202ms@45s")
+        );
+        // A clock that runs behind the entry never yields a negative age.
+        assert_eq!(
+            tested.urltest_label(9_000_000).as_deref(),
+            Some("vless-out-6:202ms@0s")
+        );
+        let failed = ProxySample {
+            urltest_ms: Some(0),
+            ..tested.clone()
+        };
+        assert_eq!(
+            failed.urltest_label(10_000_000).as_deref(),
+            Some("vless-out-6:0ms@0s")
+        );
+        let untested = ProxySample {
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: Some("vless-out-6".into()),
             ..p
         };
-        assert_eq!(half.dial_label().as_deref(), Some("vless-out-6:202/-ms"));
+        assert_eq!(untested.urltest_label(1).as_deref(), Some("vless-out-6:-"));
+    }
+
+    #[test]
+    fn instant_rfc3339_is_utc_and_never_panics() {
+        assert_eq!(
+            instant_rfc3339(1_789_657_800_000_000),
+            "2026-09-17T15:10:00Z"
+        );
+        assert_eq!(instant_rfc3339(i64::MAX), format!("ts_us={}", i64::MAX));
     }
 
     #[test]
