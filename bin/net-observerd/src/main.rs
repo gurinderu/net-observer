@@ -44,9 +44,9 @@ use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
-    BanCycle, EndpointBlock, EstablishedStall, FakeIp, FakeIpHijack, Gated, GwChange, GwDrop,
-    GwMacChange, NeighborMacCollision, PerClientBlock, Roam, SingboxDialTimeout, SingboxNoRoute,
-    Starvation, Wedge, WifiChurn,
+    BanCycle, EndpointBlock, EndpointDialStall, EstablishedStall, FakeIp, FakeIpHijack, Gated,
+    GwChange, GwDrop, GwMacChange, NeighborMacCollision, PerClientBlock, Roam, SingboxDialTimeout,
+    SingboxNoRoute, Starvation, Wedge, WifiChurn,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -354,6 +354,7 @@ fn record_startup_probing_edge(
         ts_us,
         tier,
         peer_uid: None,
+        reason: types::ProbingReason::Startup,
     };
     match EncodedFrame::encode(&net_observer_ipc::StreamFrame::Probing(edge)) {
         Ok(frame) => {
@@ -1780,16 +1781,21 @@ fn build_api_server(
         // writes through, and the socket is world-connectable.
         query_gate: Arc::new(tokio::sync::Semaphore::new(api::MAX_QUERIES_IN_FLIGHT)),
         events_tx,
+        // Empty at boot on purpose: a window is process-scoped like the tier
+        // it withholds, and a finished one is read back from the `experiment`
+        // table (realm net-observer, node #61).
+        experiments: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        // What a window's report can see of our own frames, and the tick it
+        // measures a sleep and a straddling echo against.
+        ring_filter: cfg.collectors.pcap_ring.filter.clone(),
+        link_interval: cfg.collectors.link.interval,
     }
 }
 
 /// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
 /// roam, wifi-churn, gw-mac-change, neighbor-mac-collision, per-client-block,
 /// ban-cycle, fakeip, fakeip-hijack, endpoint-block, established-stall,
-/// singbox-no-route, singbox-dial-timeout, starvation). Every rule records an
-/// incident (durable, in DuckDB) and mirrors it into the live snapshot's ring
-/// for the socket API; gw-change and gw-mac-change additionally freeze the
-/// pcap ring when one is available.
+/// endpoint-dial-stall, singbox-no-route, singbox-dial-timeout, starvation). /// Every rule records an incident (durable, in DuckDB) and mirrors it into the /// live snapshot's ring for the socket API; gw-change and gw-mac-change /// additionally freeze the pcap ring when one is available.
 fn build_engine(
     store: Arc<DuckdbStore>,
     cfg: &Config,
@@ -1967,6 +1973,25 @@ fn build_engine(
             Box::new(Gated {
                 inner: SingboxDialTimeout,
                 require_direct: false,
+                load_below: Some(STARVATION_LOAD),
+                settle_us: Some(SETTLE_US),
+            }),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
+        // Endpoint-dial-stall (realm net-observer, node #62). No pcap freeze:
+        // the evidence is sing-box's own test gone absent beside the
+        // endpoint's TCP verdict. The threshold is two of sing-box's URLTest
+        // intervals plus slack — the interval is config, and must match
+        // sing-box's. Gated like the other fault signatures — a test that
+        // fails with the uplink, under starvation or in the settle window
+        // after a move measures those, not sing-box.
+        Trigger::new(
+            Box::new(Gated {
+                inner: EndpointDialStall::new(Duration::from_secs(
+                    cfg.collectors.proxy.urltest_interval_secs,
+                )),
+                require_direct: true,
                 load_below: Some(STARVATION_LOAD),
                 settle_us: Some(SETTLE_US),
             }),
@@ -2498,6 +2523,10 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
+            urltest_absent_since_us: None,
         })
     }
 
@@ -2516,6 +2545,34 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
+            urltest_absent_since_us: None,
+        })
+    }
+
+    /// A healthy proxy tick carrying sing-box's own URL-test reading of the
+    /// traffic-carrying node (realm net-observer, node #62): the row of that
+    /// node's endpoint, its TCP fine, the tun fine, no entry, and the
+    /// absence dated as given — the endpoint-dial-stall shape (the other
+    /// builders pin the urltest fields to `None`).
+    fn untested_proxy(ts_us: i64, urltest_absent_since_us: i64) -> Sample {
+        Sample::Proxy(ProxySample {
+            ts_us,
+            server_ip: "1.1.1.1:443".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: None,
+            tun_code: Some(204),
+            selector: Some("vless-out-6".into()),
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: Some("vless-out-6".into()),
+            urltest_absent_since_us: Some(urltest_absent_since_us),
         })
     }
 
@@ -2535,6 +2592,10 @@ mod tests {
             est_direct_age_s: Some(120),
             est_tun_alive: Some(tun_alive),
             est_tun_age_s: Some(45),
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
+            urltest_absent_since_us: None,
         })
     }
 
@@ -3172,6 +3233,34 @@ mod tests {
             incidents_for(&fx.store, "singbox-no-route"),
             1,
             "sing-box reporting no route while the link holds a router must be recorded as singbox-no-route"
+        );
+    }
+
+    /// The `endpoint-dial-stall` rule the daemon actually runs takes its
+    /// threshold from the config's `urltest_interval_secs` — the default
+    /// 180 s, so 2 × 180 + 30 = 390 s of absence: an absence of 389 s stays
+    /// silent, one of 390 s fires. The seconds are LITERALS on purpose —
+    /// this test IS the wiring's pin, like the wedge pin above; a config
+    /// default that moves must move it too, and it says so when it reds.
+    ///
+    /// Nothing else fires on this stream: the tun is healthy, the endpoint
+    /// answers, the gateway is steadily OK, no DNS, host or neighbors sample.
+    #[test]
+    fn build_engine_wires_the_production_dial_stall_threshold() {
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(8);
+        feed(&mut fx.engine, &mut w, link(0, GwVerdict::Ok));
+        feed(&mut fx.engine, &mut w, untested_proxy(389_000_000, 0));
+        assert_eq!(
+            incidents_for(&fx.store, "endpoint-dial-stall"),
+            0,
+            "389 s of absence is one short of 2 x urltest_interval_secs + 30 s"
+        );
+        feed(&mut fx.engine, &mut w, untested_proxy(390_000_000, 0));
+        assert_eq!(
+            incidents_for(&fx.store, "endpoint-dial-stall"),
+            1,
+            "390 s of absence over a live listener must be recorded as endpoint-dial-stall"
         );
     }
 

@@ -5,14 +5,38 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use types::{
-    BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, SingboxLogSample,
-    TopologyLifetime, TopologyLink, TriggerFired,
+    BlobRef, Incident, NeighborLifetime, ObservingEdge, ParseVerdictError, ProbingEdge,
+    ProbingTier, Sample, SingboxLogSample, TopologyLifetime, TopologyLink, TriggerFired,
 };
 
 /// `network_key` for a segment whose gateway MAC could not be read. Neighbours
 /// still get recorded — under a key that says plainly the network was not
 /// identified, rather than being silently merged into someone else's.
 const UNKNOWN_NETWORK: &str = "unknown";
+
+/// One finished experiment window, as written to `experiment` (realm
+/// net-observer, node #61).
+///
+/// The report itself travels as the JSON `net_observer_ipc` renders from a
+/// `types::ExperimentReport` — this crate stores the text and never reads
+/// inside it, so it needs no JSON dependency of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExperimentRecord {
+    /// `experiment-<start_us>`.
+    pub id: String,
+    pub start_us: i64,
+    pub end_us: i64,
+    /// The tier in force before the window (restored at its close unless an
+    /// operator moved the tier inside it).
+    pub tier_before: ProbingTier,
+    /// Where the start and end freezes copied the ring; `None` when a freeze
+    /// copied nothing. Each copied file also has a `blob_ref` row against
+    /// the window's id.
+    pub freeze_start_dir: Option<String>,
+    pub freeze_end_dir: Option<String>,
+    /// The `ExperimentReport`, serialised.
+    pub report_json: String,
+}
 
 /// One open port found on a neighbour, as written to `neighbor_port`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,7 +409,7 @@ impl Store for DuckdbStore {
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
-                "INSERT INTO proxy_sample VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO proxy_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     p.ts_us,
                     p.server_ip,
@@ -396,7 +420,11 @@ impl Store for DuckdbStore {
                     p.est_direct_alive,
                     p.est_direct_age_s,
                     p.est_tun_alive,
-                    p.est_tun_age_s
+                    p.est_tun_age_s,
+                    p.urltest_ms,
+                    p.urltest_at_us,
+                    p.urltest_node,
+                    p.urltest_absent_since_us
                 ],
             )?,
             Sample::Dns(d) => c.execute(
@@ -740,10 +768,61 @@ impl Store for DuckdbStore {
     }
     fn write_probing_edge(&self, e: &ProbingEdge) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO probing_edge (ts_us, tier, peer_uid) VALUES (?,?,?)",
-            params![e.ts_us, e.tier.as_str(), e.peer_uid.map(i64::from)],
+            "INSERT INTO probing_edge (ts_us, tier, peer_uid, reason) VALUES (?,?,?,?)",
+            params![
+                e.ts_us,
+                e.tier.as_str(),
+                e.peer_uid.map(i64::from),
+                e.reason.as_str()
+            ],
         )?;
         Ok(())
+    }
+    fn write_experiment(&self, x: &ExperimentRecord) -> Result<(), StoreError> {
+        self.conn.lock().unwrap().execute(
+            // An id is one window's start instant; a second write of the same
+            // id is the same window reported again (a retry), so it replaces.
+            "INSERT OR REPLACE INTO experiment
+               (id, start_us, end_us, tier_before, freeze_start_dir, freeze_end_dir,
+                report_json)
+             VALUES (?,?,?,?,?,?,?)",
+            params![
+                x.id,
+                x.start_us,
+                x.end_us,
+                x.tier_before.as_str(),
+                x.freeze_start_dir,
+                x.freeze_end_dir,
+                x.report_json
+            ],
+        )?;
+        Ok(())
+    }
+    fn experiment(&self, id: &str) -> Result<Option<ExperimentRecord>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, start_us, end_us, tier_before, freeze_start_dir, freeze_end_dir,
+                    report_json
+             FROM experiment WHERE id = ?",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        let Some(r) = rows.next()? else {
+            return Ok(None);
+        };
+        let tier: String = r.get(3)?;
+        Ok(Some(ExperimentRecord {
+            id: r.get(0)?,
+            start_us: r.get(1)?,
+            end_us: r.get(2)?,
+            // A token this build cannot name is the driver's own conversion
+            // failure, column named — never a silently substituted tier.
+            tier_before: tier.parse().map_err(|e: ParseVerdictError| {
+                duckdb::Error::FromSqlConversionFailure(3, duckdb::types::Type::Text, Box::new(e))
+            })?,
+            freeze_start_dir: r.get(4)?,
+            freeze_end_dir: r.get(5)?,
+            report_json: r.get(6)?,
+        }))
     }
     fn neighbor_lifetimes(
         &self,
@@ -1714,6 +1793,10 @@ mod tests {
             est_direct_age_s: Some(120),
             est_tun_alive: Some(false),
             est_tun_age_s: Some(45),
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
+            urltest_absent_since_us: None,
         }))
         .unwrap();
         assert_eq!(
@@ -1721,6 +1804,164 @@ mod tests {
                 "SELECT count(*) FROM proxy_sample \
                  WHERE est_direct_alive AND est_direct_age_s = 120 \
                    AND NOT est_tun_alive AND est_tun_age_s = 45"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    /// sing-box's own URL test lands in its own proxy columns (realm
+    /// net-observer, node #62): the node, the newest entry's delay and its
+    /// time, and — for a node whose entry sing-box deleted — since when the
+    /// history has read empty; a node never seen tested carries NULLs under
+    /// its name, and a row without a reading NULLs throughout — told apart in
+    /// SQL.
+    #[test]
+    fn proxy_sample_urltest_columns_round_trip() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let row = ProxySample {
+            ts_us: 1000,
+            server_ip: "1.1.1.1:443".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: Some(9.0),
+            tun_code: Some(204),
+            selector: Some("vless-out-6".into()),
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: Some("vless-out-6".into()),
+            urltest_absent_since_us: Some(700),
+        };
+        s.write_sample(&Sample::Proxy(row.clone())).unwrap();
+        s.write_sample(&Sample::Proxy(ProxySample {
+            server_ip: "2.2.2.2:443".into(),
+            urltest_ms: Some(0),
+            urltest_at_us: Some(1_789_659_600_000_000),
+            urltest_node: Some("vless-out-5".into()),
+            urltest_absent_since_us: None,
+            ..row.clone()
+        }))
+        .unwrap();
+        s.write_sample(&Sample::Proxy(ProxySample {
+            server_ip: "3.3.3.3:443".into(),
+            urltest_node: Some("vless-out-4".into()),
+            urltest_absent_since_us: None,
+            ..row.clone()
+        }))
+        .unwrap();
+        s.write_sample(&Sample::Proxy(ProxySample {
+            server_ip: "4.4.4.4:443".into(),
+            urltest_node: None,
+            urltest_absent_since_us: None,
+            ..row
+        }))
+        .unwrap();
+        let t = s
+            .query_table(
+                "SELECT server_ip, urltest_node, urltest_ms, urltest_at_us, \
+                        urltest_absent_since_us \
+                 FROM proxy_sample ORDER BY server_ip",
+            )
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec![
+                    "1.1.1.1:443".to_string(),
+                    "vless-out-6".to_string(),
+                    String::new(),
+                    String::new(),
+                    "700".to_string(),
+                ],
+                vec![
+                    "2.2.2.2:443".to_string(),
+                    "vless-out-5".to_string(),
+                    "0".to_string(),
+                    "1789659600000000".to_string(),
+                    String::new(),
+                ],
+                vec![
+                    "3.3.3.3:443".to_string(),
+                    "vless-out-4".to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ],
+                vec![
+                    "4.4.4.4:443".to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ],
+            ]
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM proxy_sample \
+                 WHERE urltest_node = selector AND tcp = 'OK' \
+                   AND ts_us - urltest_absent_since_us >= 300"
+            )
+            .unwrap(),
+            1,
+            "the selected node's absent test over a live listener is one SQL predicate"
+        );
+    }
+
+    /// A database written by the daemon that shipped `proxy_sample` with the
+    /// established-stream columns but no URL-test columns keeps its
+    /// ten-column table (`CREATE TABLE IF NOT EXISTS` does nothing to an
+    /// existing one); the four columns are added on open, the old row reads
+    /// back with them NULL, and the new daemon's fourteen-value insert lands.
+    #[test]
+    fn an_old_proxy_table_without_urltest_columns_opens_and_keeps_its_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE proxy_sample (
+                ts_us BIGINT, server_ip VARCHAR, tcp VARCHAR, rtt_ms DOUBLE, tun_code USMALLINT,
+                selector VARCHAR, est_direct_alive BOOLEAN, est_direct_age_s UINTEGER,
+                est_tun_alive BOOLEAN, est_tun_age_s UINTEGER);
+             INSERT INTO proxy_sample VALUES
+                (1000, '1.1.1.1:443', 'OK', 9.0, 204, 'vless-out-6', NULL, NULL, NULL, NULL);",
+        )
+        .unwrap();
+        let s = DuckdbStore::from_conn(conn).unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM proxy_sample \
+                 WHERE ts_us = 1000 AND tun_code = 204 \
+                   AND urltest_ms IS NULL AND urltest_at_us IS NULL AND urltest_node IS NULL \
+                   AND urltest_absent_since_us IS NULL"
+            )
+            .unwrap(),
+            1,
+            "the old row must survive the added columns"
+        );
+        s.write_sample(&Sample::Proxy(ProxySample {
+            ts_us: 2000,
+            server_ip: "1.1.1.1:443".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: Some(9.0),
+            tun_code: Some(204),
+            selector: Some("vless-out-6".into()),
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
+            urltest_ms: Some(202),
+            urltest_at_us: Some(1_789_659_600_000_000),
+            urltest_node: Some("vless-out-6".into()),
+            urltest_absent_since_us: None,
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM proxy_sample \
+                 WHERE ts_us = 2000 AND urltest_node = 'vless-out-6' \
+                   AND urltest_ms = 202 AND urltest_at_us = 1789659600000000"
             )
             .unwrap(),
             1
@@ -2307,6 +2548,10 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
+            urltest_absent_since_us: None,
         }))
         .unwrap();
         s.open_incident(&Incident {
@@ -2421,12 +2666,18 @@ mod tests {
         ));
         let path_str = path.to_str().unwrap().to_string();
 
-        // The pre-`cause` table, written by the daemon of the day.
+        // The pre-`cause` table, written by the daemon of the day — and the
+        // five-column `experiment` table of the daemon that shipped the window
+        // before its freeze directories were recorded.
         {
             let conn = Connection::open(&path_str).unwrap();
             conn.execute_batch(
                 "CREATE TABLE observing_edge (ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT);
-                 INSERT INTO observing_edge VALUES (1000, false, 501);",
+                 INSERT INTO observing_edge VALUES (1000, false, 501);
+                 CREATE TABLE experiment (
+                   id VARCHAR PRIMARY KEY, start_us BIGINT, end_us BIGINT,
+                   tier_before VARCHAR, report_json VARCHAR);
+                 INSERT INTO experiment VALUES ('experiment-1', 1, 2, 'active', '{}');",
             )
             .unwrap();
         }
@@ -2449,6 +2700,32 @@ mod tests {
         assert_eq!(
             s.query_scalar_i64("SELECT count(*) FROM observing_edge WHERE cause = 'startup'")
                 .unwrap(),
+            1
+        );
+        // The five-column window reads back with no freeze directory — none
+        // was recorded — and the migrated table takes a full row.
+        let old = s
+            .experiment("experiment-1")
+            .unwrap()
+            .expect("the old window must survive the added columns");
+        assert_eq!(old.freeze_start_dir, None);
+        assert_eq!(old.freeze_end_dir, None);
+        assert_eq!(old.report_json, "{}");
+        s.write_experiment(&ExperimentRecord {
+            id: "experiment-2".into(),
+            start_us: 3,
+            end_us: 4,
+            tier_before: ProbingTier::Passive,
+            freeze_start_dir: Some("/blobs/freeze-experiment-3-start".into()),
+            freeze_end_dir: None,
+            report_json: "{}".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM experiment WHERE freeze_start_dir IS NOT NULL"
+            )
+            .unwrap(),
             1
         );
         drop(s);
@@ -2484,12 +2761,21 @@ mod tests {
             ts_us: 100,
             tier: ProbingTier::Passive,
             peer_uid: None,
+            reason: types::ProbingReason::Startup,
         })
         .unwrap();
         s.write_probing_edge(&ProbingEdge {
             ts_us: 200,
             tier: ProbingTier::Active,
             peer_uid: Some(501),
+            reason: types::ProbingReason::Control,
+        })
+        .unwrap();
+        s.write_probing_edge(&ProbingEdge {
+            ts_us: 300,
+            tier: ProbingTier::Passive,
+            peer_uid: Some(501),
+            reason: types::ProbingReason::Experiment,
         })
         .unwrap();
         assert_eq!(
@@ -2501,15 +2787,65 @@ mod tests {
             "the startup default is a peerless edge"
         );
         let t = s
-            .query_table("SELECT ts_us, tier, peer_uid FROM probing_edge ORDER BY ts_us")
+            .query_table("SELECT ts_us, tier, peer_uid, reason FROM probing_edge ORDER BY ts_us")
             .unwrap();
         assert_eq!(
             t.rows,
             vec![
-                vec!["100".to_string(), "passive".to_string(), String::new()],
-                vec!["200".to_string(), "active".to_string(), "501".to_string()],
+                vec![
+                    "100".to_string(),
+                    "passive".to_string(),
+                    String::new(),
+                    "startup".to_string()
+                ],
+                vec![
+                    "200".to_string(),
+                    "active".to_string(),
+                    "501".to_string(),
+                    "control".to_string()
+                ],
+                vec![
+                    "300".to_string(),
+                    "passive".to_string(),
+                    "501".to_string(),
+                    "experiment".to_string()
+                ],
             ]
         );
+    }
+
+    /// A finished window's record survives a round trip whole — the JSON is
+    /// stored as text and read back byte for byte — a second write of the
+    /// same id replaces, and an id never written is `None`, never an error.
+    #[test]
+    fn write_experiment_round_trips_and_replaces() {
+        let s = DuckdbStore::in_memory().unwrap();
+        assert_eq!(s.experiment("experiment-1").unwrap(), None);
+        let first = ExperimentRecord {
+            id: "experiment-1".into(),
+            start_us: 1,
+            end_us: 300_000_001,
+            tier_before: ProbingTier::Active,
+            freeze_start_dir: Some("/blobs/freeze-experiment-1-start".into()),
+            freeze_end_dir: None,
+            report_json: r#"{"id":"experiment-1","notes":[]}"#.into(),
+        };
+        s.write_experiment(&first).unwrap();
+        assert_eq!(s.experiment("experiment-1").unwrap(), Some(first.clone()));
+        let again = ExperimentRecord {
+            report_json: r#"{"id":"experiment-1","notes":["retried"]}"#.into(),
+            tier_before: ProbingTier::Passive,
+            freeze_end_dir: Some("/blobs/freeze-experiment-1-end".into()),
+            ..first
+        };
+        s.write_experiment(&again).unwrap();
+        assert_eq!(s.experiment("experiment-1").unwrap(), Some(again));
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM experiment")
+                .unwrap(),
+            1
+        );
+        assert_eq!(s.experiment("experiment-2").unwrap(), None);
     }
 
     #[test]

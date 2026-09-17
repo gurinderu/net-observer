@@ -146,6 +146,16 @@ impl PreparedSql {
         }
     }
 
+    /// A statement with its `?` values bound in order — for a builder outside
+    /// this module (the experiment window's counts) that binds the same way
+    /// the builders here do.
+    pub(crate) fn bound(sql: &str, params: Vec<Value>) -> Self {
+        Self {
+            sql: sql.to_string(),
+            params,
+        }
+    }
+
     pub(crate) fn sql(&self) -> &str {
         &self.sql
     }
@@ -420,9 +430,12 @@ gap_at AS (
 /// | --- | --- |
 /// | `active` | an operator `SetProbing(active)` (a peer asked) |
 /// | `startup` | a startup edge whose configured default is `active` |
+/// | `experiment` | an experiment window's closing edge restoring `active` (realm net-observer, node #61) |
 ///
-/// Samples never close it — they keep landing throughout — so `gap_closed_us`
-/// is `NULL` exactly when the record ends still passive.
+/// The kind is read from the edge's `reason` when the row carries one, and
+/// derived from `peer_uid` (NULL = startup) for rows written before the
+/// column existed. Samples never close it — they keep landing throughout —
+/// so `gap_closed_us` is `NULL` exactly when the record ends still passive.
 const PROBING_STRETCH_CTE: &str = "\
 probing_stretch AS (
   SELECT gap_opened_us, gap_closed_us, gap_closed_by
@@ -439,7 +452,11 @@ probing_stretch AS (
     ) p
     LEFT JOIN (
       SELECT ts_us,
-             CASE WHEN peer_uid IS NULL THEN 'startup' ELSE 'active' END AS closed_by
+             CASE WHEN reason = 'experiment-end' THEN 'experiment'
+                  WHEN reason = 'startup' THEN 'startup'
+                  WHEN reason = 'control' THEN 'active'
+                  WHEN peer_uid IS NULL THEN 'startup'
+                  ELSE 'active' END AS closed_by
       FROM probing_edge WHERE tier = 'active'
     ) e ON e.ts_us > p.ts_us
   )
@@ -1385,6 +1402,10 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
+            urltest_absent_since_us: None,
         }))
         .unwrap();
     }
@@ -1451,6 +1472,11 @@ mod tests {
             ts_us,
             tier,
             peer_uid: peer,
+            reason: if peer.is_some() {
+                types::ProbingReason::Control
+            } else {
+                types::ProbingReason::Startup
+            },
         })
         .unwrap();
     }
@@ -2758,6 +2784,59 @@ mod tests {
             cell(&s.verdict_at(40 * SEC).unwrap(), 0, "layer"),
             "healthy"
         );
+    }
+
+    /// An experiment window on an active daemon is a passive stretch closed
+    /// by its own closing edge, and `gap_closed_by` says so from the edge's
+    /// reason — `experiment`, not the operator's `active` — while a row with
+    /// no reason (written before the column) still derives its kind from
+    /// `peer_uid` (realm net-observer, node #61).
+    #[test]
+    fn an_experiment_window_closes_its_stretch_as_experiment() {
+        use types::{ProbingEdge, ProbingReason};
+        let s = DuckdbStore::in_memory().unwrap();
+        let edge = |ts_us, tier, reason| ProbingEdge {
+            ts_us,
+            tier,
+            peer_uid: Some(501),
+            reason,
+        };
+        probing_edge(&s, SEC, ProbingTier::Active, None);
+        s.write_probing_edge(&edge(
+            5 * SEC,
+            ProbingTier::Passive,
+            ProbingReason::Experiment,
+        ))
+        .unwrap();
+        passive_tick(&s, 10 * SEC);
+        s.write_probing_edge(&edge(
+            30 * SEC,
+            ProbingTier::Active,
+            ProbingReason::ExperimentEnd,
+        ))
+        .unwrap();
+        healthy_tick(&s, 40 * SEC);
+        // A pre-column row: NULL reason, a peer — derived as an operator's.
+        s.query_table(
+            "INSERT INTO probing_edge (ts_us, tier, peer_uid) VALUES (50000000, 'passive', 501)",
+        )
+        .unwrap();
+        s.query_table(
+            "INSERT INTO probing_edge (ts_us, tier, peer_uid) VALUES (60000000, 'active', 501)",
+        )
+        .unwrap();
+
+        let g = s.silences().unwrap();
+        let passive: Vec<_> = (0..g.rows.len())
+            .filter(|&i| cell(&g, i, "kind") == "passive")
+            .collect();
+        assert_eq!(passive.len(), 2, "{:?}", g.rows);
+        let (first, second) = (passive[0], passive[1]);
+        assert_eq!(cell(&g, first, "gap_opened_us"), (5 * SEC).to_string());
+        assert_eq!(cell(&g, first, "gap_closed_us"), (30 * SEC).to_string());
+        assert_eq!(cell(&g, first, "gap_closed_by"), "experiment");
+        assert_eq!(cell(&g, second, "gap_opened_us"), (50 * SEC).to_string());
+        assert_eq!(cell(&g, second, "gap_closed_by"), "active");
     }
 
     /// The record ends passive: the stretch is open-ended, and the ticks after

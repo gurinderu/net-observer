@@ -57,7 +57,9 @@ impl Default for ProbingCfg {
 }
 
 fn default_probing_tier() -> ProbingTier {
-    ProbingTier::Passive
+    // One spelling of the default: `types::ProbingTier::default` IS passive,
+    // so a tier nobody recorded and a tier nobody configured agree.
+    ProbingTier::default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,10 +107,22 @@ pub struct ProxyCfg {
     /// Point it at the deployment's selector/urltest group.
     #[serde(default = "default_selector_group")]
     pub selector_group: String,
+    /// How often sing-box's URLTest group re-tests its members, seconds —
+    /// MUST match the group's `interval` in sing-box's config (its default
+    /// is 3 min). sing-box deletes a node's history entry on a failed test,
+    /// so the `endpoint-dial-stall` rule waits `2 × interval + 30 s` of
+    /// absence before calling the traffic-carrying node's test dead: two
+    /// missed rounds, not one slow one (realm net-observer, node #62).
+    #[serde(default = "default_urltest_interval_secs")]
+    pub urltest_interval_secs: u64,
 }
 
 fn default_selector_group() -> String {
     "GLOBAL".into()
+}
+
+fn default_urltest_interval_secs() -> u64 {
+    180
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,6 +346,7 @@ impl Default for Config {
                     tun_probe_url: "http://connectivitycheck.gstatic.com/generate_204".into(),
                     clash_api: "http://127.0.0.1:9090".into(),
                     selector_group: default_selector_group(),
+                    urltest_interval_secs: default_urltest_interval_secs(),
                 },
                 dns: DnsCfg {
                     enabled: true,
@@ -448,6 +463,34 @@ mod tests {
         assert!(c.collectors.route.enabled);
         assert!(c.collectors.host.enabled);
         assert_eq!(c.collectors.host.interval.as_secs(), 15);
+    }
+    /// sing-box's URLTest default is 3 min; a proxy section written before
+    /// the field existed loads with it, and a section naming it overrides.
+    #[test]
+    fn urltest_interval_defaults_to_singbox_three_minutes() {
+        let c = Config::load(None).unwrap();
+        assert_eq!(c.collectors.proxy.urltest_interval_secs, 180);
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        std::fs::write(
+            &p,
+            "[collectors.proxy]\nenabled = true\ninterval = \"15s\"\n\
+             tun_probe_url = \"http://x/204\"\nclash_api = \"http://127.0.0.1:9090\"\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert_eq!(c.collectors.proxy.urltest_interval_secs, 180);
+
+        std::fs::write(
+            &p,
+            "[collectors.proxy]\nenabled = true\ninterval = \"15s\"\n\
+             tun_probe_url = \"http://x/204\"\nclash_api = \"http://127.0.0.1:9090\"\n\
+             urltest_interval_secs = 60\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert_eq!(c.collectors.proxy.urltest_interval_secs, 60);
     }
     #[test]
     fn wifi_defaults_apply_and_can_be_disabled() {

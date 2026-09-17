@@ -1,9 +1,10 @@
 pub mod diagnosis;
 mod duckdb_store;
+pub mod experiment;
 mod schema;
 
 pub use duckdb_store::{
-    DuckdbStore, NeighborPort, NeighborScan, NeighborVuln, QueryTable, StoreError,
+    DuckdbStore, ExperimentRecord, NeighborPort, NeighborScan, NeighborVuln, QueryTable, StoreError,
 };
 use types::{
     BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, SingboxLogSample,
@@ -38,6 +39,16 @@ pub trait Store {
     /// probes rather than probes that could not run — and who withheld them.
     /// (realm net-observer, node #88)
     fn write_probing_edge(&self, e: &ProbingEdge) -> Result<(), StoreError>;
+    /// Record one finished experiment window (see [`ExperimentRecord`] and
+    /// the `experiment` table; realm net-observer, node #61), so its report
+    /// outlives the daemon process that computed it. Replaces a row of the
+    /// same id.
+    fn write_experiment(&self, x: &ExperimentRecord) -> Result<(), StoreError>;
+    /// The finished window `id` names, or `None` when the record holds no
+    /// such window — the daemon answers `Query(Experiment { id })` from here
+    /// once the window is no longer in its memory, and the CLI's offline
+    /// `experiment-report` reads the file through it.
+    fn experiment(&self, id: &str) -> Result<Option<ExperimentRecord>, StoreError>;
     /// Record one operator-pressed neighbour scan (see the `neighbor_scan`
     /// table).
     ///

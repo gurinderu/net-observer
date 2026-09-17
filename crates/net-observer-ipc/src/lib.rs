@@ -39,10 +39,10 @@ use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
 use types::{
-    AirSample, ConnectionsGroupBy, ConnectionsSample, ConnectionsVerdict, DnsSample, HistoryWindow,
-    HostSample, LinkSample, NeighborLifetime, NeighborsSample, ObservingEdge, ProbingEdge,
-    ProbingTier, ProxySample, RouteEvent, SingboxLogClass, SingboxLogSample, TopologyLifetime,
-    TopologyLink, WifiSample,
+    AirSample, ConnectionsGroupBy, ConnectionsSample, ConnectionsVerdict, DnsSample,
+    ExperimentReport, HistoryWindow, HostSample, LinkSample, NeighborLifetime, NeighborsSample,
+    ObservingEdge, ProbingEdge, ProbingTier, ProxySample, RouteEvent, SingboxLogClass,
+    SingboxLogSample, TopologyLifetime, TopologyLink, WifiSample,
 };
 
 /// A request from a client (the bar or cli) to the daemon.
@@ -148,6 +148,110 @@ pub enum ControlCmd {
     /// as an ordinary [`Event::Air`] (a `Skip` one, with its reason, when the
     /// radio could not be read — never silence).
     ScanAir,
+    /// Run an experiment window of `minutes` (realm net-observer, node #61):
+    /// "is it us or the network", as a command. The daemon goes passive for
+    /// the window — bracketed by a `probing_edge` whose reason is
+    /// `experiment`, written even if it was passive already — freezes the
+    /// pcap ring at the start and again at the end, restores the previous
+    /// tier when the window elapses (a second edge, `experiment-end`) and
+    /// computes an [`ExperimentReport`].
+    ///
+    /// **Self-control**, like [`ControlCmd::SetProbing`]: it withholds the
+    /// daemon's own emissions and touches nothing else. Answered AT ONCE
+    /// with the experiment id in the result's message (`experiment-<start_us>`,
+    /// see [`experiment_id`]); the report is read later with
+    /// [`DiagnosticQuery::Experiment`], so a socket dropped mid-window loses
+    /// nothing — the window runs in the daemon, not on the connection.
+    /// Refused while another window runs, and for `minutes` outside
+    /// `1..=`[`EXPERIMENT_MAX_MINUTES`].
+    StartExperiment { minutes: u32 },
+}
+
+/// The window an `experiment` gets when the operator names no length.
+pub const EXPERIMENT_DEFAULT_MINUTES: u32 = 5;
+
+/// The longest window the daemon accepts: an hour passive is a measurement,
+/// longer is a state the operator should ask for as one (`SetProbing`).
+pub const EXPERIMENT_MAX_MINUTES: u32 = 60;
+
+// The default the CLI sends must be a length the daemon accepts.
+const _: () = assert!(
+    EXPERIMENT_DEFAULT_MINUTES >= 1 && EXPERIMENT_DEFAULT_MINUTES <= EXPERIMENT_MAX_MINUTES,
+    "EXPERIMENT_DEFAULT_MINUTES must lie within the daemon's accepted range"
+);
+
+/// The id of the experiment window that opened at `start_us` — spelled here
+/// so the daemon's answer and the CLI's `experiment-report <id>` agree.
+#[must_use]
+pub fn experiment_id(start_us: i64) -> String {
+    format!("experiment-{start_us}")
+}
+
+/// The id inside a `StartExperiment` result's message — the first token
+/// shaped like [`experiment_id`]'s output — so the CLI reads the id the
+/// daemon named rather than guessing one from its own clock. `None` when the
+/// message carries none (a refusal).
+#[must_use]
+pub fn experiment_id_in(message: &str) -> Option<String> {
+    message
+        .split_whitespace()
+        .map(|t| t.trim_end_matches([':', ',', ';', '.']))
+        .find(|t| {
+            t.strip_prefix("experiment-")
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(str::to_string)
+}
+
+/// The failure the daemon answers `Query(Experiment { id })` with while that
+/// window still runs, spelled once so the CLI's poll can recognise it
+/// ([`is_experiment_running`]) and keep waiting rather than exit on it. The
+/// end is a local instant, in the rendering the CLI stamps every moment
+/// with — an operator reads a clock, not an epoch.
+#[must_use]
+pub fn experiment_running_message(id: &str, ends_at_us: i64) -> String {
+    format!(
+        "experiment {id} still running (ends at {})",
+        types::local_instant(ends_at_us)
+    )
+}
+
+/// Whether a [`QueryOutcome::Failed`] message is the daemon's "still
+/// running" — the one failure a polling client waits through.
+#[must_use]
+pub fn is_experiment_running(message: &str) -> bool {
+    message.starts_with("experiment ") && message.contains(" still running (ends at ")
+}
+
+impl From<&ExperimentReport> for Table {
+    /// The report as the two-column `key | value` table the daemon answers
+    /// with — no outcome type of its own, so a reader built for tables
+    /// prints it as it prints every other diagnosis.
+    fn from(report: &ExperimentReport) -> Self {
+        Table {
+            columns: vec!["key".to_string(), "value".to_string()],
+            rows: report.rows().into_iter().map(Vec::from).collect(),
+        }
+    }
+}
+
+/// The report as the daemon stores it in the `experiment` table's
+/// `report_json` column. Here rather than in `types` (which carries no JSON
+/// dependency) or `store` (which must not gain one): this crate already
+/// speaks JSON, and both the daemon and the CLI's offline path read the
+/// column through it.
+pub fn experiment_report_json(report: &ExperimentReport) -> serde_json::Result<String> {
+    serde_json::to_string(report)
+}
+
+/// The stored `report_json` back into the table the live answer would have
+/// been — the one conversion behind the daemon's answer from its table and
+/// the CLI's `experiment-report` read of the file. The error names the id's
+/// column as unreadable rather than surfacing a serde message alone.
+pub fn experiment_table_from_json(json: &str) -> Result<Table, String> {
+    serde_json::from_str::<ExperimentReport>(json)
+        .map(|report| Table::from(&report))
+        .map_err(|e| format!("stored experiment report is unreadable: {e}"))
 }
 
 /// Which rungs of an operator-pressed scan a single run should include.
@@ -285,6 +389,16 @@ pub enum DiagnosticQuery {
     /// (`AIR_SELF_CHANNEL_SQL`). No row when the radio never reported a
     /// channel.
     AirSelfChannel,
+    /// The report of one experiment window (realm net-observer, node #61),
+    /// by the id [`ControlCmd::StartExperiment`] answered with. A finished
+    /// window answers a two-column `key | value` [`Table`] (see
+    /// `From<&ExperimentReport> for Table`); a window still running answers
+    /// [`QueryOutcome::Failed`] with [`experiment_running_message`], which
+    /// the CLI's poll waits through; an id the daemon never ran and its
+    /// `experiment` table does not hold is a plain failure. Not a store
+    /// diagnosis: the daemon answers a running window from memory, and only
+    /// a finished one from the record.
+    Experiment { id: String },
 }
 
 /// A result table: the daemon's answer to [`Request::Query`], and the shape the
@@ -605,12 +719,17 @@ pub enum StreamFrame {
     /// subscribe time rides on [`Ready::observing`] instead, so a state report
     /// can never be mistaken for an edge that never happened.
     Observing(ObservingEdge),
-    /// The probing tier switched (realm net-observer, node #88). Always a real
+    /// The probing tier switched (realm net-observer, node #88). A real
     /// transition, like [`StreamFrame::Observing`], and the same value the
     /// daemon writes to its `probing_edge` table; the tier in force is read
-    /// from [`StatusSnapshot::probing`]. Stream-integrity, so delivered
-    /// regardless of the `kinds` filter: a subscriber watching `SKIP`s arrive
-    /// has more need to know they are withheld, not less.
+    /// from [`StatusSnapshot::probing`]. The one frame that may repeat the
+    /// tier already in force is an experiment window's bracket (`reason` =
+    /// `experiment` / `experiment-end`, realm net-observer, node #61): a
+    /// window on an already-passive daemon still marks its bounds. A
+    /// subscriber therefore sets its tier FROM the frame rather than toggling
+    /// on it. Stream-integrity, so delivered regardless of the `kinds` filter:
+    /// a subscriber watching `SKIP`s arrive has more need to know they are
+    /// withheld, not less.
     Probing(ProbingEdge),
     /// A daemon-side failure, reported IN BAND instead of a bare close.
     Error(StreamError),
@@ -769,7 +888,10 @@ impl StreamFrame {
             StreamFrame::Observing(o) => {
                 format!("collection {}", if o.observing { "on" } else { "off" })
             }
-            StreamFrame::Probing(p) => format!("probing {}", p.tier),
+            // The reason rides along so a tail tells an experiment window's
+            // bracket from an operator's switch at a glance (realm
+            // net-observer, node #61).
+            StreamFrame::Probing(p) => format!("probing {} ({})", p.tier, p.reason.as_str()),
             StreamFrame::Error(e) => format!("{}: {}", e.code.as_str(), e.message),
             StreamFrame::Unrecognized(u) => {
                 format!("a frame this build cannot read: {}", u.detail)
@@ -1805,7 +1927,172 @@ mod tests {
                 scan_ts_us: 1_756_731_900_000_000,
             },
             DiagnosticQuery::AirSelfChannel,
+            DiagnosticQuery::Experiment {
+                id: experiment_id(1_756_731_900_000_000),
+            },
         ]
+    }
+
+    /// `StartExperiment` must survive the wire with its length intact, and
+    /// the id the daemon answers with must be the one `experiment-report`
+    /// asks by — spelled in one place.
+    #[test]
+    fn start_experiment_round_trips_and_the_id_is_spelled_once() {
+        let line = String::from_utf8(
+            encode_frame(&Request::Control(ControlCmd::StartExperiment {
+                minutes: 7,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            line.contains(r#"{"StartExperiment":{"minutes":7}}"#),
+            "{line}"
+        );
+        match serde_json::from_str::<Request>(&line).unwrap() {
+            Request::Control(ControlCmd::StartExperiment { minutes }) => assert_eq!(minutes, 7),
+            other => panic!("expected StartExperiment, got {other:?}"),
+        }
+        assert_eq!(experiment_id(42), "experiment-42");
+        // The daemon's start message names the id; the CLI reads it back
+        // from there, trailing punctuation and all.
+        assert_eq!(
+            experiment_id_in(
+                "experiment experiment-1756731900000000 started: passive for 5 min (was active); froze 2 pcap file(s) at the start"
+            )
+            .as_deref(),
+            Some("experiment-1756731900000000")
+        );
+        assert_eq!(
+            experiment_id_in("experiment length must be 1..=60 minutes, not 0"),
+            None
+        );
+        assert_eq!(experiment_id_in("experiment-x is not an id"), None);
+    }
+
+    /// The `SetProbing` precedent: a daemon built before the experiment
+    /// window cannot decode the command and answers its one-shot
+    /// `Response::Error("bad request: …")`, which the client must read as
+    /// `Unsupported` — never as a refusal to run one.
+    #[test]
+    fn an_old_daemon_rejects_start_experiment_as_unsupported_not_refused() {
+        /// The control vocabulary as a pre-experiment daemon decodes it.
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        enum OldControlCmd {
+            KickstartProxy,
+            SetObserving(bool),
+            FreezePcap,
+            SetProbing(ProbingTier),
+            ScanNeighbors(ScanOptions),
+            ScanAir,
+        }
+        let line =
+            String::from_utf8(encode_frame(&ControlCmd::StartExperiment { minutes: 5 }).unwrap())
+                .unwrap();
+        let e = serde_json::from_str::<OldControlCmd>(&line)
+            .expect_err("an old daemon cannot decode StartExperiment");
+        let answer = Response::Error(format!("{UNDECODABLE_REQUEST_PREFIX}{e}"));
+        match classify_control(answer).unwrap() {
+            ControlOutcome::Unsupported(m) => assert!(m.contains("StartExperiment"), "{m}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// The one failure a polling client waits through is the daemon's own
+    /// "still running" spelling, and only that: a window the daemon never
+    /// ran, or a daemon that cannot decode the query, must end the poll.
+    #[test]
+    fn still_running_is_recognised_and_nothing_else_is() {
+        let ends_at_us = 1_756_731_900_000_000;
+        let m = experiment_running_message("experiment-42", ends_at_us);
+        assert_eq!(
+            m,
+            format!(
+                "experiment experiment-42 still running (ends at {})",
+                types::local_instant(ends_at_us)
+            )
+        );
+        assert!(!m.contains("1756731900"), "an epoch is not a clock: {m}");
+        assert!(is_experiment_running(&m));
+        assert!(!m.starts_with(UNDECODABLE_REQUEST_PREFIX));
+        assert!(!is_experiment_running("experiment experiment-42 not found"));
+        assert!(!is_experiment_running(
+            "bad request: unknown variant `Experiment`"
+        ));
+        match classify_query(Response::Error(m.clone())).unwrap() {
+            QueryOutcome::Failed(back) => assert_eq!(back, m),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The report travels as a plain two-column table, and the stored JSON
+    /// renders to the same table the live answer gives — one conversion
+    /// behind the daemon's answer from its table and the CLI's offline read.
+    #[test]
+    fn an_experiment_report_is_a_key_value_table_live_and_from_json() {
+        let report = ExperimentReport {
+            id: experiment_id(100),
+            window: types::ExperimentWindow {
+                start_us: 100,
+                end_us: 100 + 60_000_000,
+                requested_minutes: 1,
+                link_interval_us: 15_000_000,
+                tier_before: ProbingTier::Passive,
+                tier_at_end: ProbingTier::Passive,
+                restore: types::TierRestore::Restored,
+                freeze_start_dir: None,
+                freeze_end_dir: Some("/blobs/freeze-experiment-100-end".into()),
+                frames_pcap_start: None,
+                frames_pcap_end: Some(3),
+            },
+            ring_filter: "arp or icmp".into(),
+            own_mac: Some("f0:18:98:0a:0b:0c".into()),
+            our_frames: Some(types::OwnFrames {
+                records: 3,
+                earliest_us: Some(90),
+                latest_us: Some(500),
+                truncated: false,
+                in_window: 2,
+                icmp_echo: 0,
+                first_echo_us: None,
+                last_echo_us: None,
+                arp: 1,
+                dhcp: 0,
+                other: 1,
+            }),
+            network: Some(types::NetworkFacts::default()),
+            edges: types::WindowEdges::default(),
+            notes: vec!["start freeze: pcap ring not running".into()],
+        };
+        let live = Table::from(&report);
+        assert_eq!(live.columns, vec!["key".to_string(), "value".to_string()]);
+        assert!(live.rows.iter().all(|r| r.len() == 2));
+        assert!(
+            live.rows
+                .contains(&vec!["id".to_string(), "experiment-100".to_string()])
+        );
+        assert!(live.rows.contains(&vec![
+            "frames_pcap_start".to_string(),
+            "not read".to_string()
+        ]));
+        let json = experiment_report_json(&report).unwrap();
+        assert_eq!(experiment_table_from_json(&json).unwrap(), live);
+        let e = experiment_table_from_json("{").unwrap_err();
+        assert!(
+            e.starts_with("stored experiment report is unreadable"),
+            "{e}"
+        );
+        assert!(!e.starts_with(UNDECODABLE_REQUEST_PREFIX));
+
+        // The table itself round-trips the wire like every other answer.
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &Response::Table(live.clone())).unwrap();
+        let mut reader = std::io::BufReader::new(&buf[..]);
+        match read_frame::<_, Response>(&mut reader).unwrap() {
+            Response::Table(back) => assert_eq!(back, live),
+            other => panic!("unexpected response variant: {other:?}"),
+        }
     }
 
     /// A sender built before the grouping existed names none, and the
@@ -2274,6 +2561,10 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
+            urltest_absent_since_us: None,
         });
         assert_eq!(proxy.detail(), "tun=204 sel=auto");
 
@@ -2289,6 +2580,10 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
+            urltest_absent_since_us: None,
         });
         assert_eq!(proxy_bare.detail(), "tun=- sel=-");
 
@@ -2634,11 +2929,13 @@ mod tests {
                 ts_us: 910,
                 tier: ProbingTier::Active,
                 peer_uid: Some(501),
+                reason: types::ProbingReason::Control,
             },
             ProbingEdge {
                 ts_us: 1,
                 tier: ProbingTier::Passive,
                 peer_uid: None,
+                reason: types::ProbingReason::Startup,
             },
         ] {
             match round_trip_frame(&StreamFrame::Probing(edge)) {
@@ -2669,6 +2966,7 @@ mod tests {
                 ts_us: 3,
                 tier: ProbingTier::Passive,
                 peer_uid: None,
+                reason: types::ProbingReason::Startup,
             }))
             .unwrap(),
         )
@@ -2764,6 +3062,7 @@ mod tests {
                 ts_us: 0,
                 tier: ProbingTier::Passive,
                 peer_uid: Some(0),
+                reason: types::ProbingReason::Control,
             }),
             StreamFrame::Error(StreamError {
                 ts_us: 0,
@@ -2824,6 +3123,7 @@ mod tests {
                 ts_us: 0,
                 tier: ProbingTier::Active,
                 peer_uid: Some(501),
+                reason: types::ProbingReason::Control,
             }),
             StreamFrame::Error(StreamError {
                 ts_us: 0,
@@ -2910,17 +3210,35 @@ mod tests {
             ts_us: 13,
             tier: ProbingTier::Passive,
             peer_uid: None,
+            reason: types::ProbingReason::Startup,
         });
         assert_eq!(passive.label(), "probing");
-        assert_eq!(passive.detail(), "probing passive");
+        assert_eq!(passive.detail(), "probing passive (startup)");
         assert_eq!(passive.ts_us(), 13);
         assert_eq!(passive.event_kind(), None);
         let active = StreamFrame::Probing(ProbingEdge {
             ts_us: 14,
             tier: ProbingTier::Active,
             peer_uid: Some(501),
+            reason: types::ProbingReason::Control,
         });
-        assert_eq!(active.detail(), "probing active");
+        assert_eq!(active.detail(), "probing active (control)");
+        // An experiment window's bracket names itself, so a tail tells it
+        // from an operator's switch.
+        let bracket = StreamFrame::Probing(ProbingEdge {
+            ts_us: 15,
+            tier: ProbingTier::Passive,
+            peer_uid: Some(501),
+            reason: types::ProbingReason::Experiment,
+        });
+        assert_eq!(bracket.detail(), "probing passive (experiment)");
+        let closing = StreamFrame::Probing(ProbingEdge {
+            ts_us: 16,
+            tier: ProbingTier::Active,
+            peer_uid: Some(501),
+            reason: types::ProbingReason::ExperimentEnd,
+        });
+        assert_eq!(closing.detail(), "probing active (experiment-end)");
 
         let err = StreamFrame::Error(StreamError {
             ts_us: 12,

@@ -54,6 +54,33 @@ ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_direct_alive BOOLEAN;
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_direct_age_s UINTEGER;
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_tun_alive BOOLEAN;
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_tun_age_s UINTEGER;
+-- sing-box's OWN URL test of one node under the selector group, as its Clash
+-- API shows it THIS tick (`GET /proxies/<node>` -> history), read each tick
+-- for every node under the group and never triggered by this daemon (realm
+-- net-observer, node #62). `urltest_node` names the node whose reading this
+-- row carries; a row carries at most one, on the row of the node's own
+-- endpoint (server_ip), so `tcp` beside it is that listener's raw
+-- reachability -- or on a reading-only row (tcp = SKIP, no rtt) when the
+-- endpoint's row is taken by another node on the same endpoint, or unknown,
+-- or was not probed (the passive tier: a local read, so the reading still
+-- lands). `urltest_ms` is the newest entry's delay and `urltest_at_us` its
+-- time; sing-box writes an entry only for a SUCCESSFUL test -- 0 ms is a real
+-- sub-millisecond answer -- and DELETES the node's entry on a failed one, so
+-- a failure shows only as the entry going ABSENT: `urltest_absent_since_us`
+-- is the tick the collector first read the history empty after having seen
+-- an entry, kept across later empty reads and cleared by an entry (its
+-- memory is per process: a restart, bracketed by the startup observing edge,
+-- starts it over). Dated ONLY for a member of a URLTest-typed group, the one
+-- kind sing-box re-tests on an interval: a node selected directly in a
+-- Selector is never re-tested, and its entry vanishing on a sing-box restart
+-- or a failed manual test is not evidence, so the column stays NULL for it.
+-- NULL node = no reading on this row; NULL `urltest_ms` with NULL
+-- `urltest_absent_since_us` under a named node = never seen tested, or not a
+-- re-tested node: not measured. Same migration treatment.
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS urltest_ms UINTEGER;
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS urltest_at_us BIGINT;
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS urltest_node VARCHAR;
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS urltest_absent_since_us BIGINT;
 CREATE TABLE IF NOT EXISTS incident (
   id VARCHAR PRIMARY KEY, opened_us BIGINT, closed_us BIGINT, trigger_id VARCHAR, signature VARCHAR);
 CREATE TABLE IF NOT EXISTS blob_ref (
@@ -254,4 +281,29 @@ ALTER TABLE observing_edge ADD COLUMN IF NOT EXISTS cause VARCHAR;
 -- an older DB file gains the table on open like `topology_link` above.
 CREATE TABLE IF NOT EXISTS probing_edge (
   ts_us BIGINT, tier VARCHAR, peer_uid BIGINT);
+-- `reason` names what produced the edge ('control' | 'startup' | 'experiment'
+-- | 'experiment-end'), added when the experiment window landed (realm
+-- net-observer, node #61): a passive stretch the operator asked for as a
+-- measurement is told apart from one asked for as a state. Rows written
+-- before it read back NULL, which the reader treats as 'control' — what
+-- they in fact were. Same migration treatment as `observing_edge.cause`.
+ALTER TABLE probing_edge ADD COLUMN IF NOT EXISTS reason VARCHAR;
+-- One row per finished experiment window (realm net-observer, node #61):
+-- its bounds, the tier in force before it, where its two pcap freezes
+-- landed (NULL when a freeze copied nothing), and the whole report as JSON
+-- — the same `ExperimentReport` the daemon answers `Query(Experiment { id })`
+-- with, kept here so a report outlives the daemon process that computed
+-- it. Each copied ring file also has a `blob_ref` row (`kind = 'pcap'`,
+-- `incident_id` = the window's id), like an incident's freeze. A window the
+-- daemon was restarted under leaves no row: its opening `probing_edge`
+-- (reason 'experiment') without a closing one is the trace.
+CREATE TABLE IF NOT EXISTS experiment (
+  id VARCHAR PRIMARY KEY, start_us BIGINT, end_us BIGINT, tier_before VARCHAR,
+  report_json VARCHAR);
+-- Where the two freezes landed, added after the table first shipped with the
+-- five columns above: a file written by that daemon keeps its column set until
+-- these ALTERs run on open, exactly like `probing_edge.reason`. Rows from
+-- before read back NULL — no path was recorded, not an empty one.
+ALTER TABLE experiment ADD COLUMN IF NOT EXISTS freeze_start_dir VARCHAR;
+ALTER TABLE experiment ADD COLUMN IF NOT EXISTS freeze_end_dir VARCHAR;
 "#;

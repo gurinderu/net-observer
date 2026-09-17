@@ -33,11 +33,13 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::Config;
 use net_observer_ipc::{
-    ControlCmd, ControlResult, DiagnosticQuery, EventKind, IncidentSummary, QueryOutcome, Request,
-    Response, ScanOptions, StatusSnapshot, StreamFrame, Table,
+    ControlCmd, ControlResult, DiagnosticQuery, EXPERIMENT_DEFAULT_MINUTES, EventKind,
+    IncidentSummary, QueryOutcome, Request, Response, ScanOptions, StatusSnapshot, StreamFrame,
+    Table,
 };
 use std::io::Write;
 use std::process::ExitCode;
+use std::time::Duration;
 use store::{DuckdbStore, QueryTable, Store as _, diagnosis};
 use types::{ConnectionsGroupBy, ProbingTier};
 
@@ -162,6 +164,38 @@ enum Command {
         /// `passive` withholds every probe; `active` sends them.
         #[arg(value_enum)]
         tier: ProbeTier,
+    },
+    /// "Is it us or the network": ask the running daemon to run an experiment
+    /// window (`Control(StartExperiment)`). For the window the daemon goes
+    /// passive — nothing of its own on the wire, bracketed by a
+    /// `probing_edge` with reason `experiment` — freezes the pcap ring at the
+    /// start and at the end, restores the previous tier when the window
+    /// elapses, and computes a report: the frames this machine itself sent
+    /// inside the window (from the end freeze, by protocol; the daemon's
+    /// ICMP echoes expected to be 0) next to what the record says the network
+    /// did in the same minutes (route events, incidents, gateway verdicts,
+    /// roams, announce flushes, flow totals, signal range) and one plain
+    /// verdict line. The daemon answers at once with the window's id; this
+    /// command then polls the daemon every 5 s until the report is ready and
+    /// prints it, so a dropped socket does not lose the window. Benign
+    /// self-control like `probe`. Exits non-zero if the daemon refused
+    /// (another window running, a bad length) or is unreachable.
+    Experiment {
+        /// The window's length in minutes, 1 to 60.
+        #[arg(long, default_value_t = EXPERIMENT_DEFAULT_MINUTES)]
+        minutes: u32,
+        /// Print the id and return at once instead of waiting for the report;
+        /// read it later with `experiment-report <id>`.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// The report of a past experiment window, by the id `experiment`
+    /// printed. Asks the running daemon first, reads the DB file's
+    /// `experiment` table only when no daemon answers. A window still
+    /// running is reported as such, not waited for.
+    ExperimentReport {
+        /// The window's id, `experiment-<start_us>`.
+        id: String,
     },
     /// Ask the running daemon to go and find out who is on this segment NOW:
     /// sweep the local IPv4 subnet and browse mDNS for names, sent as a
@@ -500,6 +534,50 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
+        }
+        Command::Experiment { minutes, no_wait } => {
+            let cfg = load_config(cli)?;
+            let result = fetch_start_experiment(&cfg.socket_path, *minutes)?;
+            print!("{}", format_control(&result));
+            if !result.ok {
+                return Ok(ExitCode::FAILURE);
+            }
+            // The id is the daemon's, read back from its own words: a window
+            // is named by the instant ITS clock opened it.
+            let id = net_observer_ipc::experiment_id_in(&result.message).ok_or_else(|| {
+                anyhow!(
+                    "net-observerd accepted the experiment but named no id: {}",
+                    result.message
+                )
+            })?;
+            if *no_wait {
+                return Ok(ExitCode::SUCCESS);
+            }
+            eprintln!("waiting {minutes} min for {id}; polling every {POLL_EVERY_S} s");
+            let table = await_experiment(
+                &cfg.socket_path,
+                &id,
+                experiment_polls(*minutes),
+                net_observer_ipc::diagnose,
+                std::thread::sleep,
+            )?;
+            print!("{}", format_table(&table));
+        }
+        Command::ExperimentReport { id } => {
+            let table =
+                diagnose_table(cli, DiagnosticQuery::Experiment { id: id.clone() }, |off| {
+                    let record = open_store(off)?
+                        .experiment(id)
+                        .map_err(|e| anyhow!("query failed: {e}"))?
+                        .ok_or_else(|| anyhow!("experiment {id} not found in {}", off.db_path))?;
+                    let table = net_observer_ipc::experiment_table_from_json(&record.report_json)
+                        .map_err(|e| anyhow!("experiment {id}: {e}"))?;
+                    Ok(QueryTable {
+                        columns: table.columns,
+                        rows: table.rows,
+                    })
+                })?;
+            print!("{}", format_table(&table));
         }
         Command::ScanNeighbors {
             ports,
@@ -1206,6 +1284,102 @@ fn fetch_set_probing(socket_path: &str, tier: ProbingTier) -> Result<ControlResu
     }
 }
 
+/// Ask the daemon to open an experiment window (`Control(StartExperiment)`)
+/// and return its [`ControlResult`] — the id is in the message. Benign
+/// self-control like [`fetch_set_probing`], and the same forward rule: a
+/// daemon built before the window existed is "cannot", not a refusal.
+fn fetch_start_experiment(socket_path: &str, minutes: u32) -> Result<ControlResult> {
+    let outcome = net_observer_ipc::control(socket_path, ControlCmd::StartExperiment { minutes })
+        .map_err(|e| {
+        if daemon_not_running(&e) {
+            anyhow!("net-observerd not running (socket {socket_path} unavailable)")
+        } else {
+            anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
+        }
+    })?;
+    match outcome {
+        net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
+        net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
+            "net-observerd cannot run an experiment window (built before it existed): {e}"
+        )),
+    }
+}
+
+/// How often `experiment` asks the daemon whether its window has closed.
+const POLL_EVERY_S: u64 = 5;
+
+/// Polls past the window's own length that `experiment` still waits: the
+/// end task freezes the ring, restores the tier and counts the record, and
+/// the daemon's clock may run behind ours. Two minutes.
+const POLL_GRACE: u32 = 24;
+
+/// Consecutive socket failures `experiment` waits through before giving up
+/// on the daemon — one minute. The window itself runs on in the daemon.
+const MAX_POLL_FAILURES: u32 = 12;
+
+/// How many polls a window of `minutes` gets before `experiment` stops
+/// waiting: its own length at [`POLL_EVERY_S`], plus [`POLL_GRACE`].
+fn experiment_polls(minutes: u32) -> u32 {
+    (u64::from(minutes) * 60 / POLL_EVERY_S) as u32 + POLL_GRACE
+}
+
+/// Wait for an experiment window's report: ask `Query(Experiment { id })`
+/// every [`POLL_EVERY_S`] until the daemon answers a table.
+///
+/// The rule, pure — `ask` is the socket round-trip and `sleep` the wait, both
+/// injected so it is tested without a daemon or a clock:
+/// - a table ends the wait with the report;
+/// - the daemon's own "still running" ([`net_observer_ipc::is_experiment_running`])
+///   is the ONE failure waited through;
+/// - any other failure is the daemon's answer and ends the wait as an error
+///   — a window this daemon did not run (it restarted mid-window: the tier
+///   is back to its default and there is no report), or a bad id;
+/// - a daemon that cannot decode the query never ran the window either, and
+///   says so;
+/// - a socket error is waited through up to [`MAX_POLL_FAILURES`] times in a
+///   row, because the window runs in the daemon, not on this connection —
+///   past that, or past `max_polls` in all, the wait ends naming
+///   `experiment-report <id>` as the way to read the report later.
+fn await_experiment(
+    socket: &str,
+    id: &str,
+    max_polls: u32,
+    mut ask: impl FnMut(&str, DiagnosticQuery) -> std::io::Result<QueryOutcome>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<Table> {
+    let later =
+        format!("the window runs on in the daemon; read it later with `experiment-report {id}`");
+    let mut failures = 0u32;
+    for _ in 0..max_polls {
+        match ask(socket, DiagnosticQuery::Experiment { id: id.to_string() }) {
+            Ok(QueryOutcome::Table(table)) => return Ok(table),
+            Ok(QueryOutcome::Failed(m)) if net_observer_ipc::is_experiment_running(&m) => {
+                failures = 0;
+            }
+            Ok(QueryOutcome::Failed(m)) => {
+                return Err(anyhow!("net-observerd returned an error: {m}"));
+            }
+            Ok(QueryOutcome::Unsupported(m)) => {
+                return Err(anyhow!(
+                    "net-observerd at {socket} cannot report experiments (built before them): {m}"
+                ));
+            }
+            Err(e) => {
+                failures += 1;
+                if failures >= MAX_POLL_FAILURES {
+                    return Err(anyhow!(
+                        "lost net-observerd on {socket} while waiting for {id} ({e}); {later}"
+                    ));
+                }
+            }
+        }
+        sleep(Duration::from_secs(POLL_EVERY_S));
+    }
+    Err(anyhow!(
+        "{id} did not report within {max_polls} polls; {later}"
+    ))
+}
+
 /// Send `Control(ScanNeighbors)` and return the daemon's verdict.
 fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
     match daemon_query(
@@ -1351,8 +1525,15 @@ fn format_status(snap: &StatusSnapshot) -> String {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "-".to_string());
             let sel = p.selector.as_deref().unwrap_or("-");
+            // sing-box's own URL test (realm net-observer, node #62): the
+            // newest row of a tick is the selected node's, so this is its
+            // test, aged against the snapshot's own instant; `-` = no reading
+            // (a pre-field daemon, no group).
+            let urltest = p
+                .urltest_label(snap.generated_us)
+                .unwrap_or_else(|| "-".to_string());
             out.push_str(&format!(
-                "proxy          tun={tun} selector={sel} ts_us={}\n",
+                "proxy          tun={tun} selector={sel} urltest={urltest} ts_us={}\n",
                 diagnose::stamp_us(p.ts_us)
             ));
         }
@@ -1545,6 +1726,10 @@ mod tests {
                 est_direct_age_s: None,
                 est_tun_alive: None,
                 est_tun_age_s: None,
+                urltest_ms: Some(202),
+                urltest_at_us: Some(-4_999_900),
+                urltest_node: Some("auto".into()),
+                urltest_absent_since_us: None,
             }),
             dns: None,
             host: None,
@@ -1574,7 +1759,7 @@ mod tests {
             diagnose::stamp_us(42)
         )));
         assert!(out.contains(&format!(
-            "proxy          tun=204 selector=auto ts_us={}",
+            "proxy          tun=204 selector=auto urltest=auto:202ms@5s ts_us={}",
             diagnose::stamp_us(43)
         )));
         assert!(out.contains("dns            (no data)"));
@@ -2147,6 +2332,193 @@ mod tests {
             assert_eq!(by.to_group_by(), wire, "{token}");
         }
         assert!(Cli::try_parse_from(["net-observer-cli", "connections", "--by", "port"]).is_err());
+    }
+
+    /// `experiment` defaults to the shared default length and waits;
+    /// `--minutes` and `--no-wait` are read; `experiment-report` takes the
+    /// id as it was printed.
+    #[test]
+    fn experiment_parses_its_length_and_no_wait_and_the_report_its_id() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("net-observer-cli").chain(args.iter().copied()))
+                .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+                .command
+        };
+        match parse(&["experiment"]) {
+            Command::Experiment { minutes, no_wait } => {
+                assert_eq!(minutes, EXPERIMENT_DEFAULT_MINUTES);
+                assert!(!no_wait);
+            }
+            _ => panic!("did not parse as `experiment`"),
+        }
+        match parse(&["experiment", "--minutes", "7", "--no-wait"]) {
+            Command::Experiment { minutes, no_wait } => {
+                assert_eq!(minutes, 7);
+                assert!(no_wait);
+            }
+            _ => panic!("did not parse as `experiment`"),
+        }
+        match parse(&["experiment-report", "experiment-42"]) {
+            Command::ExperimentReport { id } => assert_eq!(id, "experiment-42"),
+            _ => panic!("did not parse as `experiment-report`"),
+        }
+        assert!(Cli::try_parse_from(["net-observer-cli", "experiment", "--minutes", "x"]).is_err());
+        assert!(Cli::try_parse_from(["net-observer-cli", "experiment-report"]).is_err());
+        // A 5-minute window gets its 60 polls and the grace on top.
+        assert_eq!(experiment_polls(5), 60 + POLL_GRACE);
+    }
+
+    /// The poll waits through the daemon's own "still running" — sleeping
+    /// between asks, asking for the SAME id every time — and returns the
+    /// table the moment it comes.
+    #[test]
+    fn experiment_poll_waits_through_still_running_then_takes_the_table() {
+        use std::cell::RefCell;
+        let asked: RefCell<Vec<DiagnosticQuery>> = RefCell::new(Vec::new());
+        let slept: RefCell<Vec<Duration>> = RefCell::new(Vec::new());
+        let report = Table {
+            columns: vec!["key".into(), "value".into()],
+            rows: vec![vec!["id".into(), "experiment-42".into()]],
+        };
+        let table = await_experiment(
+            "/run/observer.sock",
+            "experiment-42",
+            10,
+            |_, q| {
+                asked.borrow_mut().push(q.clone());
+                Ok(if asked.borrow().len() < 3 {
+                    QueryOutcome::Failed(net_observer_ipc::experiment_running_message(
+                        "experiment-42",
+                        99,
+                    ))
+                } else {
+                    QueryOutcome::Table(report.clone())
+                })
+            },
+            |d| slept.borrow_mut().push(d),
+        )
+        .unwrap();
+        assert_eq!(table, report);
+        assert_eq!(asked.borrow().len(), 3);
+        assert!(asked.borrow().iter().all(|q| {
+            *q == DiagnosticQuery::Experiment {
+                id: "experiment-42".into(),
+            }
+        }));
+        assert_eq!(
+            *slept.borrow(),
+            vec![Duration::from_secs(POLL_EVERY_S); 2],
+            "one sleep per still-running answer, none after the table"
+        );
+    }
+
+    /// Every other answer ends the wait: a failure in the daemon's words
+    /// (a window it did not run), and a daemon that cannot decode the query
+    /// — neither is waited through, and each is reported as itself.
+    #[test]
+    fn experiment_poll_stops_on_a_real_failure_and_on_an_old_daemon() {
+        let mut polls = 0;
+        let e = await_experiment(
+            "/run/observer.sock",
+            "experiment-42",
+            10,
+            |_, _| {
+                polls += 1;
+                Ok(QueryOutcome::Failed(
+                    "experiment experiment-42 not found".into(),
+                ))
+            },
+            |_| panic!("a real failure must not be slept through"),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("not found"), "{e}");
+        assert_eq!(polls, 1);
+
+        let e = await_experiment(
+            "/run/observer.sock",
+            "experiment-42",
+            10,
+            |_, _| {
+                Ok(QueryOutcome::Unsupported(
+                    "bad request: unknown variant `Experiment`".into(),
+                ))
+            },
+            |_| panic!("an old daemon must not be slept through"),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("cannot report experiments"), "{e}");
+    }
+
+    /// A socket that fails is waited through — the window runs in the
+    /// daemon — but not for ever: past the failure budget the wait ends
+    /// naming `experiment-report`, and a recovered socket resets the count.
+    #[test]
+    fn experiment_poll_survives_transient_socket_errors_but_not_a_lost_daemon() {
+        use std::cell::RefCell;
+        let polls = RefCell::new(0u32);
+        let running = || {
+            QueryOutcome::Failed(net_observer_ipc::experiment_running_message(
+                "experiment-42",
+                99,
+            ))
+        };
+        let refused = || std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let report = Table::default();
+        // Failures short of the budget, then a still-running (resets), then
+        // failures short of it again, then the table.
+        let table = await_experiment(
+            "/run/observer.sock",
+            "experiment-42",
+            100,
+            |_, _| {
+                *polls.borrow_mut() += 1;
+                let n = *polls.borrow();
+                if n < MAX_POLL_FAILURES || (n > MAX_POLL_FAILURES && n < 2 * MAX_POLL_FAILURES) {
+                    Err(refused())
+                } else if n == MAX_POLL_FAILURES {
+                    Ok(running())
+                } else {
+                    Ok(QueryOutcome::Table(report.clone()))
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(table, report);
+        assert_eq!(*polls.borrow(), 2 * MAX_POLL_FAILURES);
+
+        let e = await_experiment(
+            "/run/observer.sock",
+            "experiment-42",
+            100,
+            |_, _| Err(refused()),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("lost net-observerd"), "{e}");
+        assert!(
+            e.to_string().contains("experiment-report experiment-42"),
+            "{e}"
+        );
+
+        // The overall bound: a daemon that says still-running for ever.
+        let mut polls = 0;
+        let e = await_experiment(
+            "/run/observer.sock",
+            "experiment-42",
+            4,
+            |_, _| {
+                polls += 1;
+                Ok(running())
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(polls, 4);
+        assert!(
+            e.to_string().contains("did not report within 4 polls"),
+            "{e}"
+        );
     }
 
     /// The table the daemon (or the file) answers renders as the grouped

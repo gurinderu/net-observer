@@ -64,3 +64,36 @@ impl ObservingCause {
         }
     }
 }
+
+impl std::str::FromStr for ObservingCause {
+    type Err = crate::verdict::ParseVerdictError;
+
+    /// The column token back into the cause, for a reader of `observing_edge`
+    /// rows. A `NULL` column is not a token: the reader treats it as
+    /// `Control` before asking here, as the gap derivation does.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "control" => Ok(Self::Control),
+            "startup" => Ok(Self::Startup),
+            _ => Err(crate::verdict::ParseVerdictError(s.to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn cause_token_round_trips() {
+        for (cause, token) in [
+            (ObservingCause::Control, "control"),
+            (ObservingCause::Startup, "startup"),
+        ] {
+            assert_eq!(cause.as_str(), token);
+            assert_eq!(ObservingCause::from_str(token).unwrap(), cause);
+        }
+        assert!(ObservingCause::from_str("Startup").is_err());
+    }
+}

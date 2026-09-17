@@ -197,7 +197,15 @@ flowchart LR
   `endpoint-block` (whole upstream fleet dead from the underlay while the
   direct reference answers), `established-stall` (a held long-lived stream
   through the tunnel stops carrying while fresh probes succeed; the direct
-  underlay stream's fate scopes the verdict), `singbox-no-route` (three or
+  underlay stream's fate scopes the verdict), `endpoint-dial-stall`
+  (sing-box's own URL test of the node that carries traffic has been ABSENT
+  — its history entry deleted by a failed test and not restored — for longer
+  than two of sing-box's test intervals plus 30 s, while raw TCP to that
+  node's listener answers: the listener is reachable, what sing-box does
+  through it is not. Read off the newest proxy tick's reading, dated by the
+  collector's `urltest_absent_since_us`; the interval is
+  `collectors.proxy.urltest_interval_secs` and must match sing-box's; realm
+  net-observer, node #62), `singbox-no-route` (three or
   more `no-route` / `unreachable` / `no-default-iface` lines of sing-box's own
   log within a minute while the newest link sample still holds a DHCP router
   with an `OK` or `SKIP` gateway — the OS has a network and sing-box cannot
@@ -210,7 +218,8 @@ flowchart LR
   cannot map a node to its endpoint, so the gate is the whole fleet and the
   detail says so; both clear after two link ticks with no such line, the link
   collector being the tick clock since the reader writes nothing on a quiet
-  tick; realm net-observer, node #141), `starvation`. Each fires at most
+  tick; realm net-observer, node #141), `starvation`.
+  Each fires at most
   once per 5 min (backoff) — except `roam`, which has no backoff so that each
   hop at the field cadence is its own incident (hops on consecutive ticks
   merge into one under the engine's latch; the rows still record both) — and
@@ -545,8 +554,16 @@ graph TD
 - `macos` implements every port trait with the real adapters, all on
   **async-native I/O** on the daemon's tokio runtime: `surge-ping` (raw ICMP),
   `socket2` + `tokio::net::TcpStream` with `IP_BOUND_IF` (bound TCP probes),
-  `reqwest`'s **async** client (Clash API — the selector and the live flow
-  list, TUN 204 probe, DoH), and
+  `reqwest`'s **async** client (Clash API — one `GET /proxies/<name>` per
+  proxy, a group's selection and members and a node's own URL-test history
+  alike, the members of a level read together on the daemon's runtime; the
+  live flow list; TUN 204 probe; DoH — and deliberately never
+  `GET /proxies/<node>/delay`: on this sing-box that handler ignores an
+  `http://` URL and, worse, writes its result into the urltest group's
+  history and so steers the selection, which "observe, never act" forbids;
+  the two observations and the history's semantics — an entry only for a
+  successful test, deleted on a failed one — are recorded at the top of
+  `macos::clash` and in realm net-observer, node #62), and
   `tokio::process::Command` (DHCP/ARP + Wi-Fi subprocesses); `getloadavg` stays
   an inline syscall inside its `async fn`, as does the CoreWLAN read behind
   `WifiFacts` (hand-declared `objc2` message sends — no subprocess and no text
@@ -699,7 +716,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | Table | Columns | Notes |
 | --- | --- | --- |
 | `link_sample` | `ts_us, gw, gw_rtt_ms, direct, direct_rtt_ms, dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present, lan_probed, lan_alive, fakeip_route_if, singbox_tun_if, bssid, if_mac, medium, lease_start_us, lease_secs, if_mac_private` | Local path: gateway ping, direct TCP (bound to phys iface), DHCP/ARP facts, Wi-Fi SSID + CoreCapture presence. `lan_probed`/`lan_alive` are the probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL tick (NULL = not probed). `fakeip_route_if` is the egress interface the route table resolves for a fakeip-pool address; `singbox_tun_if` is the interface carrying sing-box's own TUN address (present only while sing-box runs — the sing-box-alive fact, not "any utun", so a foreign VPN's utun does not read as sing-box being up). Both NULL = could not be determined. `gw_arp_mac` is normalised (`aa:bb:cc:dd:ee:ff`); rows written before the normalisation may carry `arp -n`'s raw form. `bssid` is the BSSID of the access point associated with and `if_mac` the interface's own MAC as currently assigned (Private Wi-Fi Address rotates it per SSID), both lowercase; a BSSID change at the same SSID is a roam the SSID alone cannot show, an `if_mac` change a new DHCP identity toward the network. NULL = not associated / not determinable. `medium` is the medium of the default-route interface (`wifi` or `wired`), measured from the hardware-port table so an `if_mac` change can be judged as a Wi-Fi roam or a dock/undock without a readable SSID or BSSID; NULL = not determinable. `lease_start_us` is the current DHCP lease's start (epoch microseconds, from the same `ipconfig getsummary` parse as `bssid`, resolved against the machine's local zone) — a change is a fresh DHCP exchange, an INIT-REBOOT every few minutes a roam; NULL = absent, unparseable, or a DST fold/gap left the local time ambiguous. `lease_secs` is that lease's length in seconds; NULL = absent or unparseable. `if_mac_private` is whether `if_mac`'s U/L bit reads as an administratively-assigned (Private Wi-Fi) address rather than the hardware-burned one; NULL exactly when `if_mac` is. |
-| `proxy_sample` | `ts_us, server_ip, tcp, rtt_ms, tun_code, selector, est_direct_alive, est_direct_age_s, est_tun_alive, est_tun_age_s` | Per-VLESS TCP reachability, tun HTTP 204 (`tun_code`), Clash selector. `tun_code` is the HTTP status the probe got; `0` = probed, no HTTP status (connect refused, timeout, transport error — the shell oracle's curl `000`), the value every reading, live (`starvation`) and offline (`why`, `wedge-or-starvation`), takes as the dead tun; `NULL` = not probed (the passive tier, a preflight skip), neither health nor fault. The `est_*` columns are the established-flow discriminator (held reference streams: direct underlay / through the tunnel), per-tick facts replicated across the tick's rows like `tun_code`; NULL = no measurement. |
+| `proxy_sample` | `ts_us, server_ip, tcp, rtt_ms, tun_code, selector, est_direct_alive, est_direct_age_s, est_tun_alive, est_tun_age_s, urltest_ms, urltest_at_us, urltest_node, urltest_absent_since_us` | Per-VLESS TCP reachability, tun HTTP 204 (`tun_code`), Clash selector. `tun_code` is the HTTP status the probe got; `0` = probed, no HTTP status (connect refused, timeout, transport error — the shell oracle's curl `000`), the value every reading, live (`starvation`) and offline (`why`, `wedge-or-starvation`), takes as the dead tun; `NULL` = not probed (the passive tier, a preflight skip), neither health nor fault. The `est_*` columns are the established-flow discriminator (held reference streams: direct underlay / through the tunnel), per-tick facts replicated across the tick's rows like `tun_code`; NULL = no measurement. The `urltest_*` columns are **sing-box's own URL test** of one node under the selector group (realm net-observer, node #62), READ from its Clash API each tick for every node under the configured group — nested groups flattened, `Direct`/`Block`/`DNS` outbounds left out (`GET /proxies/<node>` → the newest `history` entry) — and never triggered by the daemon: the API's delay test writes into the group's history and steers its selection, which "observe, never act" forbids. `selector` on the same rows is the node that carries traffic: the configured group's `now`, followed down through nested groups to a node (realm net-observer, node #139). `urltest_node` names the node; `urltest_ms` is the newest entry's delay and `urltest_at_us` its time, as the API shows them THIS tick. sing-box writes an entry only for a **successful** test — `0` ms is a real sub-millisecond answer — and **deletes** the node's entry on a failed one, so a failure is visible only as the entry going absent: `urltest_absent_since_us` is the tick the collector first read the history empty after having seen an entry, kept across later empty reads and cleared by an entry (collector memory per node, per process — a restart, bracketed by the startup observing edge, starts it over). Dated ONLY for a member of a `URLTest`-typed group, the one kind sing-box re-tests on an interval: a node selected directly in a Selector (as `vless-out-8` in `vless-main` on the Mac) is never re-tested, and its entry vanishing — on a sing-box restart, whose process memory a URLTest member gets back within seconds and a directly selected node never, or on a failed manual test from a GUI — is not evidence of a failed test, so the column stays `NULL` for it (realm net-observer, node #62). A reading rides the row of its node's endpoint (so `tcp` beside it is that listener's raw reachability), or a **reading-only row** (`tcp = SKIP`, no rtt, under a named `urltest_node`) when that row is taken by another node on the same endpoint, is unknown, or was not probed — a local read, so the passive tier still records it; the traffic-carrying node's row is the tick's last, so the live snapshot carries its reading. `NULL` node = no reading on this row; `NULL` `urltest_ms` with `NULL` `urltest_absent_since_us` under a named node = never seen tested (not yet — the empty history observed on every node at 18:23 on 2026-09-17), or a node no URLTest group re-tests — not measured, never a failure. |
 | `dns_sample` | `ts_us, probe, server, verdict, ip, rtt_ms` | One row per resolver probe (name label × resolver path); `verdict` drives the `fakeip` trigger. |
 | `route_event` | `ts_us, kind, iface, detail` | PF_ROUTE event stream (`kind` = `iface` / `addr` / `route`): iface up/down, addr add/loss, default-route change. |
 | `host_sample` | `ts_us, load1, load5, load15, disk_used_pct, disk_free_mb, swap_used_mb` | Host load averages — the `starvation` discriminator — plus the usage of the volume holding the record (`disk_used_pct` as `df` computes capacity, `disk_free_mb` what a writer can still take, in MiB) and the swap in use in MiB: the ENOSPC and memory-pressure discriminators the shell oracle carried. A store write that fails for want of space is logged as a gap; these columns let the record name the cause. NULL = not measured, never a zero. |
@@ -712,7 +729,8 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `blob_ref` | `id, incident_id, ts_us, kind, path` | On-disk forensics blobs (pcap freeze, dumps) referenced by path. |
 | `trigger_fired` | `ts_us, trigger_id, incident_id, detail` | One row per trigger fire. |
 | `observing_edge` | `ts_us, observing, peer_uid, cause` | One row per collection boundary — the one sanctioned gap in "SKIP, never silence"; `observing` is the state entered, so `false` opens a gap and `true` closes one. `peer_uid` attributes it to the control-socket peer that asked (SQL `NULL` when nobody did), and `cause` (`control` / `startup`) says what produced it. |
-| `probing_edge` | `ts_us, tier, peer_uid` | One row per switch of the probing tier (`tier` is the tier entered, `passive` / `active`). Not a gap — a passive daemon keeps writing a row per tick with every probe verdict `SKIP` — but the bracket that says those `SKIP`s were *withheld*, not failed, and by whom. `peer_uid` is `NULL` for the startup edge, which records the configured default so a record that begins passive says so. (realm net-observer, node #88) |
+| `probing_edge` | `ts_us, tier, peer_uid, reason` | One row per switch of the probing tier (`tier` is the tier entered, `passive` / `active`). Not a gap — a passive daemon keeps writing a row per tick with every probe verdict `SKIP` — but the bracket that says those `SKIP`s were *withheld*, not failed, and by whom. `peer_uid` is `NULL` for the startup edge, which records the configured default so a record that begins passive says so. `reason` (`control` / `startup` / `experiment` / `experiment-end`) says what produced the edge; added with the experiment window, so older rows read back `NULL`, which means `control` — what they were (realm net-observer, nodes #88, #61). The experiment pair is the one place an edge may repeat the tier already in force: a window on an already-passive daemon still marks its bounds. |
+| `experiment` | `id PK, start_us, end_us, tier_before, freeze_start_dir, freeze_end_dir, report_json` | One row per finished experiment window (realm net-observer, node #61): its bounds, the tier in force before it, where its two pcap freezes landed (NULL when a freeze copied nothing, and NULL on rows from before the columns existed — they are `ALTER`ed in on open like `probing_edge.reason`; each copied file also has a `blob_ref` row, `kind = pcap`, `incident_id` = the window's id, and the freeze pruner keeps `freeze-experiment-*` on its own budget of twelve), and the whole `types::ExperimentReport` as JSON — the same report the daemon answers `Query(Experiment { id })` with, kept so it outlives the process that computed it. A window the daemon was restarted under leaves no row; its opening `probing_edge` (`reason = experiment`) without a closing one is the trace. |
 
 `dns_sample`, `route_event`, and `host_sample` are created by the v1.1 `dns`,
 `route-events`, and `host-metrics` collectors respectively.
@@ -971,10 +989,11 @@ the durable record; the socket is the live, low-latency read path.
     (realm net-observer, node #58)
   - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
     write/control path (see [Control path](#control-path) below); the only
-    non-read request. Six commands today — `ControlCmd::KickstartProxy`,
+    non-read request. Seven commands today — `ControlCmd::KickstartProxy`,
     `SetObserving(bool)`, `SetProbing(ProbingTier)`, `FreezePcap`,
-    `ScanNeighbors(ScanOptions)`, `ScanAir` — every one behind
-    the same peer-credential check and none behind a config switch.
+    `ScanNeighbors(ScanOptions)`, `ScanAir`, `StartExperiment { minutes }` —
+    every one behind the same peer-credential check and none behind a config
+    switch.
   - `Request::Subscribe { kinds }` → a **held-open stream** of newline-JSON
     `StreamFrame`s (not a single `Response`, and not bare `Event`s) — the
     realtime pub/sub path (see [Event bus and live
@@ -989,9 +1008,11 @@ the durable record; the socket is the live, low-latency read path.
     `Gap` (this subscriber fell behind the bus and lost `skipped` events),
     `Observing` (a real pause/resume transition — the state at subscribe time
     rides on `Ready` instead, so a state report can never be mistaken for an edge
-    that never happened), `Probing` (a real switch of the probing tier, the same
+    that never happened), `Probing` (a switch of the probing tier, the same
     `types::ProbingEdge` the daemon writes to `probing_edge`; the tier in force
-    is read from `StatusSnapshot::probing`), and `Error` (a daemon-side refusal
+    is read from `StatusSnapshot::probing` — and an experiment window's
+    bracket may repeat the tier already in force, so a subscriber sets its
+    tier from the frame rather than toggling on it), and `Error` (a daemon-side refusal
     or failure, reported **in band** instead of as a bare close). Only `Event`
     frames are subject to the `kinds` filter (`None` = every `EventKind`,
     `Some(list)` = server-side);
@@ -1375,6 +1396,103 @@ already-authorised command:
    operator believing an artifact exists. Client: the bar footer's **Freeze
    pcap** action.
 
+5. **Self-control — `ControlCmd::StartExperiment { minutes }`.** "Is it us or
+   the network", as a command (realm net-observer, node #61): the manual
+   procedure — switch everything off, watch `tcpdump`, count by hand — run by
+   the daemon for a window of 1 to 60 minutes. Refused while paused, for the
+   reason a scan is: a window measured inside bracketed silence would read
+   its zeros against no record — and read INSIDE the lock the opening switch
+   holds, the same one `SetObserving` flips the flag under, so a pause cannot
+   slip between the check and the edge. The arm switches to the passive tier
+   with a `probing_edge` whose `reason` is `experiment`, written even if the
+   daemon was passive already (the window is marked either way;
+   `api::EdgePolicy::Always`) — the tier it found under that same lock is the
+   window's `tier_before` — freezes the pcap ring into
+   `blob_dir/freeze-experiment-<start_us>-start` (one `blob_ref` row per
+   copied file, `kind = pcap`, against the window's id, as an incident freeze
+   writes), records the window as running, and answers **at once** with the
+   id `experiment-<start_us>` — the opening edge's own `ts_us`. The window
+   then runs in a spawned task, not on the connection, so a dropped socket
+   loses nothing. One window at a time: a second `StartExperiment` is refused
+   with the running id and its end. A missing ring does not refuse the window
+   — the record's half of the report needs no ring — the message and the
+   report say the freeze was not taken. The freeze pruner (`macos::pcap`)
+   keeps `freeze-experiment-*` on a budget of its own — the newest twelve,
+   six windows, pruned apart from the incident freezes' twelve — so neither
+   kind spends the other's: the report was read from that slice and names
+   it, and a season of windows still cannot grow the blob directory without
+   bound.
+
+   When the window elapses the task takes the end instant on the **wall
+   clock** (the sleep that timed the window is monotonic, which a sleeping
+   machine does not advance — an end more than one link interval past the
+   requested length is reported as `machine slept for ~N s inside the
+   window`), freezes the ring again (`…-end`, blob rows likewise), reads the
+   boundary rows inside the window (`store::experiment::window_edges`: every
+   `observing_edge` and `probing_edge` between the bounds, so the report
+   names each pause and each operator switch with its instant as a local
+   clock, plus the collection state in force AT the start — the newest
+   `observing_edge` at or before it — so a window that opened inside a pause
+   says `paused at the start` even though that pause's row sits before
+   `start_us`), and writes the closing edge (`reason = experiment-end`, again
+   under `Always`). That
+   edge restores `tier_before` **only if** the tier it finds under its lock
+   is still the window's passive AND no operator edge landed inside the
+   window; otherwise the operator's choice stands, the edge merely marks the
+   end, and the report's `tier_at_end` row says which — `active (changed by
+   the operator at <ts>; restore skipped)`. It then reads this machine's MAC
+   **once** from the newest link sample the snapshot holds, and computes the
+   report on the blocking pool: the END freeze's `ring.pcap*` files are
+   walked with the same pure-Rust `PcapStream` the announce listener reads
+   through (`collector_announce::count_own_frames`), counting inside
+   `[start_us, end_us]` the frames whose Ethernet source is that MAC — ICMP
+   echo *requests*, ARP and DHCP (the OS's) and other — plus every frame in
+   the window, the first and last own echo (a link tick that read `active` a
+   moment before the flip still sends its echo after `start_us`: the report
+   says `first own echo at +3.2 s`, and `(the straddling tick)` when every
+   own echo lies within one link interval of the start — named, never
+   excluded), the slice's earliest stamp (whether the ring still reached back
+   to the start) and whether a file was cut mid-record; the START freeze is
+   walked for its record count; and `store::experiment::window_facts` counts
+   what the record says the network did in the same minutes — `route_event`
+   rows, incidents opened (by trigger; `gw-change`, roams and Wi-Fi churn
+   read off it), the `link_sample.gw` verdict distribution (all `SKIP` under
+   passive, said outright), announce flushes and the frames they heard, the
+   flow table's newest tick at each bound, the Wi-Fi signal's range. The
+   `types::ExperimentReport` goes to two sinks, like an edge: the in-memory
+   registry and an `experiment` row (both freeze directories and
+   `report_json`), and every count that could not be taken is a note in it —
+   an unreadable MAC, a ring that was not running, a slice that was cut —
+   never a zero. Its verdict line is derived from the counts on render and
+   claims only what the ring's filter (recorded on the report as `ring
+   filter`) can show: `our ICMP echo requests in the ring: 0 in 5.0 minutes
+   (what the ring's filter passes — see ring_filter; the shell oracle and a
+   hand-run ping share this MAC); the OS sent 2 ARP, 1 DHCP, 0 other; the
+   network showed: 2 route events, 1 incidents (…), 0 roams` — never "the
+   daemon was silent".
+
+   Reading it: `Request::Query(DiagnosticQuery::Experiment { id })`. A window
+   this process holds in memory answers from there without the query gate —
+   `still running (ends at <local instant>)` as a `Response::Error` the CLI's
+   poll waits through (spelled once,
+   `net_observer_ipc::experiment_running_message`, the end rendered by the
+   same `types::local_instant` the CLI stamps every moment with), or the
+   finished report as a two-column `key | value` `Table`
+   (`From<&ExperimentReport> for Table`); an id the process does not remember
+   goes through the gated `api_query` path to the `experiment` table, and an
+   id the record does not hold is a plain failure — the cue that the daemon
+   restarted mid-window, its tier back at the configured default and the
+   report never computed. Clients: `net-observer-cli experiment [--minutes N]
+   [--no-wait]`, which prints the id and polls every 5 s until the table
+   comes (waiting through socket errors up to a minute, since the window runs
+   in the daemon), and `experiment-report <id>`, which asks the daemon first
+   and reads the file's `experiment` table when none answers. In `gaps`, a
+   passive stretch an experiment opened on an active daemon closes with
+   `gap_closed_by = experiment` (read from the closing edge's `reason`; rows
+   without one keep the `peer_uid` derivation), and on the event stream a
+   `Probing` frame's detail names the reason: `probing passive (experiment)`.
+
+
 The `ScanNeighbors` and `ScanAir` arms are described under their own
 subsystems; both take the same path below and are refused only by a state they
 contradict (paused) or a missing dependency.
@@ -1407,9 +1525,22 @@ Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
                                     │             events_tx.send(StreamFrame::Probing(edge))
                                     │
                                     ├─ FreezePcap
-                                    │     └─► freeze_now(cx) → freezer.freeze(dir)
+                                    │     └─► freeze_now(cx) → freeze_ring(freezer, dir)
                                     │         — or ok: false with a
                                     │         reason when no ring is running
+                                    │
+                                    ├─ StartExperiment { minutes }
+                                    │     └─► refused while paused (like a scan)
+                                    │         switch_probing(|_| Passive, reason=experiment, EdgePolicy::Always)
+                                    │         + freeze_ring(…-start) + blob_ref rows + experiments[id] = Running
+                                    │         └─► ControlResult { ok: true, "experiment <id> started …" }
+                                    │         └─► tokio::spawn: sleep(minutes) → finish_experiment
+                                    │               end_us = now_us() → freeze_ring(…-end) + blob_ref rows
+                                    │               → window_edges (blocking pool)
+                                    │               → switch_probing(|was| if was == Passive && no operator
+                                    │                 edge { tier_before } else { was }, reason=experiment-end, Always)
+                                    │               → count (blocking pool)
+                                    │               → store.write_experiment + experiments[id] = Finished
                                     │
                                     └─ KickstartProxy
                                           └─► acting::kickstart_proxy(&singbox_service)
