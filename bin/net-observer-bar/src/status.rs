@@ -65,6 +65,26 @@ pub fn render_status(snap: &StatusSnapshot) -> String {
     out
 }
 
+/// Move incident `id` to closed at `closed_us` in a snapshot's incident list —
+/// the bar's own mirror of the stamp the daemon's ring gets on `on_clear`,
+/// applied when an `Event::IncidentClosed` frame arrives so the panel does not
+/// wait for its next poll (realm net-observer, node #135). `false` when the
+/// list does not hold `id` (opened after the last poll, or already past the
+/// ring's cap): nothing is added, and the next poll settles it.
+pub fn close_incident(
+    incidents: &mut [net_observer_ipc::IncidentSummary],
+    id: &str,
+    closed_us: i64,
+) -> bool {
+    match incidents.iter_mut().find(|i| i.id == id) {
+        Some(inc) => {
+            inc.closed_us = Some(closed_us);
+            true
+        }
+        None => false,
+    }
+}
+
 /// The three-state health of a [`StatusSnapshot`], derived from the gateway
 /// verdict and the tun probe code. The single source of truth for both the
 /// menu-bar dot ([`status_dot`]) and the panel's header dot
@@ -362,6 +382,31 @@ mod tests {
         assert!(out.contains("gw=OK direct=OK"));
         assert!(out.contains("tun=204 selector=auto urltest=-"));
         assert!(out.contains("wedge opened=80 closed=open"));
+    }
+
+    /// An incident-closed frame moves exactly the entry it names to closed,
+    /// leaves the others alone, and adds nothing for an id the list does not
+    /// hold (realm net-observer, node #135).
+    #[test]
+    fn close_incident_stamps_the_named_entry_only() {
+        let incident = |id: &str, opened_us: i64| IncidentSummary {
+            id: id.into(),
+            opened_us,
+            closed_us: None,
+            trigger_id: "wedge".into(),
+            signature: "tun dead".into(),
+        };
+        let mut incidents = vec![incident("wedge-105", 105), incident("wedge-80", 80)];
+
+        assert!(close_incident(&mut incidents, "wedge-80", 95));
+        assert_eq!(incidents[1].closed_us, Some(95));
+        assert_eq!(incidents[0].closed_us, None, "the other entry is untouched");
+
+        assert!(
+            !close_incident(&mut incidents, "wedge-1", 96),
+            "an id the list does not hold is reported, not invented"
+        );
+        assert_eq!(incidents.len(), 2);
     }
 
     /// sing-box's own test of the selected node renders as the CLI renders
