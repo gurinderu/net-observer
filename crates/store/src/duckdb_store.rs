@@ -927,8 +927,15 @@ impl Store for DuckdbStore {
 
     fn schema_drift(&self) -> Result<Vec<SchemaDrift>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT count(*) FROM information_schema.columns WHERE table_name = ?")?;
+        // Scoped to this file's own catalogue and schema: a same-named table
+        // in the temp catalogue or in an attached database is filed under
+        // `main` too, so the catalogue is what tells them apart.
+        let mut stmt = conn.prepare(
+            "SELECT count(*) FROM information_schema.columns
+             WHERE table_catalog = current_database()
+               AND table_schema = 'main'
+               AND table_name = ?",
+        )?;
         let mut drift = Vec::new();
         for (table, insert) in POSITIONAL_INSERTS {
             let expected = insert.matches('?').count();
@@ -3011,5 +3018,40 @@ mod tests {
             ),
             other => panic!("a widened table must refuse the positional write, got {other:?}"),
         }
+    }
+
+    /// The count is scoped to this file's own catalogue and schema: a table
+    /// of the same name in the temp catalogue or in an attached database is
+    /// not this build's table and must not be added to its column count.
+    /// Nothing attaches a second database today; the scope is what keeps a
+    /// later `ATTACH` from reading as drift.
+    #[test]
+    fn a_same_named_table_in_another_catalogue_does_not_count_toward_drift() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.with_conn(|c| {
+            Ok(c.execute_batch(
+                "CREATE TEMP TABLE host_sample (extra INTEGER);
+                 ATTACH ':memory:' AS other;
+                 CREATE TABLE other.host_sample (extra INTEGER);",
+            )?)
+        })
+        .unwrap();
+        // Where DuckDB files the two look-alikes, so the scope below is
+        // checked against what the catalogue says rather than assumed.
+        let t = s
+            .query_table(
+                "SELECT table_catalog, table_schema FROM information_schema.columns
+                 WHERE table_name = 'host_sample' AND column_name = 'extra'
+                 ORDER BY table_catalog",
+            )
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec!["other".to_string(), "main".to_string()],
+                vec!["temp".to_string(), "main".to_string()],
+            ]
+        );
+        assert_eq!(s.schema_drift().unwrap(), Vec::new());
     }
 }
