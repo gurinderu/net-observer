@@ -42,7 +42,7 @@ use gpui::{
 use net_observer_ipc::Table;
 use types::ConnectionsGroupBy;
 
-use crate::ui::{Dating, Glance, Theme, dated, note, separator};
+use crate::ui::{Dating, Glance, Theme, column_index, dated, note, separator};
 
 /// Initial size of the connections window (resizable afterwards), gpui logical
 /// px. Wider than the map's default by exactly what the table needs: the
@@ -171,19 +171,13 @@ enum Tick {
 
 /// Reduce the daemon's `Connections` table to what the window draws.
 ///
-/// Columns are found by NAME, never by position: a table missing one of the
-/// seven is an `Err` naming it, so a daemon whose diagnosis grew or shrank is
-/// reported rather than drawn misaligned. A row with an empty `key` is the
-/// daemon's empty-tick marker, never a group. Pure over its input so the
-/// reduction is testable without a window.
+/// Columns are found by NAME, never by position ([`column_index`]): a table
+/// missing one of the seven is an `Err` naming it, so a daemon whose diagnosis
+/// grew or shrank is reported rather than drawn misaligned. A row with an
+/// empty `key` is the daemon's empty-tick marker, never a group. Pure over its
+/// input so the reduction is testable without a window.
 fn tick_rows(table: &Table) -> Result<Tick, String> {
-    let col = |name: &str| {
-        table
-            .columns
-            .iter()
-            .position(|c| c == name)
-            .ok_or_else(|| format!("connections table has no `{name}` column"))
-    };
+    let col = |name: &str| column_index(table, name);
     let ts_us = col("ts_us")?;
     let verdict = col("verdict")?;
     let key = col("key")?;
@@ -813,11 +807,11 @@ mod tests {
         };
         assert_eq!(
             tick_rows(&table),
-            Err("connections table has no `count` column".to_string())
+            Err("table has no `count` column".to_string())
         );
         assert_eq!(
             reduce(Ok(table)),
-            Err("connections table has no `count` column".to_string())
+            Err("table has no `count` column".to_string())
         );
         assert_eq!(
             reduce(Err("no socket".to_string())),

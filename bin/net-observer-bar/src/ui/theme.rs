@@ -47,6 +47,13 @@ pub(crate) struct Theme {
     pub(crate) knob: u32,
     /// Hover wash under a text action.
     pub(crate) hover: u32,
+    /// A neighbour the map knows only because it announced itself — heard by
+    /// the passive listener, never listed by the caches or a scan (realm
+    /// net-observer, node #92). Its own ink on purpose: it is a provenance,
+    /// not a verdict, so it is none of `ok`, `warn` or `bad`, and it must not
+    /// collapse onto a role colour (`accent`, `track_on`, `fg`, `muted`) or an
+    /// announced device would read as a scanned one of some role.
+    pub(crate) announce: u32,
 }
 
 impl Theme {
@@ -76,6 +83,7 @@ impl Theme {
             track_off: 0xcfcfd4,
             knob: 0xffffff,
             hover: 0xececef,
+            announce: 0x8250c8,
         }
     }
 
@@ -106,6 +114,7 @@ impl Theme {
             track_off: 0x4a4a50,
             knob: 0xffffff,
             hover: 0x2c2c31,
+            announce: 0xc39bff,
         }
     }
 }
