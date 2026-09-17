@@ -168,26 +168,6 @@ impl RecentWindow {
         })
     }
 
-    /// The most recent `n` wifi samples, newest first.
-    pub fn recent_wifi(&self, n: usize) -> Vec<&WifiSample> {
-        self.buf
-            .iter()
-            .rev()
-            .filter_map(|s| match s {
-                Sample::Wifi(w) => Some(w),
-                Sample::Link(_)
-                | Sample::Proxy(_)
-                | Sample::Dns(_)
-                | Sample::Route(_)
-                | Sample::Host(_)
-                | Sample::Neighbors(_)
-                | Sample::Air(_)
-                | Sample::Connections(_) => None,
-            })
-            .take(n)
-            .collect()
-    }
-
     /// The newest wifi sample with `ts_us <= given` — the channel reading
     /// that was current at that moment (typically a link sample's own
     /// `ts_us`). A sample whose `channel` is unmeasured (`None`) is skipped,
@@ -398,16 +378,6 @@ mod tests {
             channel_width_mhz: Some(20),
             channel_band: Some("5ghz".into()),
         })
-    }
-
-    #[test]
-    fn recent_wifi_returns_newest_first() {
-        let mut w = RecentWindow::new(16);
-        w.push(wifi(1, Some(48)));
-        w.push(link(2)); // interleaved link samples are transparent
-        w.push(wifi(3, Some(153)));
-        let got: Vec<i64> = w.recent_wifi(2).iter().map(|s| s.ts_us).collect();
-        assert_eq!(got, vec![3, 1]);
     }
 
     #[test]
