@@ -100,14 +100,24 @@ flowchart LR
   still yields its reading) the window flushes as one `Sample::Neighbors`:
   the neighbours heard (`source = announce`, hostname from mDNS or DHCP
   option 12), the services they announced (`NeighborsSample::services`), and
-  the frame counts (`heard`: every frame, and how many were our own — the
-  daemon's frames are recognised by the interface MAC, counted and dropped,
-  so the record can check that under the passive tier it emitted nothing).
+  the frame counts (`heard`: every frame the capture delivered, and of those
+  how many this machine itself sent that match the filter — the OS's own
+  ARP, mDNS, SSDP and DHCP, never the daemon's probes, which are ICMP, TCP
+  and DNS and do not pass the filter). Our own frames are recognised by the
+  interface's own MAC, re-read at every window's start because a Private
+  Wi-Fi Address rotates it per network, and counted and dropped: a machine
+  is not its own neighbour, and the count says the listener saw itself and
+  ignored it — nothing more. It is NOT the passivity proof; that stays the
+  frozen pcap slice (realm net-observer, node #88). A window whose own MAC
+  could not be read drops nothing as ours and says so (`own` NULL / `?`).
   Not the pcap ring: the ring's filter carries no multicast and its files are
   read only on a freeze. The listener's end (child died, pipe broke) is
-  bracketed by a `SKIP` row naming why. A flush never replaces the
-  snapshot's cache reading (it is the last window, not the table); it is
-  written and published like any reading.
+  bracketed by a `SKIP` row naming why — the one event batch that passes an
+  operator pause, since it is the bracket and not an observation. A flush
+  never replaces the snapshot's cache reading (it is the last window, not
+  the table) and never fills the trigger window's neighbour slot
+  (`RecentWindow::last_neighbors` skips it); it is written and published
+  like any reading.
 - **Consumer** (`bin/net-observerd/src/pipeline.rs::run`) — drains the stream,
   writes each sample to the store (a write error is *logged as a gap*, never
   silently dropped), mirrors the sample into the live `StatusSnapshot`, pushes
@@ -206,11 +216,18 @@ collector, whether to run it at all:
   collector is logged and skipped for the life of the process ("event cadence:
   not retried"), and retrying it means a supervisor around
   `spawn_event_collector` that reopens the socket. The `announce` listener is
-  the same shape: its `tcpdump` child is started (and the interface's own MAC
-  read) before construction, and a child that will not start — no `tcpdump`,
-  no root, no BPF — or a MAC that cannot be read leaves it `Unavailable` for
-  the life of the process, the reason logged; a child that dies later ends
-  the source, bracketed by a `SKIP` row. And the **pcap ring**: it is
+  the same shape: its `tcpdump` child is started before construction, and
+  what separates `Unavailable` from a running listener is not the spawn —
+  a spawn proves only that a binary exists — but the child's pcap global
+  header: `AnnounceCapture::start` returns `Ok` only once the child has
+  written one (which `-U` flushes at open, before any frame) declaring an
+  Ethernet link layer, waiting at most 2 s; a child that exits first (no
+  BPF device, no permission, an interface that is not configured), writes
+  nothing in time, or writes something else is killed and the reason
+  carries the child's last stderr words. That verdict is logged and holds
+  for the life of the process; a child that dies later ends the source with
+  its exit status and stderr tail as the reason on the `SKIP` row that
+  brackets the end. And the **pcap ring**: it is
   a `tcpdump` child started once by `maybe_start_pcap_ring` and handed to the
   API server, so `FreezePcap` can answer about the ring that is actually
   running; a boot that resolves no physical interface leaves the daemon with no
@@ -582,7 +599,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `host_sample` | `ts_us, load1, load5, load15, disk_used_pct, disk_free_mb, swap_used_mb` | Host load averages — the `starvation` discriminator — plus the usage of the volume holding the record (`disk_used_pct` as `df` computes capacity, `disk_free_mb` what a writer can still take, in MiB) and the swap in use in MiB: the ENOSPC and memory-pressure discriminators the shell oracle carried. A store write that fails for want of space is logged as a gap; these columns let the record name the cause. NULL = not measured, never a zero. |
 | `wifi_sample` | `ts_us, wifi, reason, rssi_dbm, noise_dbm, snr_db, tx_rate_mbps, phy_mode, channel, channel_width_mhz, channel_band` | Wi-Fi air quality from CoreWLAN. `rssi_dbm`/`noise_dbm` are the raw pair and `snr_db` is derived (`rssi - noise`), so the derivation can be revisited from the columns actually measured. `wifi = SKIP` with a `reason` when the radio could not be read (no interface, powered off, not associated) — a row every tick, never an absent one. No SSID/BSSID: macOS gates them behind Location Services, which a LaunchDaemon cannot obtain. |
 | `connection_sample` | `ts_us, verdict, host, dst_ip, dst_port, process, network, chain, count, upload, download` | What this machine talks to: the live flows sing-box's Clash API lists (`GET /connections`, realm net-observer, node #127), aggregated per tick by `(host, dst_ip, dst_port, process, network, chain)` — `count` flows shared the key, `upload`/`download` their bytes summed. `host` is the name asked for (a sniffed SNI is whatever the client put there), `dst_ip` the real destination (NULL when the proxy resolves the name on the far side), `process` the client's executable name, `chain` the outbound that actually carried the flow — the first element of the Clash API's `chains` (sing-box lists them node-first; the last is the constant top-level selector). One row per aggregate row per tick with the tick's `verdict` on each; a tick with no rows — the API did not answer (`SKIP`) or it listed nothing (`OK`) — writes ONE row with every key column NULL, so "could not look" and "nothing is talking" are different rows and neither is an absent tick (realm net-observer, node #75). |
-| `neighbor_sample` | `ts_us, network_key, iface, verdict, reason, neighbor_count, heard_frames, own_frames` | One row per neighbour reading — a neighbour-cache tick, an operator-pressed scan, or an `announce` listener flush — including its `SKIP`s. `heard_frames` / `own_frames` are the listener's counts for the window it flushed: every frame the capture delivered and, of those, the ones whose Ethernet source was this interface's own MAC (counted, never recorded as a neighbour). NULL on a cache tick or a scan, never a zero: `heard_frames = 0` is a window in which the segment said nothing, and `own_frames` is the "zero frames of ours" check the passive tier is held to. The neighbour entity tables (`neighbor`, `neighbor_scan`, `neighbor_port`, `neighbor_vuln`) are documented in `crates/store/src/schema.rs`; `neighbor.source` now also takes `announce` — the device said so itself (realm net-observer, node #92). |
+| `neighbor_sample` | `ts_us, network_key, iface, verdict, reason, neighbor_count, heard_frames, own_frames` | One row per neighbour reading — a neighbour-cache tick, an operator-pressed scan, or an `announce` listener flush — including its `SKIP`s. `heard_frames` / `own_frames` are the listener's counts for the window it flushed: every frame the capture delivered and, of those, the frames this machine itself sent that match the capture filter — the OS's own ARP, mDNS, SSDP and DHCP, never the daemon's probes (ICMP, TCP and DNS do not pass the filter) — recognised by the interface's own MAC as read at that window's start, counted and never recorded as a neighbour. The count says the listener saw itself and ignored it, nothing more; the passivity proof stays the frozen pcap slice (realm net-observer, node #88). Both NULL on a cache tick or a scan, never a zero: `heard_frames = 0` is a window in which the segment said nothing, and `own_frames` NULL under a non-NULL `heard_frames` is a window whose own MAC could not be read, so nothing was dropped as ours. The neighbour entity tables (`neighbor`, `neighbor_scan`, `neighbor_port`, `neighbor_vuln`) are documented in `crates/store/src/schema.rs`; `neighbor.source` now also takes `announce` — the device said so itself (realm net-observer, node #92). |
 | `neighbor_service` | `network_key, mac, ip, service, kind, detail, first_seen_us, last_seen_us` | A service a neighbour announced, heard passively by the `announce` listener. Keyed by `(network_key, mac, service)` with first/last seen like `neighbor_port`, so an announcement repeated every few seconds is one row: "this device has been announcing `_companion-link._tcp` since X". `service` is what was announced (an mDNS service type, an SSDP notification type, a DHCP role — `dhcp-server`, `vendor-class`), `kind` which protocol carried it (`mdns` / `ssdp` / `dhcp`), `detail` the specifics that came with it (the mDNS instance name, the SSDP `SERVER` string, the DHCP message type or vendor class), `ip` the address it was announced from (NULL for a DHCP client still without one). A later sighting that carries no `ip` or `detail` keeps the ones already learned. |
 | `incident` | `id PK, opened_us, closed_us, trigger_id, signature` | Open incident ⇒ `closed_us IS NULL`. |
 | `blob_ref` | `id, incident_id, ts_us, kind, path` | On-disk forensics blobs (pcap freeze, dumps) referenced by path. |

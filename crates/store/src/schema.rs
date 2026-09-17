@@ -122,12 +122,19 @@ CREATE TABLE IF NOT EXISTS neighbor_sample (
   ts_us BIGINT, network_key VARCHAR, iface VARCHAR, verdict VARCHAR, reason VARCHAR,
   neighbor_count INTEGER);
 -- The announce listener's frame counts for the window this reading flushed:
--- every frame the capture delivered and, of those, the ones whose Ethernet
--- source was this interface's own MAC. NULL on a neighbour-cache tick and on a
--- scan (they count no frames), never a zero; `heard_frames = 0` is a window
--- in which the segment said nothing. `own_frames` is the "zero frames of ours"
--- check the passive tier is held to (realm net-observer, node #92). Added
--- after the table first shipped — same migration treatment as link_sample.
+-- `heard_frames` is every frame the capture delivered; `own_frames` is, of
+-- those, the frames this machine itself sent that match the capture filter —
+-- the OS's own ARP, mDNS, SSDP and DHCP traffic, never the daemon's probes
+-- (ICMP, TCP and DNS do not pass the filter) — recognised by the interface's
+-- own MAC as read at that window's start, counted and dropped from the
+-- neighbour map. It says the listener saw itself and ignored it, nothing
+-- more: the passivity proof stays the frozen pcap slice (realm net-observer,
+-- node #88). Both NULL on a neighbour-cache tick and on a scan (they count no
+-- frames), never a zero; `heard_frames = 0` is a window in which the segment
+-- said nothing, and `own_frames` NULL under a non-NULL `heard_frames` is a
+-- window whose own MAC could not be read, so nothing was dropped as ours
+-- (realm net-observer, node #92). Added after the table first shipped — same
+-- migration treatment as link_sample.
 ALTER TABLE neighbor_sample ADD COLUMN IF NOT EXISTS heard_frames UINTEGER;
 ALTER TABLE neighbor_sample ADD COLUMN IF NOT EXISTS own_frames UINTEGER;
 CREATE TABLE IF NOT EXISTS neighbor (
