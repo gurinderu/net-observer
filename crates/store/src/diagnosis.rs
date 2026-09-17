@@ -38,7 +38,7 @@
 //! | `host` | tun dead under host load — starvation, not a wedge |
 //! | `healthy` | every measured layer answered |
 //! | `unknown` | a layer did not report (`SKIP`, no sample, no `load1`) |
-//! | `gap` | the moment asked about lies inside an operator pause |
+//! | `gap` | the moment asked about lies inside an observation gap (pause, stop, or sleep) |
 //!
 //! ## Observation gaps
 //!
@@ -72,6 +72,18 @@
 //!   else, so the inference stays; `gap_closed_by` says which case was taken.
 //!   Only when nothing at all follows the pause does the gap stay open-ended,
 //!   which is the truth: the record ends there.
+//!
+//! An operator pause is not the only hole the record can name this way. A
+//! **stop** is a startup edge with no preceding pause: the daemon died or was
+//! killed outright, so the record simply stops, and the gap runs from the
+//! newest sample before that edge to the edge itself — unless a pause gap
+//! already closes at that same edge, in which case the pause already names
+//! the hole. A **sleep** is two consecutive samples of any stream further
+//! apart than [`DEFAULT_SLEEP_THRESHOLD_US`], outside every pause/stop gap:
+//! the machine slept while the daemon kept running. Both are derived the same
+//! way as a pause — in SQL, never stored — and read as `gap` identically; only
+//! `observation_gaps`/`silences`'s `kind` column tells the three apart (realm
+//! net-observer, node #109).
 //!
 //! ## Passive stretches
 //!
@@ -141,6 +153,15 @@ pub const DEFAULT_EPISODE_GAP_US: i64 = 30_000_000;
 /// comfortably longer than the ~40 s climb of the coworking gateway signature).
 pub const DEFAULT_RAMP_WINDOW_US: i64 = 120_000_000;
 
+/// The gap between two consecutive samples (of any stream) above which the
+/// record reads a `sleep` rather than a lost tick: 3x the link collector's
+/// default 15 s interval. Embedded as a literal into [`observation_gap_cte`]
+/// rather than threaded as a bind parameter — the CTE feeds four call sites,
+/// each with its own already-verified `?` order, and a config knob (the CLI's
+/// `--sleep-threshold`, the daemon's `cfg.collectors.link.interval`) is a
+/// later step (realm net-observer, node #109).
+pub const DEFAULT_SLEEP_THRESHOLD_US: i64 = 45_000_000;
+
 /// One row per proxy polling tick, collapsing the per-server rows.
 ///
 /// `vless` is `OK` if any server answered, `FAIL` if none did and at least one
@@ -169,27 +190,54 @@ sample_ts AS (
   UNION ALL SELECT ts_us FROM route_event
 )";
 
-/// One row per interval in which the daemon deliberately collected nothing.
+/// One row per interval the record cannot vouch for, with `cause` naming
+/// which of three openers produced it (realm net-observer, node #109). Every
+/// interval is half-open `[gap_opened_us, gap_closed_us)`; `gap_closed_us`
+/// (and `gap_closed_by`) is `NULL` only when nothing at all follows the
+/// opener — the record simply ends inside it.
 ///
-/// A gap opens at each `observing = false` edge and is half-open
-/// `[gap_opened_us, gap_closed_us)`: the pause instant is inside it, the resume
-/// instant is not. It closes at the earliest of three candidates, and
-/// `gap_closed_by` names which one it took:
+/// - **`pause`** — an `observing = false` edge. Closes at the earliest of
+///   three candidates, `gap_closed_by` naming which:
 ///
-/// | `gap_closed_by` | what closed the gap |
-/// | --- | --- |
-/// | `resume` | an operator `observing = true` edge (`cause` `control`) |
-/// | `startup` | a recorded startup edge — this process began collecting |
-/// | `sample` | no edge at all: the first sample of any stream, inferred |
+///   | `gap_closed_by` | what closed the gap |
+///   | --- | --- |
+///   | `resume` | an operator `observing = true` edge (`cause` `control`) |
+///   | `startup` | a recorded startup edge — this process began collecting |
+///   | `sample` | no edge at all: the first sample of any stream, inferred |
 ///
-/// A recorded edge WINS a tie with a sample at the same instant, because it is
-/// the fact and the sample is only evidence of it.
+///   A recorded edge WINS a tie with a sample at the same instant, because it
+///   is the fact and the sample is only evidence of it.
+/// - **`stop`** — a recorded startup edge (`observing_edge` with
+///   `observing AND cause = 'startup'`) that no `pause` gap already explains:
+///   the daemon died or was killed with no pause edge, so the record simply
+///   stops, and the startup edge is the next fact it carries. Opens at the
+///   newest sample strictly before that edge (`gap_closed_by` always
+///   `startup`, closing at the edge itself); a startup edge that already
+///   closes an open `pause` gap opens nothing here (the pause already names
+///   the hole), and neither does the very first startup a record ever sees —
+///   no earlier sample means no "before" to bound.
+/// - **`sleep`** — two consecutive samples of any stream more than
+///   `sleep_threshold_us` apart, outside every `pause`/`stop` gap: nothing
+///   paused or stopped the daemon, but the clock between two ticks jumped
+///   further than a lost tick explains. Always closes `sample` at the later
+///   of the pair.
 ///
-/// `gap_closed_us` (and `gap_closed_by`) is `NULL` when nothing at all follows
-/// the pause: the record simply ends inside it.
-const OBSERVATION_GAP_CTE: &str = "\
-observation_gap AS (
-  SELECT gap_opened_us, gap_closed_us, gap_closed_by
+/// A function rather than a `const`, because the sleep opener embeds its
+/// threshold as a SQL literal — no new `?` placeholder, so the four call
+/// sites keep their already-verified `params` order
+/// ([`DEFAULT_SLEEP_THRESHOLD_US`]).
+/// Expands to several comma-joined sibling CTEs (`pauses`, `stops_raw`,
+/// `stops`, `closed_gap`, `sleeps`, `observation_gap`) — a fragment spliced
+/// into a caller's own `WITH` list right after [`SAMPLE_TS_CTE`], exactly
+/// where the single `observation_gap` CTE used to sit. Each later CTE only
+/// references sibling CTEs already defined earlier in the same list (the
+/// pattern [`SAMPLE_TS_CTE`] itself already relies on), so no nested `WITH`
+/// is needed.
+fn observation_gap_cte(sleep_threshold_us: i64) -> String {
+    format!(
+        "\
+pauses AS (
+  SELECT gap_opened_us, gap_closed_us, gap_closed_by, 'pause' AS cause
   FROM (
     SELECT p.ts_us AS gap_opened_us,
            e.ts_us AS gap_closed_us,
@@ -205,10 +253,55 @@ observation_gap AS (
     ) e ON e.ts_us > p.ts_us
   )
   WHERE rn = 1
-)";
+),
+-- Every recorded startup edge, opened at the newest earlier sample — before
+-- the check below drops the ones a `pause` gap already explains.
+stops_raw AS (
+  SELECT
+    (SELECT max(t.ts_us) FROM sample_ts t WHERE t.ts_us < su.ts_us) AS gap_opened_us,
+    su.ts_us AS gap_closed_us,
+    'startup' AS gap_closed_by,
+    'stop' AS cause
+  FROM (SELECT ts_us FROM observing_edge WHERE observing AND cause = 'startup') su
+),
+stops AS (
+  SELECT gap_opened_us, gap_closed_us, gap_closed_by, cause
+  FROM stops_raw
+  WHERE gap_opened_us IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM pauses p
+      WHERE p.gap_closed_by = 'startup' AND p.gap_closed_us = stops_raw.gap_closed_us
+    )
+),
+-- The finished pause/stop intervals, for the sleep opener to stay clear of.
+closed_gap AS (
+  SELECT gap_opened_us, gap_closed_us FROM pauses
+  UNION ALL SELECT gap_opened_us, gap_closed_us FROM stops
+),
+sleeps AS (
+  SELECT a AS gap_opened_us, b AS gap_closed_us, 'sample' AS gap_closed_by, 'sleep' AS cause
+  FROM (
+    SELECT ts_us AS b, lag(ts_us) OVER (ORDER BY ts_us) AS a
+    FROM (SELECT DISTINCT ts_us FROM sample_ts)
+  )
+  WHERE a IS NOT NULL AND b - a > {sleep_threshold_us}
+    AND NOT EXISTS (
+      SELECT 1 FROM closed_gap c
+      WHERE c.gap_opened_us < b AND (c.gap_closed_us IS NULL OR c.gap_closed_us > a)
+    )
+),
+observation_gap AS (
+  SELECT gap_opened_us, gap_closed_us, gap_closed_by, cause FROM pauses
+  UNION ALL SELECT gap_opened_us, gap_closed_us, gap_closed_by, cause FROM stops
+  UNION ALL SELECT gap_opened_us, gap_closed_us, gap_closed_by, cause FROM sleeps
+)"
+    )
+}
 
 /// The gap containing the moment bound at its two `?` placeholders (the same
-/// value goes to both), or no row at all. At most one row.
+/// value goes to both), or no row at all. At most one row. Reads
+/// [`observation_gap_cte`]'s output generically — any `cause` answers `gap`,
+/// so a stop or a sleep is refused exactly like a pause.
 const GAP_AT_CTE: &str = "\
 gap_at AS (
   SELECT gap_opened_us, gap_closed_us
@@ -223,7 +316,7 @@ gap_at AS (
 /// kind of bracket, read from `probing_edge` (realm net-observer, node #88).
 ///
 /// NOT an observation gap, and deliberately not folded into
-/// [`OBSERVATION_GAP_CTE`]: a passive daemon keeps writing a row per tick, so
+/// [`observation_gap_cte`]: a passive daemon keeps writing a row per tick, so
 /// the per-moment queries already answer `unknown` from the `SKIP`s they find
 /// there, and a moment inside a passive stretch must not read as `gap` — the
 /// record does exist, it just carries no measurement. This CTE only names the
@@ -265,41 +358,46 @@ probing_stretch AS (
   WHERE rn = 1
 )";
 
-/// **Observation gaps** — every interval the operator paused collection for.
+/// **Observation gaps** — every interval the record cannot vouch for at all:
+/// an operator pause, a stop before a startup, or a sleep between ticks.
 ///
-/// The read side of the bracketed silence: one row per gap, open-ended
-/// (`gap_closed_us` `NULL`) only when the record ends inside the pause.
+/// The read side of [`observation_gap_cte`]: one row per gap, carrying `kind`
+/// (`pause` | `stop` | `sleep`), open-ended (`gap_closed_us` `NULL`) only when
+/// the record ends inside it.
 ///
-/// Pauses ONLY, in the shape it has had since it shipped: this is what a
-/// reader built before the probing tier asks for as `DiagnosticQuery::Gaps`,
-/// and a passive stretch listed here would be printed by that reader as a
-/// pause. The passive stretches ride alongside in [`silences_sql`], under a
-/// query id that reader has never heard of.
+/// Never `passive`: a passive stretch still writes a sample every tick (its
+/// probe verdicts `SKIP`), so it is not a hole in the record the way these
+/// three are — this is what a reader built before the probing tier asks for
+/// as `DiagnosticQuery::Gaps`, and a passive stretch listed here would be
+/// printed by that reader as a pause. The passive stretches ride alongside in
+/// [`silences_sql`], under a query id that reader has never heard of.
 pub fn observation_gaps_sql() -> String {
+    let gap = observation_gap_cte(DEFAULT_SLEEP_THRESHOLD_US);
     format!(
         "WITH {SAMPLE_TS_CTE},
-{OBSERVATION_GAP_CTE}
-SELECT gap_opened_us, gap_closed_us, gap_closed_by
+{gap}
+SELECT cause AS kind, gap_opened_us, gap_closed_us, gap_closed_by
 FROM observation_gap ORDER BY gap_opened_us"
     )
 }
 
-/// **Silences** — every bracketed silence the record contains: each interval
-/// the operator paused collection for, and each stretch the daemon spent
-/// withholding its probes.
+/// **Silences** — every bracketed silence the record contains: each
+/// [`observation_gap_cte`] gap (pause, stop, sleep), and each stretch the
+/// daemon spent withholding its probes.
 ///
-/// The read side of both brackets, told apart by `kind`: `pause` rows are the
-/// silence of [`OBSERVATION_GAP_CTE`] (no samples at all — exactly the rows of
-/// [`observation_gaps_sql`]), `passive` rows the withheld probes of
-/// [`PROBING_STRETCH_CTE`] (samples every tick, verdicts `SKIP`). Each is
-/// open-ended (`gap_closed_us` `NULL`) only when the record ends inside it.
-/// (realm net-observer, node #88)
+/// The read side of both brackets, told apart by `kind`: `pause`/`stop`/
+/// `sleep` rows are [`observation_gap_cte`]'s own `cause` (no samples at
+/// all — exactly the rows of [`observation_gaps_sql`]), `passive` rows the
+/// withheld probes of [`PROBING_STRETCH_CTE`] (samples every tick, verdicts
+/// `SKIP`). Each is open-ended (`gap_closed_us` `NULL`) only when the record
+/// ends inside it. (realm net-observer, node #88, node #109)
 pub fn silences_sql() -> String {
+    let gap = observation_gap_cte(DEFAULT_SLEEP_THRESHOLD_US);
     format!(
         "WITH {SAMPLE_TS_CTE},
-{OBSERVATION_GAP_CTE},
+{gap},
 {PROBING_STRETCH_CTE}
-SELECT 'pause' AS kind, gap_opened_us, gap_closed_us, gap_closed_by FROM observation_gap
+SELECT cause AS kind, gap_opened_us, gap_closed_us, gap_closed_by FROM observation_gap
 UNION ALL
 SELECT 'passive' AS kind, gap_opened_us, gap_closed_us, gap_closed_by FROM probing_stretch
 ORDER BY gap_opened_us, kind"
@@ -312,6 +410,7 @@ ORDER BY gap_opened_us, kind"
 ///
 /// Binds one `?` — the starvation threshold — in `layer`'s `CASE`.
 fn layer_state_with() -> String {
+    let gap = observation_gap_cte(DEFAULT_SLEEP_THRESHOLD_US);
     format!(
         "WITH {PROXY_TICK_CTE},
 layer_state AS (
@@ -345,7 +444,7 @@ layer_state AS (
   ASOF LEFT JOIN host_sample h ON l.ts_us >= h.ts_us
 ),
 {SAMPLE_TS_CTE},
-{OBSERVATION_GAP_CTE}"
+{gap}"
     )
 }
 
@@ -554,9 +653,10 @@ ORDER BY ts_us";
 /// the window the daemon was paused for. The listed rows are still real
 /// samples, so the shape can be read by eye; only the number is withheld.
 pub fn gateway_ramp_sql(drop_ts_us: i64, window_us: i64) -> PreparedSql {
+    let gap = observation_gap_cte(DEFAULT_SLEEP_THRESHOLD_US);
     let sql = format!(
         "WITH {SAMPLE_TS_CTE},
-{OBSERVATION_GAP_CTE},
+{gap},
 win AS (
   SELECT ts_us, gw, gw_rtt_ms
   FROM link_sample
@@ -1731,16 +1831,32 @@ mod tests {
         assert!((slope - 20.0).abs() < 0.001, "slope was {slope}");
     }
 
+    /// Old, unrelated samples well outside the default window never leak into
+    /// the fitted rows — the `win` CTE's own `ts_us` range excludes them, same
+    /// as before this test's sibling `sleep` opener existed. But the ~996 s
+    /// stride from the last of them to the ramp's first sample is now itself a
+    /// named hole (realm net-observer, node #109): nothing bridges it, so it
+    /// reads as a `sleep`, and its tail overlaps the window — the slope is
+    /// withheld for the same reason a pause would withhold it, not because
+    /// the orphan samples were counted.
     #[test]
-    fn the_ramp_window_does_not_reach_past_an_earlier_run() {
+    fn an_earlier_runs_orphan_samples_become_a_sleep_that_withholds_the_slope() {
         let s = DuckdbStore::in_memory().unwrap();
-        // Old, unrelated samples well outside the default window.
         for i in 0..5 {
             link(&s, i * SEC, GwVerdict::Ok, Some(999.0), TcpVerdict::Ok);
         }
         let drop_ts = coworking_ramp(&s, 1_000 * SEC);
         let t = s.gateway_ramp(drop_ts).unwrap();
-        assert_eq!(cell(&t, 0, "fitted_samples"), "40");
+        // The orphan samples themselves are still excluded from the window's
+        // own rows — only the ramp's 40 climb ticks plus the drop.
+        assert_eq!(t.rows.len(), 41, "the orphan samples must not appear here");
+        assert_eq!(cell(&t, 0, "fitted_samples"), "");
+        assert_eq!(cell(&t, 0, "slope_ms_per_s"), "");
+        assert_eq!(cell(&t, 0, "observation_gap_us"), "80000000");
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(g.rows.len(), 1, "{:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "sleep");
     }
 
     // ---- 5. fakeip on a .ru name -------------------------------------------
@@ -1953,6 +2069,136 @@ mod tests {
         assert!(s.verdict_at(5 * SEC).unwrap().rows.is_empty());
     }
 
+    // ---- 5b. two more holes the record names on its own: a stop, a sleep ----
+    // (realm net-observer, node #109)
+
+    /// The daemon died or was killed with no pause edge at all: the record
+    /// simply stops, and the next fact it carries is the startup edge. The gap
+    /// runs from the newest sample before that edge to the edge itself, named
+    /// `stop` — and a moment inside it answers `gap` exactly like a pause.
+    #[test]
+    fn a_stop_before_a_startup_opens_a_gap_named_stop() {
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, 10 * SEC);
+        healthy_tick(&s, 20 * SEC);
+        startup_edge(&s, 100 * SEC);
+        healthy_tick(&s, 110 * SEC);
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(g.rows.len(), 1, "{:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "stop");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (20 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (100 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "startup");
+
+        // Inside the stop gap the record refuses exactly like inside a pause.
+        assert_eq!(cell(&s.verdict_at(50 * SEC).unwrap(), 0, "layer"), "gap");
+    }
+
+    /// A startup edge that closes an already-open pause names no stop of its
+    /// own: the pause already explains the hole, so listing a second gap for
+    /// the same edge would double-count it.
+    #[test]
+    fn a_stop_is_not_counted_when_a_pause_already_closes_at_the_startup() {
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, 10 * SEC);
+        healthy_tick(&s, 20 * SEC);
+        edge(&s, 25 * SEC, false);
+        startup_edge(&s, 100 * SEC);
+        healthy_tick(&s, 110 * SEC);
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(g.rows.len(), 1, "no separate stop gap: {:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "pause");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (25 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (100 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "startup");
+    }
+
+    /// Two consecutive samples further apart than the sleep threshold, with
+    /// nothing pausing or stopping the daemon between them: the machine slept.
+    #[test]
+    fn a_sleep_between_two_ticks_opens_a_gap_named_sleep() {
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, 10 * SEC);
+        healthy_tick(&s, 20 * SEC);
+        healthy_tick(&s, 100_000_000);
+        healthy_tick(&s, 100_000_010);
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(g.rows.len(), 1, "{:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "sleep");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (20 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), "100000000");
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "sample");
+    }
+
+    /// The same huge stride between two samples, but already bracketed by an
+    /// operator pause: the sleep opener must not double-count what the pause
+    /// already names.
+    #[test]
+    fn a_sleep_already_covered_by_a_pause_is_not_counted_twice() {
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, 10 * SEC);
+        edge(&s, 20 * SEC, false);
+        edge(&s, 100_000_000, true);
+        healthy_tick(&s, 100_000_010);
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(
+            g.rows.len(),
+            1,
+            "only the pause, no extra sleep: {:?}",
+            g.rows
+        );
+        assert_eq!(cell(&g, 0, "kind"), "pause");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (20 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), "100000000");
+    }
+
+    /// All four causes together, in one record: `silences` lists a passive
+    /// stretch, a pause, a stop and a sleep, each under its own `kind`.
+    #[test]
+    fn silences_lists_pause_stop_sleep_and_passive_kinds_together() {
+        let s = DuckdbStore::in_memory().unwrap();
+        // A passive stretch, closed by an operator switch to active.
+        probing_edge(&s, 5 * SEC, ProbingTier::Passive, None);
+        passive_tick(&s, 10 * SEC);
+        // A pause inside it, closed by resume.
+        edge(&s, 20 * SEC, false);
+        edge(&s, 30 * SEC, true);
+        passive_tick(&s, 30 * SEC);
+        probing_edge(&s, 60 * SEC, ProbingTier::Active, Some(501));
+        healthy_tick(&s, 65 * SEC);
+        // A stop: the daemon dies with no pause edge and boots again.
+        startup_edge(&s, 500 * SEC);
+        healthy_tick(&s, 505 * SEC);
+        // A sleep: a huge stride between two ticks with nothing bracketing it.
+        healthy_tick(&s, 505 * SEC + 100_000_000);
+
+        let g = s.silences().unwrap();
+        let kinds: std::collections::HashSet<String> =
+            (0..g.rows.len()).map(|i| cell(&g, i, "kind")).collect();
+        assert_eq!(
+            kinds,
+            ["pause", "stop", "sleep", "passive"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            "{:?}",
+            g.rows
+        );
+        assert_eq!(
+            cell(&g, 0, "kind"),
+            "passive",
+            "listed by open time: {:?}",
+            g.rows
+        );
+        assert_eq!(cell(&g, 1, "kind"), "pause");
+        assert_eq!(cell(&g, 2, "kind"), "stop");
+        assert_eq!(cell(&g, 3, "kind"), "sleep");
+    }
+
     /// An incident that opened inside a pause has no layer context, and the
     /// pre-pause state is not offered as one.
     #[test]
@@ -2079,8 +2325,8 @@ mod tests {
     /// never `gap`.
     ///
     /// `observation_gaps` (the `Gaps` query a pre-tier reader still asks for)
-    /// keeps its pauses-only shape: no `kind` column, and the stretch is NOT
-    /// among its rows — that reader would print it as a pause.
+    /// carries `kind` too (pause/stop/sleep), but the stretch is NOT among its
+    /// rows — that reader would print it as a pause.
     #[test]
     fn a_passive_stretch_is_a_silence_of_its_own_kind_and_is_not_a_gap() {
         let s = DuckdbStore::in_memory().unwrap();
@@ -2100,8 +2346,8 @@ mod tests {
         let gaps = s.observation_gaps().unwrap();
         assert_eq!(
             gaps.columns,
-            vec!["gap_opened_us", "gap_closed_us", "gap_closed_by"],
-            "`Gaps` keeps the shape it shipped with"
+            vec!["kind", "gap_opened_us", "gap_closed_us", "gap_closed_by"],
+            "`Gaps` now carries `kind` (pause/stop/sleep), but never `passive`"
         );
         assert!(
             gaps.rows.is_empty(),
