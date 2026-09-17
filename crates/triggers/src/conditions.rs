@@ -521,7 +521,11 @@ impl Condition for Roam {
         // The link address, compared the same way — on Wi-Fi ticks only. Kept
         // now carries its own predecessor too (not just Moved's): the
         // macOS-26 reader never has a BSSID to fall back on, so a channel-only
-        // hop still needs a basis when the address itself did not move.
+        // hop still needs a basis when the address itself did not move. Its
+        // provenance folds into `across_gap` the same way Moved's does,
+        // whether or not this predecessor ends up being the one the channel
+        // or router axis actually reads — so a channel-only hop whose basis
+        // came from across a resume is still labelled.
         enum Address<'w> {
             Moved(String, &'w LinkSample),
             Kept(&'w LinkSample),
@@ -532,10 +536,10 @@ impl Condition for Roam {
                 measured_predecessor(w, &recent, |l| wifi_if_mac(l).is_some())
             && let Some(old_mac) = prev.if_mac.as_deref()
         {
+            across_gap |= provenance == LinkProvenance::AcrossGap;
             if old_mac == new_mac {
                 Address::Kept(prev)
             } else {
-                across_gap |= provenance == LinkProvenance::AcrossGap;
                 Address::Moved(
                     format!("link address {old_mac} -> {new_mac} (new DHCP identity)"),
                     prev,
@@ -698,12 +702,17 @@ fn identity_changes<'w, V: PartialEq>(
 /// net-observer, node #109)
 ///
 /// A tick with a field unmeasured (`None`) is skipped in that field's
-/// comparison and never counted as a change (node #25); the address and the
-/// channel are counted only between ticks whose medium was MEASURED as
-/// Wi-Fi, so a wired or undetermined tick is neither counted nor a
-/// comparison basis ([`on_wifi`]) — the channel reading itself is looked up
-/// through [`RecentWindow::wifi_at_or_before`] at each link tick's `ts_us`.
-/// A tick where more than one field moved is one change; the per-field
+/// comparison and never counted as a change (node #25); the address is
+/// counted only between ticks whose medium was MEASURED as Wi-Fi, so a
+/// wired or undetermined tick is neither counted nor a comparison basis
+/// ([`on_wifi`]). The channel is counted only on a Wi-Fi tick whose `bssid`
+/// is UNMEASURED — the macOS-26 profile where channel substitutes for
+/// identity — so its reading is excluded wherever BSSID governs; without
+/// that gate, the wifi and link collectors' independent 15 s cadences would
+/// occasionally land one physical hop's BSSID and channel updates on
+/// different ticks and double-count it. The channel reading itself is
+/// looked up through [`RecentWindow::wifi_at_or_before`] at each link tick's
+/// `ts_us`. A tick where more than one field moved is one change; the per-field
 /// counts in the detail say which moved. The detail is written when the
 /// incident opens, so its counts and span are those of the first firing.
 pub struct WifiChurn;
@@ -718,7 +727,15 @@ impl Condition for WifiChurn {
         let bssid_changes = identity_changes(&links, horizon, |l| l.bssid.as_deref());
         let mac_changes = identity_changes(&links, horizon, wifi_if_mac);
         let channel_changes = identity_changes(&links, horizon, |l| {
-            on_wifi(l).then_some(())?;
+            // BSSID governs whenever it is measured — counting the channel
+            // there too double-counts one physical hop that landed on two
+            // different link ticks (the wifi and link collectors run on
+            // independent 15 s cadences, at an arbitrary phase against each
+            // other). The channel only substitutes for identity on the
+            // macOS-26 profile, where bssid is None on both sides of the
+            // comparison; a tick with a measured bssid is BSSID's to
+            // explain, so its channel reading is excluded here (node #126).
+            (on_wifi(l) && l.bssid.is_none()).then_some(())?;
             let wf = w.wifi_at_or_before(l.ts_us)?;
             Some((wf.channel_band.clone()?, wf.channel?, wf.channel_width_mhz?))
         });
@@ -2584,6 +2601,33 @@ lease renewed (fresh DHCP)"
         );
     }
 
+    /// A channel-only roam (BSSID unmeasured, link address kept) whose
+    /// comparison basis is the carried predecessor across an operator pause
+    /// must still be labelled, exactly like the BSSID and address axes:
+    /// `Address::Kept` folds its own provenance into `across_gap` instead of
+    /// discarding it. The old channel reading is pushed with the carried
+    /// link's own timestamp — `clear_for_resume` forgets every wifi sample,
+    /// so a resumed daemon could never see it again, but the test only needs
+    /// to exercise the comparison this basis feeds, the way the carried
+    /// `LinkSample` itself does for the BSSID/address axes.
+    #[test]
+    fn roam_labels_a_channel_hop_across_a_resume() {
+        let mut w = RecentWindow::new(16);
+        w.push(link_identity(1, None, None, Some(MAC_A)));
+        w.clear_for_resume();
+        w.push(wifi_reading(1, 48, "5ghz", 20));
+        w.push(wifi_reading(10, 153, "5ghz", 80));
+        w.push(link_identity(10, None, None, Some(MAC_A)));
+        let fire = Roam
+            .eval(&w)
+            .expect("a channel hop during a pause must fire at resume");
+        assert!(
+            fire.detail.contains("across an observation gap"),
+            "a channel comparison across a pause must be attributable: {}",
+            fire.detail
+        );
+    }
+
     /// One Wi-Fi identity reading at 15 s tick `tick` on the `Office` SSID.
     fn push_identity(w: &mut RecentWindow, tick: i64, bssid: Option<&str>, if_mac: Option<&str>) {
         w.push(link_identity(tick * TICK_US, Some("Office"), bssid, if_mac));
@@ -2655,6 +2699,53 @@ lease renewed (fresh DHCP)"
         assert_eq!(
             fire.detail,
             "wifi identity churn: 4 changes in ~540s (bssid: 0, link address: 0, channel: 4)"
+        );
+    }
+
+    /// A physical AP hop shows up as a BSSID change on the link tick where
+    /// the link collector re-associated; under the wifi and link
+    /// collectors' independent 15 s cadences, at an arbitrary phase against
+    /// each other, the channel reading can lag by a tick before it catches
+    /// up. BSSID governs whenever it is measured, so the delayed channel
+    /// reading must not be credited as a second identity change for the
+    /// same physical hop — `channel: 0` here is the proof (realm
+    /// net-observer, node #126). Dies under the un-gated channel closure,
+    /// which read 5 changes (with `channel: 1`) instead of 4.
+    #[test]
+    fn wifi_churn_does_not_double_count_a_bssid_hop_whose_channel_lags_a_tick() {
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        push_identity(&mut w, 0, Some(AP_A), Some(MAC_A));
+        push_identity(&mut w, 12, Some(AP_A), Some(MAC_B)); // mac change #1
+        push_identity(&mut w, 24, Some(AP_A), Some(MAC_A)); // mac change #2
+        push_identity(&mut w, 36, Some(AP_B), Some(MAC_A)); // the BSSID hop
+        w.push(wifi_reading(36 * TICK_US, 48, "5ghz", 20));
+        w.push(wifi_reading(37 * TICK_US, 153, "5ghz", 20)); // catches up a tick later
+        push_identity(&mut w, 37, Some(AP_B), Some(MAC_A));
+        push_identity(&mut w, 48, Some(AP_B), Some(MAC_B)); // mac change #3
+        let fire = WifiChurn.eval(&w).expect("four identity changes must fire");
+        assert_eq!(
+            fire.detail,
+            "wifi identity churn: 4 changes in ~540s (bssid: 1, link address: 3, channel: 0)"
+        );
+    }
+
+    /// The macOS-26 profile, isolated: BSSID is unmeasured throughout, so a
+    /// single channel hop is the whole observable signal for one physical AP
+    /// move — counted once, neither dropped nor doubled.
+    #[test]
+    fn wifi_churn_counts_a_bare_channel_hop_as_one_change() {
+        let mut w = RecentWindow::new(WINDOW_CAP);
+        w.push(wifi_reading(0, 48, "5ghz", 20));
+        push_identity(&mut w, 0, None, Some(MAC_A));
+        push_identity(&mut w, 12, None, Some(MAC_B)); // mac change #1
+        push_identity(&mut w, 24, None, Some(MAC_A)); // mac change #2
+        w.push(wifi_reading(36 * TICK_US, 153, "5ghz", 20)); // the channel hop
+        push_identity(&mut w, 36, None, Some(MAC_A));
+        push_identity(&mut w, 48, None, Some(MAC_B)); // mac change #3
+        let fire = WifiChurn.eval(&w).expect("four identity changes must fire");
+        assert_eq!(
+            fire.detail,
+            "wifi identity churn: 4 changes in ~540s (bssid: 0, link address: 3, channel: 1)"
         );
     }
 
