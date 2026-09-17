@@ -307,21 +307,83 @@ fn spawn_topology_patrol(
     })
 }
 
-/// One retention sweep of the record: for each configured table, delete every
-/// row older than `record.retention_days` through the store's own allow-list
-/// (realm net-observer, node #130). Never called with `retention_days == 0`
-/// — that is keep-forever, decided by the caller.
+/// The retention plan a configuration asks for: `None` for keep-forever
+/// (`retention_days == 0`) or an empty table list, otherwise the window and
+/// the tables the sweep will prune — each name checked against the store's
+/// own allow-list, the air slice made whole, duplicates folded (realm
+/// net-observer, node #130).
 ///
-/// Each prune runs on the blocking pool, the way the socket's diagnoses do: a
-/// `DELETE` over a table with months of ticks holds the connection mutex for
-/// as long as it takes, and the reactor must not wait with it. A failure —
-/// a name the store refuses, a driver error — is logged and the next table
-/// is tried; it never propagates: a table that could not be pruned is a
-/// fuller record, not a broken one.
+/// A name outside `store::PRUNABLE_TABLES` is an error and the daemon refuses
+/// to start: an unknown name is never a silent fall-back, as an unknown
+/// probing tier is not — and the five sample tables the gap derivation reads
+/// are outside that list by design, so a config asking to prune them is
+/// refused here, before the store is even opened. Checked whether or not a
+/// window is set. Naming either half of the air slice (`air_sample` /
+/// `air_ap`) names both; the half added is logged so the operator sees the
+/// list the daemon actually runs.
+fn retention_plan(record: &config::RecordCfg) -> anyhow::Result<Option<config::RecordCfg>> {
+    let mut tables: Vec<String> = Vec::new();
+    for name in &record.retention_tables {
+        if !store::PRUNABLE_TABLES.contains(&name.as_str()) {
+            anyhow::bail!(
+                "record retention: `{name}` is not a prunable table; \
+                 [record] retention_tables may name only {:?}",
+                store::PRUNABLE_TABLES
+            );
+        }
+        if !tables.contains(name) {
+            tables.push(name.clone());
+        }
+    }
+    if record.retention_days == 0 {
+        tracing::info!("record retention: keep forever");
+        return Ok(None);
+    }
+    if tables.is_empty() {
+        tracing::info!("record retention: no tables listed");
+        return Ok(None);
+    }
+    if store::AIR_SLICE
+        .iter()
+        .any(|half| tables.iter().any(|t| t == half))
+    {
+        for half in store::AIR_SLICE {
+            if !tables.iter().any(|t| t == half) {
+                tracing::info!(
+                    "record retention: air_sample and air_ap are one scan slice; \
+                     pruning {half} with its pair"
+                );
+                tables.push(half.to_string());
+            }
+        }
+    }
+    Ok(Some(config::RecordCfg {
+        retention_days: record.retention_days,
+        retention_tables: tables,
+    }))
+}
+
+/// One retention sweep of the record: for each table of a plan
+/// [`retention_plan`] returned, delete every row older than
+/// `record.retention_days` through the store's own allow-list (realm
+/// net-observer, node #130). A window of `0` returns at once: that is
+/// keep-forever, and a cutoff computed from it would be "everything before
+/// now" — the whole record — so the guard lives here, in the function whose
+/// failure mode that is, not only in its caller.
+///
+/// Each prune runs on the blocking pool: a `DELETE` over a table with months
+/// of ticks holds the connection mutex for as long as it takes, and the
+/// reactor must not wait with it. A failure — a name the store refuses, a
+/// driver error — is logged and the next table is tried; it never
+/// propagates: a table that could not be pruned is a fuller record, not a
+/// broken one.
 async fn prune_record(store: &Arc<DuckdbStore>, record: &config::RecordCfg) {
     use store::Store as _;
 
     let days = record.retention_days;
+    if days == 0 {
+        return;
+    }
     // Saturating on purpose: an absurd `retention_days` must land the cutoff
     // before every row (nothing pruned), never wrap it past them all.
     let cutoff_us = types::now_us().saturating_sub(i64::from(days).saturating_mul(86_400_000_000));
@@ -354,8 +416,11 @@ async fn prune_record(store: &Arc<DuckdbStore>, record: &config::RecordCfg) {
 
 /// Spawn the daily retention sweep. The startup sweep has already run by the
 /// time this is called, so the interval's immediate first tick is consumed
-/// before the loop; `Delay` so a laptop asleep past a tick sweeps once on
-/// waking, not in a burst.
+/// before the loop. The interval counts AWAKE time: tokio's timer does not
+/// advance while the Mac sleeps, so a laptop awake eight hours a day sweeps
+/// every three wall days or so — a later sweep, never a missed one. `Delay`
+/// keeps consecutive sweeps a full interval apart even after a late tick,
+/// rather than firing a burst to catch up.
 fn spawn_retention_sweep(store: Arc<DuckdbStore>, record: config::RecordCfg) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(RETENTION_SWEEP_INTERVAL);
@@ -457,6 +522,12 @@ async fn run_daemon() -> anyhow::Result<()> {
     let cfg = Config::load(cli.config.as_deref()).context("loading config")?;
     tracing::info!(db = %cfg.db_path, "starting net-observerd");
 
+    // The record's retention plan, validated BEFORE the store is opened: a
+    // config naming a table the store will not prune refuses to start here,
+    // having written nothing (realm net-observer, node #130). `None` is
+    // keep-forever or an empty list — no sweep at all.
+    let retention = retention_plan(&cfg.record)?;
+
     // Ensure the store + blob directories exist before opening the database.
     if let Some(parent) = Path::new(&cfg.db_path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -518,23 +589,21 @@ async fn run_daemon() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "failed to close stale open incidents"),
     }
 
-    // The record's retention: keep forever unless config says otherwise (the
-    // policy is the owner's; this is the mechanism — realm net-observer, node
-    // #130). With a window set, the first sweep runs HERE, before any
-    // collector can write, and the daily one is spawned; its handle joins
-    // the collectors' below so shutdown aborts it with them.
-    let retention_sweep = if cfg.record.retention_days == 0 {
-        tracing::info!("record retention: keep forever");
-        None
-    } else {
+    // The record's retention sweep, for the plan validated above (the policy
+    // is the owner's; this is the mechanism — realm net-observer, node #130).
+    // The first sweep runs HERE, before any collector can write, and the
+    // daily one is spawned; its handle joins the collectors' below so shutdown
+    // aborts it with them.
+    let mut retention_sweep = None;
+    if let Some(record) = retention {
         tracing::info!(
-            days = cfg.record.retention_days,
-            tables = ?cfg.record.retention_tables,
-            "record retention: pruning at startup and then daily"
+            days = record.retention_days,
+            tables = ?record.retention_tables,
+            "record retention: pruning at startup and then every 24 h awake"
         );
-        prune_record(&store, &cfg.record).await;
-        Some(spawn_retention_sweep(store.clone(), cfg.record.clone()))
-    };
+        prune_record(&store, &record).await;
+        retention_sweep = Some(spawn_retention_sweep(store.clone(), record));
+    }
 
     // The OUI registry for neighbour ROLE inference, loaded ONCE here and shared
     // (Arc) by the passive collector and the active scanner — loading it per tick
