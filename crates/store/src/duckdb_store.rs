@@ -311,7 +311,7 @@ fn value_to_string(v: &duckdb::types::Value) -> String {
 
 impl Store for DuckdbStore {
     fn write_sample(&self, s: &Sample) -> Result<(), StoreError> {
-        let c = self.conn.lock().unwrap();
+        let mut c = self.conn.lock().unwrap();
         match s {
             Sample::Link(l) => c.execute(
                 "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -472,16 +472,22 @@ impl Store for DuckdbStore {
             // tick with none, ONE all-NULL row carrying the verdict, so a SKIP
             // (could not look) and an empty OK (nothing is talking) are both
             // rows, and different ones (realm net-observer, node #75).
+            //
+            // The tick is ONE transaction: a failure on any row rolls the whole
+            // tick back (the transaction drops uncommitted on the early `?`
+            // return), so `connections_sql` never presents a half-written tick
+            // as the complete flow table.
             Sample::Connections(cs) => {
                 let verdict = cs.verdict.to_string();
+                let tx = c.transaction()?;
                 if cs.rows.is_empty() {
-                    c.execute(
+                    tx.execute(
                         "INSERT INTO connection_sample (ts_us, verdict) VALUES (?,?)",
                         params![cs.ts_us, verdict],
                     )?;
                 }
                 for r in &cs.rows {
-                    c.execute(
+                    tx.execute(
                         "INSERT INTO connection_sample VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                         params![
                             cs.ts_us, verdict, r.host, r.dst_ip, r.dst_port, r.process, r.network,
@@ -489,6 +495,7 @@ impl Store for DuckdbStore {
                         ],
                     )?;
                 }
+                tx.commit()?;
                 0
             }
         };
@@ -1578,7 +1585,7 @@ mod tests {
             dst_port: Some(443),
             process: process.map(str::to_string),
             network: "tcp".into(),
-            chain: Some("vless-main".into()),
+            chain: Some("vless-out-6".into()),
             count,
             upload: 10 * u64::from(count),
             download: 5000,
@@ -1615,7 +1622,7 @@ mod tests {
             s.query_scalar_i64(
                 "SELECT count(*) FROM connection_sample WHERE ts_us=8000 AND verdict='OK' \
                  AND host='claude.ai' AND dst_ip IS NULL AND dst_port=443 AND process IS NULL \
-                 AND network='tcp' AND chain='vless-main' AND count=3 AND upload=30 \
+                 AND network='tcp' AND chain='vless-out-6' AND count=3 AND upload=30 \
                  AND download=5000"
             )
             .unwrap(),
@@ -1637,6 +1644,39 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    /// A multi-row tick lands whole under one transaction — every row present,
+    /// one `ts_us`, and the grouped read sees exactly that tick — so a store
+    /// that commits per tick has nothing half-written to present.
+    #[test]
+    fn a_three_row_tick_is_written_whole_and_read_as_one_tick() {
+        use types::{ConnectionsGroupBy, ConnectionsSample, ConnectionsVerdict};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Connections(ConnectionsSample {
+            ts_us: 8300,
+            verdict: ConnectionsVerdict::Ok,
+            rows: vec![
+                connection_row(Some("a.example"), None, None, 1),
+                connection_row(Some("b.example"), Some("10.0.0.2"), Some("curl"), 2),
+                connection_row(None, Some("10.0.0.3"), None, 1),
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM connection_sample WHERE ts_us=8300")
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(DISTINCT ts_us) FROM connection_sample")
+                .unwrap(),
+            1
+        );
+        let t = s.connections(ConnectionsGroupBy::Host).unwrap();
+        let ts = t.columns.iter().position(|c| c == "ts_us").unwrap();
+        assert_eq!(t.rows.len(), 3);
+        assert!(t.rows.iter().all(|r| r[ts] == "8300"), "{:?}", t.rows);
     }
 
     /// The distinction the SKIP rule exists for, at the storage layer: a tick
