@@ -167,6 +167,7 @@ fn stopped(
         heard: Some(HeardFrames {
             total: 0,
             own: Some(0),
+            dropped: 0,
         }),
     })
 }
@@ -219,17 +220,29 @@ impl<R: Read + Send + 'static, S: SegmentIdentity> EventSource for AnnounceSourc
         if ended.is_none() || !window.is_empty() {
             let heard = window.heard();
             let undecoded = window.undecoded();
-            let dropped = window.dropped();
             let sample = window.flush(ts_us);
-            tracing::debug!(
-                heard = heard.total,
-                own = ?heard.own,
-                undecoded,
-                dropped,
-                neighbours = sample.neighbors.len(),
-                services = sample.services.len(),
-                "announce: window flushed"
-            );
+            // A window that refused observations is worth a warning; the
+            // routine flush is not.
+            if heard.dropped > 0 {
+                tracing::warn!(
+                    heard = heard.total,
+                    own = ?heard.own,
+                    undecoded,
+                    dropped = heard.dropped,
+                    neighbours = sample.neighbors.len(),
+                    services = sample.services.len(),
+                    "announce: window flushed with observations refused by its caps"
+                );
+            } else {
+                tracing::debug!(
+                    heard = heard.total,
+                    own = ?heard.own,
+                    undecoded,
+                    neighbours = sample.neighbors.len(),
+                    services = sample.services.len(),
+                    "announce: window flushed"
+                );
+            }
             out.push(Sample::Neighbors(sample));
         }
         if let Some(reason) = ended {
@@ -361,7 +374,8 @@ mod tests {
             flush.heard,
             Some(HeardFrames {
                 total: 3,
-                own: Some(1)
+                own: Some(1),
+                dropped: 0
             })
         );
         assert_eq!(flush.network_key.as_deref(), Some("60:22:32:aa:25:21"));
@@ -424,7 +438,8 @@ mod tests {
             s.heard,
             Some(HeardFrames {
                 total: 0,
-                own: Some(0)
+                own: Some(0),
+                dropped: 0
             })
         );
         assert_eq!(s.verdict, NeighborsVerdict::Ok);
@@ -462,7 +477,8 @@ mod tests {
             s.heard,
             Some(HeardFrames {
                 total: 3,
-                own: Some(1)
+                own: Some(1),
+                dropped: 0
             })
         );
         assert!(s.neighbors.iter().all(|n| n.mac != mac_text(&OWN)));
@@ -479,7 +495,8 @@ mod tests {
             s.heard,
             Some(HeardFrames {
                 total: 3,
-                own: Some(1)
+                own: Some(1),
+                dropped: 0
             })
         );
         assert!(s.neighbors.iter().all(|n| n.mac != mac_text(&PEER)));
@@ -495,7 +512,8 @@ mod tests {
             s.heard,
             Some(HeardFrames {
                 total: 3,
-                own: None
+                own: None,
+                dropped: 0
             })
         );
         assert_eq!(s.neighbors.len(), 3);

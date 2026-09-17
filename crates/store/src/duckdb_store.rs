@@ -464,7 +464,7 @@ impl Store for DuckdbStore {
             // flush (realm net-observer, node #92).
             Sample::Neighbors(n) => {
                 c.execute(
-                    "INSERT INTO neighbor_sample VALUES (?,?,?,?,?,?,?,?)",
+                    "INSERT INTO neighbor_sample VALUES (?,?,?,?,?,?,?,?,?)",
                     params![
                         n.ts_us,
                         n.network_key,
@@ -473,7 +473,8 @@ impl Store for DuckdbStore {
                         n.reason,
                         i32::try_from(n.neighbors.len()).unwrap_or(i32::MAX),
                         n.heard.map(|h| h.total),
-                        n.heard.and_then(|h| h.own)
+                        n.heard.and_then(|h| h.own),
+                        n.heard.map(|h| h.dropped)
                     ],
                 )?;
                 let key = n.network_key.as_deref().unwrap_or(UNKNOWN_NETWORK);
@@ -992,7 +993,7 @@ mod tests {
         ts_us: i64,
         ip: Option<&str>,
         detail: Option<&str>,
-        heard: (u32, Option<u32>),
+        heard: (u32, Option<u32>, u32),
     ) -> Sample {
         use types::{AnnounceKind, AnnouncedService, HeardFrames};
         Sample::Neighbors(NeighborsSample {
@@ -1018,6 +1019,7 @@ mod tests {
             heard: Some(HeardFrames {
                 total: heard.0,
                 own: heard.1,
+                dropped: heard.2,
             }),
         })
     }
@@ -1034,23 +1036,23 @@ mod tests {
             1000,
             Some("192.168.1.6"),
             Some("0xFF"),
-            (7, Some(2)),
+            (7, Some(2), 0),
         ))
         .unwrap();
-        // The repeat: no address, no detail, more frames, and no own MAC to
-        // tell our frames by.
-        s.write_sample(&listener_flush(2000, None, None, (3, None)))
+        // The repeat: no address, no detail, more frames, no own MAC to tell
+        // our frames by, and five observations its caps refused.
+        s.write_sample(&listener_flush(2000, None, None, (3, None, 5)))
             .unwrap();
 
         let t = s
             .query_table(
-                "SELECT ts_us, heard_frames, own_frames, neighbor_count \
+                "SELECT ts_us, heard_frames, own_frames, dropped_obs, neighbor_count \
                  FROM neighbor_sample ORDER BY ts_us",
             )
             .unwrap();
-        assert_eq!(t.rows[0], vec!["1000", "7", "2", "1"]);
+        assert_eq!(t.rows[0], vec!["1000", "7", "2", "0", "1"]);
         // A window with no readable own MAC: heard counted, own NULL — not 0.
-        assert_eq!(t.rows[1], vec!["2000", "3", "", "1"]);
+        assert_eq!(t.rows[1], vec!["2000", "3", "", "5", "1"]);
 
         let t = s
             .query_table("SELECT source, hostname, ip FROM neighbor")
@@ -1097,9 +1099,12 @@ mod tests {
         ))
         .unwrap();
         let t = s
-            .query_table("SELECT heard_frames IS NULL, own_frames IS NULL FROM neighbor_sample")
+            .query_table(
+                "SELECT heard_frames IS NULL, own_frames IS NULL, dropped_obs IS NULL \
+                 FROM neighbor_sample",
+            )
             .unwrap();
-        assert_eq!(t.rows[0], vec!["true", "true"]);
+        assert_eq!(t.rows[0], vec!["true", "true", "true"]);
         assert_eq!(
             s.query_scalar_i64("SELECT count(*) FROM neighbor_service")
                 .unwrap(),

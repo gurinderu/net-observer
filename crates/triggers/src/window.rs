@@ -525,6 +525,7 @@ mod tests {
             Some(HeardFrames {
                 total: 3,
                 own: Some(0),
+                dropped: 0,
             }),
             "a4:83:e7:1b:2c:3d",
         ));
@@ -539,6 +540,7 @@ mod tests {
             Some(HeardFrames {
                 total: 0,
                 own: Some(0),
+                dropped: 0,
             }),
             "a4:83:e7:1b:2c:3d",
         ));

@@ -14,14 +14,20 @@
 //!   target, would put the sleeper's name on the proxy's row. Neither is a
 //!   name claim here.
 //! * `SRV` — the owner is a service *instance* (`Nick._companion-link._tcp.local`):
-//!   its type is the service, its first label the detail.
+//!   its type is the service, its first label the detail — unless the
+//!   message ties the SRV target to an address that is not the frame's
+//!   source: then the instance is announced on another host's behalf (the
+//!   Sleep Proxy again) and is refused and counted (`proxied`), not put on
+//!   the announcer's row.
 //! * `PTR` — under `_services._dns-sd._udp.local` the target names a type the
-//!   sender offers; under a service type the target is an instance of it;
-//!   under `in-addr.arpa` / `ip6.arpa` the target is a reverse-lookup name,
-//!   a claim only when the owner spells the frame's own source address.
+//!   sender offers; under a service type the target is an instance of it
+//!   (refused with the instance when that instance is proxied); under
+//!   `in-addr.arpa` / `ip6.arpa` the target is a reverse-lookup name, a
+//!   claim only when the owner spells the frame's own source address.
 //!
 //! `TXT`, `NSEC`, `OPT` and every other type carry nothing the record wants.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use simple_dns::rdata::RData;
@@ -39,6 +45,12 @@ pub struct MdnsFacts {
     /// (`_companion-link._tcp`), the detail an instance name when the record
     /// carried one.
     pub services: Vec<(String, Option<String>)>,
+    /// Service records the message announced on another host's behalf — an
+    /// SRV whose target the message ties to an address that is not the
+    /// frame's source, and the PTRs naming that instance: a Bonjour Sleep
+    /// Proxy answering for a sleeper. Not the sender's services, so not in
+    /// `services`; counted so the flush can say it refused them.
+    pub proxied: u32,
 }
 
 /// The meta-query name under which DNS-SD responders enumerate their types.
@@ -51,16 +63,49 @@ const LOCAL: &str = "local";
 #[must_use]
 pub fn decode(payload: &[u8], src_ip: IpAddr) -> Option<MdnsFacts> {
     let packet = Packet::parse(payload).ok()?;
-    let mut facts = MdnsFacts::default();
-    // Ranked name claims: (rank, name); lower rank = stronger.
-    let mut names: Vec<(u8, String)> = Vec::new();
-    let records = packet
+    let records: Vec<&ResourceRecord<'_>> = packet
         .answers
         .iter()
         .chain(packet.name_servers.iter())
-        .chain(packet.additional_records.iter());
+        .chain(packet.additional_records.iter())
+        .collect();
+
+    // What addresses the message itself ties to each name.
+    let mut addresses: BTreeMap<String, Vec<IpAddr>> = BTreeMap::new();
+    for rr in &records {
+        let addr = match &rr.rdata {
+            RData::A(a) => IpAddr::V4(Ipv4Addr::from(a.address)),
+            RData::AAAA(a) => IpAddr::V6(Ipv6Addr::from(a.address)),
+            _ => continue,
+        };
+        addresses
+            .entry(join(&labels(&rr.name)))
+            .or_default()
+            .push(addr);
+    }
+    // Instances announced on another host's behalf: an SRV whose target the
+    // message ties to addresses none of which is the frame's source — the
+    // Sleep Proxy shape. A target the message ties to nothing is taken as
+    // the sender's own (a responder always includes its own address records).
+    let proxied: BTreeSet<String> = records
+        .iter()
+        .filter_map(|rr| match &rr.rdata {
+            RData::SRV(srv) => {
+                let target = join(&labels(&srv.target));
+                addresses
+                    .get(&target)
+                    .is_some_and(|ips| !ips.contains(&src_ip))
+                    .then(|| join(&labels(&rr.name)))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut facts = MdnsFacts::default();
+    // Ranked name claims: (rank, name); lower rank = stronger.
+    let mut names: Vec<(u8, String)> = Vec::new();
     for rr in records {
-        absorb(rr, src_ip, &mut names, &mut facts.services);
+        absorb(rr, src_ip, &proxied, &mut names, &mut facts);
     }
     // Stable, so two claims of one rank keep record order.
     names.sort_by_key(|(rank, _)| *rank);
@@ -76,8 +121,9 @@ pub fn decode(payload: &[u8], src_ip: IpAddr) -> Option<MdnsFacts> {
 fn absorb(
     rr: &ResourceRecord<'_>,
     src_ip: IpAddr,
+    proxied: &BTreeSet<String>,
     names: &mut Vec<(u8, String)>,
-    services: &mut Vec<(String, Option<String>)>,
+    facts: &mut MdnsFacts,
 ) {
     let owner = labels(&rr.name);
     match &rr.rdata {
@@ -94,7 +140,11 @@ fn absorb(
         RData::SRV(_) => {
             // Owner: <instance> . <_type> . <_tcp|_udp> . local
             if let Some((service, instance)) = split_instance(&owner) {
-                services.push((service, Some(instance)));
+                if proxied.contains(&join(&owner)) {
+                    facts.proxied += 1;
+                } else {
+                    facts.services.push((service, Some(instance)));
+                }
             }
         }
         RData::PTR(ptr) => {
@@ -102,19 +152,22 @@ fn absorb(
             let owner_text = join(&owner);
             if owner_text == SERVICES_META {
                 if let Some(service) = service_type(&target) {
-                    services.push((service, None));
+                    facts.services.push((service, None));
                 }
             } else if is_reverse_of(&owner, src_ip) {
                 names.push((1, join(&target)));
             } else if let Some(service) = service_type(&owner) {
-                let instance = split_instance(&target).map(|(_, i)| i);
-                services.push((service, instance));
+                if proxied.contains(&join(&target)) {
+                    facts.proxied += 1;
+                } else {
+                    let instance = split_instance(&target).map(|(_, i)| i);
+                    facts.services.push((service, instance));
+                }
             }
         }
         _ => {}
     }
 }
-
 /// Whether `owner` is the reverse-lookup name of `ip`: `d.c.b.a.in-addr.arpa`
 /// for an IPv4 `a.b.c.d`, or the 32 reversed nibbles under `ip6.arpa`.
 fn is_reverse_of(owner: &[String], ip: IpAddr) -> bool {
@@ -236,6 +289,7 @@ pub(crate) mod tests {
                 ("_asquic._udp".to_string(), Some("0xFF".to_string())),
             ]
         );
+        assert_eq!(facts.proxied, 0, "the SRV target is the sender itself");
     }
 
     /// Only a name the packet ties to the frame's own source is the sender's:
@@ -284,15 +338,20 @@ pub(crate) mod tests {
         );
     }
 
-    /// The Sleep Proxy shape itself: a proxy announcing a sleeper's `A`, `SRV`
-    /// and reverse pointer from the proxy's own address names nobody, while
-    /// the services it offers on the sleeper's behalf are still announced
-    /// from the proxy's MAC (they are reachable there — that is the point).
+    /// The Sleep Proxy shape itself: a proxy announcing a sleeper's `A`, `SRV`,
+    /// service `PTR` and reverse pointer from the proxy's own address names
+    /// nobody and offers nothing on the proxy's row — the SRV target's address
+    /// is not the frame's source, so the instance is somebody else's — and
+    /// the refused records are counted, so the flush can say so.
     #[test]
-    fn a_sleep_proxys_announcement_carries_no_hostname_for_the_proxy() {
+    fn a_sleep_proxys_announcement_yields_neither_name_nor_service_for_the_proxy() {
         let proxy = Ipv4Addr::new(192, 168, 1, 9);
         let sleeper = Ipv4Addr::new(192, 168, 1, 6);
         let mut p = Packet::new_reply(0);
+        p.answers.push(rr(
+            "_afpovertcp._tcp.local",
+            RData::PTR(PTR(Name::new_unchecked("Sleeper._afpovertcp._tcp.local"))),
+        ));
         p.answers.push(rr(
             "Sleeper._afpovertcp._tcp.local",
             RData::SRV(SRV {
@@ -314,10 +373,17 @@ pub(crate) mod tests {
         ));
         let facts = decode(&p.build_bytes_vec().unwrap(), IpAddr::V4(proxy)).unwrap();
         assert!(facts.hostnames.is_empty(), "{:?}", facts.hostnames);
+        assert!(facts.services.is_empty(), "{:?}", facts.services);
+        assert_eq!(facts.proxied, 2, "the SRV and the PTR naming its instance");
+
+        // The same message from the sleeper itself is its own announcement.
+        let own = decode(&p.build_bytes_vec().unwrap(), IpAddr::V4(sleeper)).unwrap();
+        assert_eq!(own.hostnames, vec!["sleeper.local"]);
         assert_eq!(
-            facts.services,
+            own.services,
             vec![("_afpovertcp._tcp".to_string(), Some("Sleeper".to_string()))]
         );
+        assert_eq!(own.proxied, 0);
     }
 
     /// The reverse-pointer check, both families, case-insensitively.

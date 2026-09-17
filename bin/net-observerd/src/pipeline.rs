@@ -1963,6 +1963,7 @@ mod tests {
             heard: Some(HeardFrames {
                 total: 5,
                 own: Some(1),
+                dropped: 0,
             }),
         });
 
@@ -2487,6 +2488,7 @@ mod tests {
                 heard: Some(HeardFrames {
                     total: 0,
                     own: Some(0),
+                    dropped: 0,
                 }),
             })
         };

@@ -137,6 +137,12 @@ CREATE TABLE IF NOT EXISTS neighbor_sample (
 -- migration treatment as link_sample.
 ALTER TABLE neighbor_sample ADD COLUMN IF NOT EXISTS heard_frames UINTEGER;
 ALTER TABLE neighbor_sample ADD COLUMN IF NOT EXISTS own_frames UINTEGER;
+-- Observations the window's caps refused (a sighting past the device cap, an
+-- address or service past its per-device cap, a DHCP name past the pending
+-- cap, a service announced on another host's behalf): how much a flush lost.
+-- NULL exactly when heard_frames is (not a listener flush); 0 when nothing
+-- was refused. Same migration treatment.
+ALTER TABLE neighbor_sample ADD COLUMN IF NOT EXISTS dropped_obs UINTEGER;
 CREATE TABLE IF NOT EXISTS neighbor (
   network_key VARCHAR, mac VARCHAR, ip VARCHAR, iface VARCHAR, oui VARCHAR,
   hostname VARCHAR, source VARCHAR, first_seen_us BIGINT, last_seen_us BIGINT,

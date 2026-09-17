@@ -489,7 +489,8 @@ impl Event {
             },
             // A listener flush carries its frame counts after the reading:
             // `heard=<n> own=<m>`, with `own=?` when the window had no own
-            // MAC to tell its frames by (realm net-observer, node #92).
+            // MAC to tell its frames by, and ` dropped=<k>` only when the window's
+            // caps refused something (realm net-observer, node #92).
             Event::Neighbors(n) => {
                 let mut line = match n.verdict {
                     types::NeighborsVerdict::Skip => {
@@ -508,6 +509,9 @@ impl Event {
                         .map(|o| o.to_string())
                         .unwrap_or_else(|| "?".to_string());
                     line.push_str(&format!(" heard={} own={own}", heard.total));
+                    if heard.dropped > 0 {
+                        line.push_str(&format!(" dropped={}", heard.dropped));
+                    }
                 }
                 line
             }
@@ -2324,7 +2328,8 @@ mod tests {
             reading(
                 Some(types::HeardFrames {
                     total: 7,
-                    own: Some(2)
+                    own: Some(2),
+                    dropped: 0
                 }),
                 types::NeighborsVerdict::Ok
             )
@@ -2335,7 +2340,8 @@ mod tests {
             reading(
                 Some(types::HeardFrames {
                     total: 7,
-                    own: None
+                    own: None,
+                    dropped: 0
                 }),
                 types::NeighborsVerdict::Ok
             )
@@ -2345,8 +2351,21 @@ mod tests {
         assert_eq!(
             reading(
                 Some(types::HeardFrames {
+                    total: 1000,
+                    own: Some(0),
+                    dropped: 488
+                }),
+                types::NeighborsVerdict::Ok
+            )
+            .detail(),
+            "0 on en0 net=aa:bb:cc:dd:ee:ff heard=1000 own=0 dropped=488"
+        );
+        assert_eq!(
+            reading(
+                Some(types::HeardFrames {
                     total: 0,
-                    own: Some(0)
+                    own: Some(0),
+                    dropped: 0
                 }),
                 types::NeighborsVerdict::Skip
             )

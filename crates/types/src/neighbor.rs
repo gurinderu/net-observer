@@ -202,6 +202,14 @@ pub struct HeardFrames {
     /// NOT the passivity proof — that stays the frozen pcap slice (realm
     /// net-observer, node #88).
     pub own: Option<u32>,
+    /// Observations the window's caps refused — a sighting past the device
+    /// cap, an address or service past its per-device cap, a DHCP name past
+    /// the pending cap, a service announced on another host's behalf (a Sleep
+    /// Proxy's) — so a flush that lost something says how much. `0` when
+    /// nothing was refused; `serde(default)` so a flush from before the
+    /// counter still decodes.
+    #[serde(default)]
+    pub dropped: u32,
 }
 
 /// One tick of the `neighbors` collector.
@@ -335,6 +343,7 @@ mod tests {
             heard: Some(HeardFrames {
                 total: 7,
                 own: Some(2),
+                dropped: 0,
             }),
         };
         assert!(flush.is_listener_flush());

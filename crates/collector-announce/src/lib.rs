@@ -45,6 +45,6 @@ pub mod ssdp;
 pub mod window;
 
 pub use collector::{AnnounceCollector, META};
-pub use frame::{Mac, mac_octets, mac_text};
+pub use frame::{Mac, is_unicast, mac_octets, mac_text};
 pub use source::{AnnounceSource, FLUSH_EVERY, SegmentIdentity, SegmentIdentityReading};
 pub use window::Window;

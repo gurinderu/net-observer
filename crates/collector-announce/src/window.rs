@@ -32,8 +32,10 @@
 //! Devices are keyed by MAC and services by `(MAC, service)`, and each is
 //! capped ([`MAX_DEVICES`], [`MAX_IPS_PER_DEVICE`],
 //! [`MAX_SERVICES_PER_DEVICE`], [`MAX_PENDING_NAMES`]), so a window is bounded
-//! by these numbers, never by the segment's chatter; what the caps refuse is
-//! counted in `dropped` and logged at the flush.
+//! by these numbers, never by the segment's chatter. What the caps refuse —
+//! and a service a Sleep Proxy announced on a sleeper's behalf, refused
+//! for the same reason a stranger's name is — is counted in `dropped`,
+//! carried on the flush (`HeardFrames::dropped`) and warned about at it.
 //!
 //! One rule picks the address a row carries, for the neighbour row and the
 //! service row alike: a routable IPv4 first, then a routable IPv6, then a
@@ -187,13 +189,14 @@ impl Window {
         }
     }
 
-    /// The frame counts so far; `own` is `None` when this window has no own
-    /// MAC to recognise its frames by.
+    /// The frame counts so far, with what the caps refused; `own` is `None`
+    /// when this window has no own MAC to recognise its frames by.
     #[must_use]
     pub fn heard(&self) -> HeardFrames {
         HeardFrames {
             total: self.heard,
             own: self.own_mac.map(|_| self.own),
+            dropped: self.dropped,
         }
     }
 
@@ -335,6 +338,10 @@ impl Window {
         for (service, detail) in facts.services {
             self.announce(src_mac, Some(src_ip), service, AnnounceKind::Mdns, detail);
         }
+        // Services announced on another host's behalf are refused, and count
+        // with what the caps refused: the flush says how much it lost, whatever
+        // the reason.
+        self.dropped = self.dropped.saturating_add(facts.proxied);
     }
 
     fn absorb_ssdp(&mut self, src_mac: Mac, src_ip: IpAddr, payload: &[u8]) {
@@ -406,7 +413,7 @@ impl Window {
 
     /// Hold a DHCP hostname until the `ACK` that names its address.
     fn remember_name(&mut self, client: Mac, hostname: String) {
-        if self.pending_names.contains_key(&client) {
+        if !is_unicast(&client) || self.pending_names.contains_key(&client) {
             return;
         }
         if self.pending_names.len() >= MAX_PENDING_NAMES {
@@ -527,7 +534,8 @@ mod tests {
             w.heard(),
             HeardFrames {
                 total: 5,
-                own: Some(1)
+                own: Some(1),
+                dropped: 0
             }
         );
         let s = w.flush(42);
@@ -539,7 +547,8 @@ mod tests {
             s.heard,
             Some(HeardFrames {
                 total: 5,
-                own: Some(1)
+                own: Some(1),
+                dropped: 0
             })
         );
         assert!(s.is_listener_flush());
@@ -591,7 +600,8 @@ mod tests {
             w.heard(),
             HeardFrames {
                 total: 1,
-                own: Some(1)
+                own: Some(1),
+                dropped: 0
             }
         );
         let s = w.flush(1);
@@ -754,7 +764,8 @@ mod tests {
             s.heard,
             Some(HeardFrames {
                 total: 3,
-                own: Some(0)
+                own: Some(0),
+                dropped: 0
             })
         );
     }
@@ -788,7 +799,8 @@ mod tests {
             w.heard(),
             HeardFrames {
                 total: 3,
-                own: Some(0)
+                own: Some(0),
+                dropped: 0
             }
         );
         assert!(!w.is_empty());
@@ -808,7 +820,8 @@ mod tests {
             s.heard,
             Some(HeardFrames {
                 total: 0,
-                own: Some(0)
+                own: Some(0),
+                dropped: 0
             })
         );
     }
@@ -829,7 +842,8 @@ mod tests {
             w.heard(),
             HeardFrames {
                 total: 2,
-                own: Some(1)
+                own: Some(1),
+                dropped: 0
             }
         );
         let s = w.flush(1);
@@ -843,7 +857,8 @@ mod tests {
             w.heard(),
             HeardFrames {
                 total: 2,
-                own: Some(1)
+                own: Some(1),
+                dropped: 0
             }
         );
         let s = w.flush(2);
@@ -861,7 +876,8 @@ mod tests {
             w.heard(),
             HeardFrames {
                 total: 1,
-                own: None
+                own: None,
+                dropped: 0
             }
         );
         let s = w.flush(1);
@@ -869,7 +885,8 @@ mod tests {
             s.heard,
             Some(HeardFrames {
                 total: 1,
-                own: None
+                own: None,
+                dropped: 0
             })
         );
         assert_eq!(s.neighbors.len(), 1, "our own frame is a sighting here");
@@ -893,7 +910,8 @@ mod tests {
             s.heard,
             Some(HeardFrames {
                 total: 1000,
-                own: Some(0)
+                own: Some(0),
+                dropped: 488
             })
         );
     }
@@ -950,33 +968,37 @@ mod tests {
         let ll4: Ipv4Addr = Ipv4Addr::new(169, 254, 7, 7);
         let ll6: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
         let g6: std::net::Ipv6Addr = "2001:db8::6".parse().unwrap();
-        let msg = owner_announcement(PEER_IP);
-        let mdns6 = |src| udp6(PEER, src, "ff02::fb".parse().unwrap(), 5353, 5353, &msg);
+        // SSDP notifies carry the service half: an SSDP announcement names no
+        // address of its own, so the row's address is the frame's alone.
+        let ssdp6 = |src| {
+            udp6(
+                PEER,
+                src,
+                "ff02::c".parse().unwrap(),
+                1900,
+                1900,
+                NOTIFY_ALIVE.as_bytes(),
+            )
+        };
+        let ssdp4 = |src| udp4(PEER, src, SSDP_GROUP, 1900, 1900, NOTIFY_ALIVE.as_bytes());
 
         // Link-local v6, then link-local v4, then routable v6: the v6 wins.
         let mut w = window();
-        w.absorb(&mdns6(ll6));
-        w.absorb(&udp4(PEER, ll4, MDNS_GROUP, 5353, 5353, &msg));
-        w.absorb(&mdns6(g6));
+        w.absorb(&ssdp6(ll6));
+        w.absorb(&ssdp4(ll4));
+        w.absorb(&ssdp6(g6));
         let s = w.flush(1);
         assert_eq!(s.neighbors[0].ip, "2001:db8::6");
-        assert!(
-            s.services
-                .iter()
-                .all(|a| a.ip.as_deref() == Some("2001:db8::6"))
-        );
+        assert_eq!(s.services.len(), 1);
+        assert_eq!(s.services[0].ip.as_deref(), Some("2001:db8::6"));
 
         // A routable v4 seen later still beats it.
         let mut w = window();
-        w.absorb(&mdns6(g6));
-        w.absorb(&udp4(PEER, PEER_IP, MDNS_GROUP, 5353, 5353, &msg));
+        w.absorb(&ssdp6(g6));
+        w.absorb(&ssdp4(PEER_IP));
         let s = w.flush(1);
         assert_eq!(s.neighbors[0].ip, "192.168.1.6");
-        assert!(
-            s.services
-                .iter()
-                .all(|a| a.ip.as_deref() == Some("192.168.1.6"))
-        );
+        assert_eq!(s.services[0].ip.as_deref(), Some("192.168.1.6"));
 
         // Two routable v4s: the first seen, not the lowest.
         let mut w = window();
@@ -998,10 +1020,96 @@ mod tests {
 
         // Only link-local: v4 before v6.
         let mut w = window();
-        w.absorb(&mdns6(ll6));
-        w.absorb(&udp4(PEER, ll4, MDNS_GROUP, 5353, 5353, &msg));
+        w.absorb(&ssdp6(ll6));
+        w.absorb(&ssdp4(ll4));
         assert_eq!(w.flush(1).neighbors[0].ip, "169.254.7.7");
 
         assert_eq!(preferred(&[]), None);
+    }
+
+    /// The pending-name cap: DISCOVERs from more clients than the cap holds
+    /// are refused and counted; a group `chaddr` is never held at all.
+    #[test]
+    fn pending_dhcp_names_are_capped_and_never_held_for_a_group_chaddr() {
+        let mut w = window();
+        let discover = |mac: Mac, name: &[u8]| {
+            dhcp_message(
+                1,
+                mac,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::UNSPECIFIED,
+                &[(53, &[1]), (12, name)],
+            )
+        };
+        for i in 0..(MAX_PENDING_NAMES as u32 + 20) {
+            let [a, b] = (i as u16).to_be_bytes();
+            let mac: Mac = [0x02, 0, 0, 1, a, b];
+            w.absorb(&udp4(
+                mac,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::BROADCAST,
+                68,
+                67,
+                &discover(mac, b"host"),
+            ));
+        }
+        assert_eq!(w.pending_names.len(), MAX_PENDING_NAMES);
+        assert_eq!(w.dropped(), 20);
+
+        let mut w = window();
+        let group: Mac = [0x01, 0x00, 0x5e, 0, 0, 0xfb];
+        w.absorb(&udp4(
+            PEER,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            68,
+            67,
+            &discover(group, b"nobody"),
+        ));
+        assert!(w.pending_names.is_empty());
+    }
+
+    /// A Sleep Proxy's announcement puts neither the sleeper's name nor its
+    /// services on the proxy's row, and the flush counts what it refused.
+    #[test]
+    fn a_sleep_proxys_services_stay_off_the_proxys_row_and_are_counted() {
+        use simple_dns::rdata::{A, PTR, RData, SRV};
+        use simple_dns::{CLASS, Name, Packet, ResourceRecord};
+        let proxy_ip = Ipv4Addr::new(192, 168, 1, 9);
+        let mut p = Packet::new_reply(0);
+        p.answers.push(ResourceRecord::new(
+            Name::new_unchecked("_afpovertcp._tcp.local"),
+            CLASS::IN,
+            120,
+            RData::PTR(PTR(Name::new_unchecked("Sleeper._afpovertcp._tcp.local"))),
+        ));
+        p.answers.push(ResourceRecord::new(
+            Name::new_unchecked("Sleeper._afpovertcp._tcp.local"),
+            CLASS::IN,
+            120,
+            RData::SRV(SRV {
+                priority: 0,
+                weight: 0,
+                port: 548,
+                target: Name::new_unchecked("sleeper.local"),
+            }),
+        ));
+        p.additional_records.push(ResourceRecord::new(
+            Name::new_unchecked("sleeper.local"),
+            CLASS::IN,
+            120,
+            RData::A(A {
+                address: u32::from(PEER_IP),
+            }),
+        ));
+        let bytes = p.build_bytes_vec().unwrap();
+        let mut w = window();
+        w.absorb(&udp4(PEER, proxy_ip, MDNS_GROUP, 5353, 5353, &bytes));
+        let s = w.flush(1);
+        let proxy = obs(&s, &PEER);
+        assert_eq!(proxy.ip, "192.168.1.9");
+        assert_eq!(proxy.hostname, None);
+        assert!(s.services.is_empty(), "{:?}", s.services);
+        assert_eq!(s.heard.map(|h| h.dropped), Some(2));
     }
 }
