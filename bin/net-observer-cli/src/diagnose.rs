@@ -109,15 +109,11 @@ fn pad_seconds(time: &str) -> String {
 }
 
 /// Render a `ts_us` as a local ISO instant, so the moment the CLI actually used
-/// is visible next to the raw number. Out-of-range never panics.
+/// is visible next to the raw number. The one formatter, shared with the
+/// daemon's own messages (`types::local_instant`), so a clock the daemon
+/// names and a clock the CLI stamps read the same. Out-of-range never panics.
 pub(crate) fn fmt_instant(ts_us: i64) -> String {
-    match jiff::Timestamp::from_microsecond(ts_us) {
-        Ok(ts) => ts
-            .to_zoned(jiff::tz::TimeZone::system())
-            .strftime("%Y-%m-%dT%H:%M:%S%:z")
-            .to_string(),
-        Err(_) => "(timestamp out of range)".to_string(),
-    }
+    types::local_instant(ts_us)
 }
 
 /// A microsecond instant as `<raw> (<local ISO>)` — the raw number stays

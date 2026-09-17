@@ -24,6 +24,7 @@
 //! daemon); *control* is not. Every `Request::Control` first passes the
 //! peer-credential gate in [`control_request`] — see [`ControlPolicy`].
 
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -32,17 +33,18 @@ use std::time::{Duration, Instant};
 
 use collector_core::ProbingState;
 use net_observer_ipc::{
-    ControlCmd, ControlResult, EncodedFrame, Event, EventKind, Gap, Ready, Request, Response,
-    ScanOptions, StatusSnapshot, StreamError, StreamErrorCode, StreamFrame,
-    UNDECODABLE_REQUEST_PREFIX,
+    ControlCmd, ControlResult, DiagnosticQuery, EXPERIMENT_MAX_MINUTES, EncodedFrame, Event,
+    EventKind, Gap, Ready, Request, Response, ScanOptions, StatusSnapshot, StreamError,
+    StreamErrorCode, StreamFrame, Table, UNDECODABLE_REQUEST_PREFIX, experiment_id,
+    experiment_report_json, experiment_running_message,
 };
 use store::Store;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, broadcast};
 use types::{
-    NeighborsSample, NeighborsVerdict, ObservingCause, ObservingEdge, ProbingEdge, ProbingTier,
-    Sample,
+    ExperimentReport, ExperimentWindow, NeighborsSample, NeighborsVerdict, ObservingCause,
+    ObservingEdge, OwnFrames, ProbingEdge, ProbingReason, ProbingTier, Sample,
 };
 
 use crate::acting;
@@ -357,6 +359,59 @@ pub struct ActingConfig {
     pub singbox_service: String,
 }
 
+/// One experiment window as the daemon holds it in memory (realm
+/// net-observer, node #61): running, with the bound a poll is told; or
+/// finished, with the report the `experiment` table also holds. A restart
+/// empties this — the table is what outlives the process.
+pub enum ExperimentState {
+    /// The window is open; `ends_at_us` is when the end task wakes.
+    Running { ends_at_us: i64 },
+    /// The window closed and its report is computed. Boxed: the report is a
+    /// few hundred bytes next to `Running`'s one instant, and the registry
+    /// holds one entry per window ever run.
+    Finished(Box<ExperimentReport>),
+}
+
+/// Every window this process has run, by id. At most one is `Running`.
+pub type Experiments = Mutex<HashMap<String, ExperimentState>>;
+
+/// The owned handles an experiment window's end needs once the control
+/// connection that opened it is gone: the window runs in the daemon, not on
+/// the connection, so a dropped socket loses nothing (realm net-observer,
+/// node #61). Cloned per control request — a handful of `Arc`s.
+#[derive(Clone)]
+pub struct ExperimentHandles {
+    pub store: Arc<dyn Store + Send + Sync>,
+    pub probing: Arc<ProbingState>,
+    pub snapshot: Arc<Mutex<StatusSnapshot>>,
+    pub events_tx: broadcast::Sender<EncodedFrame>,
+    pub freezer: Arc<PcapRingSlot>,
+    pub blob_dir: PathBuf,
+    pub resume_at_us: Arc<AtomicI64>,
+    pub session_end_us: Arc<AtomicI64>,
+    pub experiments: Arc<Experiments>,
+    /// The pcap ring's BPF filter, as configured — recorded on the report
+    /// as the whole of what its own-frame count can see.
+    pub ring_filter: String,
+    /// The link collector's tick, as configured — the yardstick for a sleep
+    /// inside the window and for the tick that straddled the flip.
+    pub link_interval: Duration,
+}
+
+impl ExperimentHandles {
+    /// The tier switch's sinks, borrowed from the owned handles.
+    fn tier_sinks(&self) -> TierSinks<'_> {
+        TierSinks {
+            probing: &self.probing,
+            snapshot: &self.snapshot,
+            resume_at_us: &self.resume_at_us,
+            session_end_us: &self.session_end_us,
+            store: self.store.as_ref(),
+            events_tx: &self.events_tx,
+        }
+    }
+}
+
 /// Everything the socket server needs, assembled once by the daemon.
 ///
 /// Bundled rather than passed as eleven positional arguments (which would trip
@@ -454,9 +509,37 @@ pub struct ApiServer {
     /// connection slots — one refusal each, and unthrottled that is the same
     /// root-log amplification the control path already defends against.
     pub sub_refusals: RateLimitedLog,
+    /// The experiment windows this process has run (realm net-observer,
+    /// node #61): `StartExperiment` opens one, its end task closes it, and
+    /// `Query(Experiment { id })` reads a running or just-finished one here
+    /// before the `experiment` table.
+    pub experiments: Arc<Experiments>,
+    /// The pcap ring's BPF filter, as configured (`collectors.pcap_ring.filter`)
+    /// — what an experiment report says its own-frame count can see.
+    pub ring_filter: String,
+    /// The link collector's tick, as configured (`collectors.link.interval`)
+    /// — an experiment report's yardstick for a sleep and a straddling tick.
+    pub link_interval: Duration,
 }
 
 impl ApiServer {
+    /// The owned handles an experiment window's end task carries.
+    fn experiment_handles(&self) -> ExperimentHandles {
+        ExperimentHandles {
+            store: Arc::clone(&self.store),
+            probing: Arc::clone(&self.probing),
+            snapshot: Arc::clone(&self.snapshot),
+            events_tx: self.events_tx.clone(),
+            freezer: Arc::clone(&self.freezer),
+            blob_dir: self.blob_dir.clone(),
+            resume_at_us: Arc::clone(&self.resume_at_us),
+            session_end_us: Arc::clone(&self.session_end_us),
+            experiments: Arc::clone(&self.experiments),
+            ring_filter: self.ring_filter.clone(),
+            link_interval: self.link_interval,
+        }
+    }
+
     /// Bind the Unix-domain socket at `socket_path`, `chmod` it to `socket_mode`
     /// so an unprivileged client (the bar; the daemon runs as root) can connect,
     /// optionally `chown` it to `socket_owner_uid`, and serve [`Request`]s from
@@ -684,41 +767,18 @@ async fn handle_conn(
                 .collect();
             Response::Incidents(incidents)
         }
-        // A read, like `Status`: no peer gate. DuckDB is synchronous and a
-        // diagnosis walks the whole record, so it runs off the runtime — and at
-        // most ONE at a time (`MAX_QUERIES_IN_FLIGHT`): the permit is claimed
-        // with `try_acquire`, so a second concurrent query is refused at once
-        // rather than queued behind the store mutex, and it is held only for
-        // the blocking run, not the reply. That run is itself bounded: the
-        // statement is interrupted at `QUERY_DEADLINE`, so a client that gave
-        // up cannot leave the mutex — and every write behind it — held for as
-        // long as the join takes. The daemon's own starvation load keeps a
-        // live reading in step with the incidents it recorded (see `api_query`).
-        Ok(Request::Query(q)) => match srv.query_gate.try_acquire() {
-            Err(_busy) => {
-                // Client-triggerable on a mode-0666 socket: never above `debug!`.
-                tracing::debug!("query refused: another diagnosis is running");
-                Response::Error(QUERY_BUSY.to_string())
+        // An experiment window this process holds in memory — running, or
+        // finished and not yet asked for — answers from there, no store read
+        // and no gate; only a window this process does not remember goes to
+        // the `experiment` table by the gated path below (realm
+        // net-observer, node #61).
+        Ok(Request::Query(DiagnosticQuery::Experiment { id })) => {
+            match experiment_in_memory(&srv.experiments, &id) {
+                Some(answer) => answer,
+                None => query_store(srv, DiagnosticQuery::Experiment { id }).await,
             }
-            Ok(permit) => {
-                let store = Arc::clone(&srv.store);
-                let ran = tokio::task::spawn_blocking(move || {
-                    crate::api_query::run_query(
-                        store.as_ref(),
-                        q,
-                        crate::STARVATION_LOAD,
-                        QUERY_DEADLINE,
-                    )
-                })
-                .await;
-                drop(permit);
-                match ran {
-                    Ok(Ok(table)) => Response::Table(table),
-                    Ok(Err(message)) => Response::Error(message),
-                    Err(e) => Response::Error(format!("diagnosis task failed: {e}")),
-                }
-            }
-        },
+        }
+        Ok(Request::Query(q)) => query_store(srv, q).await,
         Ok(Request::Control(cmd)) => {
             let cx = ControlCtx {
                 policy: &srv.policy,
@@ -736,6 +796,7 @@ async fn handle_conn(
                 store: srv.store.as_ref(),
                 events_tx: &srv.events_tx,
                 refusals: &srv.control_refusals,
+                experiment: srv.experiment_handles(),
             };
             Response::Control(control_request(cmd, peer_uid, &cx))
         }
@@ -748,6 +809,61 @@ async fn handle_conn(
     let buf = net_observer_ipc::encode_frame(&response)?;
     wr.write_all(&buf).await?;
     wr.flush().await
+}
+
+/// Run one [`DiagnosticQuery`] against the store and answer it.
+///
+/// A read, like `Status`: no peer gate. DuckDB is synchronous and a
+/// diagnosis walks the whole record, so it runs off the runtime — and at
+/// most ONE at a time (`MAX_QUERIES_IN_FLIGHT`): the permit is claimed
+/// with `try_acquire`, so a second concurrent query is refused at once
+/// rather than queued behind the store mutex, and it is held only for
+/// the blocking run, not the reply. That run is itself bounded: the
+/// statement is interrupted at `QUERY_DEADLINE`, so a client that gave
+/// up cannot leave the mutex — and every write behind it — held for as
+/// long as the join takes. The daemon's own starvation load keeps a
+/// live reading in step with the incidents it recorded (see `api_query`).
+async fn query_store(srv: &ApiServer, q: DiagnosticQuery) -> Response {
+    match srv.query_gate.try_acquire() {
+        Err(_busy) => {
+            // Client-triggerable on a mode-0666 socket: never above `debug!`.
+            tracing::debug!("query refused: another diagnosis is running");
+            Response::Error(QUERY_BUSY.to_string())
+        }
+        Ok(permit) => {
+            let store = Arc::clone(&srv.store);
+            let ran = tokio::task::spawn_blocking(move || {
+                crate::api_query::run_query(
+                    store.as_ref(),
+                    q,
+                    crate::STARVATION_LOAD,
+                    QUERY_DEADLINE,
+                )
+            })
+            .await;
+            drop(permit);
+            match ran {
+                Ok(Ok(table)) => Response::Table(table),
+                Ok(Err(message)) => Response::Error(message),
+                Err(e) => Response::Error(format!("diagnosis task failed: {e}")),
+            }
+        }
+    }
+}
+
+/// The answer for an experiment window this process holds in memory, or
+/// `None` when it holds no window of that id and the `experiment` table is
+/// the place to look. A running window is a failure the CLI waits through —
+/// spelled by `net_observer_ipc::experiment_running_message`, never with
+/// [`UNDECODABLE_REQUEST_PREFIX`]; a finished one is its report as a table.
+fn experiment_in_memory(experiments: &Experiments, id: &str) -> Option<Response> {
+    let map = experiments.lock().unwrap_or_else(|e| e.into_inner());
+    Some(match map.get(id)? {
+        ExperimentState::Running { ends_at_us } => {
+            Response::Error(experiment_running_message(id, *ends_at_us))
+        }
+        ExperimentState::Finished(report) => Response::Table(Table::from(report.as_ref())),
+    })
 }
 
 /// One of a bounded pool of slots — connections at accept time, or held-open
@@ -967,6 +1083,59 @@ pub(crate) struct ControlCtx<'a> {
     /// The bounded log for the refusal line, so an unauthorised local process
     /// cannot grow a root daemon's log at its own loop rate.
     pub refusals: &'a RateLimitedLog,
+    /// The owned handles `StartExperiment` gives its end task, and the
+    /// registry it refuses a second window from (realm net-observer, node
+    /// #61). Owned, not borrowed: the end task outlives the connection.
+    pub experiment: ExperimentHandles,
+}
+
+impl ControlCtx<'_> {
+    /// The tier switch's sinks, borrowed from the control context.
+    fn tier_sinks(&self) -> TierSinks<'_> {
+        TierSinks {
+            probing: self.probing,
+            snapshot: self.snapshot,
+            resume_at_us: self.resume_at_us,
+            session_end_us: self.session_end_us,
+            store: self.store,
+            events_tx: self.events_tx,
+        }
+    }
+}
+
+/// What a tier switch flips and the two sinks it writes — borrowed from a
+/// [`ControlCtx`] on the control path, and from the owned
+/// [`ExperimentHandles`] when an experiment window ends off it.
+pub(crate) struct TierSinks<'a> {
+    pub probing: &'a ProbingState,
+    pub snapshot: &'a Mutex<StatusSnapshot>,
+    pub resume_at_us: &'a AtomicI64,
+    pub session_end_us: &'a AtomicI64,
+    pub store: &'a (dyn Store + Send + Sync),
+    pub events_tx: &'a broadcast::Sender<EncodedFrame>,
+}
+
+/// Whether a switch to the tier already in force still writes an edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgePolicy {
+    /// No change, no edge: an operator's repeated `SetProbing` must not
+    /// manufacture a boundary.
+    OnChange,
+    /// The edge is written regardless: an experiment window marks its bounds
+    /// on an already-passive daemon too (realm net-observer, node #61).
+    Always,
+}
+
+/// A tier switch that wrote an edge.
+struct Switched {
+    edge: ProbingEdge,
+    /// The tier in force when the switch was decided, read under the same
+    /// lock that flipped it — the one reading of "before" that cannot be
+    /// stale.
+    was: ProbingTier,
+    /// The store-failure note for the operator's message; empty when the
+    /// row landed.
+    note: String,
 }
 
 /// The single entry point for `Request::Control`: authorise the peer FIRST, then
@@ -1125,6 +1294,7 @@ fn control_response(
             }
         }
         ControlCmd::SetProbing(tier) => set_probing(tier, authorized, cx),
+        ControlCmd::StartExperiment { minutes } => start_experiment(minutes, authorized, cx),
         ControlCmd::FreezePcap => freeze_now(cx),
         ControlCmd::ScanNeighbors(opts) => scan_now(cx, &opts, Some(authorized.uid())),
         ControlCmd::ScanAir => air_scan_now(cx, authorized.uid()),
@@ -1135,21 +1305,83 @@ fn control_response(
     }
 }
 
-/// Switch the probing tier on operator demand (realm net-observer, node #88).
-///
-/// Flip the shared state, mirror it into the snapshot, answer — plus the two
-/// sinks `SetObserving` uses, because a tier switch IS bracketed: one
-/// `ProbingEdge` built once, written as a `probing_edge` row and
-/// published as a `StreamFrame::Probing`. The state flip, the clock and the
-/// publish sit under the snapshot lock for the reason `SetObserving` spells
-/// out: two opposite switches must stamp and land in one order, or the rows
-/// read back claim the daemon was probing while it was not. No `.await` and no
-/// store write under the guard.
+/// Switch the probing tier on operator demand (realm net-observer, node #88):
+/// [`switch_probing`] with the operator's uid, a `control` reason, and an
+/// edge only on a real change.
 ///
 /// A switch to the tier already in force is not an edge: no row, no frame,
 /// still `ok` — the requested tier does hold. A store failure is logged as a
 /// gap and reported in the message but never fails the control, because the
 /// tier really did change and `ok: false` would say otherwise.
+fn set_probing(
+    tier: ProbingTier,
+    authorized: PeerAuthorized,
+    cx: &ControlCtx<'_>,
+) -> ControlResult {
+    // An operator's switch refuses nothing from inside the lock: `Ok` always,
+    // so the `Err` arm cannot be reached and is written out rather than
+    // unwrapped.
+    let switched = match switch_probing(
+        |_| Ok(tier),
+        Some(authorized.uid()),
+        ProbingReason::Control,
+        EdgePolicy::OnChange,
+        &cx.tier_sinks(),
+    ) {
+        Ok(Some(switched)) => switched,
+        Ok(None) => {
+            tracing::info!(probing = %tier, changed = false, "probing tier unchanged");
+            return ControlResult {
+                ok: true,
+                message: format!("probing {tier}"),
+            };
+        }
+        Err(message) => {
+            return ControlResult { ok: false, message };
+        }
+    };
+    tracing::info!(
+        probing = %tier,
+        ts_us = switched.edge.ts_us,
+        peer_uid = authorized.uid(),
+        "probing tier changed via control socket"
+    );
+    ControlResult {
+        ok: true,
+        message: format!("probing {tier}{}", switched.note),
+    }
+}
+
+/// Switch the probing tier and bracket the switch (realm net-observer,
+/// node #88).
+///
+/// Flip the shared state, mirror it into the snapshot — plus the two sinks
+/// `SetObserving` uses, because a tier switch IS bracketed: one
+/// `ProbingEdge` built once, written as a `probing_edge` row and published
+/// as a `StreamFrame::Probing`. The state flip, the clock and the publish
+/// sit under the snapshot lock for the reason `SetObserving` spells out: two
+/// opposite switches must stamp and land in one order, or the rows read
+/// back claim the daemon was probing while it was not. No `.await` and no
+/// store write under the guard.
+///
+/// `target` names the tier to move into FROM the tier in force, decided
+/// under the lock that flips it: an operator's switch ignores what it finds
+/// (`|_| Ok(tier)`), an experiment window's close moves back only if what it
+/// finds is still its own passive, and a window's OPENING refuses from in
+/// here when collection is paused — the same lock `SetObserving` flips the
+/// flag under, so a pause cannot land between the check and the edge. An
+/// `Err` from `target` is that refusal: nothing is stamped, flipped or
+/// written, and the message is the caller's to return. The tier found is
+/// returned as [`Switched::was`] — the one reading of "before" that cannot
+/// be stale.
+///
+/// `Ok(None)` when the tier was already in force and `policy` is
+/// [`EdgePolicy::OnChange`]; under [`EdgePolicy::Always`] such a switch
+/// still stamps and writes the edge (an experiment window's bracket, realm
+/// net-observer, node #61) but flips nothing — no epoch moves, no session
+/// ends, because nothing changed for the collectors or the triggers. A store
+/// failure is logged as a gap and carried in the returned note; the switch
+/// itself has already taken effect.
 ///
 /// A real switch, in EITHER direction, closes and re-opens detection exactly
 /// as a resume does: it publishes the same `resume_at_us` epoch the observing
@@ -1172,20 +1404,26 @@ fn control_response(
 /// `close_all`, the switch to passive turned every probe-fed condition to
 /// `None` at once and the engine closed open incidents as "recovered" at the
 /// FIRST POST-SWITCH sample instead of at the switch itself.
-fn set_probing(
-    tier: ProbingTier,
-    authorized: PeerAuthorized,
-    cx: &ControlCtx<'_>,
-) -> ControlResult {
-    let transition = {
-        let mut snap = cx.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+fn switch_probing(
+    target: impl FnOnce(ProbingTier) -> Result<ProbingTier, String>,
+    peer_uid: Option<u32>,
+    reason: ProbingReason,
+    policy: EdgePolicy,
+    s: &TierSinks<'_>,
+) -> Result<Option<Switched>, String> {
+    let (edge, was) = {
+        let mut snap = s.snapshot.lock().unwrap_or_else(|e| e.into_inner());
         // Read-then-set is safe: the snapshot lock serialises every control
-        // connection and this is the tier's only writer.
-        let was = cx.probing.tier();
-        if was == tier {
-            None
-        } else {
-            let ts_us = types::now_us();
+        // connection and the experiment end task, and these are the tier's
+        // only writers.
+        let was = s.probing.tier();
+        let tier = target(was)?;
+        let changed = was != tier;
+        if !changed && policy == EdgePolicy::OnChange {
+            return Ok(None);
+        }
+        let ts_us = types::now_us();
+        if changed {
             // The epoch is published BEFORE the tier flips, as on a resume: a
             // collector that reads the new tier has already synchronised with
             // it, so no sample taken under the new tier can reach the consumer
@@ -1207,50 +1445,34 @@ fn set_probing(
             // for this later writer, so the `Result` is ignored (realm
             // net-observer, node #124).
             let _ =
-                cx.session_end_us
+                s.session_end_us
                     .compare_exchange(0, ts_us, Ordering::AcqRel, Ordering::Acquire);
-            cx.resume_at_us.store(ts_us, Ordering::Release);
-            cx.probing.set(tier);
+            s.resume_at_us.store(ts_us, Ordering::Release);
+            s.probing.set(tier);
             snap.probing = tier;
-            let edge = ProbingEdge {
-                ts_us,
-                tier,
-                peer_uid: Some(authorized.uid()),
-            };
-            match EncodedFrame::encode(&StreamFrame::Probing(edge)) {
-                Ok(frame) => {
-                    let _ = cx.events_tx.send(frame);
-                }
-                Err(e) => tracing::warn!(error = %e, "failed to encode probing frame"),
-            }
-            Some(edge)
         }
-    };
-    let Some(edge) = transition else {
-        tracing::info!(probing = %tier, changed = false, "probing tier unchanged");
-        return ControlResult {
-            ok: true,
-            message: format!("probing {tier}"),
+        let edge = ProbingEdge {
+            ts_us,
+            tier,
+            peer_uid,
+            reason,
         };
+        match EncodedFrame::encode(&StreamFrame::Probing(edge)) {
+            Ok(frame) => {
+                let _ = s.events_tx.send(frame);
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to encode probing frame"),
+        }
+        (edge, was)
     };
 
     let mut note = String::new();
-    if let Err(e) = cx.store.write_probing_edge(&edge) {
-        tracing::error!(error = %e, probing = %tier,
+    if let Err(e) = s.store.write_probing_edge(&edge) {
+        tracing::error!(error = %e, probing = %edge.tier, reason = reason.as_str(),
             "store write failed; probing edge not recorded (gap logged)");
         note = format!(" (boundary record failed: {e})");
     }
-
-    tracing::info!(
-        probing = %tier,
-        ts_us = edge.ts_us,
-        peer_uid = authorized.uid(),
-        "probing tier changed via control socket"
-    );
-    ControlResult {
-        ok: true,
-        message: format!("probing {tier}{note}"),
-    }
+    Ok(Some(Switched { edge, was, note }))
 }
 
 /// Go and look for neighbours on operator demand.
@@ -1464,28 +1686,474 @@ fn air_scan_now(cx: &ControlCtx<'_>, peer_uid: u32) -> ControlResult {
 /// that yields no file is also a failure — the command's whole product is the
 /// copied files — and both cases say so in the message.
 fn freeze_now(cx: &ControlCtx<'_>) -> ControlResult {
-    let Some(freezer) = cx.freezer.get() else {
-        return ControlResult {
-            ok: false,
-            message: "pcap ring not running".to_string(),
-        };
-    };
     let ts_us = types::now_us();
     let dest = cx.blob_dir.join(format!("freeze-manual-{ts_us}"));
-    let paths = freezer.freeze(&dest);
-    let dest = dest.display();
+    match freeze_ring(cx.freezer, &dest) {
+        Ok(paths) => {
+            tracing::info!(dest = %dest.display(), frozen = paths.len(),
+                "froze pcap ring on operator request");
+            ControlResult {
+                ok: true,
+                message: format!("froze {} pcap file(s) into {}", paths.len(), dest.display()),
+            }
+        }
+        Err(message) => {
+            tracing::warn!(dest = %dest.display(), %message, "manual pcap freeze copied nothing");
+            ControlResult { ok: false, message }
+        }
+    }
+}
+
+/// Copy the ring that is running NOW into `dest`, or say why nothing was
+/// copied: no ring is running, or the ring yielded no file. Shared by the
+/// operator's `FreezePcap` and the experiment window's two freezes, so a
+/// missing ring is worded the same wherever it is met.
+fn freeze_ring(freezer: &PcapRingSlot, dest: &Path) -> Result<Vec<PathBuf>, String> {
+    let Some(ring) = freezer.get() else {
+        return Err("pcap ring not running".to_string());
+    };
+    let paths = ring.freeze(dest);
     if paths.is_empty() {
-        tracing::warn!(%dest, "manual pcap freeze copied no files");
+        return Err(format!("pcap ring froze no files into {}", dest.display()));
+    }
+    Ok(paths)
+}
+
+/// Open an experiment window on operator demand (realm net-observer, node
+/// #61): go passive, freeze the ring, and hand the window to a task that
+/// closes it after `minutes`.
+///
+/// Refused for a length outside `1..=EXPERIMENT_MAX_MINUTES` and while
+/// another window runs — one window at a time, because two would share one
+/// tier and one ring. The opening edge is written under
+/// [`EdgePolicy::Always`], so an already-passive daemon still marks where the
+/// window began; its `ts_us` is the window's start and names the id. The
+/// registry lock is held across the switch so a second `StartExperiment`
+/// racing this one meets the running entry, never a second edge. The start
+/// freeze may fail (no ring): the window still runs — the record's half of
+/// the report needs no ring — and the message and the report say so.
+///
+/// Answers at once with the id; the report is read later with
+/// `Query(Experiment { id })`. Nothing here awaits: the sleep lives in the
+/// spawned task, on the daemon's runtime, which is why this arm must run on
+/// it (`handle_conn` does; a bare unit test must build one).
+fn start_experiment(
+    minutes: u32,
+    authorized: PeerAuthorized,
+    cx: &ControlCtx<'_>,
+) -> ControlResult {
+    if minutes == 0 || minutes > EXPERIMENT_MAX_MINUTES {
         return ControlResult {
             ok: false,
-            message: format!("pcap ring froze no files into {dest}"),
+            message: format!(
+                "experiment length must be 1..={EXPERIMENT_MAX_MINUTES} minutes, not {minutes}"
+            ),
         };
     }
-    tracing::info!(%dest, frozen = paths.len(), "froze pcap ring on operator request");
+    let h = &cx.experiment;
+    let peer_uid = authorized.uid();
+    let (id, start_us, ends_at_us, tier_before, start_note) = {
+        let mut map = h.experiments.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((running, ExperimentState::Running { ends_at_us })) = map
+            .iter()
+            .find(|(_, s)| matches!(s, ExperimentState::Running { .. }))
+        {
+            return ControlResult {
+                ok: false,
+                message: experiment_running_message(running, *ends_at_us),
+            };
+        }
+        // Paused: the pause is bracketed silence — `observing_edge` says the
+        // daemon deliberately collected nothing between two instants — and a
+        // window measured inside it would read its zeros against no record
+        // at all. Refused for the reason a scan is (`scan_now`), and read
+        // INSIDE the switch's lock: `SetObserving` flips the flag under that
+        // same lock, so a pause cannot slip between this check and the
+        // opening edge and write its row just before `start_us`.
+        let observing = cx.observing;
+        let switched = match switch_probing(
+            |_| {
+                if observing.load(Ordering::Acquire) {
+                    Ok(ProbingTier::Passive)
+                } else {
+                    Err("observation is paused; resume before starting an experiment".to_string())
+                }
+            },
+            Some(peer_uid),
+            ProbingReason::Experiment,
+            EdgePolicy::Always,
+            &h.tier_sinks(),
+        ) {
+            Ok(Some(switched)) => switched,
+            Err(message) => {
+                return ControlResult { ok: false, message };
+            }
+            // Unreachable under `Always`; said rather than unwrapped.
+            Ok(None) => {
+                return ControlResult {
+                    ok: false,
+                    message: "experiment could not open: no opening edge".to_string(),
+                };
+            }
+        };
+        // The tier in force before the window is the one the switch found
+        // under its lock — never a separate read that a racing control
+        // could sit between.
+        let tier_before = switched.was;
+        let start_us = switched.edge.ts_us;
+        let id = experiment_id(start_us);
+        let ends_at_us = start_us + i64::from(minutes) * 60_000_000;
+        map.insert(id.clone(), ExperimentState::Running { ends_at_us });
+        (id, start_us, ends_at_us, tier_before, switched.note)
+    };
+
+    let start_dir = h
+        .blob_dir
+        .join(format!("freeze-experiment-{start_us}-start"));
+    let start_freeze = freeze_ring(&h.freezer, &start_dir);
+    let freeze_note = match &start_freeze {
+        Ok(paths) => {
+            record_freeze_blobs(h.store.as_ref(), &id, "start", start_us, paths);
+            format!("froze {} pcap file(s) at the start", paths.len())
+        }
+        Err(why) => format!("start freeze: {why}"),
+    };
+
+    tracing::info!(
+        %id, minutes, start_us, ends_at_us, tier_before = %tier_before, peer_uid,
+        %freeze_note, "experiment window opened via control socket"
+    );
+
+    let handles = h.clone();
+    let task_id = id.clone();
+    let start_freeze = start_freeze.ok().map(|paths| (start_dir, paths));
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(u64::from(minutes) * 60)).await;
+        finish_experiment(
+            handles,
+            task_id,
+            ExperimentOpen {
+                start_us,
+                requested_minutes: minutes,
+                tier_before,
+                peer_uid,
+                start_freeze,
+            },
+        )
+        .await;
+    });
+
     ControlResult {
         ok: true,
-        message: format!("froze {} pcap file(s) into {dest}", paths.len()),
+        message: format!(
+            "experiment {id} started: passive for {minutes} min (was {tier_before}); {freeze_note}{start_note}"
+        ),
     }
+}
+
+/// What `start_experiment` hands its end task: the window as it opened.
+struct ExperimentOpen {
+    /// The opening edge's `ts_us`.
+    start_us: i64,
+    /// The length the operator asked for.
+    requested_minutes: u32,
+    /// The tier the opening switch found in force, under its lock.
+    tier_before: ProbingTier,
+    /// The operator who opened the window; both edges carry it.
+    peer_uid: u32,
+    /// The start freeze's directory and copied files, when it copied any.
+    start_freeze: Option<(PathBuf, Vec<PathBuf>)>,
+}
+
+/// One `blob_ref` row per copied ring file, against the window's id — the
+/// shape the incident freeze writes (`pipeline::FreezePcapHandler`), so the
+/// record refers to the slice the report was read from. A write that fails
+/// is logged as a gap; the files are on disk either way.
+fn record_freeze_blobs(store: &dyn Store, id: &str, which: &str, ts_us: i64, paths: &[PathBuf]) {
+    for (i, path) in paths.iter().enumerate() {
+        let blob = types::BlobRef {
+            id: format!("{id}-pcap-{which}-{i}"),
+            incident_id: id.to_string(),
+            ts_us,
+            kind: "pcap".into(),
+            path: path.display().to_string(),
+        };
+        if let Err(e) = store.write_blob_ref(&blob) {
+            tracing::warn!(%id, which, error = %e, "failed to write experiment pcap blob_ref");
+        }
+    }
+}
+
+/// Close an experiment window (realm net-observer, node #61): freeze the ring
+/// again, read the boundary rows the window holds, restore the tier that was
+/// in force — only if it is still the window's own to restore — count what
+/// the two freezes and the record hold, and keep the report in memory and in
+/// the `experiment` table.
+///
+/// The end instant is the wall clock, taken BEFORE the end freeze so the
+/// slice holds no frame from after the window; against the requested length
+/// it is what says the machine slept. The boundary rows are read next:
+/// every `observing_edge` and `probing_edge` inside the window, so the
+/// report names each, and so the closing edge knows whether an operator
+/// moved the tier meanwhile. The closing edge then restores `tier_before`
+/// only when the tier it finds is still the passive the window set AND no
+/// operator edge landed inside the window — otherwise the operator's choice
+/// stands, the edge (reason `experiment-end`, written under
+/// [`EdgePolicy::Always`]) merely marks the end, and the report says which.
+/// This machine's own MAC is read ONCE here, from the newest link sample the
+/// snapshot holds — the same value the link collector read on its last tick,
+/// which the passive tier keeps reading. The pcap walk and the store's
+/// counts run on the blocking pool. Nothing here fails the window: every
+/// count that could not be taken is a note in the report, never a zero and
+/// never a missing report.
+async fn finish_experiment(h: ExperimentHandles, id: String, open: ExperimentOpen) {
+    let ExperimentOpen {
+        start_us,
+        requested_minutes,
+        tier_before,
+        peer_uid,
+        start_freeze,
+    } = open;
+    let end_us = types::now_us();
+    let end_dir = h.blob_dir.join(format!("freeze-experiment-{start_us}-end"));
+    let end_freeze = freeze_ring(&h.freezer, &end_dir);
+    let mut notes = Vec::new();
+    let end_paths = match end_freeze {
+        Ok(paths) => {
+            record_freeze_blobs(h.store.as_ref(), &id, "end", end_us, &paths);
+            Some(paths)
+        }
+        Err(why) => {
+            notes.push(format!("end freeze: {why}"));
+            None
+        }
+    };
+
+    // The boundary rows inside the window, read before the closing edge is
+    // written so that edge is not among them.
+    let edge_store = Arc::clone(&h.store);
+    let edges = tokio::task::spawn_blocking(move || {
+        store::experiment::window_edges(edge_store.as_ref(), start_us, end_us, QUERY_DEADLINE)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("edge read task failed: {e}")));
+    let (edges, edges_read) = match edges {
+        Ok(edges) => (edges, true),
+        Err(why) => {
+            notes.push(format!("boundary rows: {why}"));
+            (types::WindowEdges::default(), false)
+        }
+    };
+    let operator_moved_at = edges.operator_probing().next().map(|e| e.ts_us);
+
+    // The closing edge: back to `tier_before` only if the tier is still the
+    // window's own passive and nobody moved it meanwhile — a window whose
+    // rows could not be read cannot vouch for that, so it keeps its hands
+    // off too. Decided under the switch's own lock, from the tier it finds.
+    let may_restore = operator_moved_at.is_none() && edges_read;
+    // The closing edge refuses nothing: `Ok` always, so `Err` is unreachable
+    // and folded into the "no closing edge" arm below rather than unwrapped.
+    let closing = switch_probing(
+        |was| {
+            Ok(if was == ProbingTier::Passive && may_restore {
+                tier_before
+            } else {
+                was
+            })
+        },
+        Some(peer_uid),
+        ProbingReason::ExperimentEnd,
+        EdgePolicy::Always,
+        &h.tier_sinks(),
+    );
+    let (tier_at_end, restore) = match closing {
+        Ok(Some(Switched { edge, was, note })) => {
+            if !note.is_empty() {
+                notes.push(format!("closing edge{note}"));
+            }
+            // The operator's switch is named first: it is the usual way the
+            // tier stops being the window's passive, and the instant is what
+            // the operator will look for.
+            let restore = if let Some(at_us) = operator_moved_at {
+                types::TierRestore::OperatorMoved { at_us }
+            } else if was != ProbingTier::Passive {
+                types::TierRestore::NotPassive { found: was }
+            } else if !edges_read {
+                types::TierRestore::Unverified {
+                    why: "the window's boundary rows could not be read".into(),
+                }
+            } else {
+                types::TierRestore::Restored
+            };
+            (edge.tier, restore)
+        }
+        // Unreachable under `Always` with an `Ok` target; recorded rather
+        // than unwrapped.
+        Ok(None) | Err(_) => {
+            notes.push("closing edge: none written".into());
+            (
+                h.probing.tier(),
+                types::TierRestore::Unverified {
+                    why: "no closing edge".into(),
+                },
+            )
+        }
+    };
+
+    let own_mac = h
+        .snapshot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .link
+        .as_ref()
+        .and_then(|l| l.if_mac.clone());
+    if start_freeze.is_none() {
+        notes.push("start freeze: none taken".to_string());
+    }
+    let (freeze_start_dir, start_paths) = match start_freeze {
+        Some((dir, paths)) => (Some(dir.display().to_string()), Some(paths)),
+        None => (None, None),
+    };
+    let freeze_end_dir = end_paths.as_ref().map(|_| end_dir.display().to_string());
+
+    let record_store = Arc::clone(&h.store);
+    let mac_for_count = own_mac.clone();
+    let counted = tokio::task::spawn_blocking(move || {
+        // The failure crosses the pool as words: the report carries them as a
+        // note, and nothing downstream matches on the store's error type.
+        let network = store::experiment::window_facts(
+            record_store.as_ref(),
+            start_us,
+            end_us,
+            QUERY_DEADLINE,
+        )
+        .map_err(|e| e.to_string());
+        let start_frames = start_paths
+            .as_deref()
+            .map(|paths| count_slice(paths, mac_for_count.as_deref(), start_us, end_us));
+        let end_frames = end_paths
+            .as_deref()
+            .map(|paths| count_slice(paths, mac_for_count.as_deref(), start_us, end_us));
+        (network, start_frames, end_frames)
+    })
+    .await;
+
+    let (network, frames_pcap_start, our_frames, frames_pcap_end) = match counted {
+        Ok((network, start_frames, end_frames)) => {
+            let network = match network {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    notes.push(format!("record: {e}"));
+                    None
+                }
+            };
+            let frames_pcap_start = match start_frames {
+                Some(Ok(f)) => Some(f.records),
+                Some(Err(why)) => {
+                    notes.push(format!("start slice: {why}"));
+                    None
+                }
+                None => None,
+            };
+            let (our_frames, frames_pcap_end) = match end_frames {
+                Some(Ok(f)) => (own_mac.as_ref().map(|_| f), Some(f.records)),
+                Some(Err(why)) => {
+                    notes.push(format!("end slice: {why}"));
+                    (None, None)
+                }
+                None => (None, None),
+            };
+            (network, frames_pcap_start, our_frames, frames_pcap_end)
+        }
+        Err(e) => {
+            notes.push(format!("counting task failed: {e}"));
+            (None, None, None, None)
+        }
+    };
+    if own_mac.is_none() {
+        notes.push("own MAC unreadable from the newest link sample".to_string());
+    }
+
+    let report = ExperimentReport {
+        id: id.clone(),
+        window: ExperimentWindow {
+            start_us,
+            end_us,
+            requested_minutes,
+            link_interval_us: i64::try_from(h.link_interval.as_micros()).unwrap_or(i64::MAX),
+            tier_before,
+            tier_at_end,
+            restore,
+            freeze_start_dir: freeze_start_dir.clone(),
+            freeze_end_dir: freeze_end_dir.clone(),
+            frames_pcap_start,
+            frames_pcap_end,
+        },
+        ring_filter: h.ring_filter.clone(),
+        own_mac,
+        our_frames,
+        network,
+        edges,
+        notes,
+    };
+    tracing::info!(%id, verdict = %report.verdict(), "experiment window closed");
+
+    match experiment_report_json(&report) {
+        Ok(report_json) => {
+            let record = store::ExperimentRecord {
+                id: id.clone(),
+                start_us,
+                end_us,
+                tier_before,
+                freeze_start_dir,
+                freeze_end_dir,
+                report_json,
+            };
+            if let Err(e) = h.store.write_experiment(&record) {
+                tracing::error!(error = %e, %id,
+                    "store write failed; experiment report not recorded (gap logged)");
+            }
+        }
+        Err(e) => tracing::error!(error = %e, %id, "experiment report could not be serialised"),
+    }
+    h.experiments
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, ExperimentState::Finished(Box::new(report)));
+}
+
+/// Walk every ring file of one freeze and fold the counts. The MAC is
+/// `None` when it could not be read: the slice is still walked for its
+/// record count and bounds against an address no device carries, so no
+/// bucket fills and the caller reports them as not counted. A MAC that is
+/// present but not six octets is an error, not a zero count: a zero against
+/// the wrong address would read as silence. A file that is not pcap, or
+/// cannot be opened, fails the whole slice by name.
+fn count_slice(
+    paths: &[PathBuf],
+    own_mac: Option<&str>,
+    start_us: i64,
+    end_us: i64,
+) -> Result<OwnFrames, String> {
+    let mac = match own_mac {
+        None => [0u8; 6],
+        Some(text) => collector_announce::mac_octets(text)
+            .ok_or_else(|| format!("own MAC {text:?} is not six octets"))?,
+    };
+    let mut total = OwnFrames::default();
+    for path in paths {
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let counted = collector_announce::count_own_frames(
+            std::io::BufReader::new(file),
+            &mac,
+            start_us,
+            end_us,
+        )
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+        total.absorb(&counted);
+    }
+    Ok(total)
 }
 
 /// Clone the live snapshot, recovering the lock if a previous holder panicked.
@@ -1673,6 +2341,9 @@ mod tests {
             events_tx,
             control_refusals: RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
             sub_refusals: RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
+            experiments: Arc::new(Mutex::new(HashMap::new())),
+            ring_filter: "arp or icmp or udp port 67 or udp port 68 or ether broadcast".into(),
+            link_interval: Duration::from_secs(15),
         }
     }
 
@@ -1695,6 +2366,7 @@ mod tests {
             store: srv.store.as_ref(),
             events_tx: &srv.events_tx,
             refusals: &srv.control_refusals,
+            experiment: srv.experiment_handles(),
         }
     }
 
@@ -1971,6 +2643,15 @@ mod tests {
         fn write_probing_edge(&self, e: &ProbingEdge) -> Result<(), store::StoreError> {
             self.inner.write_probing_edge(e)
         }
+        fn write_experiment(&self, x: &store::ExperimentRecord) -> Result<(), store::StoreError> {
+            self.inner.write_experiment(x)
+        }
+        fn experiment(
+            &self,
+            id: &str,
+        ) -> Result<Option<store::ExperimentRecord>, store::StoreError> {
+            self.inner.experiment(id)
+        }
         fn write_neighbor_scan(&self, s: &store::NeighborScan) -> Result<(), store::StoreError> {
             self.inner.write_neighbor_scan(s)
         }
@@ -2174,6 +2855,7 @@ mod tests {
             ControlCmd::KickstartProxy,
             ControlCmd::ScanNeighbors(ScanOptions::default()),
             ControlCmd::ScanAir,
+            ControlCmd::StartExperiment { minutes: 5 },
         ] {
             // Exhaustive on purpose — a new variant breaks this arm list.
             match cmd {
@@ -2182,7 +2864,8 @@ mod tests {
                 | ControlCmd::FreezePcap
                 | ControlCmd::KickstartProxy
                 | ControlCmd::ScanNeighbors(_)
-                | ControlCmd::ScanAir => {}
+                | ControlCmd::ScanAir
+                | ControlCmd::StartExperiment { .. } => {}
             }
             // A refusal here can only come from the peer gate: there is no
             // other gate on the control path.
@@ -2809,6 +3492,475 @@ mod tests {
             1,
             "the LIVE ring was frozen"
         );
+    }
+
+    /// A window outside `1..=EXPERIMENT_MAX_MINUTES` is refused before
+    /// anything moves: no edge, no freeze, no registry entry, the tier held.
+    #[test]
+    fn an_experiment_of_a_bad_length_is_refused_before_anything_moves() {
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
+        for minutes in [0, EXPERIMENT_MAX_MINUTES + 1] {
+            let res = control_request(
+                ControlCmd::StartExperiment { minutes },
+                Some(TEST_DAEMON_UID),
+                &cx,
+            );
+            assert!(!res.ok, "{minutes}: {}", res.message);
+            assert!(res.message.contains("minutes"), "{}", res.message);
+        }
+        assert_eq!(srv.probing.tier(), ProbingTier::Active);
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM probing_edge")
+                .unwrap(),
+            0
+        );
+        assert!(srv.experiments.lock().unwrap().is_empty());
+    }
+
+    /// Opening a window goes passive and brackets it: one `probing_edge`
+    /// row and one frame with reason `experiment`, whose `ts_us` names the
+    /// id; the registry holds it as running, a poll for it is told so in the
+    /// spelling the CLI waits through, and a second window is refused while
+    /// the first runs. On a runtime, because the arm spawns the end task.
+    #[tokio::test]
+    async fn starting_an_experiment_goes_passive_marks_the_window_and_refuses_a_second() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        srv.blob_dir = temp_dir("experiment-start");
+        let mut rx = srv.events_tx.subscribe();
+        let cx = test_ctx(&srv);
+
+        let res = control_request(
+            ControlCmd::StartExperiment { minutes: 1 },
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(
+            res.message.contains("pcap ring not running"),
+            "no ring: the message must say the start freeze was not taken: {}",
+            res.message
+        );
+        assert_eq!(srv.probing.tier(), ProbingTier::Passive);
+
+        let t = srv
+            .store
+            .query_table("SELECT ts_us, tier, peer_uid, reason FROM probing_edge")
+            .unwrap();
+        assert_eq!(t.rows.len(), 1, "{:?}", t.rows);
+        let start_us: i64 = t.rows[0][0].parse().unwrap();
+        assert_eq!(t.rows[0][1], "passive");
+        assert_eq!(t.rows[0][2], TEST_DAEMON_UID.to_string());
+        assert_eq!(t.rows[0][3], "experiment");
+        let id = experiment_id(start_us);
+        assert!(res.message.contains(&id), "{}", res.message);
+
+        let frame = rx.try_recv().expect("the opening edge publishes one frame");
+        match serde_json::from_slice::<StreamFrame>(frame.bytes()).unwrap() {
+            StreamFrame::Probing(edge) => {
+                assert_eq!(edge.ts_us, start_us);
+                assert_eq!(edge.reason, ProbingReason::Experiment);
+            }
+            other => panic!("expected a Probing frame, got {other:?}"),
+        }
+
+        match experiment_in_memory(&srv.experiments, &id) {
+            Some(Response::Error(m)) => {
+                assert!(net_observer_ipc::is_experiment_running(&m), "{m}");
+                assert_eq!(m, experiment_running_message(&id, start_us + 60_000_000));
+            }
+            other => panic!("a running window answers its poll with still-running: {other:?}"),
+        }
+        assert!(
+            experiment_in_memory(&srv.experiments, "experiment-0").is_none(),
+            "an id this process never ran is for the table to answer"
+        );
+
+        let second = control_request(
+            ControlCmd::StartExperiment { minutes: 1 },
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(!second.ok, "{}", second.message);
+        assert!(
+            net_observer_ipc::is_experiment_running(&second.message),
+            "{}",
+            second.message
+        );
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM probing_edge")
+                .unwrap(),
+            1,
+            "a refused second window writes no edge"
+        );
+        let _ = std::fs::remove_dir_all(&srv.blob_dir);
+    }
+
+    /// A paused daemon refuses to open a window, for the reason it refuses a
+    /// scan: the pause is bracketed silence, and a window measured inside it
+    /// would read its zeros against no record. Nothing moves.
+    #[test]
+    fn a_paused_daemon_refuses_an_experiment() {
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        srv.observing.store(false, Ordering::Release);
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::StartExperiment { minutes: 1 },
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(!res.ok, "{}", res.message);
+        assert_eq!(
+            res.message,
+            "observation is paused; resume before starting an experiment"
+        );
+        assert_eq!(srv.probing.tier(), ProbingTier::Active);
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM probing_edge")
+                .unwrap(),
+            0
+        );
+        assert!(srv.experiments.lock().unwrap().is_empty());
+    }
+
+    /// The window as `start_experiment` hands it to the end task, for a
+    /// window the test opens by hand.
+    fn opened(start_us: i64, tier_before: ProbingTier) -> ExperimentOpen {
+        ExperimentOpen {
+            start_us,
+            requested_minutes: 1,
+            tier_before,
+            peer_uid: TEST_DAEMON_UID,
+            start_freeze: None,
+        }
+    }
+
+    /// Closing a window restores the tier in force before it with an
+    /// `experiment-end` edge — written even when that restoration changes
+    /// nothing — and leaves the report in memory and in the `experiment`
+    /// table, with every count that could not be taken named in it, the
+    /// ring's filter recorded, and no boundary row inside the window.
+    #[tokio::test]
+    async fn finishing_an_experiment_restores_the_tier_and_records_the_report() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        srv.blob_dir = temp_dir("experiment-finish");
+        srv.probing.set(ProbingTier::Passive);
+        let start_us = types::now_us() - 30_000_000;
+        let id = experiment_id(start_us);
+
+        finish_experiment(
+            srv.experiment_handles(),
+            id.clone(),
+            opened(start_us, ProbingTier::Passive),
+        )
+        .await;
+
+        assert_eq!(srv.probing.tier(), ProbingTier::Passive);
+        let t = srv
+            .store
+            .query_table("SELECT tier, reason FROM probing_edge")
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![vec!["passive".to_string(), "experiment-end".to_string()]],
+            "an already-passive daemon still marks the window's end"
+        );
+
+        let record = srv
+            .store
+            .experiment(&id)
+            .unwrap()
+            .expect("the report is durable");
+        assert_eq!(record.start_us, start_us);
+        assert_eq!(record.tier_before, ProbingTier::Passive);
+        assert_eq!(record.freeze_start_dir, None);
+        assert_eq!(record.freeze_end_dir, None, "no ring: nothing was copied");
+        let from_table = net_observer_ipc::experiment_table_from_json(&record.report_json).unwrap();
+
+        let live = match experiment_in_memory(&srv.experiments, &id) {
+            Some(Response::Table(t)) => t,
+            other => panic!("a finished window answers its table: {other:?}"),
+        };
+        assert_eq!(live, from_table, "memory and record render the same table");
+        assert_eq!(live.columns, vec!["key".to_string(), "value".to_string()]);
+        let cell = |k: &str| {
+            live.rows
+                .iter()
+                .find(|r| r[0] == k)
+                .map(|r| r[1].clone())
+                .unwrap_or_else(|| panic!("no row {k}"))
+        };
+        assert_eq!(cell("id"), id);
+        assert_eq!(cell("tier_before"), "passive");
+        assert_eq!(
+            cell("tier_at_end"),
+            "passive (restored from the window's passive)"
+        );
+        assert_eq!(cell("requested_minutes"), "1");
+        assert_eq!(cell("machine_slept"), "no");
+        assert_eq!(cell("ring_filter"), srv.ring_filter);
+        assert_eq!(cell("freeze_start_dir"), "none");
+        assert_eq!(cell("freeze_end_dir"), "none");
+        assert_eq!(cell("own_mac"), "unreadable");
+        assert_eq!(cell("our_icmp_echo"), "not counted: own MAC unreadable");
+        assert_eq!(cell("route_events"), "0");
+        assert_eq!(cell("pauses_inside_window"), "0");
+        assert_eq!(cell("probing_edges_inside_window"), "0");
+        assert!(
+            cell("notes").contains("end freeze: pcap ring not running"),
+            "{}",
+            cell("notes")
+        );
+        assert!(
+            cell("notes").contains("own MAC unreadable"),
+            "{}",
+            cell("notes")
+        );
+        assert!(
+            cell("verdict").starts_with("our ICMP echo requests in the ring: not counted"),
+            "{}",
+            cell("verdict")
+        );
+        assert!(!cell("verdict").contains("silent"), "{}", cell("verdict"));
+
+        // A window that finished is not a running one: a new window may open.
+        let cx = test_ctx(&srv);
+        let next = control_request(
+            ControlCmd::StartExperiment { minutes: 1 },
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(next.ok, "{}", next.message);
+        let _ = std::fs::remove_dir_all(&srv.blob_dir);
+    }
+
+    /// An operator's `probe active` inside the window is theirs to keep: the
+    /// closing edge marks the end without moving the tier, and the report
+    /// names the switch and the skipped restore — with a window opened from
+    /// passive, where an unconditional restore would have flipped the
+    /// operator's `active` back.
+    #[tokio::test]
+    async fn an_operator_switch_inside_the_window_is_kept_and_named() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        srv.blob_dir = temp_dir("experiment-operator-moved");
+        srv.probing.set(ProbingTier::Passive);
+        let cx = test_ctx(&srv);
+
+        let res = control_request(
+            ControlCmd::StartExperiment { minutes: 1 },
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(res.message.contains("(was passive)"), "{}", res.message);
+        let start_us: i64 = srv
+            .store
+            .query_table("SELECT ts_us FROM probing_edge WHERE reason = 'experiment'")
+            .unwrap()
+            .rows[0][0]
+            .parse()
+            .unwrap();
+        let id = experiment_id(start_us);
+
+        // The operator, mid-window.
+        let moved = control_request(
+            ControlCmd::SetProbing(ProbingTier::Active),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(moved.ok, "{}", moved.message);
+        let moved_at: i64 = srv
+            .store
+            .query_table("SELECT ts_us FROM probing_edge WHERE reason = 'control'")
+            .unwrap()
+            .rows[0][0]
+            .parse()
+            .unwrap();
+        assert!(moved_at >= start_us);
+
+        // The end task, run by hand instead of after the sleep.
+        finish_experiment(
+            srv.experiment_handles(),
+            id.clone(),
+            opened(start_us, ProbingTier::Passive),
+        )
+        .await;
+
+        assert_eq!(
+            srv.probing.tier(),
+            ProbingTier::Active,
+            "the operator's choice stands; an unconditional restore would have flipped it back"
+        );
+        let t = srv
+            .store
+            .query_table("SELECT tier, reason FROM probing_edge ORDER BY ts_us")
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec!["passive".to_string(), "experiment".to_string()],
+                vec!["active".to_string(), "control".to_string()],
+                vec!["active".to_string(), "experiment-end".to_string()],
+            ],
+            "the closing edge marks the end at the tier found"
+        );
+        let live = match experiment_in_memory(&srv.experiments, &id) {
+            Some(Response::Table(t)) => t,
+            other => panic!("a finished window answers its table: {other:?}"),
+        };
+        let cell = |k: &str| {
+            live.rows
+                .iter()
+                .find(|r| r[0] == k)
+                .map(|r| r[1].clone())
+                .unwrap_or_else(|| panic!("no row {k}"))
+        };
+        // The instant is a clock on the human rows, never a raw epoch.
+        let moved_at_clock = types::local_instant(moved_at);
+        assert_eq!(
+            cell("tier_at_end"),
+            format!("active (changed by the operator at {moved_at_clock}; restore skipped)")
+        );
+        assert_eq!(
+            cell("probing_edges_inside_window"),
+            format!("1 ({moved_at_clock} active (control))")
+        );
+        assert!(
+            cell("verdict").contains(&format!(
+                "the tier was moved inside the window at {moved_at_clock}"
+            )),
+            "{}",
+            cell("verdict")
+        );
+        assert_eq!(
+            cell("pauses_inside_window"),
+            "0",
+            "collection was on at the start and stayed on"
+        );
+        let _ = std::fs::remove_dir_all(&srv.blob_dir);
+    }
+
+    /// A ring that is running is frozen at both ends into the window's own
+    /// directories, each copied file gets a `blob_ref` row against the
+    /// window's id, and the report names both directories.
+    #[tokio::test]
+    async fn an_experiments_freezes_are_recorded_as_blobs_and_named() {
+        struct TwoFiles;
+        impl crate::pipeline::PcapFreezer for TwoFiles {
+            fn freeze(&self, dest_dir: &Path) -> Vec<std::path::PathBuf> {
+                std::fs::create_dir_all(dest_dir).unwrap();
+                let mut out = Vec::new();
+                for name in ["ring.pcap0", "ring.pcap1"] {
+                    let p = dest_dir.join(name);
+                    // A classic pcap header and no record: readable, empty.
+                    let mut header = vec![0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00];
+                    header.extend_from_slice(&[0u8; 8]);
+                    header.extend_from_slice(&262_144u32.to_le_bytes());
+                    header.extend_from_slice(&1u32.to_le_bytes());
+                    std::fs::write(&p, header).unwrap();
+                    out.push(p);
+                }
+                out
+            }
+        }
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        srv.blob_dir = temp_dir("experiment-freezes");
+        srv.freezer = Arc::new(PcapRingSlot::with_ring(
+            Arc::new(TwoFiles) as Arc<dyn crate::pipeline::PcapFreezer>
+        ));
+        let cx = test_ctx(&srv);
+
+        let res = control_request(
+            ControlCmd::StartExperiment { minutes: 1 },
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(
+            res.message.contains("froze 2 pcap file(s) at the start"),
+            "{}",
+            res.message
+        );
+        let start_us: i64 = srv
+            .store
+            .query_table("SELECT ts_us FROM probing_edge WHERE reason = 'experiment'")
+            .unwrap()
+            .rows[0][0]
+            .parse()
+            .unwrap();
+        let id = experiment_id(start_us);
+        let start_dir = srv
+            .blob_dir
+            .join(format!("freeze-experiment-{start_us}-start"));
+        let start_paths = vec![start_dir.join("ring.pcap0"), start_dir.join("ring.pcap1")];
+
+        finish_experiment(
+            srv.experiment_handles(),
+            id.clone(),
+            ExperimentOpen {
+                start_freeze: Some((start_dir.clone(), start_paths)),
+                ..opened(start_us, ProbingTier::Active)
+            },
+        )
+        .await;
+
+        let blobs = srv
+            .store
+            .query_table(&format!(
+                "SELECT id, kind, path FROM blob_ref WHERE incident_id = '{id}' ORDER BY id"
+            ))
+            .unwrap();
+        assert_eq!(blobs.rows.len(), 4, "{:?}", blobs.rows);
+        assert!(blobs.rows.iter().all(|r| r[1] == "pcap"));
+        assert!(
+            blobs
+                .rows
+                .iter()
+                .any(|r| r[0] == format!("{id}-pcap-start-0"))
+        );
+        assert!(
+            blobs
+                .rows
+                .iter()
+                .any(|r| r[0] == format!("{id}-pcap-end-1"))
+        );
+        assert!(
+            blobs.rows.iter().any(|r| r[2].ends_with("-end/ring.pcap0")),
+            "{:?}",
+            blobs.rows
+        );
+
+        let record = srv.store.experiment(&id).unwrap().expect("durable");
+        assert_eq!(
+            record.freeze_start_dir.as_deref(),
+            Some(start_dir.display().to_string().as_str())
+        );
+        assert!(
+            record
+                .freeze_end_dir
+                .as_deref()
+                .is_some_and(|d| d.ends_with(&format!("freeze-experiment-{start_us}-end"))),
+            "{:?}",
+            record.freeze_end_dir
+        );
+        let live = match experiment_in_memory(&srv.experiments, &id) {
+            Some(Response::Table(t)) => t,
+            other => panic!("a finished window answers its table: {other:?}"),
+        };
+        let cell = |k: &str| {
+            live.rows
+                .iter()
+                .find(|r| r[0] == k)
+                .map(|r| r[1].clone())
+                .unwrap_or_else(|| panic!("no row {k}"))
+        };
+        assert_eq!(cell("freeze_start_dir"), start_dir.display().to_string());
+        assert_eq!(cell("frames_pcap_start"), "0");
+        assert_eq!(cell("frames_pcap_end"), "0");
+        let _ = std::fs::remove_dir_all(&srv.blob_dir);
     }
 
     /// An unauthorised peer cannot reach the new self-control commands either:

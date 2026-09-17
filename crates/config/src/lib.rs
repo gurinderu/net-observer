@@ -56,7 +56,9 @@ impl Default for ProbingCfg {
 }
 
 fn default_probing_tier() -> ProbingTier {
-    ProbingTier::Passive
+    // One spelling of the default: `types::ProbingTier::default` IS passive,
+    // so a tier nobody recorded and a tier nobody configured agree.
+    ProbingTier::default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

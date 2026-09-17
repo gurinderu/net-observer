@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use net_observer_ipc::{DiagnosticQuery, Table};
+use net_observer_ipc::{DiagnosticQuery, Table, experiment_table_from_json};
 use store::diagnosis::{self, PreparedSql};
 use store::{QueryTable, Store, StoreError};
 
@@ -85,6 +85,20 @@ pub fn run_query(
         DiagnosticQuery::AirAps { scan_ts_us } => diagnosis::air_aps_at_sql(scan_ts_us),
         DiagnosticQuery::AirSelfChannel => {
             PreparedSql::plain(diagnosis::AIR_SELF_CHANNEL_SQL.to_string())
+        }
+        // Not a SQL diagnosis: a primary-key read of the `experiment` table,
+        // rendered through the one conversion the CLI's offline path also
+        // uses. Reached only for a window the daemon no longer holds in
+        // memory (`api::experiment_in_memory` answers those first). (realm
+        // net-observer, node #61)
+        DiagnosticQuery::Experiment { id } => {
+            return match store.experiment(&id).map_err(describe)? {
+                Some(record) => experiment_table_from_json(&record.report_json)
+                    .map_err(|e| format!("experiment {id}: {e}")),
+                None => Err(format!(
+                    "experiment {id} not found: this daemon did not run it and the record holds no such window"
+                )),
+            };
         }
     };
     store
@@ -242,6 +256,71 @@ mod tests {
             DiagnosticQuery::AirSelfChannel,
             &["ts_us", "channel", "channel_band", "channel_width_mhz"],
         );
+    }
+
+    /// An experiment the record does not hold is a failure in the daemon's
+    /// words — never a bad request, never the CLI's cue to wait — and one
+    /// the record holds renders as the `key | value` table the live answer
+    /// would have been.
+    #[test]
+    fn an_experiment_is_read_from_the_table_or_named_as_absent() {
+        let store = DuckdbStore::in_memory().unwrap();
+        let absent = run_query(
+            &store,
+            DiagnosticQuery::Experiment {
+                id: "experiment-7".into(),
+            },
+            10.0,
+            GENEROUS,
+        )
+        .expect_err("no such window");
+        assert!(absent.contains("experiment-7 not found"), "{absent}");
+        assert!(!absent.starts_with(UNDECODABLE_REQUEST_PREFIX));
+        assert!(!net_observer_ipc::is_experiment_running(&absent));
+
+        let report = types::ExperimentReport {
+            id: "experiment-7".into(),
+            window: types::ExperimentWindow {
+                start_us: 7,
+                end_us: 7 + 60_000_000,
+                requested_minutes: 1,
+                link_interval_us: 15_000_000,
+                tier_before: types::ProbingTier::Active,
+                tier_at_end: types::ProbingTier::Active,
+                restore: types::TierRestore::Restored,
+                freeze_start_dir: None,
+                freeze_end_dir: None,
+                frames_pcap_start: None,
+                frames_pcap_end: None,
+            },
+            ring_filter: "arp or icmp".into(),
+            own_mac: None,
+            our_frames: None,
+            network: Some(types::NetworkFacts::default()),
+            edges: types::WindowEdges::default(),
+            notes: Vec::new(),
+        };
+        store
+            .write_experiment(&::store::ExperimentRecord {
+                id: "experiment-7".into(),
+                start_us: 7,
+                end_us: 7 + 60_000_000,
+                tier_before: types::ProbingTier::Active,
+                freeze_start_dir: None,
+                freeze_end_dir: None,
+                report_json: net_observer_ipc::experiment_report_json(&report).unwrap(),
+            })
+            .unwrap();
+        let table = run_query(
+            &store,
+            DiagnosticQuery::Experiment {
+                id: "experiment-7".into(),
+            },
+            10.0,
+            GENEROUS,
+        )
+        .unwrap();
+        assert_eq!(table, Table::from(&report));
     }
 
     /// A filter the store could never have written is refused with the
