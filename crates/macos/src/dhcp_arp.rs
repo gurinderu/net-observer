@@ -65,6 +65,18 @@ impl SystemFacts {
         self.singbox_config = Some(path.into());
         self
     }
+
+    /// The segment's identity — the default gateway's MAC, the `network_key`
+    /// every neighbour record is filed under. `None` when there is no default
+    /// route or no ARP entry for it; a caller then records under the "unknown
+    /// network" key rather than under a wrong one. The one derivation the
+    /// neighbour-cache read, the operator-pressed scan and the announce
+    /// listener all share, so their rows can never key the same segment
+    /// three different ways.
+    pub async fn network_key(&self) -> Option<String> {
+        let gw = self.default_gw().await?;
+        self.gw_arp_mac(&gw).await
+    }
 }
 
 impl LinkFacts for SystemFacts {

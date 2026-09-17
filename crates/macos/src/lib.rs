@@ -7,14 +7,17 @@
 //! (`socket2` + `IP_BOUND_IF` → `tokio::net::TcpStream`), DHCP/ARP/Wi-Fi facts
 //! (`tokio::process` over `route` / `ipconfig` / `arp` / `networksetup`), Wi-Fi
 //! air quality read from CoreWLAN via hand-declared `objc2` message sends, the
-//! Clash/Mihomo RESTful API and DoH client (`reqwest` async), and the `tcpdump`
-//! pcap ring with freeze-to-disk. The only genuinely blocking probe, the
-//! PF_ROUTE `read`, stays a sync `EventSource` driven on a dedicated thread.
+//! Clash/Mihomo RESTful API and DoH client (`reqwest` async), the `tcpdump`
+//! pcap ring with freeze-to-disk, and a second `tcpdump` child streaming the
+//! segment's announcements for the passive `announce` listener. The
+//! genuinely blocking sources — the PF_ROUTE `read` and that pcap pipe —
+//! stay sync `EventSource`s driven on dedicated threads.
 //!
 //! Raw ICMP and `tcpdump` require root, so the reachability paths are verified
 //! manually; the pure parsing/copy logic is unit-tested.
 
 pub mod air;
+pub mod announce;
 pub mod clash;
 pub mod corewlan;
 pub mod dhcp_arp;
@@ -31,6 +34,7 @@ pub mod tls;
 pub mod wifi;
 
 pub use air::SystemProfilerAir;
+pub use announce::{ANNOUNCE_FILTER, AnnounceCapture, SystemSegment};
 pub use clash::{ClashClient, ConnectionSystemFacts, ProxySystemFacts};
 pub use corewlan::CoreWlanFacts;
 pub use dhcp_arp::SystemFacts;

@@ -15,6 +15,7 @@ collector-wifi.workspace = true
 collector-neighbors.workspace = true
 collector-air.workspace = true
 collector-connections.workspace = true
+collector-announce.workspace = true
 # CoreWLAN is reached by hand-declared message sends against the Objective-C
 # runtime (`objc2` alone — no `objc2-foundation`, since the adapter passes and
 # returns only scalars and untyped objects). See `src/corewlan.rs`.
