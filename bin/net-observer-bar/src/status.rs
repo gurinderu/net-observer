@@ -78,23 +78,31 @@ pub enum Health {
 
 /// Classify a [`StatusSnapshot`] into a [`Health`]: [`Health::NoData`] when there
 /// is no link *and* no proxy tick (and when the gateway verdict is `SKIP` — the
-/// passive tier — while the tun is healthy: nothing was measured at the gateway,
-/// so there is no verdict to give), [`Health::Ok`] when the gateway verdict is
-/// `OK` *and* the tun probe returned HTTP 204 (the healthy reachability code),
-/// and [`Health::Bad`] otherwise (gw or tun bad / degraded — e.g. tun `0` =
-/// wedge). Pure over its input, so it is unit-tested without a socket or a GUI.
+/// passive tier — while the tun is unmeasured (`None`) or healthy (`204`):
+/// nothing was measured at the gateway, so there is no verdict to give),
+/// [`Health::Ok`] when the gateway verdict is `OK` *and* the tun probe returned
+/// HTTP 204 (the healthy reachability code), and [`Health::Bad`] otherwise (gw
+/// or tun bad / degraded — e.g. tun `0` = wedge). Pure over its input, so it is
+/// unit-tested without a socket or a GUI.
 pub fn health(snap: &StatusSnapshot) -> Health {
     if snap.link.is_none() && snap.proxy.is_none() {
         return Health::NoData;
     }
     // A `SKIP` gateway is the passive tier: the echo was deliberately not sent, so
-    // there is no gateway verdict to judge. Calling that red would be a false
-    // alarm about the network and calling it green would be a claim we did not
-    // measure — so unless the tun is independently bad, the dot goes to
-    // `NoData`, the "no verdict" state.
+    // there is no gateway verdict to judge. Under this tier the tun 204 probe is
+    // withheld too, so `tun_code` is usually `None` ("not probed"), not `204`
+    // ("probed and healthy") — both mean the same thing here: nothing was
+    // measured, so there is no verdict to give. Only a *measured* non-204 tun
+    // (a wedge, or another code) is an independent fault the gateway withholding
+    // does not excuse. The first passive daemon left `None` unhandled here and
+    // lit the dot red on a healthy network for exactly this reason
+    // (realm net-observer, node #88).
     if snap.link.as_ref().is_some_and(|l| l.gw == GwVerdict::Skip) {
-        let tun_ok = snap.proxy.as_ref().and_then(|p| p.tun_code) == Some(204);
-        return if tun_ok { Health::NoData } else { Health::Bad };
+        let tun_code = snap.proxy.as_ref().and_then(|p| p.tun_code);
+        return match tun_code {
+            None | Some(204) => Health::NoData,
+            Some(_) => Health::Bad,
+        };
     }
     let gw_ok = snap.link.as_ref().is_some_and(|l| l.gw == GwVerdict::Ok);
     // The tun HTTP 204 probe: 204 means the tunnel path is reachable; anything
@@ -219,9 +227,11 @@ mod tests {
         assert_eq!(status_glyph(&snap), "🟢 gw:OK tun:204");
     }
 
-    /// The passive tier (`gw = SKIP`) is not a fault: with the tun healthy the
-    /// dot is the "no verdict" one, not red — and not green either, since
-    /// nothing at the gateway was measured.
+    /// The passive tier (`gw = SKIP`) is not a fault: with the tun healthy —
+    /// measured 204, or unmeasured (`None`, the tier's default since the tun
+    /// probe is withheld too) — the dot is the "no verdict" one, not red, and
+    /// not green either, since nothing at the gateway was measured. A
+    /// *measured* non-204 tun is still an independent fault.
     #[test]
     fn skip_gateway_is_no_verdict_not_a_fault() {
         let passive = StatusSnapshot {
@@ -230,6 +240,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(health(&passive), Health::NoData);
+
+        // The passive tier's actual default: tun not probed at all.
+        let passive_unmeasured = StatusSnapshot {
+            link: Some(link(GwVerdict::Skip)),
+            proxy: Some(proxy(None, Some("auto"))),
+            ..Default::default()
+        };
+        assert_eq!(health(&passive_unmeasured), Health::NoData);
+
         // A wedged tun is still a fault while the gateway is withheld.
         let wedged = StatusSnapshot {
             link: Some(link(GwVerdict::Skip)),
@@ -237,6 +256,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(health(&wedged), Health::Bad);
+
+        // A measured, non-204, non-wedge code is also a fault.
+        let bad_code = StatusSnapshot {
+            link: Some(link(GwVerdict::Skip)),
+            proxy: Some(proxy(Some(200), None)),
+            ..Default::default()
+        };
+        assert_eq!(health(&bad_code), Health::Bad);
     }
 
     #[test]
