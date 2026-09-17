@@ -1347,7 +1347,7 @@ impl Collector for FakeCollector {
     fn skip(&self, ts_us: i64) -> Vec<Sample> {
         vec![Sample::Link(types::LinkSample {
             ts_us,
-            gw: types::GwVerdict::NoGw,
+            gw: types::GwVerdict::Skip,
             gw_rtt_ms: None,
             direct: types::TcpVerdict::Skip,
             direct_rtt_ms: None,

@@ -2192,7 +2192,7 @@ mod tests {
                 panic!("expected a link sample")
             };
             // The SKIP vocabulary, not a fabricated healthy value.
-            assert_eq!(l.gw, GwVerdict::NoGw);
+            assert_eq!(l.gw, GwVerdict::Skip);
             assert_eq!(l.direct, TcpVerdict::Skip);
             assert_eq!(l.gw_rtt_ms, None);
         }
@@ -2225,7 +2225,7 @@ mod tests {
                 .await
                 .expect("an unready collector must still emit every tick")
                 .expect("channel should stay open");
-            assert!(matches!(s, Sample::Link(ref l) if l.gw == GwVerdict::NoGw));
+            assert!(matches!(s, Sample::Link(ref l) if l.gw == GwVerdict::Skip));
         }
 
         // The prerequisite appears.
