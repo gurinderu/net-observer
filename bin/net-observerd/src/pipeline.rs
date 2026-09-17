@@ -410,6 +410,13 @@ pub async fn run(
             dropped_pre_resume = dropped_pre_resume.saturating_add(1);
             continue;
         }
+        // The flow table stays out of the trigger window: no rule reads it, and
+        // it is the heaviest sample in the process — a tick of it would take a
+        // slot from every count-bounded rule the window was sized for. It is
+        // already stored and published above (realm net-observer, node #75).
+        if matches!(sample, Sample::Connections(_)) {
+            continue;
+        }
         window.push(sample);
         engine.on_sample(&window, now_us);
     }
