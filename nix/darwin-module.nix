@@ -25,12 +25,16 @@ in
 
     package = mkOption {
       type = types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.net-observerd;
-      defaultText = "self.packages.\${system}.net-observerd";
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.net-observer;
+      defaultText = "self.packages.\${system}.net-observer";
       description = ''
-        The daemon package. Defaults to this flake's own build, taken through
-        `self` rather than an overlay so a consumer gets the version pinned by
-        its `flake.lock` and not whatever a nixpkgs overlay happens to hold.
+        The package that carries `bin/net-observerd` and `bin/net-observer-cli`
+        — the flake's `net-observer` symlink join, so a host that puts this
+        option into `environment.systemPackages` gets the operator's CLI next
+        to the daemon. Under crate2nix each crate is its own derivation, and
+        `packages.net-observerd` alone is the daemon binary only (realm
+        net-observer, node #117). Taken through `self` rather than an overlay
+        so a consumer gets the version pinned by its `flake.lock`.
       '';
     };
 
