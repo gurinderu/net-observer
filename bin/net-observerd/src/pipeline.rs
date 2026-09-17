@@ -228,15 +228,20 @@ impl ResumeGate {
 /// handled here identically: a passive stretch is bracketed for the triggers
 /// exactly as a pause is (realm net-observer, node #88).
 ///
-/// A RESUME edge RE-OPENS detection; it does not dedup it. The recent-sample
-/// window is cleared and every trigger is re-armed
-/// ([`TriggerEngine::rearm_all`]), so a fault that is still present when
-/// collection resumes is recorded again — as a NEW incident belonging to the new
-/// observation session, not as a duplicate of the pre-pause one. What a resume
-/// does NOT do is reset the firing budget: `last_fire_us` survives it, so each
-/// trigger still fires at most once per `backoff_us` and a toggled switch cannot
-/// storm the incident log. The `observing_edge` rows bound the gap between the
-/// two records.
+/// A RESUME edge RE-OPENS detection; it does not dedup it. Before the window
+/// clears and every trigger is re-armed ([`TriggerEngine::rearm_all`]),
+/// [`TriggerEngine::close_all`] closes whatever incident the PREVIOUS session
+/// left open, at the `ts_us` of the edge that ended it — the pause's own, or
+/// the tier switch's, carried in `session_end_us` — never at the first
+/// post-edge sample's, which would misattribute the unobserved gap to it.
+/// Closing there also releases that trigger's firing budget, so a fault still
+/// present when collection resumes is recorded again — as a NEW incident
+/// belonging to the new observation session, AT ONCE, not once whatever
+/// backoff the closed incident had spent happens to expire. A trigger with
+/// NOTHING open at the edge keeps its budget exactly as before, so a toggled
+/// switch on a healthy network still cannot storm the incident log. The
+/// `observing_edge` rows bound the gap between the two records (realm
+/// net-observer, node #124).
 ///
 /// Exactly one thing survives [`RecentWindow::clear_for_resume`]: the newest link
 /// sample, kept as the gateway-CHANGE BASIS and reachable ONLY through
@@ -304,6 +309,16 @@ pub async fn run(
     // clears and re-arms by exactly this path (realm net-observer, node #88).
     // `0` = no such edge yet.
     resume_at_us: Arc<AtomicI64>,
+    // `ts_us` of the edge that ENDED the observation session this resume/switch
+    // re-opens: a pause's own `ts_us` (published because `resume_at_us` will
+    // not move until the LATER resume), or a tier switch's own `ts_us` (the
+    // same instant as its `resume_at_us` bump). The writers publish it with
+    // `compare_exchange(0, ts_us, ..)` so the FIRST unconsumed end wins; this
+    // side CONSUMES it with `swap(0, ..)` — read and reset in one step — so a
+    // value once used at one edge is never read again at a later one. `0` =
+    // none recorded — the edge's own `ts_us` is used instead (realm
+    // net-observer, node #124).
+    session_end_us: Arc<AtomicI64>,
 ) {
     let mut window = RecentWindow::new(triggers::WINDOW_CAP);
     // The bounded post-resume drain filter, replacing the raw
@@ -381,12 +396,31 @@ pub async fn run(
         // so a sample is never timed against two different instants.
         let now = Instant::now();
         if gate.observe_edge(resume_at_us.load(Ordering::Acquire), now) {
+            // Close whatever the PREVIOUS observation session left open before
+            // clearing the window and re-arming: that incident belongs to the
+            // session that just ended, not to whatever this edge's first
+            // sample finds. `session_end_us` is the pause's own `ts_us` when
+            // this edge is a resume from a pause (the pause published no edge
+            // of its own); falling back to the edge's own `ts_us` covers a
+            // tier switch (which stamps both atomics alike) and the case
+            // where nothing was ever recorded. `swap`, not `load`: this is the
+            // one place that atomic is ever consumed, and consuming it means
+            // resetting it, or a LATER edge would read a stale end that
+            // belongs to this one (realm net-observer, node #124).
+            let end = session_end_us.swap(0, Ordering::AcqRel);
+            let closed_at_us = if end > 0 {
+                end
+            } else {
+                gate.applied_resume_us()
+            };
+            engine.close_all(closed_at_us);
             // Forget the samples, KEEP the gateway-change basis (see
             // `RecentWindow::clear_for_resume`), and re-open detection.
             window.clear_for_resume();
             engine.rearm_all();
             tracing::info!(
                 edge_us = gate.applied_resume_us(),
+                closed_at_us,
                 "resume or probing-tier switch; window cleared (gateway-change basis kept), \
                  triggers re-armed"
             );
@@ -1716,6 +1750,16 @@ mod tests {
         Arc::new(AtomicI64::new(0))
     }
 
+    /// No session-end recorded: `run` then closes an edge's open incidents at
+    /// the edge's OWN `ts_us` ([`ResumeGate::applied_resume_us`]) instead of a
+    /// separately-published pause instant. Correct for every test here that
+    /// drives a bare `resume_at_us` edge with no matching pause — a real tier
+    /// switch stamps this atomic to that same edge instant rather than leaving
+    /// it at `0`, but the fallback lands on the identical value either way.
+    fn no_session_end() -> Arc<AtomicI64> {
+        Arc::new(AtomicI64::new(0))
+    }
+
     fn link(ts_us: i64, gw: GwVerdict) -> Sample {
         Sample::Link(LinkSample {
             ts_us,
@@ -1756,6 +1800,7 @@ mod tests {
             snapshot,
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
         tx.send(Sample::Link(LinkSample {
             ts_us: 1,
@@ -1820,6 +1865,7 @@ mod tests {
             snapshot,
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
         // Ok -> Fail is a gateway-verdict change: gw-change must fire.
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -2292,6 +2338,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
 
         // A link sample then a proxy sample: each populates its own snapshot field,
@@ -2363,6 +2410,7 @@ mod tests {
             snapshot,
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
 
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -2409,6 +2457,7 @@ mod tests {
             snapshot,
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
 
         tx.send(link(11, GwVerdict::Ok)).await.unwrap();
@@ -2449,6 +2498,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
         tx.send(link(7, GwVerdict::Ok)).await.unwrap();
         tx.send(Sample::Host(HostSample {
@@ -2563,6 +2613,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         // Two wedge-shaped tick pairs before the pause.
@@ -2634,6 +2685,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             no_resume(),
+            no_session_end(),
         ));
 
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -2709,6 +2761,7 @@ mod tests {
             snapshot,
             events_tx,
             resume_at_us,
+            no_session_end(),
         ));
 
         // The straggler: the probe that spanned both edges.
@@ -2896,6 +2949,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         // Enough stale-looking samples to exhaust the drop cap on their own.
@@ -2958,6 +3012,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         // Fires once, then stays latched while the fault persists.
@@ -3001,18 +3056,289 @@ mod tests {
         );
     }
 
-    /// The matched twin of the test above: the identical stream under the daemon's
-    /// PRODUCTION backoff yields exactly ONE incident. A resume re-arms the latch;
-    /// it does not hand the trigger a fresh firing budget, so a spammed switch
-    /// cannot storm the incident log.
-    ///
-    /// The operator scenario, stated plainly: toggling collection off and on again
-    /// inside [`crate::BACKOFF_US`] — the real firing budget the daemon ships with,
-    /// not a synthetic one — writes no second incident. Reading the production
-    /// constant here is what makes this die under `BACKOFF_US = 0`, which nothing
-    /// else in the suite reads.
+    /// Item 3 (realm net-observer, node #124): the incident a pre-pause firing
+    /// left open closes at the PAUSE's own `ts_us` — the edge that actually
+    /// ended its observation session — never at the resume's, which would
+    /// misattribute the whole unobserved gap to it. A pause moves no
+    /// `resume_at_us` of its own (it produces no sample for the consumer to
+    /// react to), so `session_end_us` is what carries the pause's `ts_us`
+    /// forward to the edge the consumer actually processes: the later resume.
     #[tokio::test]
-    async fn run_does_not_refire_within_the_backoff_after_a_resume() {
+    async fn run_closes_the_pre_pause_incident_at_the_pause_ts_not_the_resumes() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 0)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        // The pause's own ts_us, published the way `SetObserving(false)` does in
+        // `api::control_response` — BEFORE the later resume moves `resume_at_us`.
+        const PAUSE_US: i64 = 10;
+        const RESUME_US: i64 = 100;
+        let session_end_us = Arc::new(AtomicI64::new(PAUSE_US));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+            session_end_us,
+        ));
+
+        // Fires once; stays latched while the fault persists across the
+        // (unmodelled) pause.
+        tx.send(link(1, GwVerdict::Fail)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 2,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 2).await;
+
+        // The edge the consumer actually observes: `resume_at_us` moving to
+        // `RESUME_US`, well past the pause that really ended the session.
+        resume_at_us.store(RESUME_US, Ordering::Release);
+        tx.send(link(RESUME_US + 1, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            2,
+            "the persistent fault opens a second incident at the resume"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT closed_us FROM incident WHERE id = 'gw-drop-1'")
+                .unwrap(),
+            PAUSE_US,
+            "the pre-pause incident closes at the pause's own ts_us, not the resume's"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(&format!(
+                    "SELECT count(*) FROM incident \
+                     WHERE id = 'gw-drop-{}' AND closed_us IS NULL",
+                    RESUME_US + 1
+                ))
+                .unwrap(),
+            1,
+            "the post-resume incident is freshly opened and still asserting"
+        );
+    }
+
+    /// Item 1 (realm net-observer, node #124): the coordinator's exact repro. A
+    /// tier switch ACCEPTED WHILE STILL PAUSED publishes no sample of its own
+    /// (the daemon is paused; nothing flows to let the consumer observe and
+    /// consume `session_end_us`), so it must not push the close point forward
+    /// past the pause that actually opened the gap. `SetObserving(false)` and
+    /// `set_probing` both use `compare_exchange(0, ts_us, ..)`: the FIRST
+    /// unconsumed end wins. Simulated here exactly as `api::control_response`
+    /// performs it — the pause's compare_exchange, then (nothing flows) the
+    /// switch's compare_exchange plus its unconditional `resume_at_us` store,
+    /// then the resume's unconditional `resume_at_us` store — so this pins the
+    /// CONTRACT between the two writers and the one consumer, not a
+    /// reimplementation of either.
+    #[tokio::test]
+    async fn run_closes_at_the_pause_ts_even_when_a_switch_lands_inside_the_pause() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 0)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let session_end_us = Arc::new(AtomicI64::new(0));
+        const PAUSE_US: i64 = 10;
+        const SWITCH_US: i64 = 50;
+        const RESUME_US: i64 = 100;
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+            session_end_us.clone(),
+        ));
+
+        tx.send(link(1, GwVerdict::Fail)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 2,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 2).await;
+
+        // `SetObserving(false)` at t=10: the FIRST end, and nothing consumes it.
+        let _ = session_end_us.compare_exchange(0, PAUSE_US, Ordering::AcqRel, Ordering::Acquire);
+        // `set_probing` at t=50, still paused: its compare_exchange loses the
+        // race (session_end_us already holds PAUSE_US, not 0) and is ignored,
+        // but its `resume_at_us` store is unconditional either way — exactly
+        // as `api::set_probing` performs both.
+        let _ = session_end_us.compare_exchange(0, SWITCH_US, Ordering::AcqRel, Ordering::Acquire);
+        resume_at_us.store(SWITCH_US, Ordering::Release);
+        // `SetObserving(true)` at t=100: only `resume_at_us` moves.
+        resume_at_us.store(RESUME_US, Ordering::Release);
+
+        tx.send(link(RESUME_US + 1, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            2,
+            "exactly two incidents: the pre-pause one and the post-resume one"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT closed_us FROM incident WHERE id = 'gw-drop-1'")
+                .unwrap(),
+            PAUSE_US,
+            "the blind switch at t=50 must not move the close point off the pause at t=10"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(&format!(
+                    "SELECT count(*) FROM incident WHERE id = 'gw-drop-{}'",
+                    RESUME_US + 1
+                ))
+                .unwrap(),
+            1,
+            "the persistent fault still opens its new-session incident at the resume"
+        );
+    }
+
+    /// Item 4 (realm net-observer, node #124): two pause/resume cycles with the
+    /// fault persisting throughout produce three incidents — the first two
+    /// closed at their OWN pause's `ts_us`, the third still open. Each pause
+    /// publishes its own `session_end_us` and each resume only moves
+    /// `resume_at_us`, exactly as the single-cycle test above; this is that
+    /// same contract iterated, so a fix that only handles one edge (a
+    /// leftover `armed`/`last_fire_us` from the first cycle bleeding into the
+    /// second) would still be caught.
+    #[tokio::test]
+    async fn run_closes_two_successive_pre_pause_incidents_at_their_own_pause_ts() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(Box::new(GwDrop), vec![rec], 0)]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let session_end_us = Arc::new(AtomicI64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+            session_end_us.clone(),
+        ));
+
+        // Cycle 1: fires at t=1 (A), pauses at t=10, resumes at t=20 — the
+        // fault is still present at t=21, so A closes at 10 and B opens at 21.
+        tx.send(link(1, GwVerdict::Fail)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 2,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 2).await;
+        session_end_us.store(10, Ordering::Release);
+        resume_at_us.store(20, Ordering::Release);
+        tx.send(link(21, GwVerdict::Fail)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 22,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 22).await;
+
+        // Cycle 2: pauses at t=30, resumes at t=40 — the fault is STILL
+        // present at t=41, so B closes at 30 and C opens at 41.
+        session_end_us.store(30, Ordering::Release);
+        resume_at_us.store(40, Ordering::Release);
+        tx.send(link(41, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            3,
+            "two persistent-fault cycles open three incidents in total"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT closed_us FROM incident WHERE id = 'gw-drop-1'")
+                .unwrap(),
+            10,
+            "the first incident closes at its OWN pause's ts_us"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT closed_us FROM incident WHERE id = 'gw-drop-21'")
+                .unwrap(),
+            30,
+            "the second incident closes at its OWN pause's ts_us, not the first pause's"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(
+                    "SELECT count(*) FROM incident WHERE id = 'gw-drop-41' AND closed_us IS NULL"
+                )
+                .unwrap(),
+            1,
+            "the third incident is still open"
+        );
+    }
+
+    /// Item 2 (realm net-observer, node #124): closing an incident at the edge
+    /// releases that trigger's firing budget. A fault that persists across an
+    /// ACTUAL PAUSE — a real `session_end_us`, distinct from the resume's own
+    /// `ts_us` — opens a SECOND incident at the resume even though the
+    /// daemon's PRODUCTION `BACKOFF_US` is nowhere near elapsed: the engine's
+    /// documented contract ("a fault still present when collection resumes is
+    /// recorded again, as a NEW incident") must hold without waiting out the
+    /// closed incident's budget. Reading the production constant is what
+    /// makes this die under `BACKOFF_US = 0`, which nothing else in the suite
+    /// reads. The non-vacuity control — nothing open at the edge still
+    /// respects the old budget — is the next test.
+    #[tokio::test]
+    async fn run_refires_a_persistent_fault_at_once_after_a_resume_that_closed_it() {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
         let eng = TriggerEngine::new(vec![Trigger::new(
@@ -3023,6 +3349,7 @@ mod tests {
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let (events_tx, _events_rx) = broadcast::channel(16);
         let resume_at_us = Arc::new(AtomicI64::new(0));
+        let session_end_us = Arc::new(AtomicI64::new(0));
         let (tx, rx) = mpsc::channel(16);
         let h = tokio::spawn(run(
             store.clone(),
@@ -3031,6 +3358,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            session_end_us.clone(),
         ));
 
         tx.send(link(1, GwVerdict::Fail)).await.unwrap();
@@ -3048,8 +3376,85 @@ mod tests {
         .unwrap();
         wait_for_generated(&snapshot, 3).await;
 
-        resume_at_us.store(10, Ordering::Release);
-        tx.send(link(11, GwVerdict::Fail)).await.unwrap();
+        // An ACTUAL pause at t=10, resumed at t=20 — both microseconds after
+        // the firing at t=1, nowhere near the production backoff's own scale.
+        session_end_us.store(10, Ordering::Release);
+        resume_at_us.store(20, Ordering::Release);
+        tx.send(link(21, GwVerdict::Fail)).await.unwrap();
+        drop(tx);
+        h.await.unwrap();
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            2,
+            "closing at the pause releases the budget; the persistent fault \
+             opens a second incident well inside the production backoff"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT closed_us FROM incident WHERE id = 'gw-drop-1'")
+                .unwrap(),
+            10,
+            "the pre-pause incident closes at the pause's own ts_us"
+        );
+    }
+
+    /// The non-vacuity control for the test above, and the invariant it used
+    /// to state alone: a trigger with NOTHING open AT THE EDGE keeps its
+    /// firing budget untouched, so a toggle across a HEALTHY network still
+    /// cannot storm the incident log. The fault fires once, then RECOVERS
+    /// while still observing (a live `Some -> None` edge, which arms the
+    /// trigger but leaves `last_fire_us` alone — `close_all` never runs for
+    /// it, since nothing is open by the time the pause/resume edge lands).
+    #[tokio::test]
+    async fn run_does_not_refire_a_toggle_storm_on_a_healthy_network() {
+        let store = Arc::new(DuckdbStore::in_memory().unwrap());
+        let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
+        let eng = TriggerEngine::new(vec![Trigger::new(
+            Box::new(GwDrop),
+            vec![rec],
+            crate::BACKOFF_US,
+        )]);
+        let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let resume_at_us = Arc::new(AtomicI64::new(0));
+        let session_end_us = Arc::new(AtomicI64::new(0));
+        let (tx, rx) = mpsc::channel(16);
+        let h = tokio::spawn(run(
+            store.clone(),
+            eng,
+            rx,
+            snapshot.clone(),
+            events_tx,
+            resume_at_us.clone(),
+            session_end_us.clone(),
+        ));
+
+        // Fires at t=1, RECOVERS at t=2 (a live edge, not close_all): armed,
+        // but `last_fire_us` stays at 1.
+        tx.send(link(1, GwVerdict::Fail)).await.unwrap();
+        tx.send(link(2, GwVerdict::Ok)).await.unwrap();
+        tx.send(Sample::Host(HostSample {
+            ts_us: 3,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .await
+        .unwrap();
+        wait_for_generated(&snapshot, 3).await;
+
+        // A pause/resume edge with NOTHING open: `close_all` has nothing to
+        // close, so the budget from the t=1 firing survives untouched.
+        session_end_us.store(10, Ordering::Release);
+        resume_at_us.store(20, Ordering::Release);
+        // Reasserts moments after the resume — well inside the untouched backoff.
+        tx.send(link(21, GwVerdict::Fail)).await.unwrap();
         drop(tx);
         h.await.unwrap();
 
@@ -3058,24 +3463,32 @@ mod tests {
                 .query_scalar_i64("SELECT count(*) FROM incident")
                 .unwrap(),
             1,
-            "a resume re-arms; it does not reset the firing budget"
+            "nothing was open at the edge, so the old backoff still stands"
         );
     }
 
-    /// The other direction of that same boundary: once the production budget HAS
-    /// elapsed, a fault still present at resume is recorded again. The post-resume
-    /// link is stamped at exactly `1 + crate::BACKOFF_US` — the FIRST microsecond
-    /// the budget is available, since the pre-pause fire was at ts 1 and the
-    /// engine's guard is `>=`.
+    /// The boundary of the budget `close_all` does NOT touch: nothing is open
+    /// when the pause/resume edge lands here (the ts-1 firing RECOVERED live —
+    /// an ordinary healthy tick at ts 2, not `close_all` — before the pause),
+    /// so the ORIGINAL, untouched backoff from ts 1 is what decides whether
+    /// the post-resume reassertion fires. The post-resume link is stamped at
+    /// exactly `1 + crate::BACKOFF_US` — the FIRST microsecond that budget is
+    /// available, since the engine's guard is `>=`.
     ///
     /// Two mutations die here, one from each side: `>=` -> `>` in
     /// `TriggerEngine::on_sample` (2 -> 1) and `BACKOFF_US = i64::MAX` (2 -> 1).
     /// `saturating_add`, not `+`, precisely because of the second: a plain `+` would
     /// panic on overflow under it and mask the assertion behind an arithmetic error.
+    /// Neither mutant would die if anything were still open at the edge —
+    /// `close_all` would release the budget regardless of either mutation — so
+    /// this fixture is deliberately the "nothing open" case, not the
+    /// "something open" one the tests above already cover.
     ///
     /// The post-resume sample is deliberately a LINK, so `GwDrop::eval` never
-    /// returns `None` after the clear and the latch cannot re-arm by accident — only
-    /// `TriggerEngine::rearm_all` can have produced the second incident.
+    /// returns `None` after the clear and the latch cannot re-arm by accident —
+    /// and `close_all` found nothing open here, so `TriggerEngine::rearm_all`
+    /// really is the ONLY thing that re-armed this trigger for the second
+    /// incident (realm net-observer, node #124).
     #[tokio::test]
     async fn run_refires_a_persistent_fault_once_the_production_backoff_has_elapsed() {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
@@ -3096,11 +3509,14 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
-        // Fires once at ts 1, then stays latched while the fault persists.
+        // Fires once at ts 1, then RECOVERS live at ts 2 (an ordinary healthy
+        // tick — GwDrop::eval returns None — not `close_all`): armed, but
+        // `last_fire_us` stays at 1, untouched.
         tx.send(link(1, GwVerdict::Fail)).await.unwrap();
-        tx.send(link(2, GwVerdict::Fail)).await.unwrap();
+        tx.send(link(2, GwVerdict::Ok)).await.unwrap();
         tx.send(Sample::Host(HostSample {
             ts_us: 3,
             load1: 0.0,
@@ -3114,8 +3530,10 @@ mod tests {
         .unwrap();
         wait_for_generated(&snapshot, 3).await;
 
+        // Nothing is open at this edge, so `close_all` has nothing to release:
+        // the budget from the ts-1 firing survives untouched into the resume.
         resume_at_us.store(10, Ordering::Release);
-        // The first microsecond at which the production budget is spent.
+        // The first microsecond at which that untouched budget is spent.
         let refire_us = 1i64.saturating_add(crate::BACKOFF_US);
         tx.send(link(refire_us, GwVerdict::Fail)).await.unwrap();
         drop(tx);
@@ -3167,6 +3585,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         // The last gateway state observed before the pause.
@@ -3231,6 +3650,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -3272,12 +3692,22 @@ mod tests {
     /// FIRES before the pause, then a second change visible at resume only against
     /// the carried basis. Returns the store.
     ///
+    /// `recovered_before_pause` selects which state [`TriggerEngine::close_all`]
+    /// meets at the edge: `false` leaves the ts-2 change STILL OPEN (no further
+    /// tick ever recovered it), so `close_all` is what closes it, releasing its
+    /// firing budget; `true` sends one more pre-pause tick that recovers it
+    /// LIVE instead — the ordinary `None` arm, never `close_all` — so nothing
+    /// is open at the edge and the budget survives untouched.
+    ///
     /// The existing cross-gap tests fire for the FIRST time at the resume, so the
     /// firing budget is never in play there and the interaction between the carried
     /// basis and the backoff is never built. Here `gw-change` has already spent its
-    /// budget at ts 2, so the cross-gap change at ts 11 is decided by `backoff_us`
-    /// alone.
-    async fn gw_change_across_a_pause_after_an_earlier_fire(backoff_us: i64) -> Arc<DuckdbStore> {
+    /// budget at ts 2, so the cross-gap change at ts 11 is decided by whichever of
+    /// the two paths above closed it (realm net-observer, node #124).
+    async fn gw_change_across_a_pause_after_an_earlier_fire(
+        backoff_us: i64,
+        recovered_before_pause: bool,
+    ) -> Arc<DuckdbStore> {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
         let freezer: Arc<dyn PcapFreezer> = Arc::new(FakeFreezer);
@@ -3302,6 +3732,7 @@ mod tests {
             snapshot.clone(),
             events_tx,
             resume_at_us.clone(),
+            no_session_end(),
         ));
 
         // No predecessor yet, so `GwChange::eval` returns `None` and the trigger
@@ -3310,10 +3741,21 @@ mod tests {
         // …then OK -> FAIL is a contiguous two-tick change: it FIRES, spending the
         // budget at ts 2 and recording the first incident + the first freeze.
         tx.send(link(2, GwVerdict::Fail)).await.unwrap();
-        // A sentinel past the last link: once it is mirrored, both links are in the
-        // window, so the resume epoch below lands on a known stream position.
+        let sentinel_ts = if recovered_before_pause {
+            // One more FAIL: the two newest link samples now agree, so
+            // `GwChange::eval` returns `None` and the LIVE `None` arm closes
+            // the incident right here — never `close_all` — leaving
+            // `last_fire_us` untouched at 2.
+            tx.send(link(3, GwVerdict::Fail)).await.unwrap();
+            4
+        } else {
+            3
+        };
+        // A sentinel past the last link: once it is mirrored, the window holds
+        // whichever stream above ran, so the resume epoch below lands on a
+        // known stream position.
         tx.send(Sample::Host(HostSample {
-            ts_us: 3,
+            ts_us: sentinel_ts,
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
@@ -3323,31 +3765,33 @@ mod tests {
         }))
         .await
         .unwrap();
-        wait_for_generated(&snapshot, 3).await;
+        wait_for_generated(&snapshot, sentinel_ts).await;
 
         resume_at_us.store(10, Ordering::Release);
         // At this sample the window is cleared with the FAIL link carried as the
         // change basis and every trigger re-armed, so `prev_link_with_provenance`
-        // yields (FAIL, AcrossGap) and `eval` returns `Some`. Only the backoff
-        // decides whether it fires.
+        // yields (FAIL, AcrossGap) and `eval` returns `Some`. Whether it fires now
+        // turns on `recovered_before_pause`: the budget was released only if the
+        // ts-2 incident was still open at the edge.
         tx.send(link(11, GwVerdict::Ok)).await.unwrap();
         drop(tx);
         h.await.unwrap();
         store
     }
 
-    /// The non-vacuity twin of the test below, and an interaction nothing covered
-    /// before it: the cross-gap freeze DOES happen once the budget permits, even
-    /// though this is `gw-change`'s SECOND firing rather than its first. Exactly one
-    /// of the two incidents carries the marker — the pre-pause firing is two
-    /// consecutive ticks and its signature is unmarked — so the `LIKE` count is not
-    /// something either firing alone could satisfy.
+    /// The non-vacuity twin of the two tests below, and an interaction nothing
+    /// covered before it: the cross-gap freeze DOES happen once the budget
+    /// permits ON ITS OWN (`backoff_us = 0`), even though this is `gw-change`'s
+    /// SECOND firing rather than its first. Exactly one of the two incidents
+    /// carries the marker — the pre-pause firing is two consecutive ticks and its
+    /// signature is unmarked — so the `LIKE` count is not something either firing
+    /// alone could satisfy.
     ///
-    /// Without this half, the suppression test below would pass just as well against
-    /// a `GwChange` that had simply stopped firing at all.
+    /// Without this half, the tests below would pass just as well against a
+    /// `GwChange` that had simply stopped firing at all.
     #[tokio::test]
     async fn run_freezes_a_cross_gap_gw_change_once_the_backoff_has_elapsed() {
-        let store = gw_change_across_a_pause_after_an_earlier_fire(0).await;
+        let store = gw_change_across_a_pause_after_an_earlier_fire(0, false).await;
 
         assert_eq!(
             store
@@ -3375,28 +3819,72 @@ mod tests {
         );
     }
 
-    /// The BOUND on the cross-gap freeze guarantee the previous commits advertise: a
-    /// gateway change visible only against the carried basis is still subject to the
-    /// trigger's firing budget, so one that lands inside [`crate::BACKOFF_US`] of an
-    /// earlier firing is suppressed. Dies under `BACKOFF_US = 0` and under an
-    /// `on_sample` that ignores the backoff once a trigger has been re-armed.
+    /// (realm net-observer, node #124): a `gw-change` still OPEN when the pause
+    /// lands — nothing ever recovered it before the edge — is closed by
+    /// [`TriggerEngine::close_all`] there, which releases its firing budget. The
+    /// cross-gap change back is then this NEW session's own finding and fires
+    /// regardless of `crate::BACKOFF_US`: the change-shaped rules carry their
+    /// basis across a pause precisely to see "the gateway changed while we were
+    /// not looking", and an incident still open at the edge belongs to exactly
+    /// that story, not to a suppressed echo of the old one. The freeze is per
+    /// RECORDED incident, so it happens twice here — the operator's own
+    /// toggling is what bounds how many, not the rule's backoff.
+    #[tokio::test]
+    async fn run_records_a_cross_gap_gw_change_when_the_pre_pause_change_was_still_open() {
+        let store = gw_change_across_a_pause_after_an_earlier_fire(crate::BACKOFF_US, false).await;
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            2,
+            "closing the still-open pre-pause change at the edge releases its budget"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(
+                    "SELECT count(*) FROM incident \
+                     WHERE signature LIKE '%across an observation gap%'"
+                )
+                .unwrap(),
+            1,
+            "only the cross-gap firing is marked; the pre-pause one is two consecutive ticks"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM blob_ref WHERE kind='pcap'")
+                .unwrap(),
+            2,
+            "the ring is frozen for each recorded incident"
+        );
+    }
+
+    /// The BOUND that survives the budget-release fix: a `gw-change` that fired
+    /// and already RECOVERED — a live, ordinary tick, not `close_all` — before
+    /// the pause keeps its firing budget across the edge, exactly as
+    /// [`TriggerEngine::close_all`]'s own doc promises for a trigger with
+    /// nothing open. A cross-gap change landing inside `crate::BACKOFF_US` of
+    /// that earlier firing is then suppressed, so a toggled switch still
+    /// cannot storm the incident log merely because something fired once, long
+    /// before the pause.
     ///
     /// All three consequences are asserted as SEPARATE observables because the
-    /// freeze is a handler and could be lost independently of the incident: no second
-    /// incident, no cross-gap marker anywhere, and — the operator-visible cost — no
-    /// second freeze, so the packets the ring kept through the pause are NOT
-    /// preserved. The twin above is what keeps this from passing against a
-    /// `GwChange` that had simply stopped firing.
+    /// freeze is a handler and could be lost independently of the incident: no
+    /// second incident, no cross-gap marker anywhere, and — the
+    /// operator-visible cost — no second freeze, so the packets the ring kept
+    /// through the pause are NOT preserved. The twin above is what keeps this
+    /// from passing against a `GwChange` that had simply stopped firing.
     #[tokio::test]
-    async fn run_does_not_freeze_a_cross_gap_gw_change_still_inside_the_backoff() {
-        let store = gw_change_across_a_pause_after_an_earlier_fire(crate::BACKOFF_US).await;
+    async fn run_does_not_refire_a_cross_gap_gw_change_once_it_had_already_recovered() {
+        let store = gw_change_across_a_pause_after_an_earlier_fire(crate::BACKOFF_US, true).await;
 
         assert_eq!(
             store
                 .query_scalar_i64("SELECT count(*) FROM incident")
                 .unwrap(),
             1,
-            "the pre-pause firing spent the budget; the cross-gap change is suppressed"
+            "the pre-pause firing had already recovered and kept its budget; \
+             the cross-gap change is suppressed"
         );
         assert_eq!(
             store

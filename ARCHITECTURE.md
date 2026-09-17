@@ -234,9 +234,17 @@ Collectors and their probe ports are **native `async fn`** (Rust ≥ 1.75), not 
   trigger only *if* the next sample is one its condition reads nothing from (a
   `host` tick re-arms `gw-drop`; a `link` tick leaves it latched), which made "does
   a persistent fault re-fire across a pause?" depend on collector arrival order.
-  What a resume does **not** do is reset the firing budget: `last_fire_us` survives
-  it, so each trigger still fires at most once per `backoff_us` and a toggled
-  switch cannot storm the incident log. The `observing_edge` rows bound the gap
+  Before either of those two steps, `TriggerEngine::close_all` closes whatever
+  incident the **previous** session left open, at the `ts_us` of the edge that
+  ended it — the pause's own, or the tier switch's, carried forward in
+  `session_end_us` — never at the first post-edge sample's, which would
+  misattribute the unobserved gap to it; so no `incident` row is ever left
+  open across the bracket. Closing there also releases that trigger's firing
+  budget: `last_fire_us` resets, so a fault still present opens its new-session
+  incident **at once**, not once whatever backoff the closed incident had spent
+  happens to expire. A trigger with **nothing** open at the edge keeps its
+  budget exactly as before, so a toggled switch on a healthy network still
+  cannot storm the incident log. The `observing_edge` rows bound the gap
   between the two records.
 - **Exactly one thing survives that clear: the gateway-CHANGE BASIS.**
   `clear_for_resume` carries the newest `LinkSample` forward, reachable **only**
@@ -1081,14 +1089,18 @@ already-authorised command:
    either direction, closes and re-opens detection exactly as a resume does —
    it publishes the same `resume_at_us` epoch, so `pipeline::run` clears the
    recent-sample window and re-arms every trigger, and the interval collectors
-   drop a tick that straddled the edge at the source — so the cleared window
-   makes the first post-edge sample judge afresh, exactly as after a resume: a
-   condition that no longer holds closes its open incident at that sample's
-   `ts_us`, one that still holds (a `NoGw` gw-drop, a fakeip hijack — both
-   readable under passive) keeps it open, and the `probing_edge` row at the
-   switch's own `ts_us` is the bracket either way; the first passive `SKIP`s
-   never read as a recovery, and dead ticks from before a stretch stay out of
-   the count after it. Clients: the bar menu's **Probe network**/**Stop probing**
+   drop a tick that straddled the edge at the source. Before either of those
+   two steps, whatever incident was open AT THE SWITCH already closed at the
+   switch's own `ts_us` (`TriggerEngine::close_all`) — never at the first
+   post-switch sample's — and that trigger's firing budget closed with it, so
+   the cleared window makes the first post-edge sample judge **completely**
+   afresh: a fault still present (a `NoGw` gw-drop, a fakeip hijack — both
+   readable under passive) opens a **new** incident of the new session at
+   once, not once whatever backoff the closed incident had spent happens to
+   expire; the `probing_edge` row at the switch's own `ts_us` is the bracket
+   that names the instant either way; the first passive `SKIP`s never read as
+   a recovery, and dead ticks from before a stretch stay out of the count
+   after it. Clients: the bar menu's **Probe network**/**Stop probing**
    row and `net-observer-cli probe passive|active`; `gaps` asks the `Silences`
    diagnosis, which lists passive stretches as `kind = passive` next to the
    pauses (`Gaps` itself stays pauses-only for readers built before the tier;

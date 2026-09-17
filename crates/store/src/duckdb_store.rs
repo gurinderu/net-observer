@@ -138,6 +138,35 @@ impl DuckdbStore {
         Ok(n)
     }
 
+    /// The newest `ts_us` across every SAMPLE table — the record's own
+    /// observation bound, distinct from whatever the wall clock reads when a
+    /// fresh process asks. `None` when the record holds no samples at all (a
+    /// freshly created database file).
+    ///
+    /// The pairing for [`Self::close_open_incidents`] at startup: a crashed
+    /// process's open incidents must close at the last instant this record
+    /// actually observed something, not at the new process's own start time —
+    /// `now_us()` is always later than that bound, so it would stamp a
+    /// crashed run's incidents as having lasted until this later moment
+    /// (realm net-observer, node #124).
+    pub fn latest_sample_ts_us(&self) -> Result<Option<i64>, StoreError> {
+        let max: Option<i64> = self.conn.lock().unwrap().query_row(
+            "SELECT MAX(m) FROM (
+                SELECT MAX(ts_us) AS m FROM link_sample
+                UNION ALL SELECT MAX(ts_us) FROM proxy_sample
+                UNION ALL SELECT MAX(ts_us) FROM dns_sample
+                UNION ALL SELECT MAX(ts_us) FROM route_event
+                UNION ALL SELECT MAX(ts_us) FROM host_sample
+                UNION ALL SELECT MAX(ts_us) FROM wifi_sample
+                UNION ALL SELECT MAX(ts_us) FROM air_sample
+                UNION ALL SELECT MAX(ts_us) FROM neighbor_sample
+            )",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(max)
+    }
+
     /// List incidents as `(trigger_id, opened_us, closed_us)`, newest first.
     pub fn list_incidents(&self) -> Result<Vec<(String, i64, Option<i64>)>, StoreError> {
         let conn = self.conn.lock().unwrap();
@@ -1491,6 +1520,58 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    /// The bound the startup sweep closes stale incidents at: the newest
+    /// `ts_us` across every sample table, not merely one of them — a link
+    /// sample older than a later host sample must not win (realm net-observer,
+    /// node #124).
+    #[test]
+    fn latest_sample_ts_us_is_the_max_across_every_sample_table() {
+        use types::{GwVerdict, HostSample, LinkSample, Sample, TcpVerdict};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 1000,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            bssid: None,
+            if_mac: None,
+            medium: None,
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        }))
+        .unwrap();
+        s.write_sample(&Sample::Host(HostSample {
+            ts_us: 5000,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .unwrap();
+
+        assert_eq!(s.latest_sample_ts_us().unwrap(), Some(5000));
+    }
+
+    /// A freshly created database file holds no samples at all: the sweep must
+    /// read that as `None`, not as a phantom `ts_us` of `0` — the caller falls
+    /// back to `now_us()` only for exactly this case (realm net-observer, node
+    /// #124).
+    #[test]
+    fn latest_sample_ts_us_is_none_with_no_samples() {
+        let s = DuckdbStore::in_memory().unwrap();
+        assert_eq!(s.latest_sample_ts_us().unwrap(), None);
     }
 
     /// The record volume's usage and the swap in use land in their own host

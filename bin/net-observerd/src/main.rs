@@ -394,8 +394,24 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // Incidents left open by the previous process can never be closed by it
     // again — the closing edge lived in its memory. Stamp them closed at the
-    // observation bound rather than leaving forever-open rows.
-    match store.close_open_incidents(types::now_us()) {
+    // observation bound: the record's own newest sample, not this new
+    // process's start time, which is always later and would make a crashed
+    // run's incidents read as though they had lasted until now. A crash WHILE
+    // PAUSED closes at the last sample before the pause — earlier than the
+    // pause's own `observing_edge` row — which is an accepted asymmetry: the
+    // incident closes at the last thing this record actually observed, not
+    // at a boundary row a paused process wrote about observing nothing
+    // (realm net-observer, node #124).
+    let stale_close_ts = match store.latest_sample_ts_us() {
+        Ok(Some(ts)) => ts,
+        Ok(None) => types::now_us(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read the record's newest sample; \
+                closing stale incidents at now instead");
+            types::now_us()
+        }
+    };
+    match store.close_open_incidents(stale_close_ts) {
         Ok(0) => {}
         Ok(n) => tracing::info!(n, "closed stale open incidents from a previous run"),
         Err(e) => tracing::warn!(error = %e, "failed to close stale open incidents"),
@@ -469,6 +485,13 @@ async fn run_daemon() -> anyhow::Result<()> {
     // span the observation gap a pause opened, nor the passive stretch a tier
     // switch opened or closed. `0` = no such edge yet.
     let resume_at_us = Arc::new(AtomicI64::new(0));
+    // `ts_us` of the edge that ENDED the observation session the next
+    // `resume_at_us` move re-opens: `SetObserving(false)` stores the pause's
+    // own `ts_us` here, `set_probing` the switch's. The pipeline consumer
+    // reads it once per edge to close whatever the previous session left
+    // open at the instant it actually ended, not at the edge's own (realm
+    // net-observer, node #124).
+    let session_end_us = Arc::new(AtomicI64::new(0));
 
     // The realtime event bus (push, not poll): the pipeline consumer publishes a
     // `StreamFrame::Event` per sample, the trigger `SnapshotHandler` publishes an
@@ -752,6 +775,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             probing.clone(),
             freezer.clone(),
             resume_at_us.clone(),
+            session_end_us.clone(),
             store.clone(),
             events_tx.clone(),
             oui.clone(),
@@ -785,6 +809,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         snapshot.clone(),
         events_tx,
         resume_at_us,
+        session_end_us,
     ));
 
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
@@ -1426,6 +1451,7 @@ fn build_api_server(
     probing: Arc<ProbingState>,
     freezer: Arc<PcapRingSlot>,
     resume_at_us: Arc<AtomicI64>,
+    session_end_us: Arc<AtomicI64>,
     store: Arc<DuckdbStore>,
     events_tx: tokio::sync::broadcast::Sender<EncodedFrame>,
     oui: Option<Arc<oui_db::OuiDb>>,
@@ -1502,6 +1528,7 @@ fn build_api_server(
             .map(std::path::PathBuf::from),
         blob_dir: std::path::PathBuf::from(&cfg.blob_dir),
         resume_at_us,
+        session_end_us,
         snapshot,
         // The durable sink for `observing_edge` boundary rows: the daemon
         // stays the sole DuckDB owner, so the control path writes through the
@@ -2082,6 +2109,7 @@ mod tests {
         let observing = Arc::new(AtomicBool::new(true));
         let probing = Arc::new(ProbingState::new(ProbingTier::Passive));
         let resume_at_us = Arc::new(AtomicI64::new(0));
+        let session_end_us = Arc::new(AtomicI64::new(0));
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         // A broadcast channel needs no runtime, so this whole test is a plain
         // `#[test]`.
@@ -2097,6 +2125,7 @@ mod tests {
             // panic, which is the empty slot's whole job.
             Arc::new(PcapRingSlot::empty()),
             resume_at_us.clone(),
+            session_end_us.clone(),
             store.clone(),
             events_tx.clone(),
             None,
@@ -2199,6 +2228,11 @@ mod tests {
             Arc::ptr_eq(&srv.resume_at_us, &resume_at_us),
             "a fresh `resume_at_us` leaves the pipeline's trigger window never \
              cleared, so a count-based condition spans the observation gap"
+        );
+        assert!(
+            Arc::ptr_eq(&srv.session_end_us, &session_end_us),
+            "a fresh `session_end_us` leaves the pipeline closing a pre-pause \
+             incident at the resume's ts_us instead of the pause's own"
         );
         assert!(
             Arc::ptr_eq(&srv.snapshot, &snapshot),
