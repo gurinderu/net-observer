@@ -39,6 +39,7 @@ pub mod collector;
 pub mod dhcp;
 pub mod frame;
 pub mod mdns;
+pub mod own_frames;
 pub mod pcap;
 pub mod source;
 pub mod ssdp;
@@ -46,5 +47,6 @@ pub mod window;
 
 pub use collector::{AnnounceCollector, META};
 pub use frame::{Mac, is_unicast, mac_octets, mac_text};
+pub use own_frames::count_own_frames;
 pub use source::{AnnounceSource, FLUSH_EVERY, SegmentIdentity, SegmentIdentityReading};
 pub use window::Window;
