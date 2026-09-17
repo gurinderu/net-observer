@@ -3674,12 +3674,22 @@ mod tests {
     /// FIRES before the pause, then a second change visible at resume only against
     /// the carried basis. Returns the store.
     ///
+    /// `recovered_before_pause` selects which state [`TriggerEngine::close_all`]
+    /// meets at the edge: `false` leaves the ts-2 change STILL OPEN (no further
+    /// tick ever recovered it), so `close_all` is what closes it, releasing its
+    /// firing budget; `true` sends one more pre-pause tick that recovers it
+    /// LIVE instead — the ordinary `None` arm, never `close_all` — so nothing
+    /// is open at the edge and the budget survives untouched.
+    ///
     /// The existing cross-gap tests fire for the FIRST time at the resume, so the
     /// firing budget is never in play there and the interaction between the carried
     /// basis and the backoff is never built. Here `gw-change` has already spent its
-    /// budget at ts 2, so the cross-gap change at ts 11 is decided by `backoff_us`
-    /// alone.
-    async fn gw_change_across_a_pause_after_an_earlier_fire(backoff_us: i64) -> Arc<DuckdbStore> {
+    /// budget at ts 2, so the cross-gap change at ts 11 is decided by whichever of
+    /// the two paths above closed it (realm net-observer, node #124).
+    async fn gw_change_across_a_pause_after_an_earlier_fire(
+        backoff_us: i64,
+        recovered_before_pause: bool,
+    ) -> Arc<DuckdbStore> {
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         let rec: Arc<dyn Handler> = Arc::new(RecordHandler::new(store.clone()));
         let freezer: Arc<dyn PcapFreezer> = Arc::new(FakeFreezer);
@@ -3713,10 +3723,21 @@ mod tests {
         // …then OK -> FAIL is a contiguous two-tick change: it FIRES, spending the
         // budget at ts 2 and recording the first incident + the first freeze.
         tx.send(link(2, GwVerdict::Fail)).await.unwrap();
-        // A sentinel past the last link: once it is mirrored, both links are in the
-        // window, so the resume epoch below lands on a known stream position.
+        let sentinel_ts = if recovered_before_pause {
+            // One more FAIL: the two newest link samples now agree, so
+            // `GwChange::eval` returns `None` and the LIVE `None` arm closes
+            // the incident right here — never `close_all` — leaving
+            // `last_fire_us` untouched at 2.
+            tx.send(link(3, GwVerdict::Fail)).await.unwrap();
+            4
+        } else {
+            3
+        };
+        // A sentinel past the last link: once it is mirrored, the window holds
+        // whichever stream above ran, so the resume epoch below lands on a
+        // known stream position.
         tx.send(Sample::Host(HostSample {
-            ts_us: 3,
+            ts_us: sentinel_ts,
             load1: 0.0,
             load5: 0.0,
             load15: 0.0,
@@ -3726,31 +3747,33 @@ mod tests {
         }))
         .await
         .unwrap();
-        wait_for_generated(&snapshot, 3).await;
+        wait_for_generated(&snapshot, sentinel_ts).await;
 
         resume_at_us.store(10, Ordering::Release);
         // At this sample the window is cleared with the FAIL link carried as the
         // change basis and every trigger re-armed, so `prev_link_with_provenance`
-        // yields (FAIL, AcrossGap) and `eval` returns `Some`. Only the backoff
-        // decides whether it fires.
+        // yields (FAIL, AcrossGap) and `eval` returns `Some`. Whether it fires now
+        // turns on `recovered_before_pause`: the budget was released only if the
+        // ts-2 incident was still open at the edge.
         tx.send(link(11, GwVerdict::Ok)).await.unwrap();
         drop(tx);
         h.await.unwrap();
         store
     }
 
-    /// The non-vacuity twin of the test below, and an interaction nothing covered
-    /// before it: the cross-gap freeze DOES happen once the budget permits, even
-    /// though this is `gw-change`'s SECOND firing rather than its first. Exactly one
-    /// of the two incidents carries the marker — the pre-pause firing is two
-    /// consecutive ticks and its signature is unmarked — so the `LIKE` count is not
-    /// something either firing alone could satisfy.
+    /// The non-vacuity twin of the two tests below, and an interaction nothing
+    /// covered before it: the cross-gap freeze DOES happen once the budget
+    /// permits ON ITS OWN (`backoff_us = 0`), even though this is `gw-change`'s
+    /// SECOND firing rather than its first. Exactly one of the two incidents
+    /// carries the marker — the pre-pause firing is two consecutive ticks and its
+    /// signature is unmarked — so the `LIKE` count is not something either firing
+    /// alone could satisfy.
     ///
-    /// Without this half, the suppression test below would pass just as well against
-    /// a `GwChange` that had simply stopped firing at all.
+    /// Without this half, the tests below would pass just as well against a
+    /// `GwChange` that had simply stopped firing at all.
     #[tokio::test]
     async fn run_freezes_a_cross_gap_gw_change_once_the_backoff_has_elapsed() {
-        let store = gw_change_across_a_pause_after_an_earlier_fire(0).await;
+        let store = gw_change_across_a_pause_after_an_earlier_fire(0, false).await;
 
         assert_eq!(
             store
@@ -3778,28 +3801,72 @@ mod tests {
         );
     }
 
-    /// The BOUND on the cross-gap freeze guarantee the previous commits advertise: a
-    /// gateway change visible only against the carried basis is still subject to the
-    /// trigger's firing budget, so one that lands inside [`crate::BACKOFF_US`] of an
-    /// earlier firing is suppressed. Dies under `BACKOFF_US = 0` and under an
-    /// `on_sample` that ignores the backoff once a trigger has been re-armed.
+    /// (realm net-observer, node #124): a `gw-change` still OPEN when the pause
+    /// lands — nothing ever recovered it before the edge — is closed by
+    /// [`TriggerEngine::close_all`] there, which releases its firing budget. The
+    /// cross-gap change back is then this NEW session's own finding and fires
+    /// regardless of `crate::BACKOFF_US`: the change-shaped rules carry their
+    /// basis across a pause precisely to see "the gateway changed while we were
+    /// not looking", and an incident still open at the edge belongs to exactly
+    /// that story, not to a suppressed echo of the old one. The freeze is per
+    /// RECORDED incident, so it happens twice here — the operator's own
+    /// toggling is what bounds how many, not the rule's backoff.
+    #[tokio::test]
+    async fn run_records_a_cross_gap_gw_change_when_the_pre_pause_change_was_still_open() {
+        let store = gw_change_across_a_pause_after_an_earlier_fire(crate::BACKOFF_US, false).await;
+
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM incident")
+                .unwrap(),
+            2,
+            "closing the still-open pre-pause change at the edge releases its budget"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64(
+                    "SELECT count(*) FROM incident \
+                     WHERE signature LIKE '%across an observation gap%'"
+                )
+                .unwrap(),
+            1,
+            "only the cross-gap firing is marked; the pre-pause one is two consecutive ticks"
+        );
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM blob_ref WHERE kind='pcap'")
+                .unwrap(),
+            2,
+            "the ring is frozen for each recorded incident"
+        );
+    }
+
+    /// The BOUND that survives the budget-release fix: a `gw-change` that fired
+    /// and already RECOVERED — a live, ordinary tick, not `close_all` — before
+    /// the pause keeps its firing budget across the edge, exactly as
+    /// [`TriggerEngine::close_all`]'s own doc promises for a trigger with
+    /// nothing open. A cross-gap change landing inside `crate::BACKOFF_US` of
+    /// that earlier firing is then suppressed, so a toggled switch still
+    /// cannot storm the incident log merely because something fired once, long
+    /// before the pause.
     ///
     /// All three consequences are asserted as SEPARATE observables because the
-    /// freeze is a handler and could be lost independently of the incident: no second
-    /// incident, no cross-gap marker anywhere, and — the operator-visible cost — no
-    /// second freeze, so the packets the ring kept through the pause are NOT
-    /// preserved. The twin above is what keeps this from passing against a
-    /// `GwChange` that had simply stopped firing.
+    /// freeze is a handler and could be lost independently of the incident: no
+    /// second incident, no cross-gap marker anywhere, and — the
+    /// operator-visible cost — no second freeze, so the packets the ring kept
+    /// through the pause are NOT preserved. The twin above is what keeps this
+    /// from passing against a `GwChange` that had simply stopped firing.
     #[tokio::test]
-    async fn run_does_not_freeze_a_cross_gap_gw_change_still_inside_the_backoff() {
-        let store = gw_change_across_a_pause_after_an_earlier_fire(crate::BACKOFF_US).await;
+    async fn run_does_not_refire_a_cross_gap_gw_change_once_it_had_already_recovered() {
+        let store = gw_change_across_a_pause_after_an_earlier_fire(crate::BACKOFF_US, true).await;
 
         assert_eq!(
             store
                 .query_scalar_i64("SELECT count(*) FROM incident")
                 .unwrap(),
             1,
-            "the pre-pause firing spent the budget; the cross-gap change is suppressed"
+            "the pre-pause firing had already recovered and kept its budget; \
+             the cross-gap change is suppressed"
         );
         assert_eq!(
             store
