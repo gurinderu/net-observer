@@ -300,6 +300,14 @@ pub(crate) fn neighbor_lifetimes_for(
     }
 }
 
+/// The samples the trigger window never holds: the flow table and every
+/// sample of the announce listener (a flush or its end bracket). Stored and
+/// published like any other; only the rules never see them.
+fn stays_out_of_the_window(sample: &Sample) -> bool {
+    matches!(sample, Sample::Connections(_))
+        || matches!(sample, Sample::Neighbors(n) if n.is_listener_flush())
+}
+
 pub async fn run(
     store: Arc<DuckdbStore>,
     mut engine: TriggerEngine,
@@ -457,7 +465,13 @@ pub async fn run(
         // it is the heaviest sample in the process — a tick of it would take a
         // slot from every count-bounded rule the window was sized for. It is
         // already stored and published above (realm net-observer, node #75).
-        if matches!(sample, Sample::Connections(_)) {
+        // The announce listener's samples stay out the same way: a flush every
+        // 15 s is the last window's announcements, not the neighbour table the
+        // rules read, and its bracket is a row about the listener, not about
+        // the segment — both would only take slots (realm net-observer, node
+        // #92). `RecentWindow::last_neighbors` skips a flush as well, belt and
+        // braces.
+        if stays_out_of_the_window(&sample) {
             continue;
         }
         window.push(sample);
@@ -646,12 +660,17 @@ pub(crate) fn spawn_event_collector(
             // time (realm net-observer, node #92).
             let paused = !observing.load(Ordering::Acquire);
             if paused {
+                let before = samples.len();
                 samples.retain(|s| matches!(s, Sample::Neighbors(n) if n.is_listener_bracket()));
-                if samples.is_empty() {
+                // A batch that lost anything counts as dropped — also one whose
+                // bracket goes on, since the flush beside it did not.
+                if samples.len() < before {
                     if dropped_while_paused == 0 {
                         tracing::debug!(collector = name, "paused: dropping event batch");
                     }
                     dropped_while_paused += 1;
+                }
+                if samples.is_empty() {
                     continue;
                 }
             }
@@ -2464,6 +2483,49 @@ mod tests {
         // ends with the test rather than outliving it.
         drop(batch_tx);
         drop(rx);
+    }
+
+    /// The trigger window never holds a listener sample: a flush or its end
+    /// bracket is refused the way the flow table is, while a cache tick, a
+    /// scan and every other kind pass.
+    #[test]
+    fn listener_samples_stay_out_of_the_trigger_window() {
+        use types::{HeardFrames, NeighborsSample, NeighborsVerdict};
+        let neighbours = |verdict: NeighborsVerdict, heard: Option<HeardFrames>| {
+            Sample::Neighbors(NeighborsSample {
+                ts_us: 1,
+                verdict,
+                reason: None,
+                network_key: None,
+                iface: None,
+                neighbors: Vec::new(),
+                services: Vec::new(),
+                heard,
+            })
+        };
+        let counted = HeardFrames {
+            total: 3,
+            own: Some(0),
+            dropped: 0,
+        };
+        assert!(stays_out_of_the_window(&neighbours(
+            NeighborsVerdict::Ok,
+            Some(counted)
+        )));
+        assert!(stays_out_of_the_window(&neighbours(
+            NeighborsVerdict::Skip,
+            Some(counted)
+        )));
+        assert!(!stays_out_of_the_window(&neighbours(
+            NeighborsVerdict::Ok,
+            None
+        )));
+        assert!(!stays_out_of_the_window(&neighbours(
+            NeighborsVerdict::Skip,
+            None
+        )));
+        assert!(!stays_out_of_the_window(&link(1, GwVerdict::Ok)));
+        assert!(!stays_out_of_the_window(&route(1)));
     }
 
     /// The one batch a pause does not swallow: the listener's end bracket.
