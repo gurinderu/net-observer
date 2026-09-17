@@ -382,12 +382,9 @@ pub struct ApiServer {
     pub policy: ControlPolicy,
     /// The collectors' pause flag; `SetObserving` is its only writer.
     pub observing: Arc<AtomicBool>,
-    /// The link collector's quiet flag; `SetQuiet` is its only writer. Shared
-    /// with the collector — a fresh `Arc` here would ack a quiet nobody honours.
-    pub quiet: Arc<AtomicBool>,
     /// The probing tier the link, proxy and dns collectors read each tick;
     /// `SetProbing` is its only writer. Shared with the collectors for the same
-    /// reason as `quiet`. (realm net-observer, node #88)
+    /// reason as `observing`. (realm net-observer, node #88)
     pub probing: Arc<ProbingState>,
     /// The slot holding the pcap ring, asked at request time rather than held by
     /// value: the ring can start late (no interface at boot) or die, and
@@ -418,7 +415,7 @@ pub struct ApiServer {
     pub store: Arc<dyn Store + Send + Sync>,
     /// The one-in-flight gate on `Request::Query` — [`MAX_QUERIES_IN_FLIGHT`]
     /// permits, claimed with `try_acquire` and never awaited. An `Arc` like
-    /// the other shared state here (`observing`, `quiet`, `store`): one gate
+    /// the other shared state here (`observing`, `probing`, `store`): one gate
     /// for the server and every connection task it spawns, whichever of them
     /// is holding the permit.
     pub query_gate: Arc<Semaphore>,
@@ -703,7 +700,6 @@ async fn handle_conn(
                 policy: &srv.policy,
                 acting: &srv.acting,
                 observing: &srv.observing,
-                quiet: &srv.quiet,
                 probing: &srv.probing,
                 freezer: &srv.freezer,
                 scanner: srv.scanner.as_deref(),
@@ -925,7 +921,6 @@ pub(crate) struct ControlCtx<'a> {
     pub policy: &'a ControlPolicy,
     pub acting: &'a ActingConfig,
     pub observing: &'a AtomicBool,
-    pub quiet: &'a AtomicBool,
     pub probing: &'a ProbingState,
     pub freezer: &'a PcapRingSlot,
     /// The neighbour scanner, when one could be built for this host.
@@ -980,8 +975,8 @@ pub(crate) fn control_request(
 /// gate on the control path, because config may switch off what the daemon does
 /// by itself, never a command the operator sends by hand — the invocation is the
 /// sanction (realm net-observer, node #91). What an arm can still refuse is a
-/// contradiction of the daemon's own state (a scan while paused or quiet) or a
-/// missing dependency (no ring, no scanner, no snapshot) — each with a reason.
+/// contradiction of the daemon's own state (a scan while paused) or a missing
+/// dependency (no ring, no scanner, no snapshot) — each with a reason.
 fn control_response(
     cmd: ControlCmd,
     authorized: PeerAuthorized,
@@ -1077,25 +1072,6 @@ fn control_response(
                 message: format!("observing {label}{note}"),
             }
         }
-        ControlCmd::SetQuiet(b) => {
-            // The quiet flag has no boundary record by design: unlike a pause it
-            // produces no gap — the link collector keeps emitting one sample per
-            // tick, carrying `gw = SKIP`, so the suppression is already visible in
-            // the record it would otherwise have to bracket.
-            let was = cx.quiet.swap(b, Ordering::AcqRel);
-            cx.snapshot.lock().unwrap_or_else(|e| e.into_inner()).quiet = b;
-            let label = if b { "on" } else { "off" };
-            tracing::info!(
-                quiet = b,
-                changed = was != b,
-                peer_uid = authorized.uid(),
-                "quiet state set via control socket"
-            );
-            ControlResult {
-                ok: true,
-                message: format!("quiet {label}"),
-            }
-        }
         ControlCmd::SetProbing(tier) => set_probing(tier, authorized, cx),
         ControlCmd::FreezePcap => freeze_now(cx),
         ControlCmd::ScanNeighbors(opts) => scan_now(cx, &opts, Some(authorized.uid())),
@@ -1109,9 +1085,9 @@ fn control_response(
 
 /// Switch the probing tier on operator demand (realm net-observer, node #88).
 ///
-/// The `SetQuiet` shape — flip the shared state, mirror it into the snapshot,
-/// answer — plus the two sinks `SetObserving` uses, because a tier switch IS
-/// bracketed: one `ProbingEdge` built once, written as a `probing_edge` row and
+/// Flip the shared state, mirror it into the snapshot, answer — plus the two
+/// sinks `SetObserving` uses, because a tier switch IS bracketed: one
+/// `ProbingEdge` built once, written as a `probing_edge` row and
 /// published as a `StreamFrame::Probing`. The state flip, the clock and the
 /// publish sit under the snapshot lock for the reason `SetObserving` spells
 /// out: two opposite switches must stamp and land in one order, or the rows
@@ -1217,21 +1193,15 @@ fn set_probing(
 /// but does not fail the command: the packets really did go out, and saying
 /// otherwise would be a false statement about what this daemon did.
 fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>) -> ControlResult {
-    // Two refusals BEFORE anything is sent, because a scan is the one command
-    // that contradicts these two states outright.
+    // One refusal BEFORE anything is sent: a scan is the one command that
+    // contradicts a paused daemon outright.
     //
     // Paused: the pause is bracketed silence — `observing_edge` says the daemon
     // deliberately collected nothing between two instants. A scan would drop
     // rows and publish an event with a timestamp inside that bracket, so the gap
     // record and the data would disagree about the same seconds.
     //
-    // Quiet: quiet means this daemon addresses no packet at the gateway; a sweep
-    // addresses the whole subnet. Honouring the click would make quiet a lie the
-    // operator has no way to see — quiet is the EVIDENCE protocol (realm
-    // net-observer, node #26): a capture taken under it must contain none of
-    // our packets.
-    //
-    // The passive probing tier is deliberately NOT a third refusal. Passive
+    // The passive probing tier is deliberately NOT a second refusal. Passive
     // promises no emission the daemon makes on its own; an operator's scan is
     // not the daemon's — the command is the sanction (realm net-observer, node
     // #91) — and the scan writes its own `neighbor_scan` row, so the record
@@ -1240,12 +1210,6 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
         return ControlResult {
             ok: false,
             message: "observation is paused; resume before scanning".to_string(),
-        };
-    }
-    if cx.quiet.load(Ordering::Acquire) {
-        return ControlResult {
-            ok: false,
-            message: "quiet is on; a scan would address the whole subnet".to_string(),
         };
     }
     let Some(scanner) = cx.scanner else {
@@ -1380,9 +1344,7 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
 /// Read the radio environment once on operator demand.
 ///
 /// The daemon asks the OS for its own radio's report and puts nothing on the
-/// air (realm net-observer, node #47). So — unlike [`scan_now`] — there is no
-/// `quiet` refusal here: quiet means this daemon addresses no packet at the
-/// gateway, and a reading that transmits nothing does not contradict it.
+/// air (realm net-observer, node #47).
 ///
 /// A PAUSE still refuses, for the reason it refuses a neighbour scan: the pause
 /// is bracketed silence, and a sample stamped inside that bracket would make the
@@ -1623,7 +1585,6 @@ mod tests {
                 peer_uid: peer_uid_of,
             },
             observing: Arc::new(AtomicBool::new(true)),
-            quiet: Arc::new(AtomicBool::new(false)),
             // Active, so the pre-tier control tests keep their premises; the
             // `set_probing` test flips it itself.
             probing: Arc::new(ProbingState::new(ProbingTier::Active)),
@@ -1649,7 +1610,6 @@ mod tests {
             policy: &srv.policy,
             acting: &srv.acting,
             observing: &srv.observing,
-            quiet: &srv.quiet,
             probing: &srv.probing,
             freezer: &srv.freezer,
             scanner: srv.scanner.as_deref(),
@@ -1692,20 +1652,6 @@ mod tests {
     fn an_air_scan_reaches_the_scanner() {
         let mut srv = test_server("/tmp/unused-air-1.sock", test_acting(), TEST_DAEMON_UID);
         let asked = with_air(&mut srv, AirScanRequest::Started);
-        let cx = test_ctx(&srv);
-        let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
-        assert!(r.ok, "{}", r.message);
-        assert_eq!(asked.load(Ordering::Acquire), 1);
-    }
-
-    /// Quiet suppresses a packet this daemon would put AT the gateway. An air
-    /// read puts nothing anywhere, so quiet does not refuse it — unlike the
-    /// neighbour sweep, which quiet must refuse.
-    #[test]
-    fn quiet_does_not_refuse_an_air_scan() {
-        let mut srv = test_server("/tmp/unused-air-2.sock", test_acting(), TEST_DAEMON_UID);
-        let asked = with_air(&mut srv, AirScanRequest::Started);
-        srv.quiet.store(true, Ordering::Release);
         let cx = test_ctx(&srv);
         let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
         assert!(r.ok, "{}", r.message);
@@ -2146,7 +2092,6 @@ mod tests {
 
         for cmd in [
             ControlCmd::SetObserving(false),
-            ControlCmd::SetQuiet(true),
             ControlCmd::SetProbing(ProbingTier::Passive),
             ControlCmd::FreezePcap,
             ControlCmd::KickstartProxy,
@@ -2156,7 +2101,6 @@ mod tests {
             // Exhaustive on purpose — a new variant breaks this arm list.
             match cmd {
                 ControlCmd::SetObserving(_)
-                | ControlCmd::SetQuiet(_)
                 | ControlCmd::SetProbing(_)
                 | ControlCmd::FreezePcap
                 | ControlCmd::KickstartProxy
@@ -2204,8 +2148,8 @@ mod tests {
     }
 
     /// `SetProbing` flips the tier the three emitting collectors read, mirrors
-    /// it into the live snapshot, and — unlike quiet — brackets the switch:
-    /// one durable `probing_edge` row and one `Probing` frame describing the
+    /// it into the live snapshot, and brackets the switch: one durable
+    /// `probing_edge` row and one `Probing` frame describing the
     /// same transition (same `ts_us`, same tier, same peer). A repeat to the
     /// tier already in force is not an edge: no row, no frame, still `ok`.
     #[test]
@@ -2226,9 +2170,8 @@ mod tests {
         assert_eq!(res.message, "probing passive");
         assert_eq!(srv.probing.tier(), ProbingTier::Passive);
         assert_eq!(srv.snapshot.lock().unwrap().probing, ProbingTier::Passive);
-        // The tier is orthogonal to the pause and to quiet.
+        // The tier is orthogonal to the pause.
         assert!(srv.observing.load(Ordering::Acquire));
-        assert!(!srv.quiet.load(Ordering::Acquire));
         // The switch closes and re-opens detection the way a resume does: the
         // window-clearing epoch moves to the edge's own instant, which is what
         // `pipeline::run` keys `clear_for_resume` + `rearm_all` off.
@@ -2476,36 +2419,11 @@ mod tests {
         );
     }
 
-    /// Quiet says this daemon addresses no packet at the gateway. A sweep
-    /// addresses the whole subnet, so the click is refused rather than silently
-    /// making quiet untrue.
-    #[test]
-    fn a_scan_is_refused_while_quiet_is_on() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
-        srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
-        srv.quiet.store(true, Ordering::Release);
-        let cx = test_ctx(&srv);
-        let res = control_request(
-            ControlCmd::ScanNeighbors(ScanOptions::default()),
-            Some(TEST_DAEMON_UID),
-            &cx,
-        );
-        assert!(!res.ok, "quiet must not be broken by a scan");
-        assert!(res.message.contains("quiet"), "{}", res.message);
-        assert_eq!(
-            srv.store
-                .query_scalar_i64("SELECT count(*) FROM neighbor")
-                .unwrap(),
-            0
-        );
-    }
-
-    /// The sibling of the quiet refusal, in the other direction: the passive
-    /// tier promises no emission the daemon makes on its own, and an operator's
-    /// scan is not the daemon's — the command is the sanction (realm
-    /// net-observer, node #91) and the scan writes its own `neighbor_scan`
-    /// row, so passive lets it through and the record shows what was sent
-    /// inside the stretch. (realm net-observer, node #88)
+    /// The passive tier promises no emission the daemon makes on its own, and
+    /// an operator's scan is not the daemon's — the command is the sanction
+    /// (realm net-observer, node #91) and the scan writes its own
+    /// `neighbor_scan` row, so passive lets it through and the record shows
+    /// what was sent inside the stretch. (realm net-observer, node #88)
     #[test]
     fn a_neighbour_scan_runs_under_the_passive_tier() {
         let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
@@ -2699,38 +2617,6 @@ mod tests {
         );
     }
 
-    /// `SetQuiet` flips the flag the link collector reads and mirrors the state
-    /// into the live snapshot so the bar renders it. Unlike a pause it writes NO
-    /// boundary row — quiet produces no gap to bracket.
-    #[test]
-    fn set_quiet_flips_the_flag_and_writes_no_boundary_row() {
-        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
-        let cx = test_ctx(&srv);
-
-        let on = control_request(ControlCmd::SetQuiet(true), Some(TEST_DAEMON_UID), &cx);
-        assert!(on.ok, "{}", on.message);
-        assert_eq!(on.message, "quiet on");
-        assert!(srv.quiet.load(Ordering::Acquire));
-        assert!(srv.snapshot.lock().unwrap().quiet);
-        // Quiet is orthogonal to the pause: the daemon keeps collecting.
-        assert!(srv.observing.load(Ordering::Acquire));
-
-        let off = control_request(ControlCmd::SetQuiet(false), Some(TEST_DAEMON_UID), &cx);
-        assert!(off.ok);
-        assert_eq!(off.message, "quiet off");
-        assert!(!srv.quiet.load(Ordering::Acquire));
-        assert!(!srv.snapshot.lock().unwrap().quiet);
-
-        assert_eq!(
-            srv.store
-                .as_ref()
-                .query_scalar_i64("SELECT count(*) FROM observing_edge")
-                .unwrap(),
-            0,
-            "quiet keeps emitting samples, so it must not write an observing edge"
-        );
-    }
-
     /// With no ring running, `FreezePcap` is a REFUSAL with a reason — never a
     /// silent success that would leave the operator believing an artifact exists.
     #[test]
@@ -2837,12 +2723,19 @@ mod tests {
     fn new_self_control_commands_still_need_an_authorised_peer() {
         let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let cx = test_ctx(&srv);
-        for cmd in [ControlCmd::SetQuiet(true), ControlCmd::FreezePcap] {
+        for cmd in [
+            ControlCmd::SetProbing(ProbingTier::Passive),
+            ControlCmd::FreezePcap,
+        ] {
             let res = control_request(cmd.clone(), None, &cx);
             assert!(!res.ok, "{cmd:?} must be refused without peer credentials");
             assert!(res.message.contains("control refused"));
         }
-        assert!(!srv.quiet.load(Ordering::Acquire), "the flag must not move");
+        assert_eq!(
+            srv.probing.tier(),
+            ProbingTier::Active,
+            "the tier must not move"
+        );
     }
 
     /// The D1↔D3 anti-drift test: one real edge produces exactly ONE durable

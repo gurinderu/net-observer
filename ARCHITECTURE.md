@@ -429,8 +429,9 @@ graph TD
   **observing on/off toggle switch** on the right, hairline dividers, two
   **sparklines**, label→value rows (gw / direct / tun / selector), an incidents
   line, and a footer of subtle text actions (**Events** — opens the live
-  event-log window — / Refresh / **Freeze pcap** / **Quiet**|**Unquiet** / Quit;
-  the "Restart sing-box" control has been removed from the bar). The panel window
+  event-log window — / Refresh / **Freeze pcap** / **Probe network**|**Stop
+  probing** / Quit; the "Restart sing-box" control has been removed from the
+  bar). The panel window
   is opened `WindowBackgroundAppearance::Blurred`, which puts an
   `NSVisualEffectView` behind it, so the surface token is deliberately
   translucent (`0xRRGGBBAA`) and the base colour lighter than instinct suggests —
@@ -445,8 +446,8 @@ graph TD
   (the coworking gateway does not drop, it *ramps* for ~40 s) and is short enough
   that 120 one-pixel columns fit the 320pt panel without downsampling, so every
   point drawn is a point measured. Both fields are `Option`, and a tick that
-  measured nothing — no sample yet, a paused daemon, quiet mode (`gw = SKIP`), a
-  failed or absent gateway, an unreachable daemon — renders as an **empty
+  measured nothing — no sample yet, a paused daemon, the passive tier (`gw =
+  SKIP`), a failed or absent gateway, an unreachable daemon — renders as an **empty
   column**, never a zero-height bar on the baseline: plotting a missing
   measurement as a value on the floor is the same lie `SKIP` exists to prevent.
   The plot is a row of thin `div`s (gpui 0.2.2 has no chart primitive) with a
@@ -650,16 +651,13 @@ Ported from the oracle and cross-checked against recorded log excerpts:
 it is recorded explicitly, never omitted**: absence of a signal is itself
 diagnostic. Two routine producers of `SKIP`, neither an exception to the rule: a
 collector whose per-tick `preflight()` is `Unavailable` (see
-[Collector capability model](#collector-capability-model)), and **quiet mode**
-(`ControlCmd::SetQuiet(true)`), where the link collector withholds the gateway
-echo but still emits one sample per tick carrying `gw = SKIP` — quiet silences
-the wire, never the record, and the triggers read that as *no measurement*, never
-as a healthy gateway and never as a drop. The **passive probing tier**
-(`ControlCmd::SetProbing`, the daemon's default) is the same rule applied to
-every emission class at once: every probe of the link, proxy and dns collectors
-lands as `SKIP`, and the switch itself is bracketed by a `probing_edge` row so
-the record can tell "withheld" from "could not run" (realm net-observer, node
-#88).
+[Collector capability model](#collector-capability-model)), and the **passive
+probing tier** (`ControlCmd::SetProbing`, the daemon's default): every probe of
+the link, proxy and dns collectors is withheld and lands as `SKIP` — the
+withholding silences the wire, never the record, and the triggers read that as
+*no measurement*, never as a healthy gateway and never as a drop. The switch
+itself is bracketed by a `probing_edge` row so the record can tell "withheld"
+from "could not run" (realm net-observer, node #88).
 
 **The one sanctioned exception: an operator pause.** When collection is paused
 (`ControlCmd::SetObserving(false)`) the collectors stop probing entirely rather
@@ -737,9 +735,9 @@ the durable record; the socket is the live, low-latency read path.
     (realm net-observer, node #58)
   - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
     write/control path (see [Control path](#control-path) below); the only
-    non-read request. Seven commands today — `ControlCmd::KickstartProxy`,
-    `SetObserving(bool)`, `SetQuiet(bool)`, `SetProbing(ProbingTier)`,
-    `FreezePcap`, `ScanNeighbors(ScanOptions)`, `ScanAir` — every one behind
+    non-read request. Six commands today — `ControlCmd::KickstartProxy`,
+    `SetObserving(bool)`, `SetProbing(ProbingTier)`, `FreezePcap`,
+    `ScanNeighbors(ScanOptions)`, `ScanAir` — every one behind
     the same peer-credential check and none behind a config switch.
   - `Request::Subscribe { kinds }` → a **held-open stream** of newline-JSON
     `StreamFrame`s (not a single `Response`, and not bare `Event`s) — the
@@ -782,11 +780,12 @@ the durable record; the socket is the live, low-latency read path.
   `host`), a `generated_us` stamp, an `observing: bool` (whether collection is
   live or paused — `serde(default)` via `observing_default()` so a fresh
   snapshot, and a frame from a pre-pause daemon, read `true`, never misreporting
-  a healthy daemon as paused), a `quiet: bool` (`serde(default)` `false` —
-  collecting but addressing no packet at the gateway, which is a different state
-  from paused), and a bounded, newest-first ring of recent `IncidentSummary`s. `write_frame` / `read_frame` pin the exact framing
-  (`serde_json` + `'\n'`); the crate is runtime-agnostic (no tokio) so the async
-  server and the blocking client share one format definition.
+  a healthy daemon as paused), a `probing: ProbingTier` (`serde(default)`
+  `active` — the tier in force, orthogonal to `observing`), and a bounded,
+  newest-first ring of recent `IncidentSummary`s. `write_frame` / `read_frame`
+  pin the exact framing (`serde_json` + `'\n'`); the crate is runtime-agnostic
+  (no tokio) so the async server and the blocking client share one format
+  definition.
 
 - **Server** (`bin/net-observerd/src/api.rs`, `ApiServer::serve`) — a tokio
   `UnixListener`. Everything the server needs (paths, modes, the acting config,
@@ -994,7 +993,7 @@ follows it — config may switch off what the daemon does by itself (a per-tick
 probe, a passive handler), never a command the operator sends by hand; the
 invocation is the sanction (realm net-observer, node #91). What an arm can
 still refuse, with a reason, is a contradiction of the daemon's own state (a
-scan while paused or quiet) or a missing dependency (no ring, no scanner, no
+scan while paused) or a missing dependency (no ring, no scanner, no
 CVE snapshot).
 
 **The peer-credential gate — who may command the daemon at all.** Before any
@@ -1090,33 +1089,22 @@ already-authorised command:
    `SetObserving` that does **not** change the state is not an edge: no row, no
    frame, because a no-op click must not manufacture a gap in the record.
 
-3. **Self-control — `ControlCmd::SetQuiet(b)`.** While quiet the daemon
-   addresses **no packet at the gateway** — in this daemon that is the link
-   collector's ICMP echo, and only that. Passive facts (ARP table, DHCP lease)
-   keep being read and the link collector keeps emitting one sample per tick with
-   `gw = SKIP`, so quiet silences the wire, never the record — which is why it
-   writes **no** `observing_edge` row: there is no gap to bracket. Like
-   `observing` it is a shared `AtomicBool` mirrored into `snapshot.quiet`, is
-   process-scoped, and is never persisted. Client: the bar footer's
-   **Quiet**/**Unquiet** action.
-
-   **Self-control — `ControlCmd::SetProbing(tier)`.** The probing tier (realm
+3. **Self-control — `ControlCmd::SetProbing(tier)`.** The probing tier (realm
    net-observer, node #88): `passive` puts **nothing on the wire** — every
    emission class of the link, proxy and dns collectors (gateway echo, direct
    probe, neighbour pings, TUN 204, endpoint connects, the held reference
    streams, resolver queries; `types::EmissionClass`) is withheld, each tick
    still lands with its probe verdicts `SKIP`, and the held streams are closed —
-   while `active` runs every class (quiet still withholds the echo inside it).
-   The daemon boots into the tier `[probing] default` names, `passive` when
-   absent, and never changes tier by itself. The three collectors read one
-   shared `collector_core::ProbingState` per tick, mirrored into
-   `snapshot.probing`; process-scoped and never persisted like quiet — but
-   unlike quiet every real switch is **bracketed**: one `types::ProbingEdge`
-   goes to two sinks, a `probing_edge` row via the `Store` and a
-   `StreamFrame::Probing` on the bus, and the startup default is written as a
-   peerless edge too. A no-op switch writes nothing. A real switch, in either
-   direction, closes and re-opens detection exactly as a resume does — it
-   publishes the same `resume_at_us` epoch, so `pipeline::run` clears the
+   while `active` runs every class. The daemon boots into the tier `[probing]
+   default` names, `passive` when absent, and never changes tier by itself. The
+   three collectors read one shared `collector_core::ProbingState` per tick,
+   mirrored into `snapshot.probing`; process-scoped and never persisted like
+   `observing` — but every real switch is **bracketed**: one
+   `types::ProbingEdge` goes to two sinks, a `probing_edge` row via the `Store`
+   and a `StreamFrame::Probing` on the bus, and the startup default is written
+   as a peerless edge too. A no-op switch writes nothing. A real switch, in
+   either direction, closes and re-opens detection exactly as a resume does —
+   it publishes the same `resume_at_us` epoch, so `pipeline::run` clears the
    recent-sample window and re-arms every trigger, and the interval collectors
    drop a tick that straddled the edge at the source — so the cleared window
    makes the first post-edge sample judge afresh, exactly as after a resume: a
@@ -1132,14 +1120,11 @@ already-authorised command:
    when an older daemon answers `Gaps` the CLI says so on stderr, and when it
    reads the file it runs `silences_sql` and prints only its usual source line).
 
-   Passive and quiet are two different promises, which is why only one of them
-   refuses a manual scan. Passive promises **no emission the daemon makes on
-   its own** — nothing on a timer; an operator's `ScanNeighbors` is not the
-   daemon's emission, the command is the sanction (realm net-observer, node
-   #91) and the scan writes its own `neighbor_scan` row, so passive lets it
-   through. Quiet is the **evidence protocol** (realm net-observer, node #26):
-   a capture taken under quiet must contain none of our packets, so quiet
-   keeps refusing the sweep.
+   Passive is deliberately **not** a refusal on a manual scan. Passive
+   promises **no emission the daemon makes on its own** — nothing on a timer;
+   an operator's `ScanNeighbors` is not the daemon's emission, the command is
+   the sanction (realm net-observer, node #91) and the scan writes its own
+   `neighbor_scan` row, so passive lets it through.
 
 4. **Self-control — `ControlCmd::FreezePcap`.** Copy the pcap ring out now, into
    a fresh freeze directory — the same passive artifact the `gw-change` trigger
@@ -1151,7 +1136,7 @@ already-authorised command:
 
 The `ScanNeighbors` and `ScanAir` arms are described under their own
 subsystems; both take the same path below and are refused only by a state they
-contradict (paused; for the sweep also quiet) or a missing dependency.
+contradict (paused) or a missing dependency.
 
 ```
 Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
@@ -1174,10 +1159,11 @@ Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
                                     │         └─► ControlResult { ok: true, "observing on|off" }
                                     │             (never touches sing-box or the network)
                                     │
-                                    ├─ SetQuiet(b)
-                                    │     └─► quiet.store(b) + snapshot.quiet = b
-                                    │         (NO observing_edge row: the record keeps
-                                    │          receiving one SKIP-gw sample per tick)
+                                    ├─ SetProbing(tier)
+                                    │     └─► probing.set(tier) + snapshot.probing = tier
+                                    │         └─► on a real EDGE only:
+                                    │             store.write_probing_edge(&edge)   (durable)
+                                    │             events_tx.send(StreamFrame::Probing(edge))
                                     │
                                     ├─ FreezePcap
                                     │     └─► freeze_now(cx) → freezer.freeze(dir)

@@ -120,7 +120,7 @@ impl LinkFacts for SystemFacts {
         let text = std::fs::read_to_string(path).ok()?;
         let probe = crate::clash::fakeip_probe_addr(&text)?;
         // `route -n get` is a local RTM_GET lookup — no packet on the wire, so
-        // this keeps running under quiet mode like every other passive fact.
+        // this keeps running in the passive tier like every other passive fact.
         let out = run("route", &["-n", "get", &probe.to_string()]).await?;
         parse_route_field(&out, "interface")
     }
@@ -132,7 +132,7 @@ impl LinkFacts for SystemFacts {
         // up. That address is assigned to an interface only while sing-box runs,
         // which is exactly how dns-fallback.nix decides sing-box is alive
         // (`ifconfig | grep 'inet 172.19.0.1 '`). A local `ifconfig` read, no
-        // packet on the wire, so it keeps running under quiet mode.
+        // packet on the wire, so it keeps running in the passive tier.
         let path = self.singbox_config.as_ref()?;
         let text = std::fs::read_to_string(path).ok()?;
         let addr = crate::clash::singbox_tun_addr(&text)?;

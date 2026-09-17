@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use crate::ui::{
     Glance, MENU_HEADING_H, MENU_HEADING_TEXT, MENU_ROW_H, MENU_ROW_PX, MENU_ROW_RADIUS,
     MENU_ROW_TEXT, MENU_SEPARATOR_H, Theme, freeze_round_trip, probing_round_trip,
-    quiet_round_trip, scan_round_trip_base, separator, spawn_control_on,
+    scan_round_trip_base, separator, spawn_control_on,
 };
 
 /// Menu width in gpui logical pixels. Wide enough for the longest label
@@ -67,8 +67,8 @@ const MENU_PAD: f32 = 4.0;
 const MENU_GAP: f32 = 2.0;
 
 /// The rows every daemon gets, whatever it can collect: events, map, freeze,
-/// quiet, probe, scan, refresh, quit. Only the collector rows come and go.
-const FIXED_ROWS: usize = 8;
+/// probe, scan, refresh, quit. Only the collector rows come and go.
+const FIXED_ROWS: usize = 7;
 /// The group headings ("windows", "daemon", "panel") and the two rules between
 /// the three groups.
 const HEADINGS: usize = 3;
@@ -141,7 +141,7 @@ const PANEL_HANDOFF: Duration = Duration::from_millis(150);
 /// The actions menu view: every control that used to crowd the footer.
 pub(crate) struct MenuView {
     model: Entity<Glance>,
-    /// Re-render on every change of the shared model. Without it the quiet row
+    /// Re-render on every change of the shared model. Without it the probe row
     /// keeps the label and colour it was born with, and since the label states
     /// what the *next* click will do, the next click does the opposite of what it
     /// says.
@@ -224,7 +224,6 @@ impl MenuView {
 impl Render for MenuView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
-        let quiet_on = self.model.read(cx).snapshot.quiet;
         let probing = self.model.read(cx).snapshot.probing;
 
         let events = self.entry("events", "Events", theme.accent, theme, cx, |this, cx| {
@@ -273,24 +272,10 @@ impl Render for MenuView {
                 spawn_control_on(&model, cx, freeze_round_trip);
             },
         );
-        // The label says what the click will do; the colour says which state the
-        // daemon is in now, because a suppressed probe is a deliberate hole in
-        // the measurement and must not look routine.
-        let quiet = self.entry(
-            "quiet",
-            if quiet_on { "Unquiet" } else { "Quiet" },
-            if quiet_on { theme.warn } else { theme.accent },
-            theme,
-            cx,
-            |this, cx| {
-                let model = this.model.clone();
-                spawn_control_on(&model, cx, quiet_round_trip);
-            },
-        );
-        // The probing tier, beside quiet. The label says what the click will
-        // do; the colour says which tier the daemon is in now: active is
-        // warn-coloured because it is the tier that puts packets on the wire —
-        // the deliberate, pressed-for state, not the routine one (realm
+        // The probing tier. The label says what the click will do; the colour
+        // says which tier the daemon is in now: active is warn-coloured
+        // because it is the tier that puts packets on the wire — the
+        // deliberate, pressed-for state, not the routine one (realm
         // net-observer, node #88).
         let probe = self.entry(
             "probe",
@@ -308,7 +293,7 @@ impl Render for MenuView {
         );
         // Scan is the only entry here that addresses other machines — it runs
         // when asked, no config switch gates it — and is warn-coloured for the
-        // same reason as quiet.
+        // same reason as the probing row.
         let scan = self.entry("scan", "Scan", theme.warn, theme, cx, |this, cx| {
             let model = this.model.clone();
             spawn_control_on(&model, cx, scan_round_trip_base);
@@ -344,7 +329,6 @@ impl Render for MenuView {
             .child(separator(theme))
             .child(Self::heading("daemon", theme))
             .child(freeze)
-            .child(quiet)
             .child(probe)
             .child(scan)
             .child(separator(theme))
@@ -817,12 +801,11 @@ mod headless_tests {
 
         // Every action the panel's footer used to carry, in flyout order. The air
         // row is the only one a daemon can be without.
-        let rows: [&'static str; 9] = [
+        let rows: [&'static str; 8] = [
             "menu-row:events",
             "menu-row:map",
             "menu-row:air",
             "menu-row:freeze",
-            "menu-row:quiet",
             "menu-row:probe",
             "menu-row:scan",
             "menu-row:refresh",
