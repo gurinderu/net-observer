@@ -4155,6 +4155,7 @@ dependencies = [
  "collector-neighbors",
  "collector-proxy",
  "collector-route",
+ "collector-singbox-log",
  "collector-wifi",
  "config",
  "libc",
