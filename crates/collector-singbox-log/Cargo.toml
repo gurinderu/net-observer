@@ -1,0 +1,12 @@
+[package]
+name = "collector-singbox-log"
+edition.workspace = true
+
+[dependencies]
+types.workspace = true
+collector-core.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true }
