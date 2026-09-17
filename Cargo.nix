@@ -53,6 +53,16 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "collector-announce" = rec {
+      packageId = "collector-announce";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "collector-announce";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "collector-connections" = rec {
       packageId = "collector-connections";
       build = internal.buildRustCrateWithFeatures {
@@ -4224,6 +4234,45 @@ rec {
         ];
 
       };
+      "collector-announce" = rec {
+        crateName = "collector-announce";
+        version = "0.0.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ./crates/collector-announce; };
+        libName = "collector_announce";
+        dependencies = [
+          {
+            name = "collector-core";
+            packageId = "collector-core";
+          }
+          {
+            name = "etherparse";
+            packageId = "etherparse";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+          {
+            name = "simple-dns";
+            packageId = "simple-dns";
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+          }
+          {
+            name = "types";
+            packageId = "types";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "rt-multi-thread" "macros" "sync" "time" "signal" "process" ];
+          }
+        ];
+
+      };
       "collector-connections" = rec {
         crateName = "collector-connections";
         version = "0.0.0";
@@ -6508,6 +6557,27 @@ rec {
           "serde" = [ "dep:serde" ];
           "serialization" = [ "serde" "euclid/serde" ];
         };
+      };
+      "etherparse" = rec {
+        crateName = "etherparse";
+        version = "0.21.0";
+        edition = "2021";
+        sha256 = "0jali1h3ds8mwky2yjfnwa73rrwmvm18wlmxqk6q6cnvml34sc0p";
+        authors = [
+          "Julian Schmid <info@julianschmid.name>"
+        ];
+        dependencies = [
+          {
+            name = "arrayvec";
+            packageId = "arrayvec";
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "default" = [ "std" ];
+          "std" = [ "alloc" "arrayvec/std" ];
+        };
+        resolvedDefaultFeatures = [ "alloc" "std" ];
       };
       "euclid" = rec {
         crateName = "euclid";
@@ -12362,6 +12432,10 @@ rec {
             packageId = "collector-air";
           }
           {
+            name = "collector-announce";
+            packageId = "collector-announce";
+          }
+          {
             name = "collector-connections";
             packageId = "collector-connections";
           }
@@ -13217,6 +13291,10 @@ rec {
           {
             name = "collector-air";
             packageId = "collector-air";
+          }
+          {
+            name = "collector-announce";
+            packageId = "collector-announce";
           }
           {
             name = "collector-connections";
@@ -20529,6 +20607,26 @@ rec {
           }
         ];
 
+      };
+      "simple-dns" = rec {
+        crateName = "simple-dns";
+        version = "0.12.0";
+        edition = "2021";
+        sha256 = "06icn8yii7x65lvrmlgz5k98v5hyp2pd7ysbfw0q3m58m57qhvrb";
+        libName = "simple_dns";
+        authors = [
+          "Ilson Roberto Balliego Junior <ilson.balliego@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "bitflags";
+            packageId = "bitflags 2.13.1";
+          }
+        ];
+        features = {
+          "default" = [ "std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "std" ];
       };
       "simplecss" = rec {
         crateName = "simplecss";
