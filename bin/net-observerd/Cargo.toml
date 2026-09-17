@@ -17,6 +17,7 @@ collector-neighbors.workspace = true
 collector-air.workspace = true
 collector-connections.workspace = true
 collector-announce.workspace = true
+collector-singbox-log.workspace = true
 triggers.workspace = true
 macos.workspace = true
 vuln-db.workspace = true

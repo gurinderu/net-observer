@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use crate::window::{LinkProvenance, RecentWindow};
 use types::{
-    DnsVerdict, GwVerdict, LinkMedium, LinkSample, NeighborsVerdict, ProxySample, TcpVerdict,
-    normalize_mac,
+    DnsVerdict, GwVerdict, LinkMedium, LinkSample, NeighborsVerdict, ProxySample, SingboxLogClass,
+    SingboxLogSample, TcpVerdict, local_instant, normalize_mac,
 };
 
 /// How many recent DNS samples the `fakeip` condition scans (one polling tick
@@ -1297,6 +1297,283 @@ direct underlay stream unmeasured"
     }
 }
 
+/// How many recent rows of sing-box's log the two sing-box signatures scan:
+/// the rows they count lie within [`SINGBOX_SPAN_US`] of the newest one,
+/// a few ticks, and a tick leaves one row per `(class, node)` — 128 reaches
+/// past that several times over.
+const SINGBOX_LOG_SCAN: usize = 128;
+
+/// The span the sing-box signatures count lines over: 60 s, ending at the
+/// newest qualifying row.
+const SINGBOX_SPAN_US: i64 = 60_000_000;
+
+/// How many lines inside that span fire either signature.
+const SINGBOX_MIN_LINES: u32 = 3;
+
+/// How many link ticks with no qualifying row clear either signature. The
+/// log reader writes nothing on a tick that saw no error, so "two ticks with
+/// no such row" is measured on the link collector's samples — the daemon's
+/// tick clock, at the same default cadence as the reader.
+const SINGBOX_CLEAR_TICKS: usize = 2;
+
+/// The rows of sing-box's log one signature reads: the ones `pick` accepts,
+/// inside [`SINGBOX_SPAN_US`] ending at the newest of them.
+struct SingboxBurst<'w> {
+    rows: Vec<&'w SingboxLogSample>,
+    /// The span's bounds: the newest qualifying row's `ts_us`, and
+    /// [`SINGBOX_SPAN_US`] before it.
+    newest_ts_us: i64,
+    horizon_us: i64,
+}
+
+impl SingboxBurst<'_> {
+    /// Lines in the span: the rows' counts summed.
+    fn lines(&self) -> u32 {
+        self.rows
+            .iter()
+            .map(|r| r.count)
+            .fold(0, u32::saturating_add)
+    }
+
+    /// `no-route ×3, no-default-iface ×1` — the classes seen, in first-seen
+    /// order, each with its lines.
+    fn classes(&self) -> String {
+        let mut seen: Vec<(SingboxLogClass, u32)> = Vec::new();
+        for r in &self.rows {
+            match seen.iter_mut().find(|(c, _)| *c == r.class) {
+                Some((_, n)) => *n = n.saturating_add(r.count),
+                None => seen.push((r.class, r.count)),
+            }
+        }
+        seen.iter()
+            .map(|(c, n)| format!("{c} ×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The burst of rows `pick` accepts, or `None` when there is none — or when
+/// [`SINGBOX_CLEAR_TICKS`] link ticks have passed since the newest one: the
+/// assertion has cleared, whatever the span still holds.
+fn singbox_burst<'w>(
+    w: &'w RecentWindow,
+    pick: impl Fn(&SingboxLogSample) -> bool,
+) -> Option<SingboxBurst<'w>> {
+    let all = w.recent_singbox_log(SINGBOX_LOG_SCAN);
+    let newest = all.iter().copied().find(|r| pick(r))?;
+    let ticks_since = w
+        .recent_link(SINGBOX_CLEAR_TICKS)
+        .into_iter()
+        .filter(|l| l.ts_us > newest.ts_us)
+        .count();
+    if ticks_since >= SINGBOX_CLEAR_TICKS {
+        return None;
+    }
+    let horizon = newest.ts_us.saturating_sub(SINGBOX_SPAN_US);
+    let rows = all
+        .into_iter()
+        .filter(|r| pick(r) && r.ts_us >= horizon)
+        .collect();
+    Some(SingboxBurst {
+        rows,
+        newest_ts_us: newest.ts_us,
+        horizon_us: horizon,
+    })
+}
+
+/// The tick at which sing-box (re)started inside the burst's span, if one
+/// did: a `started` row with `ts_us` in `[horizon, newest]`. A restart tears
+/// the TUN down, so the route-loss lines that follow it are explained by it —
+/// the incident still stands, its detail says so (realm net-observer, node
+/// #141).
+fn singbox_restart_in(w: &RecentWindow, burst: &SingboxBurst<'_>) -> Option<i64> {
+    w.recent_singbox_log(SINGBOX_LOG_SCAN)
+        .into_iter()
+        .find(|r| {
+            r.class == SingboxLogClass::Started
+                && r.ts_us >= burst.horizon_us
+                && r.ts_us <= burst.newest_ts_us
+        })
+        .map(|r| r.ts_us)
+}
+
+/// Fires when sing-box's own log says it has no route — `no-route`,
+/// `unreachable` or `no-default-iface` lines, [`SINGBOX_MIN_LINES`] or more
+/// within [`SINGBOX_SPAN_US`] — while the newest link sample shows the
+/// interface still holding a DHCP router: the OS has a network and sing-box
+/// cannot see it. This is the signature the passive tier could not name
+/// before the log was read (realm net-observer, node #141).
+///
+/// The gateway verdict is read exhaustively: `Ok` and `Skip` (the passive
+/// tier's withheld echo) both leave the router held; `NoGw` means the OS
+/// agrees there is no route and `gw-drop` owns it; `Fail` is `gw-drop`'s as
+/// well — the gateway is dead, so sing-box's complaint is not a discrepancy.
+/// Clears after [`SINGBOX_CLEAR_TICKS`] link ticks with no such line. A
+/// `started` row inside the span (sing-box restarted, tearing the TUN down —
+/// the reload agent and the shell oracle's watchdog both kickstart it) is
+/// ignored by the count and named in the detail — `after a sing-box restart at
+/// <instant>`, the restart tick as [`local_instant`] renders it, the same
+/// spelling the CLI stamps — so the burst is explained.
+pub struct SingboxNoRoute;
+impl Condition for SingboxNoRoute {
+    fn id(&self) -> &'static str {
+        "singbox-no-route"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_link()?;
+        let router = last.dhcp_router.as_deref()?;
+        match last.gw {
+            GwVerdict::Ok | GwVerdict::Skip => {}
+            GwVerdict::Fail | GwVerdict::NoGw => return None,
+        }
+        let burst = singbox_burst(w, |r| {
+            matches!(
+                r.class,
+                SingboxLogClass::NoRoute
+                    | SingboxLogClass::Unreachable
+                    | SingboxLogClass::NoDefaultIface
+            )
+        })?;
+        let lines = burst.lines();
+        if lines < SINGBOX_MIN_LINES {
+            return None;
+        }
+        let mut detail = format!(
+            "sing-box reports no route ({lines} lines in 60 s: {}) while the link holds router {router}",
+            burst.classes()
+        );
+        if let Some(restart_us) = singbox_restart_in(w, &burst) {
+            detail.push_str(&format!(
+                " after a sing-box restart at {}",
+                local_instant(restart_us)
+            ));
+        }
+        Some(Fire { detail })
+    }
+}
+
+/// The raw TCP verdict of one node's endpoint on one proxy tick, found
+/// through the URL-test reading the proxy collector rides on the node's
+/// endpoint row (realm net-observer, node #62): the row whose `urltest_node`
+/// is `node` names the endpoint in `server_ip`, and its own `tcp` is that
+/// listener's verdict — unless it is a reading-only row (`tcp = SKIP` under
+/// the node: the endpoint row was taken by another node on the same address,
+/// or not probed), in which case the endpoint's own row, if the tick has one,
+/// carries the verdict. `None` when the tick carries no reading for `node`,
+/// or a reading whose endpoint is unknown (`-`): the endpoint is unmapped.
+fn node_endpoint<'a>(tick: &[&'a ProxySample], node: &str) -> Option<(&'a str, TcpVerdict)> {
+    let reading = tick
+        .iter()
+        .find(|r| r.urltest_node.as_deref() == Some(node))?;
+    let endpoint = reading.server_ip.as_str();
+    if endpoint == "-" {
+        return None;
+    }
+    let tcp = if is_reading_only(reading) {
+        tick.iter()
+            .find(|r| r.server_ip == endpoint && !is_reading_only(r))
+            .map_or(TcpVerdict::Skip, |r| r.tcp)
+    } else {
+        reading.tcp
+    };
+    Some((endpoint, tcp))
+}
+
+/// Fires when sing-box's dial through one node times out —
+/// [`SINGBOX_MIN_LINES`] or more `dial-timeout` lines via that node within
+/// [`SINGBOX_SPAN_US`] — while raw TCP to that node's endpoint answers on the
+/// newest proxy tick: the listener is reachable, and sing-box's own dial to it
+/// is not (realm net-observer, node #141).
+///
+/// The node's endpoint is read off the proxy tick through the URL-test
+/// reading ([`node_endpoint`], node #62); the newest two ticks are consulted,
+/// since the newest may still be being written when the engine evaluates. An
+/// endpoint whose row reads `Fail` is `endpoint-block`'s question, a `Skip`
+/// no measurement — neither fires. A node the proxy collector carries no
+/// reading for (unknown to it, or a passive placeholder only) falls back to
+/// the whole fleet: every measured endpoint of the newest tick `Ok`
+/// (reading-only rows measure nothing and are not counted), and the detail
+/// says the node's own endpoint is unmapped. Clears after
+/// [`SINGBOX_CLEAR_TICKS`] link ticks with no such line.
+pub struct SingboxDialTimeout;
+impl Condition for SingboxDialTimeout {
+    fn id(&self) -> &'static str {
+        "singbox-dial-timeout"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        // The newest two proxy ticks, newest first: the rows sharing a
+        // `ts_us`. No proxy tick at all is no measurement.
+        let proxy = w.recent_proxy(ENDPOINT_BLOCK_SCAN);
+        let mut ticks: Vec<&[&ProxySample]> = Vec::new();
+        let mut start = 0;
+        while start < proxy.len() && ticks.len() < 2 {
+            let ts = proxy[start].ts_us;
+            let end = start + proxy[start..].iter().take_while(|p| p.ts_us == ts).count();
+            ticks.push(&proxy[start..end]);
+            start = end;
+        }
+        let newest = *ticks.first()?;
+        // The fallback context: every measured endpoint of the newest tick
+        // answers. Exhaustive over the verdict: `Skip` is no measurement, and
+        // a `Fail` is a fleet the underlay does not reach.
+        let mut fleet_ok = Some(0usize);
+        for p in newest.iter().filter(|p| !is_reading_only(p)) {
+            fleet_ok = match (fleet_ok, p.tcp) {
+                (Some(n), TcpVerdict::Ok) => Some(n + 1),
+                (_, TcpVerdict::Fail | TcpVerdict::Skip) | (None, _) => None,
+            };
+        }
+        // A tick of reading-only rows measured nothing: no fleet answered.
+        let fleet_ok = fleet_ok.filter(|n| *n >= 1);
+        // Each node with a dial-timeout row, newest first; the first whose
+        // own burst reaches the threshold and whose context holds fires. A
+        // row naming no node is not attributable to one and is skipped.
+        let all = w.recent_singbox_log(SINGBOX_LOG_SCAN);
+        let mut seen: Vec<&str> = Vec::new();
+        for node in all
+            .iter()
+            .filter(|r| r.class == SingboxLogClass::DialTimeout)
+            .filter_map(|r| r.node.as_deref())
+        {
+            if seen.contains(&node) {
+                continue;
+            }
+            seen.push(node);
+            let Some(burst) = singbox_burst(w, |r| {
+                r.class == SingboxLogClass::DialTimeout && r.node.as_deref() == Some(node)
+            }) else {
+                continue;
+            };
+            let lines = burst.lines();
+            if lines < SINGBOX_MIN_LINES {
+                continue;
+            }
+            match ticks.iter().find_map(|t| node_endpoint(t, node)) {
+                Some((endpoint, TcpVerdict::Ok)) => {
+                    return Some(Fire {
+                        detail: format!(
+                            "sing-box's dial through {node} times out ({lines} in 60 s) while \
+raw TCP to {endpoint} answers"
+                        ),
+                    });
+                }
+                Some((_, TcpVerdict::Fail | TcpVerdict::Skip)) => continue,
+                None => {
+                    let Some(endpoints) = fleet_ok else {
+                        continue;
+                    };
+                    return Some(Fire {
+                        detail: format!(
+                            "sing-box's dial through {node} times out ({lines} in 60 s) while \
+raw TCP to all {endpoints} endpoints answers (the node's own endpoint is not in the window)"
+                        ),
+                    });
+                }
+            }
+        }
+        None
+    }
+}
 /// How many recent proxy rows `endpoint-dial-stall` looks through for the
 /// newest tick that carries the traffic-carrying node's reading: two ticks'
 /// worth — the newest tick is still being written when the engine
@@ -4066,6 +4343,517 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             c.eval(&fill(64)).is_none(),
             "a 64-sample window holds a handful of ticks and cannot see a cycle"
         );
+    }
+
+    // ---- sing-box's own log ------------------------------------------------
+
+    const S: i64 = 1_000_000;
+
+    /// One row of the log reader: `count` lines of `class` via `node` on the
+    /// tick at `ts`.
+    fn singbox_row(ts: i64, class: SingboxLogClass, count: u32, node: Option<&str>) -> Sample {
+        Sample::SingboxLog(SingboxLogSample {
+            ts_us: ts,
+            class,
+            count,
+            node: node.map(str::to_string),
+            sample_message: Some("…".into()),
+        })
+    }
+
+    /// A link tick with an explicit gateway verdict that still holds a DHCP
+    /// router — the passive tier's shape when `gw` is `Skip`.
+    fn link_with_router(ts: i64, gw: GwVerdict) -> Sample {
+        match link_gw(ts, gw) {
+            Sample::Link(mut l) => {
+                l.dhcp_router = Some("10.20.0.1".into());
+                Sample::Link(l)
+            }
+            other => other,
+        }
+    }
+
+    /// The field shape under the passive tier: the echo withheld, the router
+    /// held, and sing-box writing `no route to internet` on every dial —
+    /// three lines inside a minute fire, two do not.
+    #[test]
+    fn singbox_no_route_fires_on_three_lines_in_a_minute_while_the_router_is_held() {
+        let c = SingboxNoRoute;
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(0, GwVerdict::Skip));
+        w.push(singbox_row(
+            1,
+            SingboxLogClass::NoRoute,
+            2,
+            Some("vless-out-6"),
+        ));
+        assert!(c.eval(&w).is_none(), "two lines are not yet a burst");
+        w.push(link_with_router(15 * S, GwVerdict::Skip));
+        w.push(singbox_row(
+            15 * S + 1,
+            SingboxLogClass::NoDefaultIface,
+            1,
+            None,
+        ));
+        let fire = c.eval(&w).expect("three lines in a minute fire");
+        assert_eq!(
+            fire.detail,
+            "sing-box reports no route (3 lines in 60 s: no-default-iface ×1, no-route ×2) \
+             while the link holds router 10.20.0.1"
+        );
+        // The same lines with an OK gateway (the active tier) fire too.
+        w.push(link_with_router(16 * S, GwVerdict::Ok));
+        assert!(c.eval(&w).is_some());
+    }
+
+    /// Lines older than the minute ending at the newest one do not count:
+    /// three lines spread over two minutes are not a burst.
+    #[test]
+    fn singbox_no_route_counts_only_the_minute_ending_at_the_newest_line() {
+        let c = SingboxNoRoute;
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(0, GwVerdict::Skip));
+        w.push(singbox_row(
+            1,
+            SingboxLogClass::NoRoute,
+            2,
+            Some("vless-out-6"),
+        ));
+        w.push(link_with_router(75 * S, GwVerdict::Skip));
+        w.push(singbox_row(
+            75 * S + 1,
+            SingboxLogClass::Unreachable,
+            1,
+            None,
+        ));
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// Without the link context there is no discrepancy to name: no router
+    /// held (nothing to contrast sing-box's view with), or a gateway the OS
+    /// itself calls gone or dead — `gw-drop`'s incident, not this one.
+    #[test]
+    fn singbox_no_route_is_silent_without_a_held_router() {
+        let c = SingboxNoRoute;
+        let burst = |w: &mut RecentWindow| {
+            w.push(singbox_row(
+                1,
+                SingboxLogClass::NoRoute,
+                3,
+                Some("vless-out-6"),
+            ));
+        };
+
+        let mut w = RecentWindow::new(64);
+        burst(&mut w);
+        assert!(c.eval(&w).is_none(), "no link sample at all");
+
+        let mut w = RecentWindow::new(64);
+        w.push(link_gw(0, GwVerdict::Skip));
+        burst(&mut w);
+        assert!(c.eval(&w).is_none(), "no DHCP router held");
+
+        for gw in [GwVerdict::NoGw, GwVerdict::Fail] {
+            let mut w = RecentWindow::new(64);
+            w.push(link_with_router(0, gw));
+            burst(&mut w);
+            assert!(c.eval(&w).is_none(), "{gw:?} is gw-drop's");
+        }
+
+        // Other classes of the log are not this signature.
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(0, GwVerdict::Skip));
+        w.push(singbox_row(
+            1,
+            SingboxLogClass::DialTimeout,
+            5,
+            Some("vless-out-6"),
+        ));
+        w.push(singbox_row(1, SingboxLogClass::Unreadable, 0, None));
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// The reader writes nothing on a quiet tick, so the clear is measured on
+    /// the link ticks: one tick after the last line still asserts, the second
+    /// clears — and a new line resets the count.
+    #[test]
+    fn singbox_no_route_clears_after_two_link_ticks_with_no_line() {
+        let c = SingboxNoRoute;
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(0, GwVerdict::Skip));
+        w.push(singbox_row(
+            1,
+            SingboxLogClass::NoRoute,
+            3,
+            Some("vless-out-6"),
+        ));
+        assert!(c.eval(&w).is_some());
+        w.push(link_with_router(15 * S, GwVerdict::Skip));
+        assert!(c.eval(&w).is_some(), "one quiet tick still asserts");
+        w.push(singbox_row(
+            15 * S + 1,
+            SingboxLogClass::NoRoute,
+            1,
+            Some("vless-out-6"),
+        ));
+        w.push(link_with_router(30 * S, GwVerdict::Skip));
+        assert!(c.eval(&w).is_some(), "a new line reset the quiet count");
+        w.push(link_with_router(45 * S, GwVerdict::Skip));
+        assert!(c.eval(&w).is_none(), "two quiet ticks clear");
+    }
+
+    /// The field's most frequent shape: sing-box restarted (the reload agent,
+    /// the watchdog), the TUN went down, and the route-loss burst followed.
+    /// The rule still fires — the burst is real — but its detail names the
+    /// restart; `started` rows are not counted, and one outside the span is
+    /// not mentioned.
+    #[test]
+    fn singbox_no_route_names_a_restart_inside_the_span() {
+        let c = SingboxNoRoute;
+        // 18:37:02Z on the day observed: a restart on the tick before the burst.
+        let restart = 1_789_670_222 * S;
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(restart - 1, GwVerdict::Skip));
+        w.push(singbox_row(restart, SingboxLogClass::Started, 1, None));
+        w.push(singbox_row(
+            restart,
+            SingboxLogClass::DefaultIfaceUpdated,
+            1,
+            Some("en0"),
+        ));
+        w.push(link_with_router(restart + 15 * S, GwVerdict::Skip));
+        w.push(singbox_row(
+            restart + 15 * S + 1,
+            SingboxLogClass::Unreachable,
+            2,
+            Some("vless-out-6"),
+        ));
+        assert!(
+            c.eval(&w).is_none(),
+            "the restart rows are not route-loss lines: two lines are not a burst"
+        );
+        w.push(singbox_row(
+            restart + 15 * S + 1,
+            SingboxLogClass::NoRoute,
+            1,
+            Some("vless-out-6"),
+        ));
+        let fire = c.eval(&w).expect("three route-loss lines fire");
+        // The instant is the restart TICK's, spelled by `types::local_instant`
+        // (the machine's zone: `2026-09-17T21:37:02+03:00` on the Mac that
+        // observed it), so the pin asks the same function rather than a zone.
+        assert_eq!(
+            fire.detail,
+            format!(
+                "sing-box reports no route (3 lines in 60 s: no-route ×1, unreachable ×2) \
+                 while the link holds router 10.20.0.1 after a sing-box restart at {}",
+                local_instant(restart)
+            )
+        );
+        assert!(
+            fire.detail.contains("restart at 2026-09-1"),
+            "the instant carries the date the restart was observed on: {}",
+            fire.detail
+        );
+
+        // A restart older than the span is not the explanation.
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(0, GwVerdict::Skip));
+        w.push(singbox_row(1, SingboxLogClass::Started, 1, None));
+        w.push(link_with_router(90 * S, GwVerdict::Skip));
+        w.push(singbox_row(
+            90 * S + 1,
+            SingboxLogClass::NoRoute,
+            3,
+            Some("vless-out-6"),
+        ));
+        let fire = c.eval(&w).expect("three lines fire");
+        assert!(!fire.detail.contains("restart"), "{}", fire.detail);
+    }
+
+    /// Three dial timeouts through one node inside a minute, while raw TCP
+    /// reaches every endpoint of the newest proxy tick: the path is open and
+    /// sing-box's own dial is not.
+    #[test]
+    fn singbox_dial_timeout_fires_when_raw_tcp_answers_everywhere() {
+        let c = SingboxDialTimeout;
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(proxy_ep(1, "2.2.2.2:2053", TcpVerdict::Ok));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            2,
+            Some("vless-out-6"),
+        ));
+        assert!(c.eval(&w).is_none(), "two lines are not yet a burst");
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            4,
+            Some("vless-out-2"),
+        ));
+        let fire = c.eval(&w).expect("four timeouts via one node fire");
+        assert_eq!(
+            fire.detail,
+            "sing-box's dial through vless-out-2 times out (4 in 60 s) while raw TCP to all \
+             2 endpoints answers (the node's own endpoint is not in the window)"
+        );
+        // Counts are per node: two nodes with two lines each do not add up,
+        // and a node that did reach three fires even when another node's
+        // single line is the newest row.
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(singbox_row(2, SingboxLogClass::DialTimeout, 2, Some("a")));
+        w.push(singbox_row(2, SingboxLogClass::DialTimeout, 1, Some("b")));
+        assert!(c.eval(&w).is_none());
+        w.push(singbox_row(3, SingboxLogClass::DialTimeout, 1, Some("a")));
+        w.push(singbox_row(4, SingboxLogClass::DialTimeout, 1, Some("b")));
+        let fire = c.eval(&w).expect("node a reached three");
+        assert!(
+            fire.detail
+                .starts_with("sing-box's dial through a times out (3 in 60 s)"),
+            "{}",
+            fire.detail
+        );
+    }
+
+    /// Without the measurement context the timeouts are not this signature:
+    /// no proxy tick at all, a tick the passive tier withheld (`Skip`), or an
+    /// endpoint the underlay itself cannot reach (`endpoint-block`'s question).
+    #[test]
+    fn singbox_dial_timeout_is_silent_without_a_measured_open_underlay() {
+        let c = SingboxDialTimeout;
+        let burst = |w: &mut RecentWindow| {
+            w.push(singbox_row(
+                2,
+                SingboxLogClass::DialTimeout,
+                3,
+                Some("vless-out-6"),
+            ));
+        };
+
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        burst(&mut w);
+        assert!(c.eval(&w).is_none(), "no proxy tick");
+
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "-", TcpVerdict::Skip));
+        burst(&mut w);
+        assert!(c.eval(&w).is_none(), "a withheld tick is no measurement");
+
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(proxy_ep(1, "2.2.2.2:2053", TcpVerdict::Fail));
+        burst(&mut w);
+        assert!(c.eval(&w).is_none(), "an endpoint dead from the underlay");
+
+        // A timeout row that names no node is not attributable.
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(singbox_row(2, SingboxLogClass::DialTimeout, 3, None));
+        assert!(c.eval(&w).is_none());
+    }
+
+    #[test]
+    fn singbox_dial_timeout_clears_after_two_link_ticks_with_no_line() {
+        let c = SingboxDialTimeout;
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-6"),
+        ));
+        assert!(c.eval(&w).is_some());
+        w.push(link(15 * S, TcpVerdict::Ok));
+        w.push(proxy_ep(15 * S + 1, "1.1.1.1:443", TcpVerdict::Ok));
+        assert!(c.eval(&w).is_some(), "one quiet tick still asserts");
+        w.push(link(30 * S, TcpVerdict::Ok));
+        w.push(proxy_ep(30 * S + 1, "1.1.1.1:443", TcpVerdict::Ok));
+        assert!(c.eval(&w).is_none(), "two quiet ticks clear");
+    }
+
+    /// A proxy row on `endpoint` carrying `node`'s URL-test reading — the
+    /// mapping the proxy collector rides on the node's endpoint row (node
+    /// #62): `tcp` is that listener's raw verdict. A reading-only row is the
+    /// same shape with `tcp = Skip` (the endpoint row taken or not probed).
+    fn proxy_ep_reading(ts: i64, endpoint: &str, tcp: TcpVerdict, node: &str) -> Sample {
+        let Sample::Proxy(mut p) = proxy_ep(ts, endpoint, tcp) else {
+            unreachable!("proxy_ep builds a proxy sample")
+        };
+        p.urltest_node = Some(node.into());
+        Sample::Proxy(p)
+    }
+
+    /// The mapped case: the newest tick names the node's endpoint through
+    /// its reading, raw TCP to it answers, and the detail names the endpoint
+    /// — while the rest of the fleet may well be failing.
+    #[test]
+    fn singbox_dial_timeout_names_the_nodes_endpoint_when_mapped() {
+        let c = SingboxDialTimeout;
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "9.9.9.9:443", TcpVerdict::Fail));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Ok,
+            "vless-out-2",
+        ));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-2"),
+        ));
+        let fire = c.eval(&w).expect("the node's own endpoint answers");
+        assert_eq!(
+            fire.detail,
+            "sing-box's dial through vless-out-2 times out (3 in 60 s) while raw TCP to \
+             2.2.2.2:2053 answers"
+        );
+
+        // A reading-only row (the endpoint row taken by another node on the
+        // same address) defers to the endpoint's own row.
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Ok,
+            "vless-out-1",
+        ));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Skip,
+            "vless-out-2",
+        ));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-2"),
+        ));
+        let fire = c.eval(&w).expect("the shared endpoint's own row answers");
+        assert!(
+            fire.detail.ends_with("raw TCP to 2.2.2.2:2053 answers"),
+            "{}",
+            fire.detail
+        );
+    }
+
+    /// Mapped and dead from the underlay: `endpoint-block`'s question, not
+    /// this one — even while the rest of the fleet answers. A reading-only
+    /// row whose endpoint has no own row is no measurement, likewise silent.
+    #[test]
+    fn singbox_dial_timeout_is_silent_when_the_mapped_endpoint_fails_or_is_unmeasured() {
+        let c = SingboxDialTimeout;
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Fail,
+            "vless-out-2",
+        ));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-2"),
+        ));
+        assert!(
+            c.eval(&w).is_none(),
+            "the node's own endpoint is dead from the underlay"
+        );
+
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Skip,
+            "vless-out-2",
+        ));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-2"),
+        ));
+        assert!(c.eval(&w).is_none(), "the node's endpoint was not probed");
+    }
+
+    /// Unmapped — the newest ticks carry no reading for the node, or one
+    /// whose endpoint is unknown — falls back to the fleet: every measured
+    /// endpoint answers (a reading-only row measures nothing and does not
+    /// count), and the detail says the endpoint is unmapped.
+    #[test]
+    fn singbox_dial_timeout_falls_back_to_the_fleet_when_unmapped() {
+        let c = SingboxDialTimeout;
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(proxy_ep_reading(
+            1,
+            "2.2.2.2:2053",
+            TcpVerdict::Ok,
+            "vless-out-2",
+        ));
+        w.push(proxy_ep_reading(1, "-", TcpVerdict::Skip, "vless-out-9"));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-7"),
+        ));
+        let fire = c.eval(&w).expect("the fleet answers");
+        assert_eq!(
+            fire.detail,
+            "sing-box's dial through vless-out-7 times out (3 in 60 s) while raw TCP to all \
+             2 endpoints answers (the node's own endpoint is not in the window)"
+        );
+
+        // A reading whose endpoint is unknown (`-`) is unmapped too.
+        w.push(singbox_row(
+            3,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-9"),
+        ));
+        let fire = c.eval(&w).expect("unmapped, and the fleet answers");
+        assert!(
+            fire.detail
+                .starts_with("sing-box's dial through vless-out-9")
+                && fire.detail.contains("not in the window"),
+            "{}",
+            fire.detail
+        );
+
+        // A tick of reading-only rows measured no endpoint: "all 0 endpoints
+        // answer" is not a fleet answering.
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep_reading(1, "-", TcpVerdict::Skip, "vless-out-9"));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-7"),
+        ));
+        assert!(c.eval(&w).is_none(), "no measured endpoint, no fleet");
     }
 
     // ---- sing-box's own URL test (realm net-observer, node #62) ----------

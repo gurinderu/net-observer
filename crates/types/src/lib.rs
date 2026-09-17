@@ -7,6 +7,7 @@ pub mod neighbor;
 pub mod observing;
 pub mod probing;
 pub mod sample;
+pub mod singbox_log;
 pub mod topology;
 pub mod verdict;
 
@@ -31,6 +32,7 @@ pub use sample::{
     DnsSample, HostSample, LinkSample, ProxySample, RouteEvent, Sample, WifiSample,
     instant_rfc3339, local_instant, now_us,
 };
+pub use singbox_log::{SingboxLogClass, SingboxLogSample};
 pub use topology::{
     LearnedVia, TopologyLifetime, TopologyLink, link_from_cdp, link_from_frame, link_from_lldp,
 };

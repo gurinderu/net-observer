@@ -250,6 +250,19 @@ CREATE TABLE IF NOT EXISTS connection_sample (
   ts_us BIGINT, verdict VARCHAR, host VARCHAR, dst_ip VARCHAR, dst_port USMALLINT,
   process VARCHAR, network VARCHAR, chain VARCHAR, count UINTEGER, upload UBIGINT,
   download UBIGINT);
+-- sing-box's own ERROR/WARN lines, read passively from its log and classed
+-- (realm net-observer, nodes #140, #141): one row per (class, node) per tick
+-- of the `singbox-log` collector, `count` lines of that class seen in the
+-- tick, `node` the outbound the line names (NULL when it names none),
+-- `sample_message` the first such line's message, ANSI stripped and bounded.
+-- A tick with no ERROR/WARN line writes NO row: the absence of errors is the
+-- healthy state, and the tick itself is evidenced by the other collectors. A
+-- tick on which the log could not be read writes one `unreadable` row with
+-- count 0 and the I/O error as its message — SKIP's spirit, never silence.
+-- Added after the store first shipped, so an older DB file gains the table on
+-- open like `topology_link` above.
+CREATE TABLE IF NOT EXISTS singbox_log_sample (
+  ts_us BIGINT, class VARCHAR, count UINTEGER, node VARCHAR, sample_message VARCHAR);
 CREATE TABLE IF NOT EXISTS observing_edge (
   ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT, cause VARCHAR);
 -- `cause` was added after the first daemon shipped rows without it. A database

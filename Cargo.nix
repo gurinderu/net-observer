@@ -143,6 +143,16 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "collector-singbox-log" = rec {
+      packageId = "collector-singbox-log";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "collector-singbox-log";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "collector-wifi" = rec {
       packageId = "collector-wifi";
       build = internal.buildRustCrateWithFeatures {
@@ -4458,6 +4468,39 @@ rec {
           }
         ];
         devDependencies = [
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "rt-multi-thread" "macros" "sync" "time" "signal" "process" ];
+          }
+        ];
+
+      };
+      "collector-singbox-log" = rec {
+        crateName = "collector-singbox-log";
+        version = "0.0.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ./crates/collector-singbox-log; };
+        libName = "collector_singbox_log";
+        dependencies = [
+          {
+            name = "collector-core";
+            packageId = "collector-core";
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+          }
+          {
+            name = "types";
+            packageId = "types";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "tempfile";
+            packageId = "tempfile";
+          }
           {
             name = "tokio";
             packageId = "tokio";
@@ -13327,6 +13370,10 @@ rec {
           {
             name = "collector-route";
             packageId = "collector-route";
+          }
+          {
+            name = "collector-singbox-log";
+            packageId = "collector-singbox-log";
           }
           {
             name = "collector-wifi";
