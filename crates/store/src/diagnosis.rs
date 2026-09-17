@@ -2529,6 +2529,33 @@ mod tests {
         assert_eq!(cell(&g, 1, "gap_opened_us"), (8 * SEC).to_string());
     }
 
+    /// The negative guarantee restored as its own sibling: a pause fully
+    /// outside the window whose resume IS promptly followed by ordinary
+    /// traffic — nothing exceeding the sleep threshold anywhere between the
+    /// resume and the ramp — really does leave the slope untouched. Unlike
+    /// its sibling above, this pause's resume is not abandoned: two filler
+    /// ticks bridge it to the ramp, each hop under the threshold, and are
+    /// SKIP so they add no rows to the least-squares fit.
+    #[test]
+    fn a_pause_outside_the_ramp_window_with_prompt_traffic_leaves_the_slope_alone() {
+        let s = DuckdbStore::in_memory().unwrap();
+        edge(&s, SEC, false);
+        edge(&s, 2 * SEC, true);
+        link(&s, 40 * SEC, GwVerdict::Skip, None, TcpVerdict::Skip);
+        link(&s, 80 * SEC, GwVerdict::Skip, None, TcpVerdict::Skip);
+        let drop_ts = coworking_ramp(&s, 100 * SEC);
+
+        let t = s.gateway_ramp(drop_ts).unwrap();
+        assert_eq!(cell(&t, 0, "observation_gap_us"), "0");
+        assert_eq!(cell(&t, 0, "fitted_samples"), "40");
+        let slope: f64 = cell(&t, 0, "slope_ms_per_s").parse().unwrap();
+        assert!((slope - 20.0).abs() < 0.001, "slope was {slope}");
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(g.rows.len(), 1, "only the pause itself: {:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "pause");
+    }
+
     /// Consecutive gaps are listed in order and stay separate.
     #[test]
     fn every_pause_is_listed_as_its_own_bounded_gap() {
