@@ -78,11 +78,13 @@
 //! killed outright, so the record simply stops, and the gap runs from the
 //! newest sample before that edge to the edge itself — unless a pause gap
 //! already closes at that same edge, in which case the pause already names
-//! the hole. A **sleep** is two consecutive POINTS — a sample of any
-//! stream, or a recorded pause/resume/startup edge — further apart than
-//! [`DEFAULT_SLEEP_THRESHOLD_US`] and not both inside one recorded
-//! pause/stop gap: the machine slept while the daemon kept running. Edges
-//! count as points so a stride can never straddle a gap's own boundary,
+//! the hole (and two startups sharing the same anchor sample, a
+//! boot-crash-boot with nothing written between them, share one `stop`: only
+//! the earlier startup closes it). A **sleep** is two consecutive POINTS —
+//! a sample of any stream, or a recorded pause/resume/startup edge — further
+//! apart than [`DEFAULT_SLEEP_THRESHOLD_US`] and not both inside one
+//! recorded pause/stop gap: the machine slept while the daemon kept running.
+//! Edges count as points so a stride can never straddle a gap's own boundary,
 //! which is what lets the residual after a short pause still surface as its
 //! own sleep instead of being swallowed whole. Both are derived the same
 //! way as a pause — in SQL, never stored — and read as `gap` identically;
@@ -219,7 +221,10 @@ sample_ts AS (
 ///   `startup`, closing at the edge itself); a startup edge that already
 ///   closes an open `pause` gap opens nothing here (the pause already names
 ///   the hole), and neither does the very first startup a record ever sees —
-///   no earlier sample means no "before" to bound.
+///   no earlier sample means no "before" to bound. Two startups sharing the
+///   same anchor sample (a boot-crash-boot with nothing written between them)
+///   share one `stop` too: only the earlier startup closes it, so the two
+///   edges never produce two overlapping rows over the same hole.
 /// - **`sleep`** — two consecutive POINTS more than `sleep_threshold_us`
 ///   apart and not both inside one recorded `pause`/`stop` gap, where a point
 ///   is a sample of any stream OR a recorded `observing_edge` (pause, resume,
@@ -267,23 +272,29 @@ pauses AS (
   )
   WHERE rn = 1
 ),
--- Every recorded startup edge, opened at the newest earlier sample — before
--- the check below drops the ones a `pause` gap already explains.
+-- Every recorded startup edge, opened at the newest earlier sample. Two
+-- startups sharing the same anchor (no sample fell between them — a
+-- boot-crash-boot) share one hole: only the earlier one, `rn = 1`, closes it;
+-- the later startup is inside no gap at all, the same as today's rule that a
+-- startup with no sample before it opens nothing.
 stops_raw AS (
   SELECT
-    (SELECT max(t.ts_us) FROM sample_ts t WHERE t.ts_us < su.ts_us) AS gap_opened_us,
     su.ts_us AS gap_closed_us,
-    'startup' AS gap_closed_by,
-    'stop' AS cause
+    (SELECT max(t.ts_us) FROM sample_ts t WHERE t.ts_us < su.ts_us) AS gap_opened_us
   FROM (SELECT ts_us FROM observing_edge WHERE observing AND cause = 'startup') su
 ),
 stops AS (
-  SELECT gap_opened_us, gap_closed_us, gap_closed_by, cause
-  FROM stops_raw
-  WHERE gap_opened_us IS NOT NULL
+  SELECT gap_opened_us, gap_closed_us, 'startup' AS gap_closed_by, 'stop' AS cause
+  FROM (
+    SELECT gap_opened_us, gap_closed_us,
+           row_number() OVER (PARTITION BY gap_opened_us ORDER BY gap_closed_us) AS rn
+    FROM stops_raw
+    WHERE gap_opened_us IS NOT NULL
+  )
+  WHERE rn = 1
     AND NOT EXISTS (
       SELECT 1 FROM pauses p
-      WHERE p.gap_closed_by = 'startup' AND p.gap_closed_us = stops_raw.gap_closed_us
+      WHERE p.gap_closed_by = 'startup' AND p.gap_closed_us = gap_closed_us
     )
 ),
 -- The finished pause/stop intervals, for the sleep opener to stay clear of.
@@ -2136,6 +2147,27 @@ mod tests {
         assert_eq!(g.rows.len(), 1, "no separate stop gap: {:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "pause");
         assert_eq!(cell(&g, 0, "gap_opened_us"), (25 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (100 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_by"), "startup");
+    }
+
+    /// Back-to-back startups with no sample between them — a boot, a crash,
+    /// and another boot — share one hole rather than opening two overlapping
+    /// ones: only the earlier startup closes it, and the later startup (whose
+    /// "newest sample before it" is the very same one) opens nothing at all.
+    #[test]
+    fn back_to_back_startups_with_no_sample_between_them_share_one_stop() {
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, 10 * SEC);
+        healthy_tick(&s, 20 * SEC);
+        startup_edge(&s, 100 * SEC);
+        startup_edge(&s, 130 * SEC);
+        healthy_tick(&s, 140 * SEC);
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(g.rows.len(), 1, "one stop, not two: {:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "stop");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (20 * SEC).to_string());
         assert_eq!(cell(&g, 0, "gap_closed_us"), (100 * SEC).to_string());
         assert_eq!(cell(&g, 0, "gap_closed_by"), "startup");
     }
