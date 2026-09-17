@@ -32,8 +32,14 @@ pub fn render_status(snap: &StatusSnapshot) -> String {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "-".to_string());
             let sel = p.selector.clone().unwrap_or_else(|| "-".to_string());
+            // sing-box's own URL test of the selected node (realm
+            // net-observer, node #62), the same rendering the CLI's `status`
+            // uses, aged against the snapshot's instant; `-` = no reading.
+            let urltest = p
+                .urltest_label(snap.generated_us)
+                .unwrap_or_else(|| "-".to_string());
             out.push_str(&format!(
-                "proxy  tun={tun} selector={sel} ts_us={}\n",
+                "proxy  tun={tun} selector={sel} urltest={urltest} ts_us={}\n",
                 p.ts_us
             ));
         }
@@ -208,6 +214,10 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
+            urltest_absent_since_us: None,
         }
     }
 
@@ -350,8 +360,38 @@ mod tests {
         };
         let out = render_status(&snap);
         assert!(out.contains("gw=OK direct=OK"));
-        assert!(out.contains("tun=204 selector=auto"));
+        assert!(out.contains("tun=204 selector=auto urltest=-"));
         assert!(out.contains("wedge opened=80 closed=open"));
+    }
+
+    /// sing-box's own test of the selected node renders as the CLI renders
+    /// it (realm net-observer, node #62): `<node>:<ms>ms@<age>s`, the age
+    /// against the snapshot's own instant.
+    #[test]
+    fn render_shows_the_urltest() {
+        let snap = StatusSnapshot {
+            generated_us: 30_000_000,
+            proxy: Some(ProxySample {
+                urltest_ms: Some(202),
+                urltest_at_us: Some(25_000_000),
+                urltest_node: Some("auto".into()),
+                ..proxy(Some(204), Some("auto"))
+            }),
+            ..Default::default()
+        };
+        assert!(render_status(&snap).contains("urltest=auto:202ms@5s"));
+
+        // A node whose entry sing-box deleted shows the age of the absence.
+        let snap = StatusSnapshot {
+            generated_us: 30_000_000,
+            proxy: Some(ProxySample {
+                urltest_node: Some("auto".into()),
+                urltest_absent_since_us: Some(20_000_000),
+                ..proxy(Some(204), Some("auto"))
+            }),
+            ..Default::default()
+        };
+        assert!(render_status(&snap).contains("urltest=auto:absent@10s"));
     }
 
     #[test]

@@ -119,6 +119,83 @@ pub struct ProxySample {
     /// Age of the tunnel held stream at the check, seconds.
     #[serde(default)]
     pub est_tun_age_s: Option<u32>,
+    /// sing-box's OWN URL test of one node of the selector group, as its
+    /// Clash API shows it THIS tick (`GET /proxies/<node>` → `history`),
+    /// read each tick for every leaf under the configured group and never
+    /// triggered by this daemon: the API's delay test writes into the
+    /// group's history and steers its selection, which "observe, never act"
+    /// forbids (realm net-observer, node #62). The NEWEST entry's delay:
+    /// `Some(ms)` = sing-box's test answered in that many milliseconds, and
+    /// `Some(0)` is a real sub-millisecond answer, NOT a failure — sing-box
+    /// never writes a failed test: its URLTest group DELETES the node's
+    /// entry on failure, so the history reads empty. `None` = no entry now:
+    /// a failed test, a node not tested yet, or a node outside every
+    /// URLTest group. Which of those it is, `urltest_absent_since_us` says.
+    /// Rides the row of the node's own endpoint (`server_ip`), so `tcp` on
+    /// the same row is the raw TCP reachability of the listener sing-box
+    /// tests through. A local read, so it is taken under every probing
+    /// tier. `serde(default)` so a pre-field daemon's samples still decode.
+    #[serde(default)]
+    pub urltest_ms: Option<u32>,
+    /// When sing-box ran that newest test (its entry's `time`, epoch
+    /// microseconds). sing-box tests on its own interval, so consecutive
+    /// ticks may carry the same entry. `Some` exactly when `urltest_ms` is.
+    #[serde(default)]
+    pub urltest_at_us: Option<i64>,
+    /// The node whose test this row carries; `None` = no reading on this
+    /// row. Named on the row because nodes may share an endpoint.
+    #[serde(default)]
+    pub urltest_node: Option<String>,
+    /// Since when the collector has seen this node's history EMPTY after
+    /// having seen it carry an entry — the tick (`ts_us`) of the first empty
+    /// read, kept across later empty reads (realm net-observer, node #62).
+    /// A failed test is observable only as this absence: sing-box deletes
+    /// the entry. Collector memory keyed by node: an entry present again
+    /// clears it; a node never seen with an entry stays `None`. Dated ONLY
+    /// for a node some `URLTest`-typed group re-tests on its interval: a
+    /// node selected directly in a Selector is never re-tested, and its
+    /// entry can vanish on a sing-box restart (a URLTest member's comes back
+    /// within seconds, a directly selected node's never) or a failed manual
+    /// test from a GUI — not evidence of a failed test, so this stays `None`
+    /// for it. The memory is process-scoped and resets with the daemon, a
+    /// restart being bracketed by the startup observing edge already.
+    /// `Some` implies `urltest_ms` is `None`. `serde(default)` as above.
+    #[serde(default)]
+    pub urltest_absent_since_us: Option<i64>,
+}
+
+impl ProxySample {
+    /// The URL-test reading as `<node>:<ms>ms@<age>s` — the age of the entry
+    /// at `now_us`, never negative — or, for a node whose entry sing-box has
+    /// deleted, `<node>:absent@<age>s` with the age of the absence; or
+    /// `<node>:-` for a node never seen tested; `None` when this row carries
+    /// no reading. One rendering for the CLI's `status` line and the bar's,
+    /// so the two cannot drift.
+    #[must_use]
+    pub fn urltest_label(&self, now_us: i64) -> Option<String> {
+        let node = self.urltest_node.as_deref()?;
+        let age_s = |since_us: i64| now_us.saturating_sub(since_us).max(0) / 1_000_000;
+        match (
+            self.urltest_ms,
+            self.urltest_at_us,
+            self.urltest_absent_since_us,
+        ) {
+            (Some(ms), Some(at_us), _) => Some(format!("{node}:{ms}ms@{}s", age_s(at_us))),
+            (_, _, Some(since_us)) => Some(format!("{node}:absent@{}s", age_s(since_us))),
+            _ => Some(format!("{node}:-")),
+        }
+    }
+}
+
+/// An epoch-microsecond instant as RFC 3339 in UTC — for a daemon-side
+/// sentence (a trigger detail) that must name a moment without a local
+/// zone. Out of range never panics: the raw number is printed instead.
+#[must_use]
+pub fn instant_rfc3339(ts_us: i64) -> String {
+    match jiff::Timestamp::from_microsecond(ts_us) {
+        Ok(ts) => ts.to_string(),
+        Err(_) => format!("ts_us={ts_us}"),
+    }
 }
 
 /// One resolver probe. `probe` is the queried name label (e.g. "nks"), `server`
@@ -328,6 +405,10 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
+            urltest_absent_since_us: None,
         });
         assert_eq!(p.ts_us(), 99);
 
@@ -418,6 +499,74 @@ mod tests {
                 swap_used_mb: None,
             }
         );
+    }
+
+    /// A proxy sample written by a daemon that shipped before the URL-test
+    /// reading carries no `urltest_*` fields; it must still decode, with the
+    /// reading as "no entry" rather than failing — and a row without a
+    /// reading has no label, while one with a reading spells the node, the
+    /// delay and the entry's age, a `0` ms answer as the answer it is, a
+    /// deleted entry as the age of its absence, and a never-tested node as
+    /// `-`.
+    #[test]
+    fn pre_urltest_proxy_sample_decodes_as_unread_and_labels_follow() {
+        let older = r#"{"ts_us":1,"server_ip":"1.1.1.1:443","tcp":"Ok","rtt_ms":null,"tun_code":204,"selector":null}"#;
+        let p: ProxySample = serde_json::from_str(older).expect("older proxy sample must decode");
+        assert_eq!(p.urltest_ms, None);
+        assert_eq!(p.urltest_at_us, None);
+        assert_eq!(p.urltest_node, None);
+        assert_eq!(p.urltest_absent_since_us, None);
+        assert_eq!(p.urltest_label(1), None);
+
+        let absent = ProxySample {
+            urltest_node: Some("vless-out-6".into()),
+            urltest_absent_since_us: Some(10_000_000),
+            ..p.clone()
+        };
+        assert_eq!(
+            absent.urltest_label(70_000_000).as_deref(),
+            Some("vless-out-6:absent@60s")
+        );
+
+        let tested = ProxySample {
+            urltest_ms: Some(202),
+            urltest_at_us: Some(10_000_000),
+            urltest_node: Some("vless-out-6".into()),
+            ..p.clone()
+        };
+        assert_eq!(
+            tested.urltest_label(55_500_000).as_deref(),
+            Some("vless-out-6:202ms@45s")
+        );
+        // A clock that runs behind the entry never yields a negative age.
+        assert_eq!(
+            tested.urltest_label(9_000_000).as_deref(),
+            Some("vless-out-6:202ms@0s")
+        );
+        let failed = ProxySample {
+            urltest_ms: Some(0),
+            ..tested.clone()
+        };
+        assert_eq!(
+            failed.urltest_label(10_000_000).as_deref(),
+            Some("vless-out-6:0ms@0s")
+        );
+        let untested = ProxySample {
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: Some("vless-out-6".into()),
+            ..p
+        };
+        assert_eq!(untested.urltest_label(1).as_deref(), Some("vless-out-6:-"));
+    }
+
+    #[test]
+    fn instant_rfc3339_is_utc_and_never_panics() {
+        assert_eq!(
+            instant_rfc3339(1_789_657_800_000_000),
+            "2026-09-17T15:10:00Z"
+        );
+        assert_eq!(instant_rfc3339(i64::MAX), format!("ts_us={}", i64::MAX));
     }
 
     #[test]

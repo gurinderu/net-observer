@@ -1523,8 +1523,15 @@ fn format_status(snap: &StatusSnapshot) -> String {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "-".to_string());
             let sel = p.selector.as_deref().unwrap_or("-");
+            // sing-box's own URL test (realm net-observer, node #62): the
+            // newest row of a tick is the selected node's, so this is its
+            // test, aged against the snapshot's own instant; `-` = no reading
+            // (a pre-field daemon, no group).
+            let urltest = p
+                .urltest_label(snap.generated_us)
+                .unwrap_or_else(|| "-".to_string());
             out.push_str(&format!(
-                "proxy          tun={tun} selector={sel} ts_us={}\n",
+                "proxy          tun={tun} selector={sel} urltest={urltest} ts_us={}\n",
                 diagnose::stamp_us(p.ts_us)
             ));
         }
@@ -1717,6 +1724,10 @@ mod tests {
                 est_direct_age_s: None,
                 est_tun_alive: None,
                 est_tun_age_s: None,
+                urltest_ms: Some(202),
+                urltest_at_us: Some(-4_999_900),
+                urltest_node: Some("auto".into()),
+                urltest_absent_since_us: None,
             }),
             dns: None,
             host: None,
@@ -1746,7 +1757,7 @@ mod tests {
             diagnose::stamp_us(42)
         )));
         assert!(out.contains(&format!(
-            "proxy          tun=204 selector=auto ts_us={}",
+            "proxy          tun=204 selector=auto urltest=auto:202ms@5s ts_us={}",
             diagnose::stamp_us(43)
         )));
         assert!(out.contains("dns            (no data)"));

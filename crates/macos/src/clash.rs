@@ -1,12 +1,43 @@
 //! Clash/Mihomo RESTful API client and the proxy-side facts adapters.
 //!
-//! [`ClashClient`] reads the currently selected node from a proxy *group* via
-//! `GET /proxies/<group>` and the live flow list via `GET /connections` (the
-//! surface as observed on sing-box: realm net-observer, node #127).
+//! [`ClashClient`] reads one proxy — a group (`type` `Selector` / `URLTest`
+//! / `Fallback`: its selected member `now` and its members `all`) or a
+//! single node (`type` `VLESS`, `Direct`, …), the same `GET /proxies/<name>`
+//! endpoint either way — together with its own URL-test history
+//! (`history: [{time, delay}]`, Clash-compatible in shape), and the live
+//! flow list via `GET /connections` (the surface as observed on sing-box:
+//! realm net-observer, nodes #127, #62 and #139).
+//!
+//! The history's semantics are sing-box's, not Clash's
+//! (`protocol/group/urltest.go` v1.12, `outbound/urltest.go` v1.8): the
+//! URLTest group tests every member on its `interval`; a SUCCESSFUL test
+//! stores one entry `{time, delay}` — `delay` in milliseconds, and `0` a
+//! real sub-millisecond answer — while a FAILED test DELETES the node's
+//! entry, so `/proxies/<node>` then renders `"history": []`. `delay: 0` as
+//! a failure marker is Clash/mihomo's convention and never appears here.
+//! An empty list therefore means "not tested yet" (observed on every node at
+//! 18:23 on 2026-09-17, before the group's first round) OR "the last test
+//! failed" — told apart only by whether an entry was seen before, which is
+//! the collector's memory, not this surface (realm net-observer, node #62).
+//!
+//! It deliberately does NOT call `GET /proxies/<node>/delay`, for two facts
+//! observed on the owner's Mac (realm net-observer, node #62): sing-box's
+//! handler ignores an `http://` URL and substitutes
+//! `https://www.gstatic.com/generate_204` (`url=http://192.0.2.1/` answered
+//! `{"delay":517}` while `https://192.0.2.1/` timed out), so a by-IP /
+//! by-name split through it never happens; and it writes its result into
+//! the urltest group's history (`urlTestHistory` in
+//! `experimental/clashapi/proxies.go`, v1.5–v1.12) — a failed dial deletes
+//! the node's entry and the group deselects it, a success overwrites the
+//! group's own measurement — so the caller steers sing-box's selection,
+//! which "observe, never act" forbids. The daemon reads what sing-box
+//! measured on its own interval instead.
+//!
 //! [`ProxySystemFacts`] implements [`collector_proxy::ProxyFacts`]: it reads the
-//! VLESS server endpoints from the rendered sing-box config at runtime (never
-//! baked into the binary — secret hygiene), probes the TUN with an HTTP request,
-//! and reports the selected node. [`ConnectionSystemFacts`] implements
+//! VLESS nodes and their server endpoints from the rendered sing-box config at
+//! runtime (never baked into the binary — secret hygiene), probes the TUN with
+//! an HTTP request, and reads the group and each node's history.
+//! [`ConnectionSystemFacts`] implements
 //! [`collector_connections::ConnectionFacts`] over the same client.
 
 use std::path::PathBuf;
@@ -14,7 +45,7 @@ use std::time::Duration;
 
 use collector_connections::ConnectionFacts;
 use collector_core::Readiness;
-use collector_proxy::{ProxyFacts, TunProbe};
+use collector_proxy::{ProxyFacts, ProxyInfo, TunProbe, UrlTestEntry};
 use serde::Deserialize;
 use types::LiveConnection;
 
@@ -41,30 +72,58 @@ impl ClashClient {
         }
     }
 
-    /// The node currently selected in the top-level `GLOBAL` group, if the API
-    /// is reachable.
-    pub async fn now(&self) -> Option<String> {
-        self.selected("GLOBAL").await
-    }
-
-    /// The node currently selected in proxy `group`, via `GET /proxies/<group>`.
-    pub async fn selected(&self, group: &str) -> Option<String> {
-        let url = format!("{}/proxies/{}", self.base.trim_end_matches('/'), group);
-        let resp = match self.http.get(&url).send().await {
+    /// One proxy as the API describes it, via `GET /proxies/<name>` — a
+    /// group or a single node, the same endpoint: its type, its selection
+    /// and members (a group's), and the newest entry of its own URL-test
+    /// history (realm net-observer, nodes #62, #139). `None` when the API
+    /// did not answer or the body does not decode.
+    pub async fn proxy(&self, name: &str) -> Option<ProxyInfo> {
+        // The name is an outbound tag from sing-box's config — a path
+        // segment, so it is percent-encoded as one rather than pasted in.
+        let url = self.endpoint(&["proxies", name])?;
+        let resp = match self.http.get(url.clone()).send().await {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::debug!(url, error = %e, "clash proxies query failed");
+                tracing::debug!(%url, error = %e, "clash proxies query failed");
                 return None;
             }
         };
         let body = match resp.text().await {
             Ok(b) => b,
             Err(e) => {
-                tracing::debug!(url, error = %e, "clash proxies query failed");
+                tracing::debug!(%url, error = %e, "clash proxies query failed");
                 return None;
             }
         };
-        parse_clash_now(&body)
+        let parsed = parse_proxy(&body, name);
+        if parsed.is_none() {
+            tracing::debug!(%url, "clash proxies body did not decode");
+        }
+        parsed
+    }
+
+    /// `base` with `segments` appended to its path, each percent-encoded as
+    /// one segment; `None` (logged) when `base` is not a URL at all — a
+    /// misconfiguration, reported once per read rather than as a
+    /// transport failure with a nonsense address.
+    fn endpoint(&self, segments: &[&str]) -> Option<reqwest::Url> {
+        let mut url = match reqwest::Url::parse(&self.base) {
+            Ok(url) => url,
+            Err(e) => {
+                tracing::debug!(base = %self.base, error = %e, "clash api base is not a url");
+                return None;
+            }
+        };
+        match url.path_segments_mut() {
+            Ok(mut path) => {
+                path.pop_if_empty().extend(segments);
+            }
+            Err(()) => {
+                tracing::debug!(base = %self.base, "clash api base cannot carry a path");
+                return None;
+            }
+        }
+        Some(url)
     }
 
     /// Every live flow the proxy carries right now, via `GET /connections`.
@@ -74,29 +133,29 @@ impl ClashClient {
     /// and each the same fact to the caller, "could not look". Never an empty
     /// list for any of them.
     pub async fn connections(&self) -> Option<Vec<LiveConnection>> {
-        let url = format!("{}/connections", self.base.trim_end_matches('/'));
-        let resp = match self.http.get(&url).send().await {
+        let url = self.endpoint(&["connections"])?;
+        let resp = match self.http.get(url.clone()).send().await {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::debug!(url, error = %e, "clash connections query failed");
+                tracing::debug!(%url, error = %e, "clash connections query failed");
                 return None;
             }
         };
         let status = resp.status();
         if !status.is_success() {
-            tracing::debug!(url, %status, "clash connections query refused");
+            tracing::debug!(%url, %status, "clash connections query refused");
             return None;
         }
         let body = match resp.text().await {
             Ok(b) => b,
             Err(e) => {
-                tracing::debug!(url, error = %e, "clash connections query failed");
+                tracing::debug!(%url, error = %e, "clash connections query failed");
                 return None;
             }
         };
         let parsed = parse_connections(&body);
         if parsed.is_none() {
-            tracing::debug!(url, "clash connections body did not decode");
+            tracing::debug!(%url, "clash connections body did not decode");
         }
         parsed
     }
@@ -208,14 +267,66 @@ fn build_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-/// Extract the `now` (selected node) field from a Clash `/proxies/<group>`
-/// JSON body.
-fn parse_clash_now(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    value
-        .get("now")
-        .and_then(|n| n.as_str())
-        .map(str::to_string)
+/// The `GET /proxies/<name>` body, as far as the daemon reads it — a
+/// group's and a single node's alike: the type, the name, a group's
+/// selection and members, and the URL-test history. `udp` and whatever else
+/// sing-box adds are ignored by serde's default.
+#[derive(Deserialize)]
+struct ProxyBody {
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    now: Option<String>,
+    #[serde(default)]
+    all: Vec<String>,
+    #[serde(default)]
+    history: Vec<HistoryEntry>,
+}
+
+/// One URL-test entry as sing-box renders it: `time` RFC 3339, `delay` in
+/// milliseconds — a real measurement, since sing-box stores an entry only
+/// for a successful test (see the module doc).
+#[derive(Deserialize)]
+struct HistoryEntry {
+    #[serde(default)]
+    time: String,
+    #[serde(default)]
+    delay: u64,
+}
+
+/// Parse a `/proxies/<name>` body (realm net-observer, nodes #62, #139).
+/// `None` when the body is not JSON of that shape at all. The name is the
+/// body's own, falling back to `requested`; the URL-test entry is the
+/// NEWEST by the entries' own times, not by position, so a reordered list
+/// still reads right, and `None` when the history is empty or no entry
+/// carries a parseable time. A delay past `u32` saturates rather than wraps.
+fn parse_proxy(body: &str, requested: &str) -> Option<ProxyInfo> {
+    let body: ProxyBody = serde_json::from_str(body).ok()?;
+    let urltest = body
+        .history
+        .iter()
+        .filter_map(|e| {
+            let at_us = chrono::DateTime::parse_from_rfc3339(&e.time)
+                .ok()?
+                .timestamp_micros();
+            Some(UrlTestEntry {
+                at_us,
+                ms: u32::try_from(e.delay).unwrap_or(u32::MAX),
+            })
+        })
+        .max_by_key(|e| e.at_us);
+    Some(ProxyInfo {
+        name: body
+            .name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| requested.to_string()),
+        kind: body.kind,
+        now: body.now,
+        all: body.all,
+        urltest,
+    })
 }
 
 /// macOS implementation of [`ProxyFacts`].
@@ -254,16 +365,17 @@ impl ProxySystemFacts {
 }
 
 impl ProxyFacts for ProxySystemFacts {
-    /// The upstream endpoints: `"server:server_port"` for every `vless`
-    /// outbound in the rendered sing-box config, deduplicated.
-    async fn server_endpoints(&self) -> Vec<String> {
+    /// Every `vless` outbound as `(tag, "server:server_port")` from the
+    /// rendered sing-box config: the endpoints to probe and the row each
+    /// node's reading rides, from one read.
+    async fn node_endpoints(&self) -> Vec<(String, String)> {
         // A small local config file: an instant read, kept synchronous inside
         // the async fn (no blocking of consequence, mirroring `getloadavg`).
         let Ok(text) = std::fs::read_to_string(&self.singbox_config) else {
             tracing::debug!(path = ?self.singbox_config, "sing-box config unreadable");
             return Vec::new();
         };
-        parse_vless_endpoints(&text)
+        parse_vless_nodes(&text)
     }
 
     async fn tun_probe(&self, url: &str) -> TunProbe {
@@ -281,8 +393,30 @@ impl ProxyFacts for ProxySystemFacts {
         }
     }
 
-    async fn selector(&self) -> Option<String> {
-        self.clash.selected(&self.selector_group).await
+    async fn group(&self) -> Option<ProxyInfo> {
+        self.clash.proxy(&self.selector_group).await
+    }
+
+    /// Every name read at once, one task each on the daemon's runtime, so a
+    /// stalled API costs the one [`HTTP_TIMEOUT`], not one per name. The
+    /// client is cloned into each task (its connection pool is shared
+    /// behind an `Arc`); a task that panicked answers `None` like a read
+    /// that failed.
+    async fn proxies(&self, names: &[String]) -> Vec<Option<ProxyInfo>> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (i, name) in names.iter().enumerate() {
+            let clash = self.clash.clone();
+            let name = name.clone();
+            tasks.spawn(async move { (i, clash.proxy(&name).await) });
+        }
+        let mut out = vec![None; names.len()];
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((i, info)) => out[i] = info,
+                Err(e) => tracing::debug!(error = %e, "clash proxies read task failed"),
+            }
+        }
+        out
     }
 
     async fn preflight(&self) -> Readiness {
@@ -326,32 +460,27 @@ impl ConnectionFacts for ConnectionSystemFacts {
     }
 }
 
-/// Collect the `"server:server_port"` endpoint of every `vless` outbound in a
-/// sing-box config. Outbounds missing either field are skipped; duplicates are
-/// dropped keeping first-occurrence order (nodes share endpoints across
-/// outbounds, and one endpoint must be probed once).
-fn parse_vless_endpoints(config_json: &str) -> Vec<String> {
+/// Every `vless` outbound in a sing-box config as `(tag, "server:server_port")`,
+/// in config order. Outbounds missing either address field are skipped; a
+/// missing `tag` reads as an empty name (sing-box requires tags, so this
+/// only keeps the endpoint list complete — no group ever names `""`).
+fn parse_vless_nodes(config_json: &str) -> Vec<(String, String)> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(config_json) else {
         return Vec::new();
     };
     let Some(outbounds) = value.get("outbounds").and_then(|o| o.as_array()) else {
         return Vec::new();
     };
-    let mut endpoints: Vec<String> = Vec::new();
-    for endpoint in outbounds
+    outbounds
         .iter()
         .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("vless"))
         .filter_map(|o| {
             let server = o.get("server").and_then(|s| s.as_str())?;
             let port = o.get("server_port").and_then(serde_json::Value::as_u64)?;
-            Some(format!("{server}:{port}"))
+            let tag = o.get("tag").and_then(|t| t.as_str()).unwrap_or_default();
+            Some((tag.to_string(), format!("{server}:{port}")))
         })
-    {
-        if !endpoints.contains(&endpoint) {
-            endpoints.push(endpoint);
-        }
-    }
-    endpoints
+        .collect()
 }
 
 /// The fakeip pool a sing-box config declares (the first `dns.servers[]`
@@ -415,44 +544,192 @@ pub(crate) fn singbox_tun_addr(config_json: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The API path is built from `base` by segments, so an outbound tag
+    /// with a space or a slash is one percent-encoded segment rather than a
+    /// second path; a trailing slash on `base` does not double up; and a
+    /// base that is not a URL at all yields no endpoint.
     #[test]
-    fn parses_selected_node() {
-        let body =
-            r#"{"name":"GLOBAL","type":"Selector","now":"node-a","all":["node-a","node-b"]}"#;
-        assert_eq!(parse_clash_now(body).as_deref(), Some("node-a"));
+    fn endpoints_encode_each_segment_and_tolerate_a_trailing_slash() {
+        let c = ClashClient::new("http://127.0.0.1:9090");
+        assert_eq!(
+            c.endpoint(&["proxies", "vless-out-8"]).unwrap().as_str(),
+            "http://127.0.0.1:9090/proxies/vless-out-8"
+        );
+        assert_eq!(
+            c.endpoint(&["proxies", "a b/c"]).unwrap().as_str(),
+            "http://127.0.0.1:9090/proxies/a%20b%2Fc"
+        );
+        let c = ClashClient::new("http://127.0.0.1:9090/");
+        assert_eq!(
+            c.endpoint(&["connections"]).unwrap().as_str(),
+            "http://127.0.0.1:9090/connections"
+        );
+        assert_eq!(ClashClient::new("not a url").endpoint(&["proxies"]), None);
+        assert_eq!(ClashClient::new("").endpoint(&["proxies"]), None);
     }
 
+    /// The three `GET /proxies/<name>` bodies observed on the owner's Mac on
+    /// 2026-09-17 (realm net-observer, nodes #62, #139), each read as the
+    /// collector needs it: the top Selector with its selection and members
+    /// (a group, so it carries no test of its own that matters), the nested
+    /// URLTest group the same way, and a node with its newest history entry
+    /// — its time as epoch microseconds, its delay as measured — with the
+    /// fields this build does not read (`udp`) ignored.
     #[test]
-    fn no_now_field_is_none() {
-        let body = r#"{"name":"GLOBAL","type":"Selector"}"#;
-        assert_eq!(parse_clash_now(body), None);
+    fn parses_the_observed_selector_urltest_and_node_bodies() {
+        let main = parse_proxy(
+            r#"{"type":"Selector","name":"vless-main","udp":true,"history":[],"now":"vless-out-8","all":["vless-auto","vless-out-8","vless-out-4","vless-out-1","block-out"]}"#,
+            "vless-main",
+        )
+        .expect("the observed Selector body decodes");
+        assert_eq!(main.name, "vless-main");
+        assert_eq!(main.kind, "Selector");
+        assert!(main.is_group());
+        assert!(!main.is_untestable());
+        assert_eq!(main.now.as_deref(), Some("vless-out-8"));
+        assert_eq!(
+            main.all,
+            vec![
+                "vless-auto",
+                "vless-out-8",
+                "vless-out-4",
+                "vless-out-1",
+                "block-out"
+            ]
+        );
+        assert_eq!(main.urltest, None);
+
+        let auto = parse_proxy(
+            r#"{"type":"URLTest","name":"vless-auto","udp":true,"history":[],"now":"vless-out-6","all":["vless-out-6","vless-out-5","vless-out-2","vless-out-3"]}"#,
+            "vless-auto",
+        )
+        .expect("the observed URLTest body decodes");
+        assert!(auto.is_group());
+        assert_eq!(auto.now.as_deref(), Some("vless-out-6"));
+        assert_eq!(auto.all.len(), 4);
+
+        let node = parse_proxy(
+            r#"{"type":"VLESS","name":"vless-out-8","udp":true,"history":[{"time":"2026-09-17T20:55:29.874142+03:00","delay":186}]}"#,
+            "vless-out-8",
+        )
+        .expect("the observed node body decodes");
+        assert_eq!(node.name, "vless-out-8");
+        assert_eq!(node.kind, "VLESS");
+        assert!(!node.is_group());
+        assert!(!node.is_untestable());
+        assert_eq!(node.now, None);
+        assert!(node.all.is_empty());
+        assert_eq!(
+            node.urltest,
+            Some(UrlTestEntry {
+                at_us: 1_789_667_729_874_142,
+                ms: 186,
+            })
+        );
     }
 
+    /// The outbounds sing-box never tests are told by their type, whatever
+    /// its case; a body without a name takes the name asked for.
     #[test]
-    fn malformed_json_is_none() {
-        assert_eq!(parse_clash_now("not json"), None);
+    fn direct_block_and_dns_are_untestable_and_the_name_falls_back() {
+        for kind in ["Direct", "Block", "DNS", "direct"] {
+            let info = parse_proxy(&format!(r#"{{"type":"{kind}","history":[]}}"#), "x").unwrap();
+            assert!(info.is_untestable(), "{kind}");
+            assert!(!info.is_group(), "{kind}");
+            assert_eq!(info.name, "x");
+        }
+        assert!(
+            parse_proxy(r#"{"type":"Fallback","now":"a","all":["a"]}"#, "f")
+                .unwrap()
+                .is_group()
+        );
     }
 
+    /// The newest entry is the newest by its own time, not by position, so
+    /// a reordered list still reads right; `delay` 0 is a real answer.
     #[test]
-    fn extracts_vless_endpoints() {
+    fn the_newest_history_entry_is_by_time() {
+        let body = r#"{"type":"VLESS","name":"vless-out-6","history":[
+            {"time":"2026-09-17T18:40:00+03:00","delay":0},
+            {"time":"2026-09-17T18:30:00+03:00","delay":352},
+            {"time":"2026-09-17T18:35:00+03:00","delay":202}
+        ]}"#;
+        assert_eq!(
+            parse_proxy(body, "vless-out-6").unwrap().urltest,
+            Some(UrlTestEntry {
+                at_us: 1_789_659_600_000_000,
+                ms: 0,
+            }),
+            "a sub-millisecond answer is the answer it is"
+        );
+    }
+
+    /// The empty history observed on every node at 18:23 on 2026-09-17 is
+    /// no entry — untested yet, or the last test failed; this surface cannot
+    /// tell — and so is a body without a history or an entry whose time
+    /// does not parse. No body of that shape at all is `None`; a delay past
+    /// `u32` saturates rather than wraps.
+    #[test]
+    fn an_empty_or_unreadable_history_is_no_entry() {
+        let empty = parse_proxy(
+            r#"{"type":"VLESS","name":"vless-out-6","history":[]}"#,
+            "vless-out-6",
+        )
+        .unwrap();
+        assert_eq!(empty.urltest, None);
+        assert_eq!(
+            parse_proxy(r#"{"type":"VLESS"}"#, "n").unwrap().urltest,
+            None
+        );
+        assert_eq!(
+            parse_proxy(r#"{"history":[{"time":"yesterday","delay":5}]}"#, "n")
+                .unwrap()
+                .urltest,
+            None
+        );
+        assert_eq!(parse_proxy("not json", "n"), None);
+        assert_eq!(
+            parse_proxy(
+                r#"{"history":[{"time":"2026-09-17T15:30:00Z","delay":4294967296}]}"#,
+                "n"
+            )
+            .unwrap()
+            .urltest
+            .map(|e| e.ms),
+            Some(u32::MAX)
+        );
+    }
+
+    /// The reading's home row: every vless outbound's tag paired with its
+    /// endpoint, in config order, shared endpoints kept per node.
+    #[test]
+    fn extracts_vless_nodes_with_their_endpoints() {
         let cfg = r#"{
             "outbounds": [
                 {"type": "vless", "tag": "a", "server": "1.1.1.1", "server_port": 443},
                 {"type": "direct", "tag": "direct"},
-                {"type": "vless", "tag": "b", "server": "2.2.2.2", "server_port": 2053}
+                {"type": "vless", "tag": "b", "server": "1.1.1.1", "server_port": 443},
+                {"type": "vless", "tag": "c", "server": "2.2.2.2", "server_port": 2053},
+                {"type": "vless", "tag": "d", "server": "3.3.3.3"}
             ]
         }"#;
         assert_eq!(
-            parse_vless_endpoints(cfg),
-            vec!["1.1.1.1:443", "2.2.2.2:2053"]
+            parse_vless_nodes(cfg),
+            vec![
+                ("a".to_string(), "1.1.1.1:443".to_string()),
+                ("b".to_string(), "1.1.1.1:443".to_string()),
+                ("c".to_string(), "2.2.2.2:2053".to_string()),
+            ]
         );
+        assert!(parse_vless_nodes("{}").is_empty());
     }
 
-    /// Nodes share a server IP across outbounds — on different ports they are
-    /// different listeners and both are probed, while a repeated (server, port)
-    /// pair is one endpoint and probed once, in first-occurrence order.
+    /// Nodes share a server IP across outbounds — on different ports they
+    /// are different listeners, while a repeated (server, port) pair is one
+    /// listener under two names: the list keeps every node, and the
+    /// collector probes each distinct endpoint once.
     #[test]
-    fn duplicate_endpoints_are_probed_once() {
+    fn shared_endpoints_are_kept_per_node() {
         let cfg = r#"{
             "outbounds": [
                 {"type": "vless", "tag": "a", "server": "1.1.1.1", "server_port": 443},
@@ -461,8 +738,12 @@ mod tests {
             ]
         }"#;
         assert_eq!(
-            parse_vless_endpoints(cfg),
-            vec!["1.1.1.1:443", "1.1.1.1:2053"]
+            parse_vless_nodes(cfg),
+            vec![
+                ("a".to_string(), "1.1.1.1:443".to_string()),
+                ("b".to_string(), "1.1.1.1:2053".to_string()),
+                ("c".to_string(), "1.1.1.1:443".to_string()),
+            ]
         );
     }
 
@@ -476,13 +757,16 @@ mod tests {
                 {"type": "vless", "tag": "b", "server": "2.2.2.2", "server_port": 443}
             ]
         }"#;
-        assert_eq!(parse_vless_endpoints(cfg), vec!["2.2.2.2:443"]);
+        assert_eq!(
+            parse_vless_nodes(cfg),
+            vec![("b".to_string(), "2.2.2.2:443".to_string())]
+        );
     }
 
     #[test]
     fn no_outbounds_is_empty() {
-        assert!(parse_vless_endpoints("{}").is_empty());
-        assert!(parse_vless_endpoints("garbage").is_empty());
+        assert!(parse_vless_nodes("{}").is_empty());
+        assert!(parse_vless_nodes("garbage").is_empty());
     }
 
     #[test]

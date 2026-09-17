@@ -54,6 +54,33 @@ ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_direct_alive BOOLEAN;
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_direct_age_s UINTEGER;
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_tun_alive BOOLEAN;
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_tun_age_s UINTEGER;
+-- sing-box's OWN URL test of one node under the selector group, as its Clash
+-- API shows it THIS tick (`GET /proxies/<node>` -> history), read each tick
+-- for every node under the group and never triggered by this daemon (realm
+-- net-observer, node #62). `urltest_node` names the node whose reading this
+-- row carries; a row carries at most one, on the row of the node's own
+-- endpoint (server_ip), so `tcp` beside it is that listener's raw
+-- reachability -- or on a reading-only row (tcp = SKIP, no rtt) when the
+-- endpoint's row is taken by another node on the same endpoint, or unknown,
+-- or was not probed (the passive tier: a local read, so the reading still
+-- lands). `urltest_ms` is the newest entry's delay and `urltest_at_us` its
+-- time; sing-box writes an entry only for a SUCCESSFUL test -- 0 ms is a real
+-- sub-millisecond answer -- and DELETES the node's entry on a failed one, so
+-- a failure shows only as the entry going ABSENT: `urltest_absent_since_us`
+-- is the tick the collector first read the history empty after having seen
+-- an entry, kept across later empty reads and cleared by an entry (its
+-- memory is per process: a restart, bracketed by the startup observing edge,
+-- starts it over). Dated ONLY for a member of a URLTest-typed group, the one
+-- kind sing-box re-tests on an interval: a node selected directly in a
+-- Selector is never re-tested, and its entry vanishing on a sing-box restart
+-- or a failed manual test is not evidence, so the column stays NULL for it.
+-- NULL node = no reading on this row; NULL `urltest_ms` with NULL
+-- `urltest_absent_since_us` under a named node = never seen tested, or not a
+-- re-tested node: not measured. Same migration treatment.
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS urltest_ms UINTEGER;
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS urltest_at_us BIGINT;
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS urltest_node VARCHAR;
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS urltest_absent_since_us BIGINT;
 CREATE TABLE IF NOT EXISTS incident (
   id VARCHAR PRIMARY KEY, opened_us BIGINT, closed_us BIGINT, trigger_id VARCHAR, signature VARCHAR);
 CREATE TABLE IF NOT EXISTS blob_ref (

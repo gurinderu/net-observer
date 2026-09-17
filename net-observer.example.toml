@@ -62,8 +62,23 @@ clash_api = "http://127.0.0.1:9090"
 # Proxy group whose `now` field names the active node. "GLOBAL" is the
 # clash-core convention, but sing-box exposes ONLY the groups its config
 # declares -- against such a config GLOBAL 404s and the selector column reads
-# "-" forever. Point this at the deployment selector/urltest group.
+# "-" forever. Point this at the TOP selector of the routing default (the one
+# the operator switches): the collector follows `now` down through nested
+# groups to the node that carries traffic, and reads every node under it.
 selector_group = "GLOBAL"
+# Each tick the collector also READS sing-box's own URL-test history for every
+# node under that group (`GET /proxies/<node>`, a loopback read that emits
+# nothing, so it runs under `passive` too) and lands the newest entry on the
+# proxy sample as `urltest_ms` / `urltest_at_us`. sing-box writes an entry only
+# for a SUCCESSFUL test and deletes it on a failed one, so a failure shows as
+# the entry going absent: `urltest_absent_since_us` dates that absence. It
+# never asks sing-box to test: the API's delay endpoint writes into the
+# group's history and steers its selection.
+# How often sing-box's URLTest group re-tests, seconds -- MUST match the
+# group's `interval` in sing-box's config (its default: 3m). The
+# `endpoint-dial-stall` rule calls the traffic-carrying node's test dead after
+# 2 x this + 30 s of absence while raw TCP to its listener still answers.
+urltest_interval_secs = 180
 
 # The `dns` collector probes resolvers (sing-box TUN DNS, DHCP resolver, DoH) for
 # the monitored service domain plus a `.ru` control domain. A fakeip answer on a
