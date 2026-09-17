@@ -205,10 +205,15 @@ pub fn experiment_id_in(message: &str) -> Option<String> {
 
 /// The failure the daemon answers `Query(Experiment { id })` with while that
 /// window still runs, spelled once so the CLI's poll can recognise it
-/// ([`is_experiment_running`]) and keep waiting rather than exit on it.
+/// ([`is_experiment_running`]) and keep waiting rather than exit on it. The
+/// end is a local instant, in the rendering the CLI stamps every moment
+/// with — an operator reads a clock, not an epoch.
 #[must_use]
 pub fn experiment_running_message(id: &str, ends_at_us: i64) -> String {
-    format!("experiment {id} still running (ends at {ends_at_us})")
+    format!(
+        "experiment {id} still running (ends at {})",
+        types::local_instant(ends_at_us)
+    )
 }
 
 /// Whether a [`QueryOutcome::Failed`] message is the daemon's "still
@@ -863,7 +868,10 @@ impl StreamFrame {
             StreamFrame::Observing(o) => {
                 format!("collection {}", if o.observing { "on" } else { "off" })
             }
-            StreamFrame::Probing(p) => format!("probing {}", p.tier),
+            // The reason rides along so a tail tells an experiment window's
+            // bracket from an operator's switch at a glance (realm
+            // net-observer, node #61).
+            StreamFrame::Probing(p) => format!("probing {} ({})", p.tier, p.reason.as_str()),
             StreamFrame::Error(e) => format!("{}: {}", e.code.as_str(), e.message),
             StreamFrame::Unrecognized(u) => {
                 format!("a frame this build cannot read: {}", u.detail)
@@ -1976,8 +1984,16 @@ mod tests {
     /// ran, or a daemon that cannot decode the query, must end the poll.
     #[test]
     fn still_running_is_recognised_and_nothing_else_is() {
-        let m = experiment_running_message("experiment-42", 99);
-        assert_eq!(m, "experiment experiment-42 still running (ends at 99)");
+        let ends_at_us = 1_756_731_900_000_000;
+        let m = experiment_running_message("experiment-42", ends_at_us);
+        assert_eq!(
+            m,
+            format!(
+                "experiment experiment-42 still running (ends at {})",
+                types::local_instant(ends_at_us)
+            )
+        );
+        assert!(!m.contains("1756731900"), "an epoch is not a clock: {m}");
         assert!(is_experiment_running(&m));
         assert!(!m.starts_with(UNDECODABLE_REQUEST_PREFIX));
         assert!(!is_experiment_running("experiment experiment-42 not found"));
@@ -2000,10 +2016,17 @@ mod tests {
             window: types::ExperimentWindow {
                 start_us: 100,
                 end_us: 100 + 60_000_000,
+                requested_minutes: 1,
+                link_interval_us: 15_000_000,
                 tier_before: ProbingTier::Passive,
+                tier_at_end: ProbingTier::Passive,
+                restore: types::TierRestore::Restored,
+                freeze_start_dir: None,
+                freeze_end_dir: Some("/blobs/freeze-experiment-100-end".into()),
                 frames_pcap_start: None,
                 frames_pcap_end: Some(3),
             },
+            ring_filter: "arp or icmp".into(),
             own_mac: Some("f0:18:98:0a:0b:0c".into()),
             our_frames: Some(types::OwnFrames {
                 records: 3,
@@ -2012,11 +2035,14 @@ mod tests {
                 truncated: false,
                 in_window: 2,
                 icmp_echo: 0,
+                first_echo_us: None,
+                last_echo_us: None,
                 arp: 1,
                 dhcp: 0,
                 other: 1,
             }),
             network: Some(types::NetworkFacts::default()),
+            edges: types::WindowEdges::default(),
             notes: vec!["start freeze: pcap ring not running".into()],
         };
         let live = Table::from(&report);
@@ -3117,7 +3143,7 @@ mod tests {
             reason: types::ProbingReason::Startup,
         });
         assert_eq!(passive.label(), "probing");
-        assert_eq!(passive.detail(), "probing passive");
+        assert_eq!(passive.detail(), "probing passive (startup)");
         assert_eq!(passive.ts_us(), 13);
         assert_eq!(passive.event_kind(), None);
         let active = StreamFrame::Probing(ProbingEdge {
@@ -3126,7 +3152,23 @@ mod tests {
             peer_uid: Some(501),
             reason: types::ProbingReason::Control,
         });
-        assert_eq!(active.detail(), "probing active");
+        assert_eq!(active.detail(), "probing active (control)");
+        // An experiment window's bracket names itself, so a tail tells it
+        // from an operator's switch.
+        let bracket = StreamFrame::Probing(ProbingEdge {
+            ts_us: 15,
+            tier: ProbingTier::Passive,
+            peer_uid: Some(501),
+            reason: types::ProbingReason::Experiment,
+        });
+        assert_eq!(bracket.detail(), "probing passive (experiment)");
+        let closing = StreamFrame::Probing(ProbingEdge {
+            ts_us: 16,
+            tier: ProbingTier::Active,
+            peer_uid: Some(501),
+            reason: types::ProbingReason::ExperimentEnd,
+        });
+        assert_eq!(closing.detail(), "probing active (experiment-end)");
 
         let err = StreamFrame::Error(StreamError {
             ts_us: 12,
