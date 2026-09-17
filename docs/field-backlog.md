@@ -17,3 +17,21 @@ the graph holds the questions, their anchors and their closing criteria.
 The "already closed" list was not transferred: those are facts about the code
 and sit in the nodes that describe it (#10 «Инцидент», #15 «Опознание
 сигнатуры»).
+
+---
+
+## V-G · Коллектор физического egress + корреляция всплеска с баном
+
+**Наблюдение (2026-09-17).** Триггер пер-клиентского бана на коворкинге
+ищется по ФИЗИЧЕСКИМ исходящим коннектам к иностранным IP на en0 (SYN к
+VLESS-серверам + синхронный залп urltest-проб раз в 3м — подпись
+адрес-сканера для MikroTik). Обсервер этого не видит: pcap-кольцо намеренно
+исключает жирный поток (только ARP/ICMP/DHCP), а Clash `/connections`
+показывает потоки ВНУТРИ туннеля (app→tun), не физические коннекты к
+серверам. Пришлось поднимать `netstat`-логгер SYN_SENT по SSH.
+
+**Answered when.** Есть коллектор физического egress'а (например, netstat
+SYN_SENT/ESTABLISHED к не-локальным IP, non-root), пишущий rate/spread
+новых коннектов; и сигнатура/запрос, коррелирующая всплеск исходящих
+коннектов с наступлением gw-drop/per-client-block — так «что я отправил
+прямо перед баном» становится ответом продукта, а не ручного netstat.
