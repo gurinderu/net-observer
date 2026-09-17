@@ -34,7 +34,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
-use triggers::engine::TriggerEngine;
+use triggers::engine::{TriggerEngine, incident_id_parts};
 use triggers::handlers::Handler;
 use triggers::window::RecentWindow;
 use types::{BlobRef, NeighborLifetime, NeighborsSample, Sample};
@@ -1319,23 +1319,18 @@ impl SnapshotHandler {
     }
 }
 
-/// `incident_id` is `"{trigger_id}-{now_us}"`; recover the trigger id from the
-/// prefix before the final `-` (matching `RecordHandler`).
-fn trigger_id_of(incident_id: &str) -> String {
-    incident_id
-        .rsplit_once('-')
-        .map(|(prefix, _)| prefix)
-        .unwrap_or(incident_id)
-        .to_string()
-}
-
 impl Handler for SnapshotHandler {
     fn on_fire(&self, incident_id: &str, ts_us: i64, detail: &str) {
+        // The rule's id, read back from the minted incident id; an id not in
+        // the minted shape is kept whole rather than guessed at.
+        let trigger_id = incident_id_parts(incident_id)
+            .map_or(incident_id, |(trigger_id, _)| trigger_id)
+            .to_string();
         let summary = IncidentSummary {
             id: incident_id.to_string(),
             opened_us: ts_us,
             closed_us: None,
-            trigger_id: trigger_id_of(incident_id),
+            trigger_id,
             signature: detail.to_string(),
         };
         self.publish(Event::Incident(summary.clone()));
@@ -1345,13 +1340,20 @@ impl Handler for SnapshotHandler {
     }
 
     fn on_clear(&self, incident_id: &str, ts_us: i64) {
-        // Published whether or not the ring still holds the id: a subscriber
+        // The opening instant rides in the id the engine minted, so the frame
+        // can say how long the incident lasted without the ring: published
+        // whether or not the ring still holds the id, because a subscriber
         // that saw the opening on the bus must see its close there too, and
         // the ring's cap says nothing about what the bus carried (realm
         // net-observer, node #135).
+        let (trigger_id, opened_us) = incident_id_parts(incident_id)
+            .map_or((incident_id, None), |(trigger_id, opened_us)| {
+                (trigger_id, Some(opened_us))
+            });
         self.publish(Event::IncidentClosed {
             id: incident_id.to_string(),
-            trigger_id: trigger_id_of(incident_id),
+            trigger_id: trigger_id.to_string(),
+            opened_us,
             closed_us: ts_us,
         });
         // An id the ring no longer holds (truncated by `cap`) has nothing to
@@ -2880,9 +2882,10 @@ mod tests {
 
     /// On clear the `SnapshotHandler` publishes an `Event::IncidentClosed` on
     /// the bus — a frame of its own, never a second `Incident` — carrying the
-    /// id the opening carried, the rule, and the closing instant. It is
-    /// published even for an id the ring no longer holds: what the bus
-    /// carried, the bus closes (realm net-observer, node #135).
+    /// id the opening carried, the rule, and both instants (the opening read
+    /// back from the id the engine minted). It is published even for an id
+    /// the ring no longer holds: what the bus carried, the bus closes (realm
+    /// net-observer, node #135).
     #[test]
     fn snapshot_handler_publishes_incident_closed_event() {
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
@@ -2891,7 +2894,7 @@ mod tests {
 
         handler.on_fire("gw-drop-42", 42, "sig");
         handler.on_clear("gw-drop-42", 57);
-        // Never in the ring (truncated, or opened before this process).
+        // No longer in the ring (truncated past its cap): still published.
         handler.on_clear("wedge-7", 58);
 
         // The opening, then the close of the same id.
@@ -2903,17 +2906,25 @@ mod tests {
             StreamFrame::Event(Event::IncidentClosed {
                 id,
                 trigger_id,
+                opened_us,
                 closed_us,
             }) => {
                 assert_eq!(id, "gw-drop-42");
                 assert_eq!(trigger_id, "gw-drop");
+                assert_eq!(opened_us, Some(42), "the opening, read back from the id");
                 assert_eq!(closed_us, 57);
             }
             other => panic!("expected an IncidentClosed event frame, got {other:?}"),
         }
         match decode(&events_rx.try_recv().unwrap()) {
-            StreamFrame::Event(Event::IncidentClosed { id, closed_us, .. }) => {
+            StreamFrame::Event(Event::IncidentClosed {
+                id,
+                opened_us,
+                closed_us,
+                ..
+            }) => {
                 assert_eq!(id, "wedge-7");
+                assert_eq!(opened_us, Some(7));
                 assert_eq!(closed_us, 58);
             }
             other => panic!("expected an IncidentClosed event frame, got {other:?}"),

@@ -474,6 +474,19 @@ impl EventKindArg {
             EventKindArg::IncidentClosed => EventKind::IncidentClosed,
         }
     }
+
+    /// The wire kinds `--kind` subscribes to: every kind the named one admits
+    /// ([`EventKind::admits`]), so `incident` carries the closes too — a tail
+    /// watching for incidents must see them end — while `incident-closed`
+    /// alone stays selectable (realm net-observer, node #135).
+    fn to_kinds(self) -> Vec<EventKind> {
+        let named = self.to_kind();
+        EventKind::ALL
+            .iter()
+            .copied()
+            .filter(|k| named.admits(*k))
+            .collect()
+    }
 }
 
 fn main() -> ExitCode {
@@ -502,9 +515,10 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Events { kind } => {
             let cfg = load_config(cli)?;
             // `None` (no `--kind`) subscribes to every kind; `Some(k)` filters
-            // server-side to that single kind. Either way the stream-integrity
-            // frames (ack, gap, observing) are delivered.
-            let kinds = kind.map(|k| vec![k.to_kind()]);
+            // server-side to the kinds that one admits (`incident` brings the
+            // closes along). Either way the stream-integrity frames (ack,
+            // gap, observing) are delivered.
+            let kinds = kind.map(EventKindArg::to_kinds);
             // The tail owns its own exit code: an orderly end is a success even
             // though the stream stopped (see [`TailEnd`]).
             return stream_events(&cfg.socket_path, kinds);
@@ -2328,6 +2342,22 @@ mod tests {
         }
     }
 
+    /// The list a `--kind` sends: `incident` subscribes to the closes as well,
+    /// `incident-closed` alone stays selectable, and any other kind is just
+    /// itself (realm net-observer, node #135).
+    #[test]
+    fn events_kind_incident_subscribes_to_closes_too() {
+        assert_eq!(
+            EventKindArg::Incident.to_kinds(),
+            vec![EventKind::Incident, EventKind::IncidentClosed]
+        );
+        assert_eq!(
+            EventKindArg::IncidentClosed.to_kinds(),
+            vec![EventKind::IncidentClosed]
+        );
+        assert_eq!(EventKindArg::Link.to_kinds(), vec![EventKind::Link]);
+    }
+
     /// `connections --by` takes the four groupings by their lowercase names,
     /// defaults to `host`, and maps onto the wire type the daemon reads.
     #[test]
@@ -2670,17 +2700,29 @@ mod tests {
     }
 
     /// The close is its own line, clocked at the closing instant: the id ties
-    /// it to the opening line above it in the tail, the rule sits in brackets
-    /// (realm net-observer, node #135).
+    /// it to the opening line above it in the tail, the rule sits in brackets,
+    /// and the duration follows when the frame carries the opening (realm
+    /// net-observer, node #135).
     #[test]
     fn format_frame_line_renders_an_incident_close() {
         let closed = StreamFrame::Event(Event::IncidentClosed {
             id: "wedge-0".into(),
             trigger_id: "wedge".into(),
+            opened_us: Some(0),
             closed_us: 15_000_000,
         });
         assert_eq!(
             format_frame_line(&closed),
+            "1970-01-01 00:00:15  incident-closed  wedge-0 (wedge) after 15s"
+        );
+        let unmeasured = StreamFrame::Event(Event::IncidentClosed {
+            id: "wedge-0".into(),
+            trigger_id: "wedge".into(),
+            opened_us: None,
+            closed_us: 15_000_000,
+        });
+        assert_eq!(
+            format_frame_line(&unmeasured),
             "1970-01-01 00:00:15  incident-closed  wedge-0 (wedge)"
         );
     }

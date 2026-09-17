@@ -198,9 +198,14 @@ impl Row {
 ///
 /// The predicate the list render uses, kept as one named function so the rule —
 /// a stream-integrity frame (`kind: None`) is admitted whatever the filter is —
-/// is stated once and testable directly.
+/// is stated once and testable directly. Which kinds a chip lets through is
+/// [`EventKind::admits`], shared with the CLI: the `incident` chip shows the
+/// closes too (realm net-observer, node #135).
 fn admits(filter: Option<EventKind>, row: &Row) -> bool {
-    row.kind.is_none() || filter.is_none_or(|k| row.kind == Some(k))
+    match (filter, row.kind) {
+        (_, None) | (None, _) => true,
+        (Some(chip), Some(kind)) => chip.admits(kind),
+    }
 }
 
 /// The shared, window-scoped model: the capped live row list plus the current
@@ -875,6 +880,7 @@ mod tests {
         Event::IncidentClosed {
             id: "i1".into(),
             trigger_id: "wedge".into(),
+            opened_us: Some(5),
             closed_us: 9,
         }
     }
@@ -1058,6 +1064,22 @@ mod tests {
         assert!(!admits(Some(EventKind::Dns), &link));
     }
 
+    /// The `incident` chip shows an incident's close as well as its opening —
+    /// a reader watching the chip must see each incident end — while the
+    /// close is not an incident for any other chip (realm net-observer,
+    /// node #135).
+    #[test]
+    fn the_incident_chip_admits_closes_too() {
+        let opened = Row::new(&StreamFrame::Event(incident_event()));
+        let closed = Row::new(&StreamFrame::Event(incident_closed_event()));
+        assert!(admits(Some(EventKind::Incident), &opened));
+        assert!(admits(Some(EventKind::Incident), &closed));
+        assert!(admits(Some(EventKind::IncidentClosed), &closed));
+        assert!(!admits(Some(EventKind::IncidentClosed), &opened));
+        assert!(!admits(Some(EventKind::Link), &closed));
+        assert!(admits(None, &closed));
+    }
+
     /// The first row of a (re)connected log states whether the daemon is
     /// collecting, so a paused daemon reads as paused rather than as an idle one.
     #[test]
@@ -1100,7 +1122,7 @@ mod tests {
         let closed = Row::new(&StreamFrame::Event(incident_closed_event()));
         assert!(!closed.alert, "an incident's close is not an alert");
         assert_eq!(closed.kind, Some(EventKind::IncidentClosed));
-        assert_eq!(closed.line, "incident-closed  i1 (wedge)");
+        assert_eq!(closed.line, "incident-closed  i1 (wedge) after 0s");
 
         let link = Row::new(&StreamFrame::Event(link_event()));
         assert!(!link.alert, "an ordinary sample is not an alert");

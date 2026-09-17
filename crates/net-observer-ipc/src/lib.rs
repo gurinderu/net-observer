@@ -474,6 +474,18 @@ event_kinds! {
     IncidentClosed => "incident-closed",
 }
 
+impl EventKind {
+    /// Whether a filter naming `self` lets a frame of `kind` through. Every
+    /// kind admits itself; `Incident` also admits `IncidentClosed`, because a
+    /// filter on incidents is about the incidents, not their openings — a
+    /// reader watching for them would otherwise see each one open and never
+    /// end. `IncidentClosed` alone stays selectable. The one rule behind the
+    /// CLI's `--kind` list and the bar's chips (realm net-observer, node #135).
+    pub fn admits(self, kind: EventKind) -> bool {
+        self == kind || (self == EventKind::Incident && kind == EventKind::IncidentClosed)
+    }
+}
+
 /// The live [`Event`] a connections tick publishes: the tick's verdict and
 /// its size, NOT its rows. A tick can carry hundreds of flows, and the bus
 /// fans every frame out to every subscriber; the table itself is read on
@@ -533,10 +545,31 @@ pub enum Event {
         /// carried, so a reader can find the entry it opened.
         id: String,
         trigger_id: String,
+        /// When it opened (epoch microseconds), so the close can say how long
+        /// the incident lasted without the reader keeping the opening around.
+        /// `serde(default)`: a sender that does not carry it leaves the
+        /// duration unsaid rather than the frame undecodable.
+        #[serde(default)]
+        opened_us: Option<i64>,
         /// When it closed (epoch microseconds): the tick whose condition
         /// stopped asserting, or the edge that ended the observation session.
         closed_us: i64,
     },
+}
+
+/// A span of microseconds as the words a tail reads at a glance: `Nm Ss`, or
+/// `Ss` under a minute, in whole seconds. A negative span (the clock stepped
+/// back between the opening and the close) keeps its sign rather than being
+/// hidden — an anomaly is a reading too.
+fn duration_label(us: i64) -> String {
+    let sign = if us < 0 { "-" } else { "" };
+    let secs = us.unsigned_abs() / 1_000_000;
+    let (m, s) = (secs / 60, secs % 60);
+    if m > 0 {
+        format!("{sign}{m}m {s}s")
+    } else {
+        format!("{sign}{s}s")
+    }
 }
 
 impl Event {
@@ -690,11 +723,22 @@ impl Event {
                 ConnectionsVerdict::Ok => format!("{} flows, {} hosts", c.flows, c.hosts),
             },
             Event::Incident(i) => format!("{} {}", i.trigger_id, i.signature),
-            // The instant is the frame's own `ts_us`, which every renderer
-            // already prints as the line's clock; the duration is not here
-            // because the frame does not carry the opening instant (realm
-            // net-observer, node #135).
-            Event::IncidentClosed { id, trigger_id, .. } => format!("{id} ({trigger_id})"),
+            // The closing instant is the frame's own `ts_us`, which every
+            // renderer prints as the line's clock; the duration is what the
+            // line adds, when the frame carries the opening to measure it
+            // from (realm net-observer, node #135).
+            Event::IncidentClosed {
+                id,
+                trigger_id,
+                opened_us,
+                closed_us,
+            } => match opened_us {
+                Some(opened) => format!(
+                    "{id} ({trigger_id}) after {}",
+                    duration_label(closed_us.saturating_sub(*opened))
+                ),
+                None => format!("{id} ({trigger_id})"),
+            },
         }
     }
 }
@@ -1770,24 +1814,14 @@ mod tests {
     /// between the client that writes it and the daemon that echoes it back.
     #[test]
     fn every_event_kind_round_trips_in_a_subscribe_request() {
-        let all = [
-            EventKind::Link,
-            EventKind::Proxy,
-            EventKind::Dns,
-            EventKind::Route,
-            EventKind::Host,
-            EventKind::Wifi,
-            EventKind::Neighbors,
-            EventKind::Air,
-            EventKind::Incident,
-            EventKind::IncidentClosed,
-        ];
+        // `ALL` is the enumeration itself, so a kind added tomorrow is in
+        // this test the moment it exists — a hand-written list drifted twice.
         let req = Request::Subscribe {
-            kinds: Some(all.to_vec()),
+            kinds: Some(EventKind::ALL.to_vec()),
         };
         let line = String::from_utf8(encode_frame(&req).unwrap()).unwrap();
         match serde_json::from_str::<Request>(&line).unwrap() {
-            Request::Subscribe { kinds: Some(ks) } => assert_eq!(ks, all.to_vec()),
+            Request::Subscribe { kinds: Some(ks) } => assert_eq!(ks, EventKind::ALL.to_vec()),
             other => panic!("expected a filtered Subscribe, got {other:?}"),
         }
     }
@@ -2519,6 +2553,7 @@ mod tests {
         let closed = Event::IncidentClosed {
             id: "inc-1".into(),
             trigger_id: "t".into(),
+            opened_us: Some(42),
             closed_us: 57,
         };
         assert_eq!(closed.kind(), EventKind::IncidentClosed);
@@ -2527,18 +2562,61 @@ mod tests {
 
     #[test]
     fn event_kind_as_str_covers_every_kind() {
-        for (kind, label) in [
-            (EventKind::Link, "link"),
-            (EventKind::Proxy, "proxy"),
-            (EventKind::Dns, "dns"),
-            (EventKind::Route, "route"),
-            (EventKind::Host, "host"),
-            (EventKind::Connections, "connections"),
-            (EventKind::Incident, "incident"),
-            (EventKind::IncidentClosed, "incident-closed"),
-        ] {
-            assert_eq!(kind.as_str(), label);
+        // The labels are a contract (the CLI's `--kind` words, the bar's
+        // chips, the capability list), pinned in declaration order over
+        // `ALL` so a new kind cannot arrive without its label being read
+        // here — the list is the whole enumeration, never a sample of it.
+        let labels: Vec<&str> = EventKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "link",
+                "proxy",
+                "dns",
+                "route",
+                "host",
+                "wifi",
+                "neighbors",
+                "air",
+                "connections",
+                "incident",
+                "incident-closed",
+            ]
+        );
+    }
+
+    /// The one filter rule both readers apply: a kind admits itself, and
+    /// `incident` admits the close too — a reader watching for incidents
+    /// must see them end — while `incident-closed` alone stays selectable
+    /// (realm net-observer, node #135).
+    #[test]
+    fn a_filter_on_incidents_admits_their_closes() {
+        for kind in EventKind::ALL {
+            assert!(kind.admits(*kind), "{} admits itself", kind.as_str());
         }
+        assert!(EventKind::Incident.admits(EventKind::IncidentClosed));
+        assert!(!EventKind::IncidentClosed.admits(EventKind::Incident));
+        assert!(!EventKind::Link.admits(EventKind::IncidentClosed));
+        assert!(!EventKind::Incident.admits(EventKind::Link));
+        // The list a `--kind incident` subscription sends, derived from the rule.
+        let widened: Vec<EventKind> = EventKind::ALL
+            .iter()
+            .copied()
+            .filter(|k| EventKind::Incident.admits(*k))
+            .collect();
+        assert_eq!(widened, [EventKind::Incident, EventKind::IncidentClosed]);
+    }
+
+    /// The words a close's duration is read in: whole seconds, minutes once
+    /// there are any, and a sign on a span the clock made negative.
+    #[test]
+    fn duration_label_reads_as_minutes_and_seconds() {
+        assert_eq!(duration_label(0), "0s");
+        assert_eq!(duration_label(999_999), "0s");
+        assert_eq!(duration_label(15_000_000), "15s");
+        assert_eq!(duration_label(60_000_000), "1m 0s");
+        assert_eq!(duration_label(3_723_000_000), "62m 3s");
+        assert_eq!(duration_label(-5_000_000), "-5s");
     }
 
     #[test]
@@ -2761,14 +2839,24 @@ mod tests {
         });
         assert_eq!(inc.detail(), "fakeip sig");
 
-        // The close names the incident it ends and the rule that opened it;
-        // the instant is the frame's `ts_us`, so it is not repeated here.
+        // The close names the incident it ends, the rule that opened it and
+        // how long it lasted; the closing instant is the frame's `ts_us`, so
+        // it is not repeated here. Without the opening there is no duration
+        // to state, and the line says nothing rather than something made up.
         let closed = Event::IncidentClosed {
             id: "fakeip-100".into(),
             trigger_id: "fakeip".into(),
-            closed_us: 115,
+            opened_us: Some(100_000_000),
+            closed_us: 175_000_000,
         };
-        assert_eq!(closed.detail(), "fakeip-100 (fakeip)");
+        assert_eq!(closed.detail(), "fakeip-100 (fakeip) after 1m 15s");
+        let unmeasured = Event::IncidentClosed {
+            id: "fakeip-100".into(),
+            trigger_id: "fakeip".into(),
+            opened_us: None,
+            closed_us: 175_000_000,
+        };
+        assert_eq!(unmeasured.detail(), "fakeip-100 (fakeip)");
     }
 
     /// The bus carries a connections tick as its summary — the counts of the
@@ -2879,29 +2967,51 @@ mod tests {
     }
 
     /// The close travels as its own frame and comes back whole: the id that
-    /// ties it to the opening, the rule, and the closing instant (realm
+    /// ties it to the opening, the rule, and both instants (realm
     /// net-observer, node #135).
     #[test]
     fn frame_round_trip_stream_frame_incident_closed() {
         let frame = StreamFrame::Event(Event::IncidentClosed {
             id: "gw-drop-5000".into(),
             trigger_id: "gw-drop".into(),
+            opened_us: Some(5000),
             closed_us: 5015,
         });
         match round_trip_frame(&frame) {
             StreamFrame::Event(Event::IncidentClosed {
                 id,
                 trigger_id,
+                opened_us,
                 closed_us,
             }) => {
                 assert_eq!(id, "gw-drop-5000");
                 assert_eq!(trigger_id, "gw-drop");
+                assert_eq!(opened_us, Some(5000));
                 assert_eq!(closed_us, 5015);
             }
             other => panic!("unexpected frame variant: {other:?}"),
         }
         assert_eq!(frame.label(), "incident-closed");
         assert_eq!(frame.event_kind(), Some(EventKind::IncidentClosed));
+    }
+
+    /// A close from a sender that does not carry the opening instant still
+    /// decodes — `serde(default)` leaves the duration unsaid, not the frame
+    /// unreadable.
+    #[test]
+    fn a_close_without_an_opening_instant_still_decodes() {
+        let old = r#"{"Event":{"IncidentClosed":{"id":"gw-drop-1","trigger_id":"gw-drop","closed_us":2}}}"#;
+        match decode_stream_frame(old).unwrap() {
+            StreamFrame::Event(Event::IncidentClosed {
+                opened_us,
+                closed_us,
+                ..
+            }) => {
+                assert_eq!(opened_us, None);
+                assert_eq!(closed_us, 2);
+            }
+            other => panic!("expected IncidentClosed, got {other:?}"),
+        }
     }
 
     /// A reader built before the close existed sees ONE `Unrecognized` frame,
@@ -2933,6 +3043,7 @@ mod tests {
             encode_frame(&StreamFrame::Event(Event::IncidentClosed {
                 id: "gw-drop-1".into(),
                 trigger_id: "gw-drop".into(),
+                opened_us: Some(1),
                 closed_us: 2,
             }))
             .unwrap(),
@@ -3258,11 +3369,12 @@ mod tests {
         let closed = StreamFrame::Event(Event::IncidentClosed {
             id: "fakeip-42".into(),
             trigger_id: "fakeip".into(),
-            closed_us: 57,
+            opened_us: Some(42_000_000),
+            closed_us: 57_000_000,
         });
         assert_eq!(closed.label(), "incident-closed");
-        assert_eq!(closed.detail(), "fakeip-42 (fakeip)");
-        assert_eq!(closed.ts_us(), 57);
+        assert_eq!(closed.detail(), "fakeip-42 (fakeip) after 15s");
+        assert_eq!(closed.ts_us(), 57_000_000);
 
         let gap = StreamFrame::Gap(Gap {
             ts_us: 9,
