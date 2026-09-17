@@ -262,6 +262,25 @@ pub enum DiagnosticQuery {
         #[serde(default)]
         group_by: ConnectionsGroupBy,
     },
+    /// The latest air scan itself: when it ran, its verdict, why it was
+    /// skipped if it was, and how many access points it heard
+    /// (`AIR_LATEST_SCAN_SQL`). Read first, its `ts_us` then pinning
+    /// [`DiagnosticQuery::AirAps`] — a `SKIP` row means the scan could not
+    /// look, and an empty AP list must never be presented as an empty air.
+    /// (realm net-observer, node #99)
+    AirScan,
+    /// The access points ONE scan heard, one row each (`air_aps_at_sql`).
+    /// `scan_ts_us` is the `ts_us` the caller already read from `AirScan`, not
+    /// re-derived as "the newest" here: the air collector can write a new scan
+    /// between a live client's two round trips, and re-deriving would pair
+    /// that scan's header with a different scan's AP list — silent wrong
+    /// data. (realm net-observer, node #99)
+    AirAps { scan_ts_us: i64 },
+    /// Our own channel, from the most recent Wi-Fi sample that actually
+    /// carried one — the band the overlap hypothesis is computed against
+    /// (`AIR_SELF_CHANNEL_SQL`). No row when the radio never reported a
+    /// channel.
+    AirSelfChannel,
 }
 
 /// A result table: the daemon's answer to [`Request::Query`], and the shape the
@@ -1740,6 +1759,11 @@ mod tests {
             DiagnosticQuery::Connections {
                 group_by: ConnectionsGroupBy::IpPort,
             },
+            DiagnosticQuery::AirScan,
+            DiagnosticQuery::AirAps {
+                scan_ts_us: 1_756_731_900_000_000,
+            },
+            DiagnosticQuery::AirSelfChannel,
         ]
     }
 

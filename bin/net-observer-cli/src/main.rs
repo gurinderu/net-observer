@@ -9,16 +9,21 @@
 //!   zero contention with the running daemon.
 //! - **LIVE FIRST, THEN OFFLINE** — the named diagnoses (`why`,
 //!   `incident-context`, `wedge-or-starvation`, `gateway-ramp`, `gaps`,
-//!   `neighbors`, `vulns`, `segments`, `history`, `topology`, `connections`)
-//!   run the canned
+//!   `neighbors`, `vulns`, `segments`, `history`, `topology`, `connections`,
+//!   `air`) run the canned
 //!   `store::diagnosis` queries, so "which layer failed" is reachable without
 //!   writing SQL. Each asks the running daemon first (`Request::Query`, answered
 //!   from the daemon's own store while it keeps collecting) and opens the
 //!   DuckDB file itself only when no daemon answers on the socket — unless the
 //!   operator gave `--db`, which names the record and means the socket is not
 //!   asked at all. Every diagnosis prints which record answered (`source:` on
-//!   stderr). See [`route`] for the exact rule. (realm net-observer, node #58)
-//! - **OFFLINE** — `query <SQL>` and `air` open the DuckDB file directly. This
+//!   stderr). See [`route`] for the exact rule. `air` is three reads pinned to
+//!   one moment: [`route_air`] decides live-or-file once, from the scan, and
+//!   reuses that choice for the other two — a daemon that answers the scan
+//!   and then fails or cannot decode one of them is a hard error, never a
+//!   silent detour to the file, which would risk mixing a live table with a
+//!   stale one. (realm net-observer, node #58)
+//! - **OFFLINE** — `query <SQL>` opens the DuckDB file directly. This
 //!   only works while the daemon is stopped; if `net-observerd` is running it
 //!   holds the lock and the open fails with a clear message rather than a panic.
 
@@ -56,7 +61,7 @@ struct Cli {
     /// Giving it means "read this file": the diagnoses then never ask the
     /// daemon's socket. Without it they ask the running daemon first and read
     /// the config's file only when nothing answers on the socket. `query <SQL>`
-    /// and `air` always read the file. Every diagnosis prints which record
+    /// always reads the file. Every diagnosis prints which record
     /// answered as a `source:` line on stderr.
     #[arg(long)]
     db: Option<String>,
@@ -236,9 +241,10 @@ enum Command {
         #[arg(long, value_enum, default_value_t = GroupByArg::Host)]
         by: GroupByArg,
     },
-    /// The latest slice of the radio environment (offline): every foreign access
-    /// point the last scan heard, with its channel, band, width, signal and
-    /// noise, ordered by how likely it is to be sitting in our own band.
+    /// The latest slice of the radio environment: every foreign access point
+    /// the last scan heard, with its channel, band, width, signal and noise,
+    /// ordered by how likely it is to be sitting in our own band. Asks the
+    /// running daemon first, reads the DB file only when no daemon answers.
     ///
     /// The OVERLAP column is a HYPOTHESIS computed from channel geometry, never
     /// a measurement of interference: macOS reports no channel occupancy to any
@@ -560,13 +566,47 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Air => {
             // Three reads, one moment: the scan itself (so a SKIP is rendered as
             // a refusal), what it heard, and our own channel to compare against.
-            let scan =
-                table_from_query(run_query(&file_only(cli)?, diagnosis::AIR_LATEST_SCAN_SQL)?);
-            let aps = table_from_query(run_query(&file_only(cli)?, diagnosis::AIR_LATEST_APS_SQL)?);
-            let own = table_from_query(run_query(
-                &file_only(cli)?,
-                diagnosis::AIR_SELF_CHANNEL_SQL,
-            )?);
+            // Routed once, live first, like the other diagnoses (realm
+            // net-observer, node #99); the choice is reused for all three so
+            // the operator sees one `source:` line, not three. The AP list is
+            // pinned to the scan's own `ts_us` (`scan_ts_us`), never
+            // re-derived as "the newest" — the offline file can be rewritten
+            // between the two reads just as a live daemon's collector can.
+            let record = Record::resolve(cli)?;
+            let (scan, aps, own) =
+                match route_air(record.socket.as_deref(), net_observer_ipc::diagnose)? {
+                    AirRoute::Live {
+                        scan,
+                        aps,
+                        own,
+                        via,
+                    } => {
+                        eprintln!("source: net-observerd via {via}");
+                        (scan, aps, own)
+                    }
+                    AirRoute::Offline { why, locked } => {
+                        if let Some(why) = why {
+                            eprintln!("{why}; reading the file instead");
+                        }
+                        eprintln!("source: file {}", record.db_path);
+                        let offline = Offline {
+                            db_path: record.db_path,
+                            locked,
+                        };
+                        let scan =
+                            table_from_query(run_query(&offline, diagnosis::AIR_LATEST_SCAN_SQL)?);
+                        let aps = match scan_ts_us(&scan) {
+                            Some(ts) => table_from_query(run_prepared(
+                                &offline,
+                                &diagnosis::air_aps_at_sql(ts),
+                            )?),
+                            None => Table::default(),
+                        };
+                        let own =
+                            table_from_query(run_query(&offline, diagnosis::AIR_SELF_CHANNEL_SQL)?);
+                        (scan, aps, own)
+                    }
+                };
             print!("{}", diagnose::format_air(&scan, &aps, &own)?);
         }
         Command::Query { sql } => {
@@ -803,6 +843,83 @@ fn ask_silences_or_gaps(
             Ok((fallback, note))
         }
         answered => Ok((answered, None)),
+    }
+}
+
+/// Where the `air` group of reads came from, once decided.
+///
+/// `Live` carries all three tables: [`route_air`] asks `AirAps` and
+/// `AirSelfChannel` over the same socket the scan answered on, so a daemon
+/// that reads one reads all three — they shipped together.
+#[derive(Debug, Clone, PartialEq)]
+enum AirRoute {
+    Live {
+        scan: Table,
+        aps: Table,
+        own: Table,
+        via: String,
+    },
+    Offline {
+        why: Option<String>,
+        locked: String,
+    },
+}
+
+/// The `ts_us` of `AirScan`'s one row, read back from its own answer rather
+/// than re-derived as "the newest scan": the air collector can write a new
+/// scan between two round trips over a live socket, and re-deriving would pin
+/// `AirAps` to a different moment than the header just read — silent wrong
+/// data. `None` when the record has no scan at all, and then `AirAps` is not
+/// asked at all: `format_air` renders that absence without ever touching an
+/// AP list. (realm net-observer, node #99)
+fn scan_ts_us(scan: &Table) -> Option<i64> {
+    let i = scan.columns.iter().position(|c| c == "ts_us")?;
+    scan.rows.first()?.get(i)?.parse().ok()
+}
+
+/// [`route`] the `air` group of reads from ONE question — `AirScan` — and
+/// reuse that choice for `AirAps` and `AirSelfChannel`: a daemon or a file is
+/// decided once, not three times, so the operator sees one `source:` line for
+/// the three tables rather than three. (realm net-observer, node #99)
+fn route_air(
+    socket: Option<&str>,
+    ask: impl Fn(&str, DiagnosticQuery) -> std::io::Result<QueryOutcome>,
+) -> Result<AirRoute> {
+    match route(socket, |s| ask(s, DiagnosticQuery::AirScan))? {
+        Route::Live { table: scan, via } => {
+            let aps = match scan_ts_us(&scan) {
+                Some(scan_ts_us) => {
+                    ask_air_table(&via, &ask, DiagnosticQuery::AirAps { scan_ts_us })?
+                }
+                None => Table::default(),
+            };
+            let own = ask_air_table(&via, &ask, DiagnosticQuery::AirSelfChannel)?;
+            Ok(AirRoute::Live {
+                scan,
+                aps,
+                own,
+                via,
+            })
+        }
+        Route::Offline { why, locked } => Ok(AirRoute::Offline { why, locked }),
+    }
+}
+
+/// One more live read over a socket [`route_air`] already committed to,
+/// mapping a daemon that stops answering mid-group to an error rather than a
+/// silent fall to the file — a fall back there would mix a live scan with an
+/// offline AP list from a possibly different moment.
+fn ask_air_table(
+    via: &str,
+    ask: &impl Fn(&str, DiagnosticQuery) -> std::io::Result<QueryOutcome>,
+    q: DiagnosticQuery,
+) -> Result<Table> {
+    match ask(via, q.clone())? {
+        QueryOutcome::Table(t) => Ok(t),
+        QueryOutcome::Failed(m) => Err(anyhow!("net-observerd returned an error: {m}")),
+        QueryOutcome::Unsupported(m) => Err(anyhow!(
+            "net-observerd at {via} answered AirScan but cannot decode {q:?} ({m})"
+        )),
     }
 }
 
@@ -1146,12 +1263,12 @@ fn lock_message(db_path: &str, locked: &str) -> String {
     format!("a daemon holds the lock on {db_path}; {locked}")
 }
 
-/// The offline context of `query <SQL>` and `air`, which read the file by
-/// ruling and never ask the socket.
+/// The offline context of `query <SQL>`, which reads the file by ruling and
+/// never asks the socket.
 fn file_only(cli: &Cli) -> Result<Offline> {
     Ok(Offline {
         db_path: Record::resolve(cli)?.db_path,
-        locked: "`query` and `air` read the file only; stop the daemon for them".to_string(),
+        locked: "`query` reads the file only; stop the daemon for it".to_string(),
     })
 }
 
@@ -1709,6 +1826,171 @@ mod tests {
         assert_eq!(out, QueryOutcome::Failed("boom".into()));
         assert_eq!(*asked.borrow(), vec![DiagnosticQuery::Silences]);
         assert_eq!(note, None);
+    }
+
+    /// `air` routes once, from `AirScan`, and reuses that choice for `AirAps`
+    /// and `AirSelfChannel`: a daemon answering all three is asked all three,
+    /// `AirAps` pinned to the `ts_us` the scan itself answered with (never
+    /// re-routed); an old daemon `Unsupported` on the first question sends
+    /// the whole group to the file without asking the other two at all; and a
+    /// scan with no row at all — an empty record — is not a moment to pin
+    /// anything to, so `AirAps` is skipped rather than asked with a made-up
+    /// `ts_us`.
+    #[test]
+    fn air_asks_all_three_on_a_live_daemon_and_none_on_an_old_one() {
+        use std::cell::RefCell;
+        let asked: RefCell<Vec<DiagnosticQuery>> = RefCell::new(Vec::new());
+
+        let scan_at = |ts_us: &str| Table {
+            columns: vec!["ts_us".into()],
+            rows: vec![vec![ts_us.into()]],
+        };
+        let t = |col: &str| Table {
+            columns: vec![col.into()],
+            rows: vec![],
+        };
+        let r = route_air(Some("/run/observer.sock"), |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(QueryOutcome::Table(match q {
+                DiagnosticQuery::AirScan => scan_at("1000"),
+                DiagnosticQuery::AirAps { scan_ts_us } => {
+                    assert_eq!(
+                        scan_ts_us, 1000,
+                        "AirAps must be pinned to the scan's ts_us"
+                    );
+                    t("channel")
+                }
+                DiagnosticQuery::AirSelfChannel => t("channel_band"),
+                other => panic!("air must not ask {other:?}"),
+            }))
+        })
+        .unwrap();
+        assert_eq!(
+            *asked.borrow(),
+            vec![
+                DiagnosticQuery::AirScan,
+                DiagnosticQuery::AirAps { scan_ts_us: 1000 },
+                DiagnosticQuery::AirSelfChannel
+            ]
+        );
+        match r {
+            AirRoute::Live {
+                scan,
+                aps,
+                own,
+                via,
+            } => {
+                assert_eq!(scan, scan_at("1000"));
+                assert_eq!(aps, t("channel"));
+                assert_eq!(own, t("channel_band"));
+                assert_eq!(via, "/run/observer.sock");
+            }
+            other => panic!("expected Live, got {other:?}"),
+        }
+
+        // An old daemon: `Unsupported` on the first question alone sends the
+        // whole group to the file — `AirAps`/`AirSelfChannel` are never asked.
+        asked.borrow_mut().clear();
+        let r = route_air(Some("/run/observer.sock"), |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(QueryOutcome::Unsupported(
+                "bad request: unknown variant `AirScan`".into(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(*asked.borrow(), vec![DiagnosticQuery::AirScan]);
+        match r {
+            AirRoute::Offline { why: Some(why), .. } => {
+                assert!(why.contains("AirScan"), "{why}");
+            }
+            other => panic!("expected Offline with a reason, got {other:?}"),
+        }
+
+        // An empty record: the scan answers with no row, so there is nothing
+        // to pin `AirAps` to — it is asked `AirSelfChannel` only.
+        asked.borrow_mut().clear();
+        let r = route_air(Some("/run/observer.sock"), |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(QueryOutcome::Table(match q {
+                DiagnosticQuery::AirScan => Table {
+                    columns: vec!["ts_us".into()],
+                    rows: vec![],
+                },
+                DiagnosticQuery::AirSelfChannel => t("channel_band"),
+                other => panic!("air must not ask {other:?}"),
+            }))
+        })
+        .unwrap();
+        assert_eq!(
+            *asked.borrow(),
+            vec![DiagnosticQuery::AirScan, DiagnosticQuery::AirSelfChannel]
+        );
+        match r {
+            AirRoute::Live { aps, .. } => assert_eq!(aps, Table::default()),
+            other => panic!("expected Live, got {other:?}"),
+        }
+    }
+
+    /// A daemon that answers the scan live and then fails or cannot decode
+    /// `AirAps` is a hard error, never a silent detour to the file: falling
+    /// back there would risk pairing the live scan just read with a stale
+    /// offline AP list from a different moment. Modelled on the
+    /// `Silences`-failed case in
+    /// `gaps_asks_silences_first_and_gaps_only_on_an_old_daemon`.
+    #[test]
+    fn air_errors_on_a_daemon_that_fails_mid_group_never_falls_to_the_file() {
+        use std::cell::RefCell;
+        let asked: RefCell<Vec<DiagnosticQuery>> = RefCell::new(Vec::new());
+        let scan_table = Table {
+            columns: vec!["ts_us".into()],
+            rows: vec![vec!["1000".into()]],
+        };
+
+        let failed = route_air(Some("/run/observer.sock"), |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(match q {
+                DiagnosticQuery::AirScan => QueryOutcome::Table(scan_table.clone()),
+                DiagnosticQuery::AirAps { .. } => QueryOutcome::Failed("boom".into()),
+                other => panic!("must not ask {other:?}"),
+            })
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(failed.contains("boom"), "{failed}");
+        assert_eq!(
+            *asked.borrow(),
+            vec![
+                DiagnosticQuery::AirScan,
+                DiagnosticQuery::AirAps { scan_ts_us: 1000 }
+            ],
+            "a failure on AirAps must not be followed by AirSelfChannel either"
+        );
+
+        // `Unsupported` mid-group is the same: an error, not a fallback — the
+        // daemon just answered the scan, so it is current enough that
+        // "cannot decode AirAps" cannot mean "too old", and the file must not
+        // silently stand in.
+        asked.borrow_mut().clear();
+        let unsupported = route_air(Some("/run/observer.sock"), |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(match q {
+                DiagnosticQuery::AirScan => QueryOutcome::Table(scan_table.clone()),
+                DiagnosticQuery::AirAps { .. } => {
+                    QueryOutcome::Unsupported("bad request: unknown variant `AirAps`".into())
+                }
+                other => panic!("must not ask {other:?}"),
+            })
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(unsupported.contains("AirAps"), "{unsupported}");
+        assert_eq!(
+            *asked.borrow(),
+            vec![
+                DiagnosticQuery::AirScan,
+                DiagnosticQuery::AirAps { scan_ts_us: 1000 }
+            ]
+        );
     }
 
     /// A daemon that read the request and could not run it, and a socket that

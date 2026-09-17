@@ -654,12 +654,16 @@ The wifi collector's air scan records the radio neighbourhood as `system_profile
 SPAirPortDataType` reports it — one `air_sample` row per scan (or a `SKIP` with
 its reason) and one `air_ap` row per access point heard: channel, band, width,
 PHY mode, security label and signal/noise; the report carries no BSSID and
-redacts every SSID (realm net-observer, node #47). `AIR_LATEST_SCAN_SQL`,
-`AIR_LATEST_APS_SQL` and `AIR_SELF_CHANNEL_SQL` read the newest scan for the CLI's
-`air` and the bar's air map.
+redacts every SSID (realm net-observer, node #47). `AIR_LATEST_SCAN_SQL` reads
+the newest scan; `air_aps_at_sql(scan_ts_us)` reads one scan's access points,
+pinned to the `ts_us` the caller already read from the scan rather than
+re-selected as "the newest" — a race between two round trips over a live
+socket could otherwise pair one scan's header with another's AP list (realm
+net-observer, node #99); `AIR_SELF_CHANNEL_SQL` reads our own channel. The CLI's
+`air` and the bar's air map read all three for one moment.
 
 **The air scan's access points also carry a grade, computed rather than
-stored.** `air_ap` (read by `AIR_LATEST_APS_SQL`, rendered by the CLI's `air`
+stored.** `air_ap` (read by `air_aps_at_sql`, rendered by the CLI's `air`
 command and the bar's air-map window) is judged on two independent axes, both
 pure functions of `AirObservation` with no query of their own: a configuration
 letter A-F (`AirObservation::grade`, penalised over security/band/width/PHY
@@ -720,7 +724,10 @@ the durable record; the socket is the live, low-latency read path.
     silence with a `kind` column, pauses and passive stretches; `Gaps` keeps
     its pauses-only shape because a reader built before the tier asks for it
     by that id and would print a stretch as a pause — `neighbors`, `vulns`,
-    `segments`, `history`, `topology`, `connections`), run by the daemon
+    `segments`, `history`, `topology`, `connections`, `air` (three variants —
+    `AirScan`, `AirAps`, `AirSelfChannel`, see [Air scan](#air-scan) — routed
+    from `AirScan` and reused for the other two, one `source:` line for the
+    group), run by the daemon
     against its **own** store while it keeps
     collecting — the only reader that can, since the daemon's per-process lock
     keeps every other opener out, and the moment of an incident is exactly when
