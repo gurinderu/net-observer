@@ -900,6 +900,7 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         });
         // newest is the proxy tick at 4s -> 6s ago at now=10s.
         assert_eq!(freshness_line(&s, 10_000_000), "updated 6s ago");

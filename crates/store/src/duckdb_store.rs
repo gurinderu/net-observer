@@ -368,7 +368,7 @@ impl Store for DuckdbStore {
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
-                "INSERT INTO proxy_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO proxy_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     p.ts_us,
                     p.server_ip,
@@ -382,7 +382,8 @@ impl Store for DuckdbStore {
                     p.est_tun_age_s,
                     p.urltest_ms,
                     p.urltest_at_us,
-                    p.urltest_node
+                    p.urltest_node,
+                    p.urltest_absent_since_us
                 ],
             )?,
             Sample::Dns(d) => c.execute(
@@ -1688,6 +1689,7 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         }))
         .unwrap();
         assert_eq!(
@@ -1703,8 +1705,10 @@ mod tests {
 
     /// sing-box's own URL test lands in its own proxy columns (realm
     /// net-observer, node #62): the node, the newest entry's delay and its
-    /// time — `0` for a test sing-box failed, NULL for a node it has not
-    /// tested and NULL for a row carrying no reading — told apart in SQL.
+    /// time, and — for a node whose entry sing-box deleted — since when the
+    /// history has read empty; a node never seen tested carries NULLs under
+    /// its name, and a row without a reading NULLs throughout — told apart in
+    /// SQL.
     #[test]
     fn proxy_sample_urltest_columns_round_trip() {
         let s = DuckdbStore::in_memory().unwrap();
@@ -1719,30 +1723,39 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            urltest_ms: Some(0),
-            urltest_at_us: Some(1_789_659_600_000_000),
+            urltest_ms: None,
+            urltest_at_us: None,
             urltest_node: Some("vless-out-6".into()),
+            urltest_absent_since_us: Some(700),
         };
         s.write_sample(&Sample::Proxy(row.clone())).unwrap();
         s.write_sample(&Sample::Proxy(ProxySample {
             server_ip: "2.2.2.2:443".into(),
-            urltest_ms: None,
-            urltest_at_us: None,
+            urltest_ms: Some(0),
+            urltest_at_us: Some(1_789_659_600_000_000),
             urltest_node: Some("vless-out-5".into()),
+            urltest_absent_since_us: None,
             ..row.clone()
         }))
         .unwrap();
         s.write_sample(&Sample::Proxy(ProxySample {
             server_ip: "3.3.3.3:443".into(),
-            urltest_ms: None,
-            urltest_at_us: None,
+            urltest_node: Some("vless-out-4".into()),
+            urltest_absent_since_us: None,
+            ..row.clone()
+        }))
+        .unwrap();
+        s.write_sample(&Sample::Proxy(ProxySample {
+            server_ip: "4.4.4.4:443".into(),
             urltest_node: None,
+            urltest_absent_since_us: None,
             ..row
         }))
         .unwrap();
         let t = s
             .query_table(
-                "SELECT server_ip, urltest_node, urltest_ms, urltest_at_us \
+                "SELECT server_ip, urltest_node, urltest_ms, urltest_at_us, \
+                        urltest_absent_since_us \
                  FROM proxy_sample ORDER BY server_ip",
             )
             .unwrap();
@@ -1752,17 +1765,27 @@ mod tests {
                 vec![
                     "1.1.1.1:443".to_string(),
                     "vless-out-6".to_string(),
-                    "0".to_string(),
-                    "1789659600000000".to_string(),
+                    String::new(),
+                    String::new(),
+                    "700".to_string(),
                 ],
                 vec![
                     "2.2.2.2:443".to_string(),
                     "vless-out-5".to_string(),
-                    String::new(),
+                    "0".to_string(),
+                    "1789659600000000".to_string(),
                     String::new(),
                 ],
                 vec![
                     "3.3.3.3:443".to_string(),
+                    "vless-out-4".to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ],
+                vec![
+                    "4.4.4.4:443".to_string(),
+                    String::new(),
                     String::new(),
                     String::new(),
                     String::new(),
@@ -1772,19 +1795,20 @@ mod tests {
         assert_eq!(
             s.query_scalar_i64(
                 "SELECT count(*) FROM proxy_sample \
-                 WHERE urltest_node = selector AND urltest_ms = 0 AND tcp = 'OK'"
+                 WHERE urltest_node = selector AND tcp = 'OK' \
+                   AND ts_us - urltest_absent_since_us >= 300"
             )
             .unwrap(),
             1,
-            "the selected node's failed test over a live listener is one SQL predicate"
+            "the selected node's absent test over a live listener is one SQL predicate"
         );
     }
 
     /// A database written by the daemon that shipped `proxy_sample` with the
     /// established-stream columns but no URL-test columns keeps its
     /// ten-column table (`CREATE TABLE IF NOT EXISTS` does nothing to an
-    /// existing one); the three columns are added on open, the old row reads
-    /// back with them NULL, and the new daemon's thirteen-value insert lands.
+    /// existing one); the four columns are added on open, the old row reads
+    /// back with them NULL, and the new daemon's fourteen-value insert lands.
     #[test]
     fn an_old_proxy_table_without_urltest_columns_opens_and_keeps_its_rows() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1802,7 +1826,8 @@ mod tests {
             s.query_scalar_i64(
                 "SELECT count(*) FROM proxy_sample \
                  WHERE ts_us = 1000 AND tun_code = 204 \
-                   AND urltest_ms IS NULL AND urltest_at_us IS NULL AND urltest_node IS NULL"
+                   AND urltest_ms IS NULL AND urltest_at_us IS NULL AND urltest_node IS NULL \
+                   AND urltest_absent_since_us IS NULL"
             )
             .unwrap(),
             1,
@@ -1822,6 +1847,7 @@ mod tests {
             urltest_ms: Some(202),
             urltest_at_us: Some(1_789_659_600_000_000),
             urltest_node: Some("vless-out-6".into()),
+            urltest_absent_since_us: None,
         }))
         .unwrap();
         assert_eq!(
@@ -2349,6 +2375,7 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         }))
         .unwrap();
         s.open_incident(&Incident {

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use crate::window::{LinkProvenance, RecentWindow};
 use types::{
@@ -119,10 +120,10 @@ fn is_reading_only(p: &ProxySample) -> bool {
     p.tcp == TcpVerdict::Skip && p.urltest_node.is_some()
 }
 
-/// The selected node's URL-test reading on one proxy tick, as the rule reads
-/// it: the row whose `urltest_node` is the tick's `selector`. The other
-/// members' readings are the record's, not the rule's: the selected node is
-/// what traffic uses.
+/// The traffic-carrying node's URL-test reading on one proxy tick, as the
+/// rule reads it: the row whose `urltest_node` is the tick's `selector` (the
+/// node the collector resolved the selection down to: realm net-observer,
+/// node #139). The other nodes' readings are the record's, not the rule's.
 struct SelectedUrlTest<'a> {
     node: &'a str,
     /// The `server_ip` of the row the reading rides — the listener sing-box
@@ -130,19 +131,19 @@ struct SelectedUrlTest<'a> {
     endpoint: &'a str,
     /// The raw TCP verdict of that same row.
     tcp: TcpVerdict,
-    /// The newest entry's delay and time; `None` = sing-box has not tested
-    /// the node (no measurement).
-    entry: Option<(u32, i64)>,
+    /// Since when the collector has read the node's history empty after an
+    /// entry (`None` = an entry is present, or the node was never seen
+    /// tested).
+    absent_since_us: Option<i64>,
 }
 
-/// Fold `rows` (newest first) into ticks and yield, per tick, the selected
-/// node's reading — `None` for a tick that carries none (no selection, the
-/// API silent, a pre-field daemon). Such ticks are transparent to the rule's
-/// run, exactly as an unmeasured tick is to `wedge`'s: they neither advance
-/// nor reset it.
+/// Fold `rows` (newest first) into ticks and yield, per tick, its `ts_us`
+/// and the selected node's reading — `None` for a tick that carries none
+/// (no selection, the API silent, a pre-field daemon, or the tick still
+/// being written: the reading rides its last row).
 fn selected_urltests<'a>(
     rows: &'a [&'a ProxySample],
-) -> impl Iterator<Item = Option<SelectedUrlTest<'a>>> + 'a {
+) -> impl Iterator<Item = (i64, Option<SelectedUrlTest<'a>>)> + 'a {
     let mut i = 0;
     std::iter::from_fn(move || {
         let ts = rows.get(i)?.ts_us;
@@ -156,12 +157,12 @@ fn selected_urltests<'a>(
                     node,
                     endpoint: r.server_ip.as_str(),
                     tcp: r.tcp,
-                    entry: r.urltest_ms.zip(r.urltest_at_us),
+                    absent_since_us: r.urltest_absent_since_us,
                 });
             }
             i += 1;
         }
-        Some(found)
+        Some((ts, found))
     })
 }
 
@@ -1296,62 +1297,83 @@ direct underlay stream unmeasured"
     }
 }
 
-/// Fires when sing-box's own URL test through the selected node failed on
-/// its `consecutive` newest DISTINCT tests while the raw TCP connect to that
-/// node's endpoint — the same row's `tcp` — answered: the node's listener is
-/// reachable from the underlay, and what sing-box does through it is not.
-/// Neither `wedge` (the tun probe, any node) nor `endpoint-block` (raw TCP,
-/// every node) can say that (realm net-observer, node #62).
+/// How many recent proxy rows `endpoint-dial-stall` looks through for the
+/// newest tick that carries the traffic-carrying node's reading: two ticks'
+/// worth — the newest tick is still being written when the engine
+/// evaluates on its earlier rows (the reading rides the LAST row of a tick),
+/// so the tick before it is the newest complete one until then. A tick is at
+/// most ~7 endpoint rows plus one reading row per node under the group.
+const DIAL_STALL_SCAN: usize = 32;
+
+/// The slack added to two URL-test intervals before an absent test reads as
+/// dead: a test just after the daemon's tick, plus a slow round.
+const DIAL_STALL_SLACK: Duration = Duration::from_secs(30);
+
+/// Fires when sing-box's own URL test of the node that carries traffic has
+/// been ABSENT — its history entry deleted by a failed test, and not
+/// restored by a later one — for longer than two test intervals plus
+/// [`DIAL_STALL_SLACK`], while the raw TCP connect to that node's endpoint
+/// (the same row's `tcp`) answers: the listener is reachable from the
+/// underlay, and what sing-box does through it is not. Neither `wedge` (the
+/// tun probe, any node) nor `endpoint-block` (raw TCP, every node) can say
+/// that (realm net-observer, node #62).
 ///
-/// The reading is sing-box's history, taken by the daemon each tick but
-/// written by sing-box on ITS interval, so consecutive ticks may carry the
-/// same entry: the run counts distinct test times (`urltest_at_us`), a tick
-/// repeating the entry already counted neither advances nor resets it. Only
-/// the selected node's reading counts (see [`selected_urltests`]); a tick
-/// without one, or with a node sing-box has not tested, is transparent. A
-/// test that answered breaks the run, and so does a failed test whose
-/// endpoint's TCP did not answer — that is an endpoint outage, not this
-/// signature. The scan is bounded by [`WEDGE_SCAN`]; the detail names the
-/// newest test of the run.
+/// Read off the NEWEST proxy tick carrying that node's reading — the row
+/// whose `urltest_node` is the tick's `selector` ([`selected_urltests`]) —
+/// never a run of rows: the absence is dated by the collector
+/// (`urltest_absent_since_us`), so age, not count, is the measure. Two
+/// missed rounds rather than one, because a node is tested once per
+/// interval and one slow round is not a dead node. `tcp == SKIP` on that
+/// row is no measurement (no fire); a node never seen tested carries no
+/// absence and cannot fire — a node outside every URLTest group is not
+/// re-tested, so its entry goes stale but never absent (honest silence).
 pub struct EndpointDialStall {
-    pub consecutive: usize,
+    /// sing-box's URLTest `interval`, from the config.
+    interval: Duration,
+    /// `2 × interval + slack`, microseconds.
+    threshold_us: i64,
 }
+
+impl EndpointDialStall {
+    /// The rule for a sing-box whose URLTest group re-tests every
+    /// `urltest_interval`.
+    #[must_use]
+    pub fn new(urltest_interval: Duration) -> Self {
+        let threshold = urltest_interval * 2 + DIAL_STALL_SLACK;
+        Self {
+            interval: urltest_interval,
+            threshold_us: i64::try_from(threshold.as_micros()).unwrap_or(i64::MAX),
+        }
+    }
+}
+
 impl Condition for EndpointDialStall {
     fn id(&self) -> &'static str {
         "endpoint-dial-stall"
     }
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
-        let rows = w.recent_proxy(WEDGE_SCAN);
-        let mut failed = 0usize;
-        // The newest counted test: its node, endpoint and time go into the
-        // detail, and its time is what a repeated entry is recognised by.
-        let mut newest: Option<(&str, &str, i64)> = None;
-        let mut last_at_us: Option<i64> = None;
-        for test in selected_urltests(&rows).flatten() {
-            let Some((ms, at_us)) = test.entry else {
-                continue;
-            };
-            if last_at_us == Some(at_us) {
-                continue;
-            }
-            if ms != 0 || test.tcp != TcpVerdict::Ok {
-                return None;
-            }
-            last_at_us = Some(at_us);
-            let (node, endpoint, at) = *newest.get_or_insert((test.node, test.endpoint, at_us));
-            failed += 1;
-            if failed == self.consecutive {
-                return Some(Fire {
-                    detail: format!(
-                        "sing-box's own test through {node} failed {} times running while TCP \
-to {endpoint} answers (last test {})",
-                        self.consecutive,
-                        types::instant_rfc3339(at)
-                    ),
-                });
-            }
+        let rows = w.recent_proxy(DIAL_STALL_SCAN);
+        let (ts_us, test) = selected_urltests(&rows)
+            .take(2)
+            .find_map(|(ts_us, test)| test.map(|t| (ts_us, t)))?;
+        if test.tcp != TcpVerdict::Ok {
+            return None;
         }
-        None
+        let since_us = test.absent_since_us?;
+        let absent_us = ts_us.saturating_sub(since_us);
+        if absent_us < self.threshold_us {
+            return None;
+        }
+        Some(Fire {
+            detail: format!(
+                "sing-box's own test of {} has had no result for {} min while TCP to {} answers \
+(interval {} s)",
+                test.node,
+                absent_us / 60_000_000,
+                test.endpoint,
+                self.interval.as_secs()
+            ),
+        })
     }
 }
 
@@ -1454,6 +1476,7 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         })
     }
 
@@ -1477,6 +1500,7 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         })
     }
 
@@ -1571,6 +1595,7 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         })
     }
 
@@ -3567,6 +3592,7 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         })
     }
 
@@ -4040,10 +4066,18 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
 
     // ---- sing-box's own URL test (realm net-observer, node #62) ----------
 
-    /// A proxy row carrying `node`'s newest URL-test entry on a tick whose
-    /// selector is `vless-out-6`: the endpoint's raw TCP verdict and the
-    /// entry as `(ms, at_us)` (`None` = not tested yet), with a healthy tun.
-    fn proxy_urltest(ts: i64, node: &str, tcp: TcpVerdict, entry: Option<(u32, i64)>) -> Sample {
+    /// A proxy row carrying `node`'s URL-test reading on a tick whose
+    /// selector is `vless-out-6`: the endpoint's raw TCP verdict, the newest
+    /// entry as `(ms, at_us)` (`None` = no entry now) and since when the
+    /// history has read empty (`None` = present, or never seen tested), with
+    /// a healthy tun.
+    fn proxy_urltest(
+        ts: i64,
+        node: &str,
+        tcp: TcpVerdict,
+        entry: Option<(u32, i64)>,
+        absent_since_us: Option<i64>,
+    ) -> Sample {
         Sample::Proxy(ProxySample {
             ts_us: ts,
             server_ip: "1.1.1.1:443".into(),
@@ -4058,186 +4092,184 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             urltest_ms: entry.map(|(ms, _)| ms),
             urltest_at_us: entry.map(|(_, at)| at),
             urltest_node: Some(node.into()),
+            urltest_absent_since_us: absent_since_us,
         })
     }
 
-    /// The selected node's own test failed on three distinct test times while
-    /// raw TCP to its endpoint answers: sing-box cannot use a listener the
-    /// underlay reaches. Two distinct failures are not yet a run; the third
-    /// fires, and the detail names the node, the listener and the newest
-    /// test's time.
+    const MIN: i64 = 60_000_000;
+
+    /// A 3-minute URLTest interval: the threshold is 2 × 3 min + 30 s.
+    fn dial_stall() -> EndpointDialStall {
+        EndpointDialStall::new(Duration::from_secs(180))
+    }
+
+    /// The traffic-carrying node's test absent for longer than two intervals
+    /// plus the slack, while raw TCP to its listener answers: fires off the
+    /// newest reading, and the detail names the node, the age in minutes,
+    /// the listener and the interval.
     #[test]
-    fn endpoint_dial_stall_fires_after_three_failed_tests_over_a_live_endpoint() {
+    fn endpoint_dial_stall_fires_once_the_absence_outlives_two_intervals() {
         let mut w = RecentWindow::new(32);
-        let c = EndpointDialStall { consecutive: 3 };
+        let c = dial_stall();
         w.push(proxy_urltest(
-            1,
+            7 * MIN,
             "vless-out-6",
             TcpVerdict::Ok,
-            Some((0, 1_000_000)),
+            None,
+            Some(0),
         ));
+        let fire = c.eval(&w).expect("7 min absent is past 2 x 3 min + 30 s");
+        assert_eq!(
+            fire.detail,
+            "sing-box's own test of vless-out-6 has had no result for 7 min while TCP to \
+1.1.1.1:443 answers (interval 180 s)"
+        );
+    }
+
+    /// Younger than the threshold — one missed round, a slow one — is not a
+    /// dead node: no fire at 6 min 29 s, a fire at 6 min 30 s exactly.
+    #[test]
+    fn endpoint_dial_stall_waits_out_two_intervals_and_the_slack() {
+        let c = dial_stall();
+        let mut w = RecentWindow::new(32);
         w.push(proxy_urltest(
-            2,
+            6 * MIN + 29_000_000,
             "vless-out-6",
             TcpVerdict::Ok,
-            Some((0, 2_000_000)),
+            None,
+            Some(0),
+        ));
+        assert!(c.eval(&w).is_none(), "one second short of the threshold");
+        let mut w = RecentWindow::new(32);
+        w.push(proxy_urltest(
+            6 * MIN + 30_000_000,
+            "vless-out-6",
+            TcpVerdict::Ok,
+            None,
+            Some(0),
+        ));
+        assert!(c.eval(&w).is_some(), "the threshold itself fires");
+    }
+
+    /// A `SKIP` on the row (the passive tier, a reading-only row) is no
+    /// measurement, and a `FAIL` is an endpoint outage — `endpoint-block`
+    /// territory — not this signature: neither fires, however old the
+    /// absence.
+    #[test]
+    fn endpoint_dial_stall_needs_the_listener_measured_alive() {
+        let c = dial_stall();
+        for tcp in [TcpVerdict::Skip, TcpVerdict::Fail] {
+            let mut w = RecentWindow::new(32);
+            w.push(proxy_urltest(30 * MIN, "vless-out-6", tcp, None, Some(0)));
+            assert!(c.eval(&w).is_none(), "{tcp:?} is not a live listener");
+        }
+    }
+
+    /// No absence — an entry present, or a node never seen tested (outside
+    /// every URLTest group: stale, never absent) — never fires; and a tick
+    /// with no reading for the selected node (another node's reading only, a
+    /// pre-field daemon) is no measurement.
+    #[test]
+    fn endpoint_dial_stall_silent_without_a_dated_absence() {
+        let c = dial_stall();
+        let mut w = RecentWindow::new(32);
+        w.push(proxy_urltest(
+            30 * MIN,
+            "vless-out-6",
+            TcpVerdict::Ok,
+            Some((186, 29 * MIN)),
+            None,
+        ));
+        assert!(c.eval(&w).is_none(), "an entry is present");
+        let mut w = RecentWindow::new(32);
+        w.push(proxy_urltest(
+            30 * MIN,
+            "vless-out-6",
+            TcpVerdict::Ok,
+            None,
+            None,
         ));
         assert!(
             c.eval(&w).is_none(),
-            "two failed tests are not a run of three"
+            "never seen tested: no absence to date"
         );
-        w.push(proxy_urltest(
-            3,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some((0, 3_000_000)),
-        ));
-        let fire = c.eval(&w).expect("three failed tests over a live endpoint");
-        assert!(
-            fire.detail.contains(
-                "sing-box's own test through vless-out-6 failed 3 times running while TCP \
-to 1.1.1.1:443 answers"
-            ),
-            "{}",
-            fire.detail
-        );
-        assert!(
-            fire.detail.contains("last test 1970-01-01T00:00:03Z"),
-            "the newest test's time: {}",
-            fire.detail
-        );
-    }
-
-    /// sing-box tests on its own interval, so several ticks carry the SAME
-    /// entry: those repeats neither advance nor reset the run. Six ticks of
-    /// two distinct failed tests are two, not six; the third distinct time
-    /// fires.
-    #[test]
-    fn endpoint_dial_stall_counts_distinct_test_times_not_ticks() {
         let mut w = RecentWindow::new(32);
-        let c = EndpointDialStall { consecutive: 3 };
-        for ts in 1..=3 {
-            w.push(proxy_urltest(
-                ts,
-                "vless-out-6",
-                TcpVerdict::Ok,
-                Some((0, 1_000_000)),
-            ));
-        }
-        for ts in 4..=6 {
-            w.push(proxy_urltest(
-                ts,
-                "vless-out-6",
-                TcpVerdict::Ok,
-                Some((0, 2_000_000)),
-            ));
-        }
+        w.push(proxy_urltest(
+            30 * MIN,
+            "vless-out-5",
+            TcpVerdict::Ok,
+            None,
+            Some(0),
+        ));
         assert!(
             c.eval(&w).is_none(),
-            "six ticks of two distinct failed tests are two failures, not six"
+            "another node's reading is not the selector's"
         );
-        w.push(proxy_urltest(
-            7,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some((0, 3_000_000)),
-        ));
-        assert!(
-            c.eval(&w).is_some(),
-            "the third distinct failed test completes the run"
-        );
+        let mut w = RecentWindow::new(32);
+        w.push(proxy(30 * MIN, 204));
+        assert!(c.eval(&w).is_none(), "no reading at all");
     }
 
-    /// A tick with no reading (a pre-field daemon, no selection) or with a
-    /// node sing-box has not tested yet (`None`) is no measurement: it is
-    /// transparent to the run, and a run of such ticks alone never fires.
+    /// The assertion ends the moment the entry is back: the newest tick's
+    /// reading has no absence, so the rule returns `None` and the engine
+    /// closes the incident.
     #[test]
-    fn endpoint_dial_stall_reads_none_as_no_measurement() {
+    fn endpoint_dial_stall_clears_when_the_entry_returns() {
+        let c = dial_stall();
         let mut w = RecentWindow::new(32);
-        let c = EndpointDialStall { consecutive: 3 };
-        for ts in 1..=6 {
-            w.push(proxy(ts, 204));
-        }
-        assert!(c.eval(&w).is_none(), "no reading: no fire");
         w.push(proxy_urltest(
-            10,
+            10 * MIN,
             "vless-out-6",
             TcpVerdict::Ok,
-            Some((0, 1_000_000)),
+            None,
+            Some(0),
         ));
-        w.push(proxy_urltest(
-            11,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some((0, 2_000_000)),
-        ));
-        w.push(proxy(12, 204));
-        w.push(proxy_urltest(13, "vless-out-6", TcpVerdict::Ok, None));
-        assert!(c.eval(&w).is_none(), "still two failed tests");
-        w.push(proxy_urltest(
-            14,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some((0, 3_000_000)),
-        ));
-        assert!(
-            c.eval(&w).is_some(),
-            "the unmeasured ticks in between neither reset nor count"
-        );
-    }
-
-    /// The run clears the moment sing-box's test answers again; a failed
-    /// test over an endpoint whose raw TCP also died is an endpoint outage,
-    /// not this signature, and breaks the run too; and another member's
-    /// reading never forms a run — only the selected node's does.
-    #[test]
-    fn endpoint_dial_stall_clears_on_recovery_and_needs_the_endpoint_alive() {
-        let c = EndpointDialStall { consecutive: 3 };
-        let mut w = RecentWindow::new(32);
-        for ts in 1..=3 {
-            w.push(proxy_urltest(
-                ts,
-                "vless-out-6",
-                TcpVerdict::Ok,
-                Some((0, ts * 1_000_000)),
-            ));
-        }
         assert!(c.eval(&w).is_some());
         w.push(proxy_urltest(
-            4,
+            11 * MIN,
             "vless-out-6",
             TcpVerdict::Ok,
-            Some((202, 4_000_000)),
+            Some((190, 10 * MIN + 30_000_000)),
+            None,
         ));
-        assert!(c.eval(&w).is_none(), "an answered test clears the run");
+        assert!(c.eval(&w).is_none(), "the entry returned");
+    }
 
+    /// The reading rides the LAST row of a tick, and the engine evaluates on
+    /// every row: while the newest tick is still being written, the rule
+    /// reads the tick before it — so an open incident is not closed by the
+    /// first endpoint row of the next tick and reopened by its last.
+    #[test]
+    fn endpoint_dial_stall_reads_the_newest_complete_tick_while_the_next_is_written() {
+        let c = dial_stall();
         let mut w = RecentWindow::new(32);
-        for ts in 1..=3 {
-            w.push(proxy_urltest(
-                ts,
-                "vless-out-6",
-                TcpVerdict::Fail,
-                Some((0, ts * 1_000_000)),
-            ));
-        }
+        w.push(proxy_ep(10 * MIN, "2.2.2.2:2053", TcpVerdict::Ok));
+        w.push(proxy_urltest(
+            10 * MIN,
+            "vless-out-6",
+            TcpVerdict::Ok,
+            None,
+            Some(0),
+        ));
+        assert!(c.eval(&w).is_some());
+        w.push(proxy_ep(11 * MIN, "2.2.2.2:2053", TcpVerdict::Ok));
         assert!(
-            c.eval(&w).is_none(),
-            "a dead listener is endpoint-block territory, not a dial stall"
+            c.eval(&w).is_some(),
+            "the next tick's first row must not read as a recovery"
         );
-
-        let mut w = RecentWindow::new(32);
-        for ts in 1..=3 {
-            w.push(proxy_urltest(
-                ts,
-                "vless-out-5",
-                TcpVerdict::Ok,
-                Some((0, ts * 1_000_000)),
-            ));
-        }
-        assert!(
-            c.eval(&w).is_none(),
-            "another member's reading is not the run"
-        );
+        w.push(proxy_urltest(
+            11 * MIN,
+            "vless-out-6",
+            TcpVerdict::Ok,
+            None,
+            Some(0),
+        ));
+        assert!(c.eval(&w).is_some());
+        // But not further back than one tick: two ticks without the reading
+        // are no measurement.
+        w.push(proxy_ep(12 * MIN, "2.2.2.2:2053", TcpVerdict::Ok));
+        w.push(proxy_ep(13 * MIN, "2.2.2.2:2053", TcpVerdict::Ok));
+        assert!(c.eval(&w).is_none());
     }
 
     /// A reading-only row (`tcp = SKIP` under a named node — the mapping's
@@ -4262,9 +4294,10 @@ to 1.1.1.1:443 answers"
                 est_direct_age_s: None,
                 est_tun_alive: None,
                 est_tun_age_s: None,
-                urltest_ms: Some(0),
+                urltest_ms: Some(186),
                 urltest_at_us: Some(1_000_000),
                 urltest_node: Some("vless-out-5".into()),
+                urltest_absent_since_us: None,
             }));
         }
         push_end_marker(&mut w, 30);

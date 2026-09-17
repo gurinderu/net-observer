@@ -217,6 +217,7 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         }
     }
 
@@ -379,6 +380,18 @@ mod tests {
             ..Default::default()
         };
         assert!(render_status(&snap).contains("urltest=auto:202ms@5s"));
+
+        // A node whose entry sing-box deleted shows the age of the absence.
+        let snap = StatusSnapshot {
+            generated_us: 30_000_000,
+            proxy: Some(ProxySample {
+                urltest_node: Some("auto".into()),
+                urltest_absent_since_us: Some(20_000_000),
+                ..proxy(Some(204), Some("auto"))
+            }),
+            ..Default::default()
+        };
+        assert!(render_status(&snap).contains("urltest=auto:absent@10s"));
     }
 
     #[test]

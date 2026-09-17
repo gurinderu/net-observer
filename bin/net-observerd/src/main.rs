@@ -105,13 +105,6 @@ const WEDGE_CONSECUTIVE: usize = 3;
 /// fire the fleet-wide signature.
 const ENDPOINT_BLOCK_CONSECUTIVE: usize = 2;
 
-/// Endpoint-dial-stall signal (realm net-observer, node #62): sing-box's own
-/// URL test of the selected node failed on this many DISTINCT test times
-/// while raw TCP to its listener answers. Distinct tests, not ticks — the
-/// history is sing-box's, written on its interval — and three of them, like
-/// `wedge`'s three, so one failed test is not an incident.
-const DIAL_STALL_CONSECUTIVE: usize = 3;
-
 /// Ban-cycle signal: this many gateway bans (`Fail` runs bounded by `Ok`) in
 /// the recent window read as one cycling incident with a period. Two bans are
 /// two outages; the third is the pattern.
@@ -1932,15 +1925,17 @@ fn build_engine(
             BACKOFF_US,
         ),
         // Endpoint-dial-stall (realm net-observer, node #62). No pcap freeze:
-        // the evidence is sing-box's own recorded test beside the endpoint's
-        // TCP verdict. Gated like the other fault signatures — a test that
+        // the evidence is sing-box's own test gone absent beside the
+        // endpoint's TCP verdict. The threshold is two of sing-box's URLTest
+        // intervals plus slack — the interval is config, and must match
+        // sing-box's. Gated like the other fault signatures — a test that
         // fails with the uplink, under starvation or in the settle window
         // after a move measures those, not sing-box.
         Trigger::new(
             Box::new(Gated {
-                inner: EndpointDialStall {
-                    consecutive: DIAL_STALL_CONSECUTIVE,
-                },
+                inner: EndpointDialStall::new(Duration::from_secs(
+                    cfg.collectors.proxy.urltest_interval_secs,
+                )),
                 require_direct: true,
                 load_below: Some(STARVATION_LOAD),
                 settle_us: Some(SETTLE_US),
@@ -2475,6 +2470,7 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         })
     }
 
@@ -2496,15 +2492,16 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         })
     }
 
-    /// A healthy proxy tick carrying sing-box's own URL test of the selected
-    /// node (realm net-observer, node #62): the row of that node's endpoint,
-    /// its TCP fine, the tun fine, and the newest test entry as given —
-    /// the endpoint-dial-stall shape (the other builders pin the urltest
-    /// fields to `None`).
-    fn tested_proxy(ts_us: i64, urltest_ms: u32, urltest_at_us: i64) -> Sample {
+    /// A healthy proxy tick carrying sing-box's own URL-test reading of the
+    /// traffic-carrying node (realm net-observer, node #62): the row of that
+    /// node's endpoint, its TCP fine, the tun fine, no entry, and the
+    /// absence dated as given — the endpoint-dial-stall shape (the other
+    /// builders pin the urltest fields to `None`).
+    fn untested_proxy(ts_us: i64, urltest_absent_since_us: i64) -> Sample {
         Sample::Proxy(ProxySample {
             ts_us,
             server_ip: "1.1.1.1:443".into(),
@@ -2516,9 +2513,10 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            urltest_ms: Some(urltest_ms),
-            urltest_at_us: Some(urltest_at_us),
+            urltest_ms: None,
+            urltest_at_us: None,
             urltest_node: Some("vless-out-6".into()),
+            urltest_absent_since_us: Some(urltest_absent_since_us),
         })
     }
 
@@ -2541,6 +2539,7 @@ mod tests {
             urltest_ms: None,
             urltest_at_us: None,
             urltest_node: None,
+            urltest_absent_since_us: None,
         })
     }
 
@@ -3146,14 +3145,12 @@ mod tests {
         );
     }
 
-    /// The `endpoint-dial-stall` rule the daemon actually runs counts to
-    /// [`DIAL_STALL_CONSECUTIVE`] — three — DISTINCT failed tests of the
-    /// selected node over a live listener, no fewer: a tick that repeats the
-    /// entry already counted is not a new test. Dies under
-    /// `DIAL_STALL_CONSECUTIVE = 2` (the two-test run fires, the first
-    /// assertion reds) and under `= 4` (the three-test run stays silent, the
-    /// second reds). The counts are LITERALS on purpose — this test IS the
-    /// constant's pin, like the wedge pin above.
+    /// The `endpoint-dial-stall` rule the daemon actually runs takes its
+    /// threshold from the config's `urltest_interval_secs` — the default
+    /// 180 s, so 2 × 180 + 30 = 390 s of absence: an absence of 389 s stays
+    /// silent, one of 390 s fires. The seconds are LITERALS on purpose —
+    /// this test IS the wiring's pin, like the wedge pin above; a config
+    /// default that moves must move it too, and it says so when it reds.
     ///
     /// Nothing else fires on this stream: the tun is healthy, the endpoint
     /// answers, the gateway is steadily OK, no DNS, host or neighbors sample.
@@ -3162,19 +3159,17 @@ mod tests {
         let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
         let mut w = RecentWindow::new(8);
         feed(&mut fx.engine, &mut w, link(0, GwVerdict::Ok));
-        feed(&mut fx.engine, &mut w, tested_proxy(1, 0, 1_000_000));
-        feed(&mut fx.engine, &mut w, tested_proxy(2, 0, 2_000_000));
-        feed(&mut fx.engine, &mut w, tested_proxy(3, 0, 2_000_000));
+        feed(&mut fx.engine, &mut w, untested_proxy(389_000_000, 0));
         assert_eq!(
             incidents_for(&fx.store, "endpoint-dial-stall"),
             0,
-            "two distinct failed tests are one short of DIAL_STALL_CONSECUTIVE"
+            "389 s of absence is one short of 2 x urltest_interval_secs + 30 s"
         );
-        feed(&mut fx.engine, &mut w, tested_proxy(4, 0, 3_000_000));
+        feed(&mut fx.engine, &mut w, untested_proxy(390_000_000, 0));
         assert_eq!(
             incidents_for(&fx.store, "endpoint-dial-stall"),
             1,
-            "the third distinct failed test completes the run"
+            "390 s of absence over a live listener must be recorded as endpoint-dial-stall"
         );
     }
 

@@ -1553,6 +1553,7 @@ mod tests {
                 urltest_ms: Some(202),
                 urltest_at_us: Some(-4_999_900),
                 urltest_node: Some("auto".into()),
+                urltest_absent_since_us: None,
             }),
             dns: None,
             host: None,
