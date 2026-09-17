@@ -400,6 +400,34 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     let store = Arc::new(DuckdbStore::open(&cfg.db_path).context("opening store")?);
 
+    // The schema migrates forward only: a file a NEWER build has opened keeps
+    // its wider tables under this build, and every positional write to them is
+    // refused by the binder — one gap line per dropped sample, for as long as
+    // this build runs. Say so ONCE here, per table, and never abort: the
+    // tables this build does fit are still recorded (realm net-observer, node
+    // #150).
+    match store::Store::schema_drift(&*store) {
+        Ok(drift) if drift.is_empty() => {
+            tracing::debug!("record schema matches this build: every write binds");
+        }
+        Ok(drift) => {
+            for d in drift {
+                tracing::warn!(
+                    "schema drift: {} has {} columns, this build writes {} — a newer build \
+                     migrated the record; every write to this table will be dropped until \
+                     the daemon is rebuilt from that or a later revision",
+                    d.table,
+                    d.actual,
+                    d.expected
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to compare the record's schema with this build"
+        ),
+    }
+
     // Incidents left open by the previous process can never be closed by it
     // again — the closing edge lived in its memory. Stamp them closed at the
     // observation bound: the record's own newest sample, not this new
@@ -1332,9 +1360,10 @@ fn collector_switch(kind: EventKind, c: &config::Collectors) -> Option<bool> {
         EventKind::Connections => c.connections.enabled,
         EventKind::SingboxLog => c.singbox_log.enabled,
         // Not a collector: incidents are what the triggers write about the
-        // collectors' samples. `pcap_ring` is absent for the same reason from the
-        // other side — it produces no event kind at all.
-        EventKind::Incident => return None,
+        // collectors' samples, and a close is the end of one (realm
+        // net-observer, node #135). `pcap_ring` is absent for the same reason
+        // from the other side — it produces no event kind at all.
+        EventKind::Incident | EventKind::IncidentClosed => return None,
     })
 }
 
@@ -2108,9 +2137,14 @@ mod tests {
             snap.collector(EventKind::Link),
             CollectorAvailability::Enabled
         );
-        // Not a collector, and deliberately never declared as one.
+        // Not a collector, and deliberately never declared as one — nor is
+        // the close of one.
         assert_eq!(
             snap.collector(EventKind::Incident),
+            CollectorAvailability::Absent
+        );
+        assert_eq!(
+            snap.collector(EventKind::IncidentClosed),
             CollectorAvailability::Absent
         );
     }
