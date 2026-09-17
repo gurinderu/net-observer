@@ -228,9 +228,17 @@ impl RecentWindow {
         })
     }
 
-    /// The newest neighbors sample, if any.
+    /// The newest neighbours READING — a cache tick or a scan — if any.
+    ///
+    /// A listener flush (`NeighborsSample::is_listener_flush`) is skipped: it
+    /// is the last window of announcements, not the neighbour table, and it
+    /// arrives every 15 s between the cache ticks. Letting it into this slot
+    /// would have the conditions judge a Sleep-Proxy ARP or a DHCP handover
+    /// as an address collision and churn between two readings of different
+    /// shape (realm net-observer, node #92).
     pub fn last_neighbors(&self) -> Option<&NeighborsSample> {
         self.buf.iter().rev().find_map(|s| match s {
+            Sample::Neighbors(n) if n.is_listener_flush() => None,
             Sample::Neighbors(n) => Some(n),
             Sample::Link(_)
             | Sample::Proxy(_)
@@ -478,5 +486,62 @@ mod tests {
         w.clear_for_resume();
         w.push(link(10));
         assert_eq!(w.prev_link().map(|l| l.ts_us), Some(1));
+    }
+
+    /// The neighbour slot holds the newest READING: a listener flush pushed
+    /// after the cache tick — even one with a different neighbour set — is
+    /// skipped, so a condition judging "the neighbours" never alternates
+    /// between the table and the last window's announcements.
+    #[test]
+    fn last_neighbors_skips_listener_flushes() {
+        use types::{HeardFrames, NeighborObs, NeighborRole, NeighborSource, NeighborsVerdict};
+        let reading = |ts_us: i64, heard: Option<HeardFrames>, mac: &str| {
+            Sample::Neighbors(NeighborsSample {
+                ts_us,
+                verdict: NeighborsVerdict::Ok,
+                reason: None,
+                network_key: None,
+                iface: None,
+                neighbors: vec![NeighborObs {
+                    mac: mac.into(),
+                    ip: "192.168.1.6".into(),
+                    source: if heard.is_some() {
+                        NeighborSource::Announce
+                    } else {
+                        NeighborSource::Arp
+                    },
+                    hostname: None,
+                    role: NeighborRole::Unknown,
+                }],
+                services: Vec::new(),
+                heard,
+            })
+        };
+        let mut w = RecentWindow::new(16);
+        assert!(w.last_neighbors().is_none());
+        w.push(reading(1, None, "11:22:33:44:55:66"));
+        w.push(reading(
+            2,
+            Some(HeardFrames {
+                total: 3,
+                own: Some(0),
+            }),
+            "a4:83:e7:1b:2c:3d",
+        ));
+        let last = w.last_neighbors().expect("the cache tick");
+        assert_eq!(last.ts_us, 1);
+        assert_eq!(last.neighbors[0].source, NeighborSource::Arp);
+
+        // Only flushes in the window: no reading at all, not a flush.
+        let mut w = RecentWindow::new(16);
+        w.push(reading(
+            3,
+            Some(HeardFrames {
+                total: 0,
+                own: Some(0),
+            }),
+            "a4:83:e7:1b:2c:3d",
+        ));
+        assert!(w.last_neighbors().is_none());
     }
 }
