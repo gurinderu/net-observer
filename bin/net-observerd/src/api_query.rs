@@ -81,6 +81,11 @@ pub fn run_query(
         DiagnosticQuery::Connections { group_by } => {
             PreparedSql::plain(diagnosis::connections_sql(group_by))
         }
+        DiagnosticQuery::AirScan => PreparedSql::plain(diagnosis::AIR_LATEST_SCAN_SQL.to_string()),
+        DiagnosticQuery::AirAps => PreparedSql::plain(diagnosis::AIR_LATEST_APS_SQL.to_string()),
+        DiagnosticQuery::AirSelfChannel => {
+            PreparedSql::plain(diagnosis::AIR_SELF_CHANNEL_SQL.to_string())
+        }
     };
     store
         .query_prepared_within(&statement, budget)
@@ -216,6 +221,26 @@ mod tests {
             &[
                 "ts_us", "verdict", "key", "count", "upload", "download", "hosts",
             ],
+        );
+        expect(
+            DiagnosticQuery::AirScan,
+            &["ts_us", "air", "reason", "ap_count"],
+        );
+        expect(
+            DiagnosticQuery::AirAps,
+            &[
+                "channel",
+                "channel_band",
+                "channel_width_mhz",
+                "phy_mode",
+                "security",
+                "rssi_dbm",
+                "noise_dbm",
+            ],
+        );
+        expect(
+            DiagnosticQuery::AirSelfChannel,
+            &["ts_us", "channel", "channel_band", "channel_width_mhz"],
         );
     }
 
