@@ -333,10 +333,40 @@ pub fn now_us() -> i64 {
     jiff::Timestamp::now().as_microsecond()
 }
 
+/// A `ts_us` as a local ISO instant (`2026-09-17T18:05:00+03:00`) — the one
+/// rendering a human reads next to a raw epoch, shared by the CLI's stamps
+/// and the daemon's own messages so both spell a moment the same way. Out of
+/// range never panics.
+#[must_use]
+pub fn local_instant(ts_us: i64) -> String {
+    match jiff::Timestamp::from_microsecond(ts_us) {
+        Ok(ts) => ts
+            .to_zoned(jiff::tz::TimeZone::system())
+            .strftime("%Y-%m-%dT%H:%M:%S%:z")
+            .to_string(),
+        Err(_) => "(timestamp out of range)".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{DnsVerdict, GwVerdict, TcpVerdict};
+
+    /// The local rendering carries the date, the time and the offset, and an
+    /// instant no calendar holds is words, never a panic.
+    #[test]
+    fn local_instant_renders_an_iso_instant_and_never_panics() {
+        let s = local_instant(1_756_731_900_000_000);
+        assert_eq!(s.len(), "2025-09-01T13:05:00+00:00".len(), "{s}");
+        assert!(s.starts_with("2025-0"), "{s}");
+        assert_eq!(s.as_bytes()[10], b'T', "{s}");
+        assert!(
+            s.ends_with(":00") || s.ends_with(":30") || s.ends_with(":45"),
+            "{s}"
+        );
+        assert_eq!(local_instant(i64::MAX), "(timestamp out of range)");
+    }
 
     #[test]
     fn sample_ts_dispatch() {
