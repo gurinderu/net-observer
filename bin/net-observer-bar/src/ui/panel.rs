@@ -897,9 +897,9 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
         });
         // newest is the proxy tick at 4s -> 6s ago at now=10s.
         assert_eq!(freshness_line(&s, 10_000_000), "updated 6s ago");

@@ -29,7 +29,7 @@ use collector_dns::DnsCollector;
 use collector_host::HostCollector;
 use collector_link::{LinkCollector, LinkFacts};
 use collector_neighbors::NeighborsCollector;
-use collector_proxy::{ProbeUrls, ProxyCollector};
+use collector_proxy::ProxyCollector;
 use collector_route::RouteCollector;
 use collector_wifi::WifiCollector;
 use config::Config;
@@ -44,8 +44,8 @@ use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
     BanCycle, EndpointBlock, EndpointDialStall, EstablishedStall, FakeIp, FakeIpHijack, Gated,
-    GwChange, GwDrop, GwMacChange, NeighborMacCollision, PerClientBlock, ProxyDnsStall, Roam,
-    Starvation, Wedge, WifiChurn,
+    GwChange, GwDrop, GwMacChange, NeighborMacCollision, PerClientBlock, Roam, Starvation, Wedge,
+    WifiChurn,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -105,11 +105,11 @@ const WEDGE_CONSECUTIVE: usize = 3;
 /// fire the fleet-wide signature.
 const ENDPOINT_BLOCK_CONSECUTIVE: usize = 2;
 
-/// The dial signals (realm net-observer, node #62): sing-box's own dial
-/// through the selected node dead by IP over a live listener
-/// (`endpoint-dial-stall`), or answering by IP but not by name
-/// (`proxy-dns-stall`), for this many dialled ticks — 45 s at the 15 s
-/// cadence, like `wedge`'s three, so one slow dial is not an incident.
+/// Endpoint-dial-stall signal (realm net-observer, node #62): sing-box's own
+/// URL test of the selected node failed on this many DISTINCT test times
+/// while raw TCP to its listener answers. Distinct tests, not ticks — the
+/// history is sing-box's, written on its interval — and three of them, like
+/// `wedge`'s three, so one failed test is not an incident.
 const DIAL_STALL_CONSECUTIVE: usize = 3;
 
 /// Ban-cycle signal: this many gateway bans (`Fail` runs bounded by `Ok`) in
@@ -587,11 +587,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 phys_iface.clone().unwrap_or_default(),
                 cfg.collectors.proxy.interval,
             ),
-            ProbeUrls {
-                tun: cfg.collectors.proxy.tun_probe_url.clone(),
-                dial_ip: cfg.collectors.proxy.dial_url_ip.clone(),
-                dial_name: cfg.collectors.proxy.dial_url_name.clone(),
-            },
+            cfg.collectors.proxy.tun_probe_url.clone(),
             phys_iface.clone().unwrap_or_default(),
             cfg.collectors.proxy.interval,
             probing.clone(),
@@ -1777,7 +1773,7 @@ fn build_api_server(
 /// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
 /// roam, wifi-churn, gw-mac-change, neighbor-mac-collision, per-client-block,
 /// ban-cycle, fakeip, fakeip-hijack, endpoint-block, established-stall,
-/// endpoint-dial-stall, proxy-dns-stall, starvation). Every rule records an
+/// endpoint-dial-stall, starvation). Every rule records an
 /// incident (durable, in DuckDB) and
 /// mirrors it into the live snapshot's ring for the socket API; gw-change and
 /// gw-mac-change additionally freeze the pcap ring when one is available.
@@ -1935,26 +1931,14 @@ fn build_engine(
             vec![record.clone(), snap.clone()],
             BACKOFF_US,
         ),
-        // The dial signals (realm net-observer, node #62). No pcap freeze:
-        // the evidence is the recorded dial pair beside the endpoint's own
-        // TCP verdict. Gated like the other fault signatures — a dial that
-        // dies with the uplink, under starvation or in the settle window
+        // Endpoint-dial-stall (realm net-observer, node #62). No pcap freeze:
+        // the evidence is sing-box's own recorded test beside the endpoint's
+        // TCP verdict. Gated like the other fault signatures — a test that
+        // fails with the uplink, under starvation or in the settle window
         // after a move measures those, not sing-box.
         Trigger::new(
             Box::new(Gated {
                 inner: EndpointDialStall {
-                    consecutive: DIAL_STALL_CONSECUTIVE,
-                },
-                require_direct: true,
-                load_below: Some(STARVATION_LOAD),
-                settle_us: Some(SETTLE_US),
-            }),
-            vec![record.clone(), snap.clone()],
-            BACKOFF_US,
-        ),
-        Trigger::new(
-            Box::new(Gated {
-                inner: ProxyDnsStall {
                     consecutive: DIAL_STALL_CONSECUTIVE,
                 },
                 require_direct: true,
@@ -2488,9 +2472,9 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
         })
     }
 
@@ -2509,18 +2493,18 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
         })
     }
 
-    /// A healthy proxy tick carrying the selected node's dial (realm
-    /// net-observer, node #62): the row of that node's endpoint, its TCP
-    /// fine, the tun fine, and the two dial sides as given — the
-    /// endpoint-dial-stall / proxy-dns-stall shapes (the other builders pin
-    /// the dial fields to `None`).
-    fn dialled_proxy(ts_us: i64, dial_ip: Option<u32>, dial_name: Option<u32>) -> Sample {
+    /// A healthy proxy tick carrying sing-box's own URL test of the selected
+    /// node (realm net-observer, node #62): the row of that node's endpoint,
+    /// its TCP fine, the tun fine, and the newest test entry as given —
+    /// the endpoint-dial-stall shape (the other builders pin the urltest
+    /// fields to `None`).
+    fn tested_proxy(ts_us: i64, urltest_ms: u32, urltest_at_us: i64) -> Sample {
         Sample::Proxy(ProxySample {
             ts_us,
             server_ip: "1.1.1.1:443".into(),
@@ -2532,9 +2516,9 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: dial_ip,
-            dial_name_ms: dial_name,
-            dial_target: Some("vless-out-6".into()),
+            urltest_ms: Some(urltest_ms),
+            urltest_at_us: Some(urltest_at_us),
+            urltest_node: Some("vless-out-6".into()),
         })
     }
 
@@ -2554,9 +2538,9 @@ mod tests {
             est_direct_age_s: Some(120),
             est_tun_alive: Some(tun_alive),
             est_tun_age_s: Some(45),
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
         })
     }
 
@@ -3162,41 +3146,36 @@ mod tests {
         );
     }
 
-    /// The two dial rules the daemon actually runs count to
-    /// [`DIAL_STALL_CONSECUTIVE`] — three — dialled ticks, no fewer. Two
-    /// streams: the selected node dead by IP over a live listener
-    /// (`endpoint-dial-stall`), and answering by IP but not by name
-    /// (`proxy-dns-stall`, the 2026-09-17 signature). Dies under
-    /// `DIAL_STALL_CONSECUTIVE = 2` (the two-tick run fires, the first
-    /// assertions red) and under `= 4` (the three-tick run stays silent, the
-    /// second assertions red). The tick counts are LITERALS on purpose — this
-    /// test IS the constant's pin, like the wedge pin above.
+    /// The `endpoint-dial-stall` rule the daemon actually runs counts to
+    /// [`DIAL_STALL_CONSECUTIVE`] — three — DISTINCT failed tests of the
+    /// selected node over a live listener, no fewer: a tick that repeats the
+    /// entry already counted is not a new test. Dies under
+    /// `DIAL_STALL_CONSECUTIVE = 2` (the two-test run fires, the first
+    /// assertion reds) and under `= 4` (the three-test run stays silent, the
+    /// second reds). The counts are LITERALS on purpose — this test IS the
+    /// constant's pin, like the wedge pin above.
     ///
-    /// Nothing else fires on these streams: the tun is healthy, the endpoint
+    /// Nothing else fires on this stream: the tun is healthy, the endpoint
     /// answers, the gateway is steadily OK, no DNS, host or neighbors sample.
     #[test]
     fn build_engine_wires_the_production_dial_stall_threshold() {
-        for (rule, ip, name) in [
-            ("endpoint-dial-stall", Some(0), Some(0)),
-            ("proxy-dns-stall", Some(202), Some(0)),
-        ] {
-            let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
-            let mut w = RecentWindow::new(8);
-            feed(&mut fx.engine, &mut w, link(0, GwVerdict::Ok));
-            feed(&mut fx.engine, &mut w, dialled_proxy(1, ip, name));
-            feed(&mut fx.engine, &mut w, dialled_proxy(2, ip, name));
-            assert_eq!(
-                incidents_for(&fx.store, rule),
-                0,
-                "{rule}: two dialled ticks are one short of DIAL_STALL_CONSECUTIVE"
-            );
-            feed(&mut fx.engine, &mut w, dialled_proxy(3, ip, name));
-            assert_eq!(
-                incidents_for(&fx.store, rule),
-                1,
-                "{rule}: the third dialled tick completes the run"
-            );
-        }
+        let mut fx = engine_under_test(Arc::new(PcapRingSlot::empty()));
+        let mut w = RecentWindow::new(8);
+        feed(&mut fx.engine, &mut w, link(0, GwVerdict::Ok));
+        feed(&mut fx.engine, &mut w, tested_proxy(1, 0, 1_000_000));
+        feed(&mut fx.engine, &mut w, tested_proxy(2, 0, 2_000_000));
+        feed(&mut fx.engine, &mut w, tested_proxy(3, 0, 2_000_000));
+        assert_eq!(
+            incidents_for(&fx.store, "endpoint-dial-stall"),
+            0,
+            "two distinct failed tests are one short of DIAL_STALL_CONSECUTIVE"
+        );
+        feed(&mut fx.engine, &mut w, tested_proxy(4, 0, 3_000_000));
+        assert_eq!(
+            incidents_for(&fx.store, "endpoint-dial-stall"),
+            1,
+            "the third distinct failed test completes the run"
+        );
     }
 
     /// The handler fan-out: `gw-change` — and only `gw-change` — gets the pcap

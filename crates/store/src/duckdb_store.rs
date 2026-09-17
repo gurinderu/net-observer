@@ -380,9 +380,9 @@ impl Store for DuckdbStore {
                     p.est_direct_age_s,
                     p.est_tun_alive,
                     p.est_tun_age_s,
-                    p.dial_ip_ms,
-                    p.dial_name_ms,
-                    p.dial_target
+                    p.urltest_ms,
+                    p.urltest_at_us,
+                    p.urltest_node
                 ],
             )?,
             Sample::Dns(d) => c.execute(
@@ -1685,9 +1685,9 @@ mod tests {
             est_direct_age_s: Some(120),
             est_tun_alive: Some(false),
             est_tun_age_s: Some(45),
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
         }))
         .unwrap();
         assert_eq!(
@@ -1701,12 +1701,12 @@ mod tests {
         );
     }
 
-    /// The dial probe lands in its own proxy columns (realm net-observer,
-    /// node #62): the node, the answer by IP and the answer by name, `0` for
-    /// a dial that got nothing back and NULL for one not made — the three
-    /// told apart in SQL.
+    /// sing-box's own URL test lands in its own proxy columns (realm
+    /// net-observer, node #62): the node, the newest entry's delay and its
+    /// time — `0` for a test sing-box failed, NULL for a node it has not
+    /// tested and NULL for a row carrying no reading — told apart in SQL.
     #[test]
-    fn proxy_sample_dial_columns_round_trip() {
+    fn proxy_sample_urltest_columns_round_trip() {
         let s = DuckdbStore::in_memory().unwrap();
         let row = ProxySample {
             ts_us: 1000,
@@ -1719,22 +1719,30 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: Some(202),
-            dial_name_ms: Some(0),
-            dial_target: Some("vless-out-6".into()),
+            urltest_ms: Some(0),
+            urltest_at_us: Some(1_789_659_600_000_000),
+            urltest_node: Some("vless-out-6".into()),
         };
         s.write_sample(&Sample::Proxy(row.clone())).unwrap();
         s.write_sample(&Sample::Proxy(ProxySample {
             server_ip: "2.2.2.2:443".into(),
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: Some("vless-out-5".into()),
+            ..row.clone()
+        }))
+        .unwrap();
+        s.write_sample(&Sample::Proxy(ProxySample {
+            server_ip: "3.3.3.3:443".into(),
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
             ..row
         }))
         .unwrap();
         let t = s
             .query_table(
-                "SELECT server_ip, dial_target, dial_ip_ms, dial_name_ms \
+                "SELECT server_ip, urltest_node, urltest_ms, urltest_at_us \
                  FROM proxy_sample ORDER BY server_ip",
             )
             .unwrap();
@@ -1744,11 +1752,17 @@ mod tests {
                 vec![
                     "1.1.1.1:443".to_string(),
                     "vless-out-6".to_string(),
-                    "202".to_string(),
                     "0".to_string(),
+                    "1789659600000000".to_string(),
                 ],
                 vec![
                     "2.2.2.2:443".to_string(),
+                    "vless-out-5".to_string(),
+                    String::new(),
+                    String::new(),
+                ],
+                vec![
+                    "3.3.3.3:443".to_string(),
                     String::new(),
                     String::new(),
                     String::new(),
@@ -1758,21 +1772,21 @@ mod tests {
         assert_eq!(
             s.query_scalar_i64(
                 "SELECT count(*) FROM proxy_sample \
-                 WHERE dial_target = 'vless-out-6' AND dial_ip_ms > 0 AND dial_name_ms = 0"
+                 WHERE urltest_node = selector AND urltest_ms = 0 AND tcp = 'OK'"
             )
             .unwrap(),
             1,
-            "the dead-DNS-path shape is one SQL predicate"
+            "the selected node's failed test over a live listener is one SQL predicate"
         );
     }
 
     /// A database written by the daemon that shipped `proxy_sample` with the
-    /// established-stream columns but no dial columns keeps its ten-column
-    /// table (`CREATE TABLE IF NOT EXISTS` does nothing to an existing one);
-    /// the three dial columns are added on open, the old row reads back with
-    /// them NULL, and the new daemon's thirteen-value insert lands.
+    /// established-stream columns but no URL-test columns keeps its
+    /// ten-column table (`CREATE TABLE IF NOT EXISTS` does nothing to an
+    /// existing one); the three columns are added on open, the old row reads
+    /// back with them NULL, and the new daemon's thirteen-value insert lands.
     #[test]
-    fn an_old_proxy_table_without_dial_columns_opens_and_keeps_its_rows() {
+    fn an_old_proxy_table_without_urltest_columns_opens_and_keeps_its_rows() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE proxy_sample (
@@ -1788,7 +1802,7 @@ mod tests {
             s.query_scalar_i64(
                 "SELECT count(*) FROM proxy_sample \
                  WHERE ts_us = 1000 AND tun_code = 204 \
-                   AND dial_ip_ms IS NULL AND dial_name_ms IS NULL AND dial_target IS NULL"
+                   AND urltest_ms IS NULL AND urltest_at_us IS NULL AND urltest_node IS NULL"
             )
             .unwrap(),
             1,
@@ -1805,16 +1819,16 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: Some(202),
-            dial_name_ms: Some(210),
-            dial_target: Some("vless-out-6".into()),
+            urltest_ms: Some(202),
+            urltest_at_us: Some(1_789_659_600_000_000),
+            urltest_node: Some("vless-out-6".into()),
         }))
         .unwrap();
         assert_eq!(
             s.query_scalar_i64(
                 "SELECT count(*) FROM proxy_sample \
-                 WHERE ts_us = 2000 AND dial_target = 'vless-out-6' \
-                   AND dial_ip_ms = 202 AND dial_name_ms = 210"
+                 WHERE ts_us = 2000 AND urltest_node = 'vless-out-6' \
+                   AND urltest_ms = 202 AND urltest_at_us = 1789659600000000"
             )
             .unwrap(),
             1
@@ -2332,9 +2346,9 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
         }))
         .unwrap();
         s.open_incident(&Incident {

@@ -109,53 +109,54 @@ fn proxy_ticks<'a>(rows: &'a [&'a ProxySample]) -> impl Iterator<Item = ProxyTic
     })
 }
 
-/// A proxy row that carries a dial and nothing else: the mapping's dial-only
-/// row (`tcp = SKIP` under a named `dial_target`), emitted when a dialled
-/// node's endpoint row was taken by another dialled node or is unknown. It
-/// measures no endpoint, so the endpoint-reading rules must not read its
-/// `SKIP` as "no endpoints were probed" (realm net-observer, node #62).
-fn is_dial_only(p: &ProxySample) -> bool {
-    p.tcp == TcpVerdict::Skip && p.dial_target.is_some()
+/// A proxy row that carries a URL-test reading and nothing else: the
+/// mapping's reading-only row (`tcp = SKIP` under a named `urltest_node`),
+/// emitted when a node's endpoint row was taken by another node on the same
+/// endpoint, is unknown, or was not probed (the passive tier). It measures
+/// no endpoint, so the endpoint-reading rules must not read its `SKIP` as
+/// "no endpoints were probed" (realm net-observer, node #62).
+fn is_reading_only(p: &ProxySample) -> bool {
+    p.tcp == TcpVerdict::Skip && p.urltest_node.is_some()
 }
 
-/// The selected node's dial on one proxy tick, as the dial rules read it: the
-/// row whose `dial_target` is the tick's `selector`. The rotating member's
-/// dial is the record's, not the rules': only the selected node is dialled
-/// every tick, so only its dial forms a run.
-struct SelectedDial<'a> {
+/// The selected node's URL-test reading on one proxy tick, as the rule reads
+/// it: the row whose `urltest_node` is the tick's `selector`. The other
+/// members' readings are the record's, not the rule's: the selected node is
+/// what traffic uses.
+struct SelectedUrlTest<'a> {
     node: &'a str,
-    /// The `server_ip` of the row the dial rides — the listener it went
-    /// through, or `-` on a dial-only row whose endpoint is unknown.
+    /// The `server_ip` of the row the reading rides — the listener sing-box
+    /// tests through, or `-` on a reading-only row whose endpoint is unknown.
     endpoint: &'a str,
     /// The raw TCP verdict of that same row.
     tcp: TcpVerdict,
-    ip: Option<u32>,
-    name: Option<u32>,
+    /// The newest entry's delay and time; `None` = sing-box has not tested
+    /// the node (no measurement).
+    entry: Option<(u32, i64)>,
 }
 
 /// Fold `rows` (newest first) into ticks and yield, per tick, the selected
-/// node's dial — `None` for a tick that carries none (the passive tier, no
-/// selection, the API silent). Such ticks are transparent to the dial rules'
-/// runs, exactly as an unmeasured tick is to `wedge`'s: they neither advance
-/// nor reset a run.
-fn selected_dials<'a>(
+/// node's reading — `None` for a tick that carries none (no selection, the
+/// API silent, a pre-field daemon). Such ticks are transparent to the rule's
+/// run, exactly as an unmeasured tick is to `wedge`'s: they neither advance
+/// nor reset it.
+fn selected_urltests<'a>(
     rows: &'a [&'a ProxySample],
-) -> impl Iterator<Item = Option<SelectedDial<'a>>> + 'a {
+) -> impl Iterator<Item = Option<SelectedUrlTest<'a>>> + 'a {
     let mut i = 0;
     std::iter::from_fn(move || {
         let ts = rows.get(i)?.ts_us;
         let mut found = None;
         while let Some(r) = rows.get(i).filter(|r| r.ts_us == ts) {
             if found.is_none()
-                && let Some(node) = r.dial_target.as_deref()
+                && let Some(node) = r.urltest_node.as_deref()
                 && r.selector.as_deref() == Some(node)
             {
-                found = Some(SelectedDial {
+                found = Some(SelectedUrlTest {
                     node,
                     endpoint: r.server_ip.as_str(),
                     tcp: r.tcp,
-                    ip: r.dial_ip_ms,
-                    name: r.dial_name_ms,
+                    entry: r.urltest_ms.zip(r.urltest_at_us),
                 });
             }
             i += 1;
@@ -860,9 +861,9 @@ impl Condition for EndpointBlock {
         // cohort key.
         let mut cohorts: Vec<Cohort> = Vec::new();
         for p in w.recent_proxy(ENDPOINT_BLOCK_SCAN) {
-            // A dial-only row is not an endpoint: it neither counts toward
+            // A reading-only row is not an endpoint: it neither counts toward
             // the fleet nor reads as "no endpoints were probed".
-            if is_dial_only(p) {
+            if is_reading_only(p) {
                 continue;
             }
             // Exhaustive over the verdict: `Skip` carries no measurement, so
@@ -1181,19 +1182,23 @@ direct underlay stream unmeasured"
     }
 }
 
-/// Fires when, for the last `consecutive` ticks on which the selected node
-/// was dialled, sing-box's own dial through it by IP got no answer
-/// (`dial_ip_ms = 0`) while the raw TCP connect to that node's endpoint —
-/// the same row's `tcp` — answered: the node's listener is reachable from
-/// the underlay, and what sing-box does through it is not. Neither `wedge`
-/// (the tun probe, any node) nor `endpoint-block` (raw TCP, every node) can
-/// say that (realm net-observer, node #62).
+/// Fires when sing-box's own URL test through the selected node failed on
+/// its `consecutive` newest DISTINCT tests while the raw TCP connect to that
+/// node's endpoint — the same row's `tcp` — answered: the node's listener is
+/// reachable from the underlay, and what sing-box does through it is not.
+/// Neither `wedge` (the tun probe, any node) nor `endpoint-block` (raw TCP,
+/// every node) can say that (realm net-observer, node #62).
 ///
-/// Only the selected node's dial counts (see [`selected_dials`]): a tick
-/// without one is transparent, a dial the API could not run (`None` under a
-/// named target) likewise. A dial that answered breaks the run; so does a
-/// dead dial whose endpoint's TCP did not answer — that is an endpoint
-/// outage, not this signature. The scan is bounded by [`WEDGE_SCAN`].
+/// The reading is sing-box's history, taken by the daemon each tick but
+/// written by sing-box on ITS interval, so consecutive ticks may carry the
+/// same entry: the run counts distinct test times (`urltest_at_us`), a tick
+/// repeating the entry already counted neither advances nor resets it. Only
+/// the selected node's reading counts (see [`selected_urltests`]); a tick
+/// without one, or with a node sing-box has not tested, is transparent. A
+/// test that answered breaks the run, and so does a failed test whose
+/// endpoint's TCP did not answer — that is an endpoint outage, not this
+/// signature. The scan is bounded by [`WEDGE_SCAN`]; the detail names the
+/// newest test of the run.
 pub struct EndpointDialStall {
     pub consecutive: usize,
 }
@@ -1203,69 +1208,31 @@ impl Condition for EndpointDialStall {
     }
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let rows = w.recent_proxy(WEDGE_SCAN);
-        let mut dead = 0usize;
-        // The detail names the NEWEST dial of the run: the fold walks
-        // newest first, so the run's first counted dial is the present one.
-        let mut newest: Option<(&str, &str)> = None;
-        for dial in selected_dials(&rows).flatten() {
-            let Some(ip) = dial.ip else {
+        let mut failed = 0usize;
+        // The newest counted test: its node, endpoint and time go into the
+        // detail, and its time is what a repeated entry is recognised by.
+        let mut newest: Option<(&str, &str, i64)> = None;
+        let mut last_at_us: Option<i64> = None;
+        for test in selected_urltests(&rows).flatten() {
+            let Some((ms, at_us)) = test.entry else {
                 continue;
             };
-            if ip != 0 || dial.tcp != TcpVerdict::Ok {
-                return None;
-            }
-            let (node, endpoint) = *newest.get_or_insert((dial.node, dial.endpoint));
-            dead += 1;
-            if dead == self.consecutive {
-                return Some(Fire {
-                    detail: format!(
-                        "dial through {node} dead while TCP to {endpoint} answers ({} ticks)",
-                        self.consecutive
-                    ),
-                });
-            }
-        }
-        None
-    }
-}
-
-/// Fires when, for the last `consecutive` ticks on which the selected node
-/// was dialled, sing-box's dial through it answered by IP but got nothing by
-/// name: the transport through the node works and sing-box's own DNS path
-/// does not — the 2026-09-17 signature, which the tun probe (a name too)
-/// reported as a plain timeout and the daemon under passive recorded as
-/// `SKIP` (realm net-observer, node #62).
-///
-/// Reads the same fold as [`EndpointDialStall`]; a tick without a selected
-/// dial, or with either side unmeasured, is transparent. A dial dead by IP
-/// breaks the run (transport, not DNS), and so does a name that answered.
-pub struct ProxyDnsStall {
-    pub consecutive: usize,
-}
-impl Condition for ProxyDnsStall {
-    fn id(&self) -> &'static str {
-        "proxy-dns-stall"
-    }
-    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
-        let rows = w.recent_proxy(WEDGE_SCAN);
-        let mut dead = 0usize;
-        // The detail names the NEWEST dial of the run and its latency by IP.
-        let mut newest: Option<(&str, u32)> = None;
-        for dial in selected_dials(&rows).flatten() {
-            let (Some(ip), Some(name)) = (dial.ip, dial.name) else {
+            if last_at_us == Some(at_us) {
                 continue;
-            };
-            if ip == 0 || name != 0 {
+            }
+            if ms != 0 || test.tcp != TcpVerdict::Ok {
                 return None;
             }
-            let (node, ip) = *newest.get_or_insert((dial.node, ip));
-            dead += 1;
-            if dead == self.consecutive {
+            last_at_us = Some(at_us);
+            let (node, endpoint, at) = *newest.get_or_insert((test.node, test.endpoint, at_us));
+            failed += 1;
+            if failed == self.consecutive {
                 return Some(Fire {
                     detail: format!(
-                        "sing-box DNS path dead: {node} dials by IP in {ip} ms but not by name \
-({} ticks)",
-                        self.consecutive
+                        "sing-box's own test through {node} failed {} times running while TCP \
+to {endpoint} answers (last test {})",
+                        self.consecutive,
+                        types::instant_rfc3339(at)
                     ),
                 });
             }
@@ -1370,9 +1337,9 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
         })
     }
 
@@ -1393,9 +1360,9 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
         })
     }
 
@@ -1487,9 +1454,9 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
         })
     }
 
@@ -3248,9 +3215,9 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             est_direct_age_s: est_direct.map(|(_, age)| age),
             est_tun_alive: est_tun.map(|(alive, _)| alive),
             est_tun_age_s: est_tun.map(|(_, age)| age),
-            dial_ip_ms: None,
-            dial_name_ms: None,
-            dial_target: None,
+            urltest_ms: None,
+            urltest_at_us: None,
+            urltest_node: None,
         })
     }
 
@@ -3722,18 +3689,12 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         );
     }
 
-    // ---- the dial probe (realm net-observer, node #62) --------------------
+    // ---- sing-box's own URL test (realm net-observer, node #62) ----------
 
-    /// A proxy row carrying a dial through `target` on a tick whose selector
-    /// is `vless-out-6`: the endpoint's raw TCP verdict and the two dial
-    /// sides (`None` = not measured), with a healthy tun.
-    fn proxy_dial(
-        ts: i64,
-        target: &str,
-        tcp: TcpVerdict,
-        ip: Option<u32>,
-        name: Option<u32>,
-    ) -> Sample {
+    /// A proxy row carrying `node`'s newest URL-test entry on a tick whose
+    /// selector is `vless-out-6`: the endpoint's raw TCP verdict and the
+    /// entry as `(ms, at_us)` (`None` = not tested yet), with a healthy tun.
+    fn proxy_urltest(ts: i64, node: &str, tcp: TcpVerdict, entry: Option<(u32, i64)>) -> Sample {
         Sample::Proxy(ProxySample {
             ts_us: ts,
             server_ip: "1.1.1.1:443".into(),
@@ -3745,58 +3706,102 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
-            dial_ip_ms: ip,
-            dial_name_ms: name,
-            dial_target: Some(target.into()),
+            urltest_ms: entry.map(|(ms, _)| ms),
+            urltest_at_us: entry.map(|(_, at)| at),
+            urltest_node: Some(node.into()),
         })
     }
 
-    /// The selected node's dial by IP dead for three dialled ticks while raw
-    /// TCP to its endpoint answers: sing-box cannot use a listener the
-    /// underlay reaches. Two ticks are not yet a run; the third fires, and
-    /// the detail names the node and the listener.
+    /// The selected node's own test failed on three distinct test times while
+    /// raw TCP to its endpoint answers: sing-box cannot use a listener the
+    /// underlay reaches. Two distinct failures are not yet a run; the third
+    /// fires, and the detail names the node, the listener and the newest
+    /// test's time.
     #[test]
-    fn endpoint_dial_stall_fires_after_three_dead_dials_over_a_live_endpoint() {
+    fn endpoint_dial_stall_fires_after_three_failed_tests_over_a_live_endpoint() {
         let mut w = RecentWindow::new(32);
         let c = EndpointDialStall { consecutive: 3 };
-        w.push(proxy_dial(
+        w.push(proxy_urltest(
             1,
             "vless-out-6",
             TcpVerdict::Ok,
-            Some(0),
-            Some(0),
+            Some((0, 1_000_000)),
         ));
-        w.push(proxy_dial(
+        w.push(proxy_urltest(
             2,
             "vless-out-6",
             TcpVerdict::Ok,
-            Some(0),
-            Some(0),
+            Some((0, 2_000_000)),
         ));
         assert!(
             c.eval(&w).is_none(),
-            "two dead dials are not a run of three"
+            "two failed tests are not a run of three"
         );
-        w.push(proxy_dial(
+        w.push(proxy_urltest(
             3,
             "vless-out-6",
             TcpVerdict::Ok,
-            Some(0),
-            Some(0),
+            Some((0, 3_000_000)),
         ));
-        let fire = c.eval(&w).expect("three dead dials over a live endpoint");
+        let fire = c.eval(&w).expect("three failed tests over a live endpoint");
         assert!(
-            fire.detail
-                .contains("dial through vless-out-6 dead while TCP to 1.1.1.1:443 answers"),
+            fire.detail.contains(
+                "sing-box's own test through vless-out-6 failed 3 times running while TCP \
+to 1.1.1.1:443 answers"
+            ),
             "{}",
+            fire.detail
+        );
+        assert!(
+            fire.detail.contains("last test 1970-01-01T00:00:03Z"),
+            "the newest test's time: {}",
             fire.detail
         );
     }
 
-    /// A tick with no dial (the passive tier: every dial field `None`) is
-    /// transparent — it neither advances nor resets the run — and a run of
-    /// such ticks alone never fires. A dial the API could not run (`None`
-    /// under a named target) is transparent the same way.
+    /// sing-box tests on its own interval, so several ticks carry the SAME
+    /// entry: those repeats neither advance nor reset the run. Six ticks of
+    /// two distinct failed tests are two, not six; the third distinct time
+    /// fires.
+    #[test]
+    fn endpoint_dial_stall_counts_distinct_test_times_not_ticks() {
+        let mut w = RecentWindow::new(32);
+        let c = EndpointDialStall { consecutive: 3 };
+        for ts in 1..=3 {
+            w.push(proxy_urltest(
+                ts,
+                "vless-out-6",
+                TcpVerdict::Ok,
+                Some((0, 1_000_000)),
+            ));
+        }
+        for ts in 4..=6 {
+            w.push(proxy_urltest(
+                ts,
+                "vless-out-6",
+                TcpVerdict::Ok,
+                Some((0, 2_000_000)),
+            ));
+        }
+        assert!(
+            c.eval(&w).is_none(),
+            "six ticks of two distinct failed tests are two failures, not six"
+        );
+        w.push(proxy_urltest(
+            7,
+            "vless-out-6",
+            TcpVerdict::Ok,
+            Some((0, 3_000_000)),
+        ));
+        assert!(
+            c.eval(&w).is_some(),
+            "the third distinct failed test completes the run"
+        );
+    }
+
+    /// A tick with no reading (a pre-field daemon, no selection) or with a
+    /// node sing-box has not tested yet (`None`) is no measurement: it is
+    /// transparent to the run, and a run of such ticks alone never fires.
     #[test]
     fn endpoint_dial_stall_reads_none_as_no_measurement() {
         let mut w = RecentWindow::new(32);
@@ -3804,30 +3809,27 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         for ts in 1..=6 {
             w.push(proxy(ts, 204));
         }
-        assert!(c.eval(&w).is_none(), "passive ticks carry no dial: no fire");
-        w.push(proxy_dial(
+        assert!(c.eval(&w).is_none(), "no reading: no fire");
+        w.push(proxy_urltest(
             10,
             "vless-out-6",
             TcpVerdict::Ok,
-            Some(0),
-            Some(0),
+            Some((0, 1_000_000)),
         ));
-        w.push(proxy_dial(
+        w.push(proxy_urltest(
             11,
             "vless-out-6",
             TcpVerdict::Ok,
-            Some(0),
-            Some(0),
+            Some((0, 2_000_000)),
         ));
         w.push(proxy(12, 204));
-        w.push(proxy_dial(13, "vless-out-6", TcpVerdict::Ok, None, None));
-        assert!(c.eval(&w).is_none(), "still two dead dials");
-        w.push(proxy_dial(
+        w.push(proxy_urltest(13, "vless-out-6", TcpVerdict::Ok, None));
+        assert!(c.eval(&w).is_none(), "still two failed tests");
+        w.push(proxy_urltest(
             14,
             "vless-out-6",
             TcpVerdict::Ok,
-            Some(0),
-            Some(0),
+            Some((0, 3_000_000)),
         ));
         assert!(
             c.eval(&w).is_some(),
@@ -3835,41 +3837,38 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         );
     }
 
-    /// The run clears the moment the dial answers again, and a dead dial over
-    /// an endpoint whose raw TCP also died is an endpoint outage, not this
-    /// signature — it breaks the run too. The rotating member's dial never
-    /// forms a run: only the selected node's does.
+    /// The run clears the moment sing-box's test answers again; a failed
+    /// test over an endpoint whose raw TCP also died is an endpoint outage,
+    /// not this signature, and breaks the run too; and another member's
+    /// reading never forms a run — only the selected node's does.
     #[test]
     fn endpoint_dial_stall_clears_on_recovery_and_needs_the_endpoint_alive() {
-        let mut w = RecentWindow::new(32);
         let c = EndpointDialStall { consecutive: 3 };
+        let mut w = RecentWindow::new(32);
         for ts in 1..=3 {
-            w.push(proxy_dial(
+            w.push(proxy_urltest(
                 ts,
                 "vless-out-6",
                 TcpVerdict::Ok,
-                Some(0),
-                Some(0),
+                Some((0, ts * 1_000_000)),
             ));
         }
         assert!(c.eval(&w).is_some());
-        w.push(proxy_dial(
+        w.push(proxy_urltest(
             4,
             "vless-out-6",
             TcpVerdict::Ok,
-            Some(202),
-            Some(210),
+            Some((202, 4_000_000)),
         ));
-        assert!(c.eval(&w).is_none(), "an answered dial clears the run");
+        assert!(c.eval(&w).is_none(), "an answered test clears the run");
 
         let mut w = RecentWindow::new(32);
         for ts in 1..=3 {
-            w.push(proxy_dial(
+            w.push(proxy_urltest(
                 ts,
                 "vless-out-6",
                 TcpVerdict::Fail,
-                Some(0),
-                Some(0),
+                Some((0, ts * 1_000_000)),
             ));
         }
         assert!(
@@ -3879,133 +3878,25 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
 
         let mut w = RecentWindow::new(32);
         for ts in 1..=3 {
-            w.push(proxy_dial(
+            w.push(proxy_urltest(
                 ts,
                 "vless-out-5",
                 TcpVerdict::Ok,
-                Some(0),
-                Some(0),
+                Some((0, ts * 1_000_000)),
             ));
         }
         assert!(
             c.eval(&w).is_none(),
-            "the rotating member's dial is not the run"
+            "another member's reading is not the run"
         );
     }
 
-    /// The 2026-09-17 signature: through the selected node, by IP in ~200 ms,
-    /// by name nothing — for three dialled ticks. The detail carries the node
-    /// and the latency that proves the transport.
+    /// A reading-only row (`tcp = SKIP` under a named node — the mapping's
+    /// row for a reading whose endpoint row was taken or not probed) is not
+    /// an endpoint: it must neither break an all-`Fail` cohort nor be
+    /// counted in the fleet.
     #[test]
-    fn proxy_dns_stall_fires_when_the_dial_answers_by_ip_but_not_by_name() {
-        let mut w = RecentWindow::new(32);
-        let c = ProxyDnsStall { consecutive: 3 };
-        w.push(proxy_dial(
-            1,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some(202),
-            Some(0),
-        ));
-        w.push(proxy_dial(
-            2,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some(198),
-            Some(0),
-        ));
-        assert!(c.eval(&w).is_none());
-        w.push(proxy_dial(
-            3,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some(205),
-            Some(0),
-        ));
-        let fire = c
-            .eval(&w)
-            .expect("three name-dead dials over a live transport");
-        assert!(
-            fire.detail.contains(
-                "sing-box DNS path dead: vless-out-6 dials by IP in 205 ms but not by name"
-            ),
-            "{}",
-            fire.detail
-        );
-    }
-
-    /// No dial (passive) is no measurement and never fires; a dial dead by IP
-    /// too is a transport fault, not a DNS one, and breaks the run; a name
-    /// that answers clears it.
-    #[test]
-    fn proxy_dns_stall_silent_without_the_exact_shape_and_clears_on_recovery() {
-        let c = ProxyDnsStall { consecutive: 3 };
-        let mut w = RecentWindow::new(32);
-        for ts in 1..=6 {
-            w.push(proxy(ts, 204));
-        }
-        assert!(c.eval(&w).is_none(), "passive: no dial, no fire");
-
-        let mut w = RecentWindow::new(32);
-        w.push(proxy_dial(
-            1,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some(202),
-            Some(0),
-        ));
-        w.push(proxy_dial(
-            2,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some(0),
-            Some(0),
-        ));
-        w.push(proxy_dial(
-            3,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some(202),
-            Some(0),
-        ));
-        w.push(proxy_dial(
-            4,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some(202),
-            Some(0),
-        ));
-        assert!(
-            c.eval(&w).is_none(),
-            "a dial dead by IP in the run is transport, and breaks it"
-        );
-
-        let mut w = RecentWindow::new(32);
-        for ts in 1..=3 {
-            w.push(proxy_dial(
-                ts,
-                "vless-out-6",
-                TcpVerdict::Ok,
-                Some(202),
-                Some(0),
-            ));
-        }
-        assert!(c.eval(&w).is_some());
-        w.push(proxy_dial(
-            4,
-            "vless-out-6",
-            TcpVerdict::Ok,
-            Some(202),
-            Some(210),
-        ));
-        assert!(c.eval(&w).is_none(), "a name that answers clears the run");
-    }
-
-    /// A dial-only row (`tcp = SKIP` under a named dial target — the mapping's
-    /// row for a dial whose endpoint row was taken) is not an endpoint: it
-    /// must neither break an all-`Fail` cohort nor be counted in the fleet.
-    #[test]
-    fn endpoint_block_ignores_dial_only_rows() {
+    fn endpoint_block_ignores_reading_only_rows() {
         let mut w = RecentWindow::new(16);
         let c = EndpointBlock { consecutive: 2 };
         w.push(link(1, TcpVerdict::Ok));
@@ -4022,18 +3913,18 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
                 est_direct_age_s: None,
                 est_tun_alive: None,
                 est_tun_age_s: None,
-                dial_ip_ms: Some(0),
-                dial_name_ms: Some(0),
-                dial_target: Some("vless-out-5".into()),
+                urltest_ms: Some(0),
+                urltest_at_us: Some(1_000_000),
+                urltest_node: Some("vless-out-5".into()),
             }));
         }
         push_end_marker(&mut w, 30);
         let fire = c
             .eval(&w)
-            .expect("the dial-only row must not read as a skipped cohort");
+            .expect("the reading-only row must not read as a skipped cohort");
         assert!(
             fire.detail.contains("all 2 endpoints"),
-            "the dial-only row is not an endpoint: {}",
+            "the reading-only row is not an endpoint: {}",
             fire.detail
         );
     }

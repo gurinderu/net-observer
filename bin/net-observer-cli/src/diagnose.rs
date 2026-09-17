@@ -251,19 +251,10 @@ pub(crate) fn format_verdict_at(table: &Table, asked_ts_us: i64) -> Result<Strin
     }
 
     kv(&mut out, "sample_ts", &stamp(at(row, ts)));
-    for col in ["gw", "gw_rtt_ms", "direct", "vless", "tun_code"] {
+    for col in ["gw", "gw_rtt_ms", "direct", "vless", "tun_code", "load1"] {
         let i = c.idx(col)?;
         kv(&mut out, col, &measured(row, i, ABSENT));
     }
-    // The selected node's dial (realm net-observer, node #62) — the columns
-    // a pre-dial daemon's answer does not carry, so their absence is an older
-    // record, not an error, and the lines are simply not printed.
-    for col in ["dial_ip_ms", "dial_name_ms"] {
-        if let Ok(i) = c.idx(col) {
-            kv(&mut out, col, &measured(row, i, ABSENT));
-        }
-    }
-    kv(&mut out, "load1", &measured(row, c.idx("load1")?, ABSENT));
     let verdict = at(row, layer);
     if verdict == "unknown" {
         kv(
@@ -1108,65 +1099,6 @@ mod tests {
     fn verdict_at_says_so_when_the_record_holds_nothing() {
         let out = format_verdict_at(&table(VERDICT_COLS, &[]), 42).unwrap();
         assert!(out.contains("(no record)"), "{out}");
-    }
-
-    /// The dial columns (realm net-observer, node #62) print between the tun
-    /// code and the load when the record carries them — the `proxy-dns`
-    /// verdict reads off them — and are left out, not errored on, when an
-    /// older daemon's answer lacks them.
-    #[test]
-    fn verdict_at_prints_the_dial_when_the_record_carries_it() {
-        let cols: Vec<&str> = [
-            "ts_us",
-            "gw",
-            "gw_rtt_ms",
-            "direct",
-            "vless",
-            "tun_code",
-            "dial_ip_ms",
-            "dial_name_ms",
-            "load1",
-            "layer",
-            "gap_opened_us",
-            "gap_closed_us",
-        ]
-        .to_vec();
-        let t = table(
-            &cols,
-            &[&[
-                "1000",
-                "OK",
-                "3.5",
-                "OK",
-                "OK",
-                "0",
-                "202",
-                "0",
-                "1.2",
-                "proxy-dns",
-                "",
-                "",
-            ]],
-        );
-        let out = format_verdict_at(&t, 1500).unwrap();
-        assert!(out.contains("dial_ip_ms     202"), "{out}");
-        assert!(out.contains("dial_name_ms   0"), "{out}");
-        assert!(out.contains("layer          proxy-dns"), "{out}");
-        assert!(out.find("tun_code") < out.find("dial_ip_ms"), "{out}");
-        assert!(out.find("dial_name_ms") < out.find("load1"), "{out}");
-
-        let older = format_verdict_at(
-            &table(
-                VERDICT_COLS,
-                &[&[
-                    "1000", "OK", "3.5", "OK", "OK", "204", "1.2", "healthy", "", "",
-                ]],
-            ),
-            1500,
-        )
-        .unwrap();
-        assert!(!older.contains("dial_"), "{older}");
-        assert!(older.contains("load1          1.2"), "{older}");
     }
 
     const CTX_COLS: &[&str] = &[
