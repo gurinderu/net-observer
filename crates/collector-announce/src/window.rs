@@ -10,14 +10,18 @@
 //!   neighbour, and the count is what lets the record check that the daemon
 //!   itself put nothing on the wire.
 //! * ARP: the sender pair from the ARP body, unless the sender address is
-//!   unspecified (an address-conflict probe, RFC 5227).
+//!   unspecified (an address-conflict probe, RFC 5227) — or the frame is a
+//!   *reply* from the gateway's MAC, which may be proxy ARP: the router
+//!   answering for an off-link host with its own MAC. The gateway's own
+//!   requests and gratuitous announcements still pair it.
 //! * Every IPv4/IPv6 frame: the Ethernet source paired with the IP source —
 //!   except when the Ethernet source is the gateway's own MAC. The gateway
 //!   forwards: a DHCP reply relayed from an off-link server, an SSDP
 //!   announcement forwarded from the uplink, arrive with its MAC and a
 //!   foreign address, and the pairing would put that address on the
-//!   gateway's row. The gateway's own address comes from its ARP traffic
-//!   instead, which never carries anyone else's.
+//!   gateway's row. The gateway's own address comes from its ARP requests
+//!   instead, which never carry anyone else's — and from the neighbour-cache
+//!   tick, which always holds it.
 //! * mDNS: the sender's strongest hostname claim and the service types it
 //!   announced; SSDP: the type a `NOTIFY` / search response announced; DHCP:
 //!   a client's hostname and vendor class, a server's replies as the
@@ -115,12 +119,20 @@ impl Window {
             self.own = self.own.saturating_add(1);
             return;
         }
+        let from_gateway = Some(frame.src_mac) == self.gateway_mac;
         match frame.heard {
             Heard::Arp {
                 sender_mac,
                 sender_ip,
+                reply,
             } => {
-                if sender_mac != self.own_mac && !sender_ip.is_unspecified() {
+                // A reply from the gateway may be proxy ARP — the router
+                // answering for an off-link host with its own MAC — so only
+                // the gateway's own requests and announcements pair it.
+                if sender_mac != self.own_mac
+                    && !sender_ip.is_unspecified()
+                    && !(reply && from_gateway)
+                {
                     self.sight(sender_mac, IpAddr::V4(sender_ip));
                 }
             }
@@ -130,7 +142,7 @@ impl Window {
                 dst_port,
                 payload,
             } => {
-                if addressable(src_ip) && Some(frame.src_mac) != self.gateway_mac {
+                if addressable(src_ip) && !from_gateway {
                     self.sight(frame.src_mac, src_ip);
                 }
                 let ports = (src_port, dst_port);
@@ -374,14 +386,23 @@ mod tests {
             .unwrap_or_else(|| panic!("no obs for {text} in {:?}", s.neighbors))
     }
 
-    /// The two minutes the owner watched, replayed: the gateway's ARP reply,
-    /// the peer's mDNS announcement, an ARP request to us, our own SSDP
-    /// search. Two neighbours, three services, one frame of ours counted and
-    /// dropped (realm net-observer, node #92).
+    /// The two minutes the owner watched, replayed: the gateway's ARP reply
+    /// (heard; a gateway's reply may be a proxy's, so the pairing waits for
+    /// its own request), the gateway asking for a host, the peer's mDNS
+    /// announcement, an ARP request to us, our own SSDP search. Three
+    /// neighbours, three services, one frame of ours counted and dropped
+    /// (realm net-observer, node #92).
     #[test]
-    fn the_owners_two_minutes_fold_into_two_neighbours_and_their_services() {
+    fn the_owners_two_minutes_fold_into_three_neighbours_and_their_services() {
         let mut w = window();
         w.absorb(&arp(GATEWAY, GATEWAY, GW_IP, OWN_IP, true));
+        w.absorb(&arp(
+            GATEWAY,
+            GATEWAY,
+            GW_IP,
+            Ipv4Addr::new(192, 168, 1, 77),
+            false,
+        ));
         w.absorb(&udp4(
             PEER,
             PEER_IP,
@@ -407,13 +428,13 @@ mod tests {
             M_SEARCH.as_bytes(),
         ));
 
-        assert_eq!(w.heard(), HeardFrames { total: 4, own: 1 });
+        assert_eq!(w.heard(), HeardFrames { total: 5, own: 1 });
         let s = w.flush(42);
         assert_eq!(s.ts_us, 42);
         assert_eq!(s.verdict, NeighborsVerdict::Ok);
         assert_eq!(s.network_key.as_deref(), Some("60:22:32:aa:25:21"));
         assert_eq!(s.iface.as_deref(), Some("en0"));
-        assert_eq!(s.heard, Some(HeardFrames { total: 4, own: 1 }));
+        assert_eq!(s.heard, Some(HeardFrames { total: 5, own: 1 }));
         assert!(s.is_listener_flush());
 
         assert_eq!(s.neighbors.len(), 3, "{:?}", s.neighbors);
@@ -501,6 +522,27 @@ mod tests {
         assert_eq!(srv.kind, AnnounceKind::Dhcp);
         assert_eq!(srv.ip.as_deref(), Some("10.0.0.5"));
         assert_eq!(srv.detail.as_deref(), Some("ack"));
+    }
+
+    /// Proxy ARP: the gateway answering for an off-link host with its own MAC
+    /// must not put that host's address on the gateway's row — but the
+    /// gateway's own request still names it, and any other host's reply
+    /// still pairs.
+    #[test]
+    fn a_proxy_arp_reply_from_the_gateway_does_not_pair_it_with_the_proxied_address() {
+        let mut w = window();
+        let off_link = Ipv4Addr::new(10, 0, 0, 5);
+        w.absorb(&arp(GATEWAY, GATEWAY, off_link, OWN_IP, true));
+        assert!(w.flush(1).neighbors.is_empty());
+
+        let mut w = window();
+        w.absorb(&arp(GATEWAY, GATEWAY, off_link, OWN_IP, true));
+        w.absorb(&arp(GATEWAY, GATEWAY, GW_IP, PEER_IP, false));
+        w.absorb(&arp(PEER, PEER, PEER_IP, OWN_IP, true));
+        let s = w.flush(1);
+        assert_eq!(s.neighbors.len(), 2);
+        assert_eq!(obs(&s, &GATEWAY).ip, "192.168.1.1");
+        assert_eq!(obs(&s, &PEER).ip, "192.168.1.6");
     }
 
     /// Without a gateway key there is no guard: every unicast IP frame pairs.

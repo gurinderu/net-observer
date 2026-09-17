@@ -36,7 +36,10 @@ use crate::window::Window;
 pub const FLUSH_EVERY: Duration = Duration::from_secs(15);
 
 /// Frames the reader thread may run ahead of a flush. When full the reader
-/// blocks, the pipe backs up and `tcpdump` buffers — back-pressure, not loss.
+/// blocks and the pipe backs up into `tcpdump`'s and the kernel's own
+/// capture buffers: the daemon itself buffers nothing past this, and a
+/// segment chatty enough to overrun it loses frames at the capture, where
+/// `tcpdump` counts them, never in a growing queue here.
 const FRAME_QUEUE: usize = 4096;
 
 /// The segment's identity, read at the start of every window so a window
@@ -250,12 +253,13 @@ mod tests {
     }
 
     fn frames() -> Vec<u8> {
+        // The gateway asking for a host: its own request, which pairs it.
         let gw = arp(
             GATEWAY,
             GATEWAY,
             Ipv4Addr::new(192, 168, 1, 1),
             Ipv4Addr::new(192, 168, 1, 5),
-            true,
+            false,
         );
         let peer_ip = Ipv4Addr::new(192, 168, 1, 6);
         let peer = udp4(

@@ -9,7 +9,9 @@
 //!
 //! Passive by default: the ARP and NDP caches are read, never filled. Rows whose
 //! [`NeighborSource`] is `Sweep` or `Mdns` exist only because an operator pressed
-//! the scan button — the daemon does not probe the segment on a timer.
+//! the scan button — the daemon does not probe the segment on a timer. Rows
+//! whose source is `Announce` came from the device itself: a frame it put on
+//! the segment, heard by the passive listener (realm net-observer, node #92).
 
 use serde::{Deserialize, Serialize};
 

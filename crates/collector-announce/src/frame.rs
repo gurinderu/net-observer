@@ -52,10 +52,14 @@ pub fn is_unicast(mac: &Mac) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Heard<'a> {
     /// An ARP packet over Ethernet/IPv4: the sender pair, straight from the
-    /// ARP body (not the Ethernet header — the two can legitimately differ).
+    /// ARP body (not the Ethernet header — the two can legitimately differ),
+    /// and whether it is a reply (a request or a gratuitous announcement is
+    /// a device speaking for itself; a reply may be a proxy speaking for
+    /// someone else).
     Arp {
         sender_mac: Mac,
         sender_ip: std::net::Ipv4Addr,
+        reply: bool,
     },
     /// A UDP datagram over IPv4 or IPv6.
     Udp {
@@ -95,6 +99,7 @@ pub fn decode(bytes: &[u8]) -> Option<Frame<'_>> {
                 (Ok(sender_mac), Ok(ip)) => Heard::Arp {
                     sender_mac,
                     sender_ip: ip.into(),
+                    reply: arp.operation() == etherparse::ArpOperation::REPLY,
                 },
                 _ => Heard::Other,
             }
@@ -240,9 +245,15 @@ pub(crate) mod tests {
             f.heard,
             Heard::Arp {
                 sender_mac: GATEWAY,
-                sender_ip: gw_ip
+                sender_ip: gw_ip,
+                reply: true,
             }
         );
+        let bytes = arp(PEER, PEER, Ipv4Addr::new(192, 168, 1, 6), gw_ip, false);
+        assert!(matches!(
+            decode(&bytes).unwrap().heard,
+            Heard::Arp { reply: false, .. }
+        ));
     }
 
     #[test]
