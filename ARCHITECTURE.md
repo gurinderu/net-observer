@@ -555,6 +555,30 @@ graph TD
   daemon built before `Request::Query` existed). Each finding is a hypothesis
   carrying its confidence, and the caption says so. (realm net-observer, node
   #90)
+  **The map draws announced neighbours apart from scanned ones.** The
+  snapshot's neighbour table is the cache reading, and a flush of the passive
+  `announce` listener deliberately does not replace it, so a device the record
+  knows only because it announced itself never reaches `snapshot.neighbors`.
+  The map window therefore reads the record's `neighbor` table for itself — a
+  read-only `Query(Neighbors { network: None })` over the socket, fetched when
+  the window opens, after each rung, and every 30 s (`ANNOUNCE_REFRESH`) while
+  it is open, since the listener grows that table with no scan to hang a read
+  on — and at each paint folds out of it the `announce`-sourced rows whose
+  `network_key` is the segment the star is drawing (other segments' rows are
+  ignored; a keyless reading folds nothing). A device the reading already
+  carries keeps its scanned node; one the record knows only from its
+  announcements is drawn as an extra ring node in its own `announce` ink under
+  a `◌` glyph, named as such in the legend, and appended to the List reading
+  with `announce` in the `via` column and the record's own first/last-seen
+  bounds — or, when its MAC is the segment key, takes the centre as the
+  gateway heard on the segment, never a ring seat beside a placeholder. Both
+  readings count alike: `N neighbours · +M announced`. The record keeps
+  history, the map shows presence: an announcement whose `last_seen_us` is
+  more than ten minutes (`ANNOUNCE_STALE_US`) older than the snapshot's
+  `generated_us` is not drawn — a bound that is honest because the table it
+  is read from is at most one refresh old. A read the daemon could not answer
+  is the daemon's own words on a line, never a silently empty overlay. (realm
+  net-observer, node #92)
   **The connections window shows what this machine talks to, grouped the
   operator's way.** The fourth normal window, after events, map and air
   (`bin/net-observer-bar/src/connections.rs`, the menu's **Connections** entry,
