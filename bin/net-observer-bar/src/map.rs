@@ -76,7 +76,8 @@ use types::{
 };
 
 use crate::ui::{
-    Dating, Glance, PROVENANCE_TEXT, Theme, dated, hint, moments_diverge, note, separator,
+    Dating, Glance, PROVENANCE_TEXT, Theme, column_index, dated, hint, moments_diverge, note,
+    separator,
 };
 
 /// Initial size of the network-map window (resizable afterwards), gpui logical px.
@@ -307,23 +308,17 @@ impl AnnouncedNeighbor {
 /// `unknown`, which every unidentified segment ever seen shares, and the star
 /// cannot tell whose they are.
 ///
-/// Columns are found by NAME, never by position, like [`finding_lines`]: a
-/// table missing one of the seven the fold reads is an `Err` naming it, and a
-/// bound that does not parse is an `Err` naming the device — never a device
-/// drawn as fresh from a cell that was not a moment. A `hostname` cell the
-/// store spelt empty (SQL `NULL`) is `None`. Pure over its input so it is
-/// testable without a window. (realm net-observer, node #92)
+/// Columns are found by NAME, never by position ([`column_index`]), like
+/// [`finding_lines`]: a table missing one of the seven the fold reads is an
+/// `Err` naming it, and a bound that does not parse is an `Err` naming the
+/// device — never a device drawn as fresh from a cell that was not a moment. A
+/// `hostname` cell the store spelt empty (SQL `NULL`) is `None`. Pure over its
+/// input so it is testable without a window. (realm net-observer, node #92)
 fn announced_neighbors(
     table: &Table,
     network_key: Option<&str>,
 ) -> Result<Vec<AnnouncedNeighbor>, String> {
-    let col = |name: &str| {
-        table
-            .columns
-            .iter()
-            .position(|c| c == name)
-            .ok_or_else(|| format!("neighbours table has no `{name}` column"))
-    };
+    let col = |name: &str| column_index(table, name);
     let key = col("network_key")?;
     let mac = col("mac")?;
     let ip = col("ip")?;
@@ -1776,18 +1771,12 @@ struct HostFindings {
 /// Reduce the daemon's `Vulns` table to what the section draws, grouped by host
 /// in order of first appearance (the daemon orders by newest sighting first).
 ///
-/// Columns are found by NAME, never by position: a table missing one of the
-/// seven is an `Err` naming it, so a daemon whose diagnosis grew or shrank is
-/// reported rather than drawn misaligned. Pure over its input so the grouping
-/// and the line format are testable without a window.
+/// Columns are found by NAME, never by position ([`column_index`]): a table
+/// missing one of the seven is an `Err` naming it, so a daemon whose diagnosis
+/// grew or shrank is reported rather than drawn misaligned. Pure over its input
+/// so the grouping and the line format are testable without a window.
 fn finding_lines(table: &Table) -> Result<Vec<HostFindings>, String> {
-    let col = |name: &str| {
-        table
-            .columns
-            .iter()
-            .position(|c| c == name)
-            .ok_or_else(|| format!("findings table has no `{name}` column"))
-    };
+    let col = |name: &str| column_index(table, name);
     let mac = col("mac")?;
     let ip = col("ip")?;
     let port = col("port")?;
@@ -2074,23 +2063,26 @@ impl MapView {
         }
     }
 
-    /// Ask the daemon for its findings on the background executor and keep the
-    /// answer (see [`crate::ui::fetch_findings`]) — the same shape as a control
-    /// round-trip: never on the gpui main thread, written back through a weak
-    /// handle so a closed window just drops it. On open and after each rung,
-    /// never on a timer — the record's findings change only when a scan runs.
+    /// Ask the daemon for one table on the background executor and keep the
+    /// answer: `fetch` is the blocking socket read, `store` where the view
+    /// keeps what came back. The same shape as a control round-trip — never on
+    /// the gpui main thread, written back through a weak handle so a closed
+    /// window just drops it — decided once for every table this window reads.
     ///
-    /// Not part of [`MapView::new`]: the open path ([`open_window`]) calls it,
-    /// so a headless test can build the view with an injected `findings` state
+    /// Not part of [`MapView::new`]: the open path ([`open_window`]) starts the
+    /// reads, so a headless test can build the view with an injected state
     /// that no socket read then races to overwrite.
-    fn spawn_findings_fetch(&self, cx: &mut Context<Self>) {
+    fn spawn_table_fetch(
+        &self,
+        cx: &mut Context<Self>,
+        fetch: fn(&str) -> Result<Table, String>,
+        store: fn(&mut Self, Result<Table, String>),
+    ) {
         let socket = self.model.read(cx).socket_path.clone();
         cx.spawn(async move |view, acx: &mut AsyncApp| {
-            let findings = acx
-                .background_spawn(async move { crate::ui::fetch_findings(&socket) })
-                .await;
+            let table = acx.background_spawn(async move { fetch(&socket) }).await;
             view.update(acx, |v, cx| {
-                v.findings = Some(findings);
+                store(v, table);
                 cx.notify();
             })
             .ok();
@@ -2098,27 +2090,24 @@ impl MapView {
         .detach();
     }
 
+    /// Read the findings (see [`crate::ui::fetch_findings`]): on open and
+    /// after each rung, never on a timer — the record's findings change only
+    /// when a scan runs.
+    fn spawn_findings_fetch(&self, cx: &mut Context<Self>) {
+        self.spawn_table_fetch(cx, crate::ui::fetch_findings, |v, table| {
+            v.findings = Some(table);
+        });
+    }
+
     /// Read the record's neighbour table for the announce overlay (see
-    /// [`crate::ui::fetch_neighbors`]) — [`MapView::spawn_findings_fetch`] to
-    /// the letter: on open, after each rung, and every [`ANNOUNCE_REFRESH`]
-    /// while the window is open ([`MapView::spawn_announced_refresh`]) — the
-    /// listener grows this table on its own cadence, with no scan to hang a
-    /// read on. Not part of [`MapView::new`] for the same reason: a headless
-    /// test injects the `announced` state and no socket read then races to
-    /// overwrite it.
+    /// [`crate::ui::fetch_neighbors`]): on open, after each rung, and every
+    /// [`ANNOUNCE_REFRESH`] while the window is open
+    /// ([`MapView::spawn_announced_refresh`]) — the listener grows this table
+    /// on its own cadence, with no scan to hang a read on.
     fn spawn_announced_fetch(&self, cx: &mut Context<Self>) {
-        let socket = self.model.read(cx).socket_path.clone();
-        cx.spawn(async move |view, acx: &mut AsyncApp| {
-            let announced = acx
-                .background_spawn(async move { crate::ui::fetch_neighbors(&socket) })
-                .await;
-            view.update(acx, |v, cx| {
-                v.announced = Some(announced);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.spawn_table_fetch(cx, crate::ui::fetch_neighbors, |v, table| {
+            v.announced = Some(table);
+        });
     }
 
     /// Re-read the announced table every [`ANNOUNCE_REFRESH`] for as long as
@@ -2127,7 +2116,7 @@ impl MapView {
     /// executor's timer, then start one read through the weak handle; the
     /// first tick that finds the view gone ends the loop. Started by the open
     /// path beside the first read, not by [`MapView::new`], for the reason
-    /// given on [`MapView::spawn_findings_fetch`].
+    /// given on [`MapView::spawn_table_fetch`].
     ///
     /// That the loop fires at the cadence is a *Ceiling* claim: a headless
     /// window cannot observe a timer, so what the tests hold is the fold and
@@ -2408,7 +2397,7 @@ fn open_window(cx: &mut App, model: Entity<Glance>) -> Option<WindowHandle<MapVi
             let view = MapView::new(model, cx);
             // The first findings and neighbour-table reads, and the
             // neighbour-table refresh loop, belong to the open, not to the
-            // constructor (see `MapView::spawn_findings_fetch`).
+            // constructor (see `MapView::spawn_table_fetch`).
             view.spawn_findings_fetch(cx);
             view.spawn_announced_fetch(cx);
             view.spawn_announced_refresh(cx);

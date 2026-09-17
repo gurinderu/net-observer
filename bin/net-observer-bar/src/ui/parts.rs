@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
 use gpui::{AnyElement, IntoElement, RenderOnce, Rgba, SharedString, div, px, rgb};
+use net_observer_ipc::Table;
 
 use super::theme::{MENU_SEPARATOR_H, Theme};
 
@@ -277,6 +278,24 @@ pub(crate) fn moments_diverge(a_us: i64, b_us: i64) -> Option<String> {
 /// window dates its picture at the same size, or the same fact reads as two
 /// different kinds of fact.
 pub(crate) const PROVENANCE_TEXT: f32 = 11.0;
+
+// ---- a column of a daemon table, by name ------------------------------------
+
+/// The position of column `name` in a daemon table, or an `Err` naming the
+/// column the table lacks.
+///
+/// Every reader of a `Table` — the map's findings and neighbour folds, the
+/// connections tick — finds its columns by NAME, never by position, so a
+/// daemon whose diagnosis grew or shrank is reported rather than drawn
+/// misaligned. One lookup for all of them, so the rule and its wording are
+/// decided once; the section that shows the `Err` names which table it was.
+pub(crate) fn column_index(table: &Table, name: &str) -> Result<usize, String> {
+    table
+        .columns
+        .iter()
+        .position(|c| c == name)
+        .ok_or_else(|| format!("table has no `{name}` column"))
+}
 
 // ---- a state, in words, under a selector that carries them -----------------
 

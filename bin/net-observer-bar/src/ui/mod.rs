@@ -54,8 +54,8 @@ pub use panel::PanelView;
 pub(crate) use parts::HINT_TIP_SELECTOR;
 pub use parts::now_us;
 pub(crate) use parts::{
-    Dating, PROVENANCE_TEXT, age_str, clock, dated, gap_label, hint, moments_diverge, note, row,
-    separator,
+    Dating, PROVENANCE_TEXT, age_str, clock, column_index, dated, gap_label, hint, moments_diverge,
+    note, row, separator,
 };
 /// How a headless test names the two halves of a shared key-value row.
 #[cfg(test)]
