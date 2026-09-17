@@ -1549,10 +1549,11 @@ async fn supervise_pcap_ring<R, Fut, S>(
 /// `start` opens the capture on the interface and spawns what drives it,
 /// returning the task that ends when the capture does (`spawn_event_collector`'s
 /// handle completes when its source thread returns; the topology patrol's never
-/// does, so it is started once per interface resolution). It runs on the
-/// runtime, so it must return promptly: `AnnounceCapture::start` waits at most
-/// its header bound. The spawned task is aborted with this one, so a capture
-/// cannot outlive its supervisor through `abort_all`.
+/// does, so it is started once per interface resolution). It may block —
+/// `AnnounceCapture::start` waits for the child's pcap header, up to its bound
+/// — so it runs on the blocking pool, never on a runtime worker. The spawned
+/// task is aborted with this one, so a capture cannot outlive its supervisor
+/// through `abort_all`.
 ///
 /// Logging is by *change of reason*, never per attempt, as for the ring: the
 /// first failure and each subsequent different reason are logged, and so is
@@ -1567,34 +1568,46 @@ async fn supervise_on_iface<R, Fut, S>(
 ) where
     R: Fn() -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
-    S: Fn(&str) -> std::io::Result<JoinHandle<()>>,
+    S: Fn(&str) -> std::io::Result<JoinHandle<()>> + Send + Sync + 'static,
 {
+    let start = Arc::new(start);
     let mut last_reason: Option<String> = None;
     loop {
         let reason = match resolve_iface().await {
             None => Some("no physical interface resolved".to_string()),
-            Some(iface) => match start(&iface) {
-                Ok(handle) => {
-                    tracing::info!(capture = name, iface, "capture started");
-                    last_reason = None;
-                    let mut running = AbortOnDrop(handle);
-                    match (&mut running.0).await {
-                        Ok(()) => tracing::warn!(
-                            capture = name,
-                            retry_s = interval.as_secs(),
-                            "capture ended; will restart"
-                        ),
-                        Err(e) => tracing::error!(
-                            capture = name,
-                            error = %e,
-                            retry_s = interval.as_secs(),
-                            "capture task failed; will restart"
-                        ),
+            Some(iface) => {
+                // Off the runtime workers: the announce start waits for the
+                // child's header. The blocking pool's threads carry the runtime
+                // context, so `tokio::spawn` and `Handle::current()` inside
+                // `start` are valid there.
+                let started = {
+                    let (start, iface) = (start.clone(), iface.clone());
+                    tokio::task::spawn_blocking(move || start(&iface)).await
+                };
+                match started {
+                    Ok(Ok(handle)) => {
+                        tracing::info!(capture = name, iface, "capture started");
+                        last_reason = None;
+                        let mut running = AbortOnDrop(handle);
+                        match (&mut running.0).await {
+                            Ok(()) => tracing::warn!(
+                                capture = name,
+                                retry_s = interval.as_secs(),
+                                "capture ended; will restart"
+                            ),
+                            Err(e) => tracing::error!(
+                                capture = name,
+                                error = %e,
+                                retry_s = interval.as_secs(),
+                                "capture task failed; will restart"
+                            ),
+                        }
+                        None
                     }
-                    None
+                    Ok(Err(e)) => Some(format!("tcpdump could not be started on {iface}: {e}")),
+                    Err(e) => Some(format!("capture start task failed on {iface}: {e}")),
                 }
-                Err(e) => Some(format!("tcpdump could not be started on {iface}: {e}")),
-            },
+            }
         };
         if reason != last_reason {
             if let Some(reason) = &reason {
