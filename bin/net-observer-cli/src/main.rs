@@ -1931,6 +1931,68 @@ mod tests {
         }
     }
 
+    /// A daemon that answers the scan live and then fails or cannot decode
+    /// `AirAps` is a hard error, never a silent detour to the file: falling
+    /// back there would risk pairing the live scan just read with a stale
+    /// offline AP list from a different moment. Modelled on the
+    /// `Silences`-failed case in
+    /// `gaps_asks_silences_first_and_gaps_only_on_an_old_daemon`.
+    #[test]
+    fn air_errors_on_a_daemon_that_fails_mid_group_never_falls_to_the_file() {
+        use std::cell::RefCell;
+        let asked: RefCell<Vec<DiagnosticQuery>> = RefCell::new(Vec::new());
+        let scan_table = Table {
+            columns: vec!["ts_us".into()],
+            rows: vec![vec!["1000".into()]],
+        };
+
+        let failed = route_air(Some("/run/observer.sock"), |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(match q {
+                DiagnosticQuery::AirScan => QueryOutcome::Table(scan_table.clone()),
+                DiagnosticQuery::AirAps { .. } => QueryOutcome::Failed("boom".into()),
+                other => panic!("must not ask {other:?}"),
+            })
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(failed.contains("boom"), "{failed}");
+        assert_eq!(
+            *asked.borrow(),
+            vec![
+                DiagnosticQuery::AirScan,
+                DiagnosticQuery::AirAps { scan_ts_us: 1000 }
+            ],
+            "a failure on AirAps must not be followed by AirSelfChannel either"
+        );
+
+        // `Unsupported` mid-group is the same: an error, not a fallback — the
+        // daemon just answered the scan, so it is current enough that
+        // "cannot decode AirAps" cannot mean "too old", and the file must not
+        // silently stand in.
+        asked.borrow_mut().clear();
+        let unsupported = route_air(Some("/run/observer.sock"), |_, q| {
+            asked.borrow_mut().push(q.clone());
+            Ok(match q {
+                DiagnosticQuery::AirScan => QueryOutcome::Table(scan_table.clone()),
+                DiagnosticQuery::AirAps { .. } => {
+                    QueryOutcome::Unsupported("bad request: unknown variant `AirAps`".into())
+                }
+                other => panic!("must not ask {other:?}"),
+            })
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(unsupported.contains("AirAps"), "{unsupported}");
+        assert_eq!(
+            *asked.borrow(),
+            vec![
+                DiagnosticQuery::AirScan,
+                DiagnosticQuery::AirAps { scan_ts_us: 1000 }
+            ]
+        );
+    }
+
     /// A daemon that read the request and could not run it, and a socket that
     /// is there but broken, are errors — never a detour to the file, where the
     /// lock would report the wrong problem.
