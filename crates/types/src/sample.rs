@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::air::AirSample;
 use crate::connection::ConnectionsSample;
 use crate::neighbor::NeighborsSample;
+use crate::singbox_log::SingboxLogSample;
 use crate::verdict::{DnsVerdict, GwVerdict, LinkMedium, TcpVerdict, WifiVerdict};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -233,6 +234,10 @@ pub enum Sample {
     /// proxy's API lists it, aggregated per destination (realm net-observer,
     /// node #75).
     Connections(ConnectionsSample),
+    /// One `(class, node)` of sing-box's own ERROR/WARN lines in one tick of
+    /// the passive log reader — several rows per tick when several classes
+    /// were seen, none when none were (realm net-observer, node #141).
+    SingboxLog(SingboxLogSample),
 }
 
 impl Sample {
@@ -247,6 +252,7 @@ impl Sample {
             Sample::Neighbors(n) => n.ts_us,
             Sample::Air(a) => a.ts_us,
             Sample::Connections(c) => c.ts_us,
+            Sample::SingboxLog(s) => s.ts_us,
         }
     }
 }
@@ -367,6 +373,15 @@ mod tests {
             rows: Vec::new(),
         });
         assert_eq!(c.ts_us(), 41);
+
+        let s = Sample::SingboxLog(crate::SingboxLogSample {
+            ts_us: 43,
+            class: crate::SingboxLogClass::NoRoute,
+            count: 2,
+            node: Some("vless-out-6".into()),
+            sample_message: None,
+        });
+        assert_eq!(s.ts_us(), 43);
     }
 
     /// A host sample written by a daemon that shipped before the disk and swap
