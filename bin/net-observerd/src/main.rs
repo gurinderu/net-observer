@@ -822,25 +822,37 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // Passive switch-topology discovery: a slow patrol that opens its OWN
     // short-lived LLDP/CDP capture (never the shared incident ring), maps each
-    // received frame to an uplink edge, and records it. Gated on the config
-    // toggle and on having resolved a physical interface to listen on. Pushed
-    // onto `handles` so it is aborted with the collectors on shutdown. The LIVE
-    // capture is a project Ceiling (needs root + BPF on a real network); the
-    // patrol degrades honestly when it cannot open one (see `lldp_capture`).
-    // Gated on the neighbours subsystem being enabled AND the topology
-    // toggle: disabling neighbours turns its sub-feature off too, no surprise.
+    // received frame to an uplink edge, and records it. Gated on the neighbours
+    // subsystem being enabled AND the topology toggle: disabling neighbours
+    // turns its sub-feature off too, no surprise. The patrol needs a physical
+    // interface to listen on, so it too waits under `supervise_on_iface` for
+    // one to appear rather than being skipped for the life of a process that
+    // booted without one (realm net-observer, node #134); once started it runs
+    // on that interface, its own capture bounded per run. Pushed onto `handles`
+    // so it is aborted with the collectors on shutdown. The LIVE capture is a
+    // project Ceiling (needs root + BPF on a real network); the patrol degrades
+    // honestly when it cannot open one (see `lldp_capture`).
     if cfg.collectors.neighbors.enabled && cfg.collectors.neighbors.topology {
-        match phys_iface.clone() {
-            Some(iface) => handles.push(spawn_topology_patrol(
-                store.clone(),
-                snapshot.clone(),
-                observing.clone(),
-                iface,
-            )),
-            None => tracing::warn!(
-                "topology discovery enabled but no physical interface resolved; not capturing LLDP/CDP"
-            ),
-        }
+        let store = store.clone();
+        let snapshot = snapshot.clone();
+        let observing = observing.clone();
+        let resolve_iface = resolve_iface.clone();
+        handles.push(tokio::spawn(async move {
+            supervise_on_iface(
+                "topology",
+                PCAP_RETRY_INTERVAL,
+                resolve_iface,
+                move |iface| {
+                    Ok(spawn_topology_patrol(
+                        store.clone(),
+                        snapshot.clone(),
+                        observing.clone(),
+                        iface.to_string(),
+                    ))
+                },
+            )
+            .await;
+        }));
     }
 
     // Serve the read-only status socket for the unprivileged bar. Best-effort: a
