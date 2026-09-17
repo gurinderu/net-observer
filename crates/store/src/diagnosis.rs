@@ -558,6 +558,43 @@ layer_state AS (
     )
 }
 
+/// How far either side of the asked moment `verdict_at` looks for sing-box's
+/// own error lines (30 s: two ticks of the log reader), and how many of them
+/// it lists, newest first.
+const SINGBOX_LOG_NEAR_US: i64 = 30_000_000;
+const SINGBOX_LOG_NEAR_MAX: i64 = 5;
+
+/// The `singbox_log_sample` rows within [`SINGBOX_LOG_NEAR_US`] of the asked
+/// moment, rendered as one line each — `<class> ×<count> via <node> at
+/// <RFC3339>` (`via` only when the row names a node) — newest first, ties by
+/// class then node (the row key), at most [`SINGBOX_LOG_NEAR_MAX`], joined by
+/// newlines into one `singbox_log` cell (realm net-observer, node #141).
+/// `NULL` when there is no such row, and
+/// the reader prints nothing: an `unreadable` row IS listed (`unreadable ×0`),
+/// so a stretch where the log could not be read never reads as "no errors".
+/// Binds the moment twice. A function like [`observation_gap_cte`], because
+/// the reach and the cap are SQL literals, not bind parameters.
+fn singbox_log_near_cte() -> String {
+    format!(
+        "\
+singbox_log_near AS (
+  SELECT ts_us, class, count, node
+  FROM singbox_log_sample
+  WHERE ts_us BETWEEN ? - {SINGBOX_LOG_NEAR_US} AND ? + {SINGBOX_LOG_NEAR_US}
+  ORDER BY ts_us DESC, class, node
+  LIMIT {SINGBOX_LOG_NEAR_MAX}
+),
+singbox_log_lines AS (
+  SELECT string_agg(
+           class || ' ×' || count
+             || CASE WHEN node IS NULL THEN '' ELSE ' via ' || node END
+             || ' at ' || strftime(make_timestamp(ts_us), '%Y-%m-%dT%H:%M:%SZ'),
+           chr(10) ORDER BY ts_us DESC, class, node) AS singbox_log
+  FROM singbox_log_near
+)"
+    )
+}
+
 /// **Verdict at a moment** — the state of every layer as of `ts_us`, and the
 /// layer the record blames.
 ///
@@ -570,12 +607,19 @@ layer_state AS (
 /// bounds of the gap in `gap_opened_us` / `gap_closed_us`. The newest sample
 /// before the pause is a reading from before the pause, not a reading at
 /// `ts_us`, and it is withheld rather than labelled.
+///
+/// The last column, `singbox_log`, is what sing-box's own log said within
+/// ±30 s of the moment ([`singbox_log_near_cte`]) — one line per row, or
+/// `NULL`. It rides both branches: the log's rows carry their own time, so a
+/// moment inside a gap can still show what sing-box wrote around it.
 pub fn verdict_at_sql(ts_us: i64, load_threshold: f64) -> PreparedSql {
     let sql = format!(
         "{},
-{GAP_AT_CTE}
+{GAP_AT_CTE},
+{}
 SELECT ts_us, gw, gw_rtt_ms, direct, vless, tun_code, load1, layer,
-       CAST(NULL AS BIGINT) AS gap_opened_us, CAST(NULL AS BIGINT) AS gap_closed_us
+       CAST(NULL AS BIGINT) AS gap_opened_us, CAST(NULL AS BIGINT) AS gap_closed_us,
+       (SELECT singbox_log FROM singbox_log_lines) AS singbox_log
 FROM (
   SELECT ts_us, gw, gw_rtt_ms, direct, vless, tun_code, load1, layer
   FROM layer_state
@@ -587,17 +631,21 @@ WHERE NOT EXISTS (SELECT 1 FROM gap_at)
 UNION ALL
 SELECT CAST(NULL AS BIGINT), CAST(NULL AS VARCHAR), CAST(NULL AS DOUBLE),
        CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), CAST(NULL AS USMALLINT),
-       CAST(NULL AS DOUBLE), 'gap', gap_opened_us, gap_closed_us
+       CAST(NULL AS DOUBLE), 'gap', gap_opened_us, gap_closed_us,
+       (SELECT singbox_log FROM singbox_log_lines)
 FROM gap_at",
         layer_state_with(),
+        singbox_log_near_cte(),
     );
     // Bound in the order their `?` appear: the threshold in `layer_state_with`,
-    // then the moment twice in `GAP_AT_CTE`, then the moment once more in the
-    // final `WHERE`.
+    // then the moment twice in `GAP_AT_CTE`, twice in `singbox_log_near_cte`,
+    // then once more in the final `WHERE`.
     PreparedSql {
         sql,
         params: vec![
             Value::Double(load_threshold),
+            Value::BigInt(ts_us),
+            Value::BigInt(ts_us),
             Value::BigInt(ts_us),
             Value::BigInt(ts_us),
             Value::BigInt(ts_us),
@@ -1612,6 +1660,110 @@ mod tests {
         let t = s.verdict_at(25 * SEC).unwrap();
         assert_eq!(cell(&t, 0, "ts_us"), (20 * SEC).to_string());
         assert_eq!(cell(&t, 0, "layer"), "link");
+    }
+
+    /// One sing-box log row, as written by the reader.
+    fn singbox_log(
+        s: &DuckdbStore,
+        ts_us: i64,
+        class: types::SingboxLogClass,
+        count: u32,
+        node: Option<&str>,
+    ) {
+        s.write_sample(&Sample::SingboxLog(types::SingboxLogSample {
+            ts_us,
+            class,
+            count,
+            node: node.map(str::to_string),
+            sample_message: Some("…".into()),
+        }))
+        .unwrap();
+    }
+
+    /// `why` lists what sing-box's own log said within ±30 s of the moment,
+    /// newest first (ties by class), at most five lines, each `<class>
+    /// ×<count> via <node> at <RFC3339>` — and nothing at all when the log
+    /// said nothing then.
+    #[test]
+    fn verdict_at_lists_the_sing_box_log_lines_around_the_moment() {
+        use types::SingboxLogClass as C;
+        let s = DuckdbStore::in_memory().unwrap();
+        // 2026-09-17T17:56:25Z, the observed line's instant.
+        let at = 1_789_667_785 * SEC;
+        healthy_tick(&s, at - 5 * SEC);
+        // Inside the window, on both sides of the moment.
+        singbox_log(&s, at - 20 * SEC, C::NoRoute, 3, Some("vless-out-6"));
+        singbox_log(&s, at - 20 * SEC, C::NoDefaultIface, 1, None);
+        singbox_log(&s, at + 10 * SEC, C::Unreadable, 0, None);
+        // Outside it: 31 s before, and 31 s after.
+        singbox_log(&s, at - 31 * SEC, C::DialTimeout, 9, Some("far"));
+        singbox_log(&s, at + 31 * SEC, C::DialTimeout, 9, Some("far"));
+
+        let t = s.verdict_at(at).unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "layer"), "healthy");
+        let lines: Vec<String> = cell(&t, 0, "singbox_log")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "unreadable ×0 at 2026-09-17T17:56:35Z",
+                "no-default-iface ×1 at 2026-09-17T17:56:05Z",
+                "no-route ×3 via vless-out-6 at 2026-09-17T17:56:05Z",
+            ]
+        );
+
+        // The cap: six rows in the window list as the five newest.
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, at - 5 * SEC);
+        for i in 0..6 {
+            singbox_log(&s, at - i * SEC, C::DialTimeout, 1, Some("vless-out-6"));
+        }
+        let t = s.verdict_at(at).unwrap();
+        let listed = cell(&t, 0, "singbox_log");
+        assert_eq!(listed.lines().count(), 5, "{listed}");
+        assert!(
+            listed.starts_with("dial-timeout ×1 via vless-out-6 at 2026-09-17T17:56:25Z"),
+            "{listed}"
+        );
+        assert!(
+            !listed.contains("17:56:20Z"),
+            "the sixth, oldest row is cut: {listed}"
+        );
+
+        // Nothing said: the cell is NULL, which the reader prints as nothing.
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, at - 5 * SEC);
+        let t = s.verdict_at(at).unwrap();
+        assert_eq!(cell(&t, 0, "singbox_log"), "");
+    }
+
+    /// Rows of one tick and one class through different nodes — the row key
+    /// is `(class, node)` — list in a defined order: by node after the class.
+    #[test]
+    fn verdict_at_orders_equal_instants_by_class_then_node() {
+        use types::SingboxLogClass as C;
+        let s = DuckdbStore::in_memory().unwrap();
+        let at = 1_789_667_785 * SEC;
+        healthy_tick(&s, at - 5 * SEC);
+        singbox_log(&s, at, C::DialTimeout, 2, Some("vless-out-6"));
+        singbox_log(&s, at, C::DialTimeout, 1, Some("vless-out-2"));
+        singbox_log(&s, at, C::Canceled, 1, Some("vless-out-9"));
+        let t = s.verdict_at(at).unwrap();
+        let lines: Vec<String> = cell(&t, 0, "singbox_log")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "canceled ×1 via vless-out-9 at 2026-09-17T17:56:25Z",
+                "dial-timeout ×1 via vless-out-2 at 2026-09-17T17:56:25Z",
+                "dial-timeout ×2 via vless-out-6 at 2026-09-17T17:56:25Z",
+            ]
+        );
     }
 
     // ---- 2. incident with its context --------------------------------------

@@ -411,6 +411,7 @@ const INSERT_NEIGHBOR: &str = "INSERT INTO neighbor VALUES (?,?,?,?,?,?,?,?,?)
        last_seen_us = excluded.last_seen_us";
 const INSERT_CONNECTION_SAMPLE: &str =
     "INSERT INTO connection_sample VALUES (?,?,?,?,?,?,?,?,?,?,?)";
+const INSERT_SINGBOX_LOG_SAMPLE: &str = "INSERT INTO singbox_log_sample VALUES (?,?,?,?,?)";
 const INSERT_NEIGHBOR_SCAN: &str = "INSERT INTO neighbor_scan VALUES (?,?,?,?,?,?,?,?)";
 const INSERT_INCIDENT: &str = "INSERT INTO incident VALUES (?,?,?,?,?)";
 const INSERT_BLOB_REF: &str = "INSERT INTO blob_ref VALUES (?,?,?,?,?)";
@@ -430,6 +431,7 @@ const POSITIONAL_INSERTS: &[(&str, &str)] = &[
     ("neighbor_sample", INSERT_NEIGHBOR_SAMPLE),
     ("neighbor", INSERT_NEIGHBOR),
     ("connection_sample", INSERT_CONNECTION_SAMPLE),
+    ("singbox_log_sample", INSERT_SINGBOX_LOG_SAMPLE),
     ("neighbor_scan", INSERT_NEIGHBOR_SCAN),
     ("incident", INSERT_INCIDENT),
     ("blob_ref", INSERT_BLOB_REF),
@@ -656,6 +658,18 @@ impl Store for DuckdbStore {
                 tx.commit()?;
                 0
             }
+            // One row per sample: the pipeline delivers a tick's rows one at
+            // a time (realm net-observer, node #141).
+            Sample::SingboxLog(r) => c.execute(
+                INSERT_SINGBOX_LOG_SAMPLE,
+                params![
+                    r.ts_us,
+                    r.class.to_string(),
+                    r.count,
+                    r.node,
+                    r.sample_message
+                ],
+            )?,
         };
         Ok(())
     }
@@ -2494,6 +2508,76 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    /// One row per (class, node) with the class as its kebab-case token, an
+    /// absent node NULL, each written as the pipeline delivers it — one
+    /// sample at a time — and an `unreadable` tick is a row with count 0,
+    /// never a missing row.
+    #[test]
+    fn write_and_read_back_singbox_log_samples() {
+        use types::{SingboxLogClass, SingboxLogSample};
+        let s = DuckdbStore::in_memory().unwrap();
+        for row in [
+            SingboxLogSample {
+                ts_us: 9000,
+                class: SingboxLogClass::NoRoute,
+                count: 3,
+                node: Some("vless-out-6".into()),
+                sample_message: Some("connection: open connection to 1.2.3.4:443 …".into()),
+            },
+            SingboxLogSample {
+                ts_us: 9000,
+                class: SingboxLogClass::NoDefaultIface,
+                count: 1,
+                node: None,
+                sample_message: Some("network: missing default interface".into()),
+            },
+        ] {
+            s.write_sample(&Sample::SingboxLog(row)).unwrap();
+        }
+        s.write_sample(&Sample::SingboxLog(SingboxLogSample {
+            ts_us: 9015,
+            class: SingboxLogClass::Unreadable,
+            count: 0,
+            node: None,
+            sample_message: Some("/var/log/sing-box.log: No such file or directory".into()),
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM singbox_log_sample WHERE ts_us=9000 AND class='no-route' \
+                 AND count=3 AND node='vless-out-6' \
+                 AND sample_message LIKE 'connection: open connection%'"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM singbox_log_sample WHERE ts_us=9000 \
+                 AND class='no-default-iface' AND count=1 AND node IS NULL"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM singbox_log_sample WHERE ts_us=9015 \
+                 AND class='unreadable' AND count=0 AND node IS NULL \
+                 AND sample_message LIKE '%No such file%'"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM singbox_log_sample")
+                .unwrap(),
+            3
+        );
+        // The table is a sample table: it counts toward the record's newest
+        // observation, which the startup sweep closes stale incidents at.
+        assert_eq!(s.latest_sample_ts_us().unwrap(), Some(9015));
     }
 
     /// The raw pair and the derived margin all reach their own columns, and a
