@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use types::{
     BlobRef, Incident, NeighborLifetime, ObservingEdge, ParseVerdictError, ProbingEdge,
-    ProbingTier, Sample, SingboxLogSample, TopologyLifetime, TopologyLink, TriggerFired,
+    ProbingTier, Sample, TopologyLifetime, TopologyLink, TriggerFired,
 };
 
 /// `network_key` for a segment whose gateway MAC could not be read. Neighbours
@@ -268,22 +268,6 @@ fn run_statement(
         columns,
         rows: out_rows,
     })
-}
-
-/// One `singbox_log_sample` row (realm net-observer, node #141). Takes the
-/// connection — or a transaction, which derefs to one — so the single-sample
-/// and the per-tick batch paths write the same statement.
-fn insert_singbox_log_row(conn: &Connection, r: &SingboxLogSample) -> Result<usize, duckdb::Error> {
-    conn.execute(
-        "INSERT INTO singbox_log_sample VALUES (?,?,?,?,?)",
-        params![
-            r.ts_us,
-            r.class.to_string(),
-            r.count,
-            r.node,
-            r.sample_message
-        ],
-    )
 }
 
 /// The text a panic payload carries, for [`StoreError::Panicked`]: `panic!`
@@ -609,22 +593,19 @@ impl Store for DuckdbStore {
                 tx.commit()?;
                 0
             }
-            // One row: the pipeline delivers a tick's rows one sample at a
-            // time. The batch path is `write_singbox_log_samples`.
-            Sample::SingboxLog(r) => insert_singbox_log_row(&c, r)?,
+            // One row per sample: the pipeline delivers a tick's rows one at
+            // a time (realm net-observer, node #141).
+            Sample::SingboxLog(r) => c.execute(
+                "INSERT INTO singbox_log_sample VALUES (?,?,?,?,?)",
+                params![
+                    r.ts_us,
+                    r.class.to_string(),
+                    r.count,
+                    r.node,
+                    r.sample_message
+                ],
+            )?,
         };
-        Ok(())
-    }
-
-    fn write_singbox_log_samples(&self, rows: &[SingboxLogSample]) -> Result<(), StoreError> {
-        let mut c = self.conn.lock().unwrap();
-        // The tick is ONE transaction, like a connections tick: a failure on
-        // any row rolls the whole tick back rather than leaving half of it.
-        let tx = c.transaction()?;
-        for r in rows {
-            insert_singbox_log_row(&tx, r)?;
-        }
-        tx.commit()?;
         Ok(())
     }
 
@@ -2389,14 +2370,14 @@ mod tests {
     }
 
     /// One row per (class, node) with the class as its kebab-case token, an
-    /// absent node NULL; the batch path writes a whole tick, the single path
-    /// one row, into the same table — and an `unreadable` tick is a row with
-    /// count 0, never a missing row.
+    /// absent node NULL, each written as the pipeline delivers it — one
+    /// sample at a time — and an `unreadable` tick is a row with count 0,
+    /// never a missing row.
     #[test]
     fn write_and_read_back_singbox_log_samples() {
         use types::{SingboxLogClass, SingboxLogSample};
         let s = DuckdbStore::in_memory().unwrap();
-        s.write_singbox_log_samples(&[
+        for row in [
             SingboxLogSample {
                 ts_us: 9000,
                 class: SingboxLogClass::NoRoute,
@@ -2411,8 +2392,9 @@ mod tests {
                 node: None,
                 sample_message: Some("network: missing default interface".into()),
             },
-        ])
-        .unwrap();
+        ] {
+            s.write_sample(&Sample::SingboxLog(row)).unwrap();
+        }
         s.write_sample(&Sample::SingboxLog(SingboxLogSample {
             ts_us: 9015,
             class: SingboxLogClass::Unreadable,

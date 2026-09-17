@@ -2625,12 +2625,6 @@ mod tests {
         fn write_sample(&self, s: &Sample) -> Result<(), store::StoreError> {
             self.inner.write_sample(s)
         }
-        fn write_singbox_log_samples(
-            &self,
-            rows: &[types::SingboxLogSample],
-        ) -> Result<(), store::StoreError> {
-            self.inner.write_singbox_log_samples(rows)
-        }
         fn open_incident(&self, i: &types::Incident) -> Result<(), store::StoreError> {
             self.inner.open_incident(i)
         }
