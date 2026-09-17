@@ -115,11 +115,19 @@ flowchart LR
   read only on a freeze. The listener is **supervised, not started once**:
   its child needs the physical interface, which a `RunAtLoad` daemon boots
   without, so `supervise_on_iface` starts it when an interface resolves and
-  again whenever its stream ends (realm net-observer, node #134). The
-  listener's end (child died, pipe broke) is bracketed by a `SKIP` row naming
-  why — the one event batch that passes an operator pause, since it is the
-  bracket and not an observation — and the next listener follows after the
-  supervisor's interval, so the gap between them is bounded and named. A flush
+  again whenever its stream ends (realm net-observer, node #134). What ends
+  a stream is the child dying: a running listener stays on the interface it
+  started on, and a default route moving to another interface is not a
+  restart trigger yet (it needs a stop path into the child inside the reader
+  thread — a follow-up), so until the child dies, windows keyed by the
+  current gateway may carry the old interface's hearing. The listener's end
+  (child died, pipe broke) is bracketed by a `SKIP` row naming why — the one
+  event batch that passes an operator pause, since it is the bracket and not
+  an observation — and the next listener follows after the supervisor's
+  interval, so the gap between them is named at its start by the `SKIP`
+  bracket and closed by the next flush; while no interface resolves or
+  `tcpdump` keeps failing, the record holds that one bracket and the log
+  names the continuing gap by change of reason. A flush
   never replaces the snapshot's cache reading (it is the last window, not
   the table) and never fills the trigger window's neighbour slot
   (`RecentWindow::last_neighbors` skips it); it is written and published
@@ -249,7 +257,12 @@ collector, whether to run it at all:
   LLDP/CDP capture on, so it waits under `supervise_on_iface` for one rather
   than being skipped for the life of a process that booted without one; once
   started it runs on that interface, and its own capture is bounded per run.
-  A supervised capture is aborted with its supervisor on shutdown.
+  On shutdown, aborting a supervisor aborts the tokio task it awaits — the
+  patrol's task, or for the listener only the oneshot bridge in front of its
+  event thread: that thread, the reader thread holding the `AnnounceCapture`
+  and the `tcpdump` child run until process exit (EPIPE on the next frame,
+  launchd's process group), exactly as `route`'s uninterruptible `read(2)`
+  thread does.
 
 ### Async collectors
 

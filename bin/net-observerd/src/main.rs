@@ -1546,14 +1546,23 @@ async fn supervise_pcap_ring<R, Fut, S>(
 /// brackets it with the `SKIP` row it emits — so the restart writes no row of
 /// its own (realm net-observer, node #134).
 ///
+/// What ends a capture is its own child dying: a running listener stays on the
+/// interface it STARTED on, and a default route moving to another interface is
+/// not a restart trigger yet — that needs a stop path into the child inside the
+/// reader thread, a follow-up — so until the child dies, windows keyed by the
+/// current gateway may carry the old interface's hearing.
+///
 /// `start` opens the capture on the interface and spawns what drives it,
 /// returning the task that ends when the capture does (`spawn_event_collector`'s
 /// handle completes when its source thread returns; the topology patrol's never
 /// does, so it is started once per interface resolution). It may block —
 /// `AnnounceCapture::start` waits for the child's pcap header, up to its bound
-/// — so it runs on the blocking pool, never on a runtime worker. The spawned
-/// task is aborted with this one, so a capture cannot outlive its supervisor
-/// through `abort_all`.
+/// — so it runs on the blocking pool, never on a runtime worker. Aborting this
+/// task aborts the awaited TOKIO task only: the topology patrol, or, for the
+/// listener, just the oneshot bridge — its event thread, the reader thread
+/// holding the `AnnounceCapture` and the `tcpdump` child run until process exit
+/// (EPIPE on the next frame, launchd's process group), as `spawn_event_collector`
+/// says.
 ///
 /// Logging is by *change of reason*, never per attempt, as for the ring: the
 /// first failure and each subsequent different reason are logged, and so is
@@ -1624,10 +1633,12 @@ async fn supervise_on_iface<R, Fut, S>(
     }
 }
 
-/// A spawned task that is aborted when this handle is dropped — so a capture
-/// task [`supervise_on_iface`] is awaiting dies with the supervisor (which
-/// `abort_all` drops) instead of being detached, as dropping a bare
-/// [`JoinHandle`] would.
+/// A spawned task that is aborted when this handle is dropped — so the tokio
+/// task [`supervise_on_iface`] is awaiting is aborted with the supervisor
+/// (which `abort_all` drops) instead of being detached, as dropping a bare
+/// [`JoinHandle`] would. That reaches the topology patrol's task; for the
+/// listener it reaches only the oneshot bridge, never the detached threads or
+/// the `tcpdump` child behind it.
 struct AbortOnDrop(JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -2296,9 +2307,12 @@ mod tests {
         task.abort();
     }
 
-    /// Shutdown: `abort_all` aborts the supervisor, and the capture task it was
-    /// awaiting must die with it — the topology patrol would otherwise keep
-    /// opening captures after the daemon had stopped its collectors.
+    /// Shutdown: `abort_all` aborts the supervisor, and the TOKIO task it was
+    /// awaiting must be aborted with it — the topology patrol's case, which
+    /// would otherwise keep opening captures after the daemon had stopped its
+    /// collectors. This proves nothing about the listener's threads or its
+    /// `tcpdump` child: those are detached and run until process exit, and the
+    /// abort reaches only the oneshot bridge in front of them.
     ///
     /// Dies under: awaiting a bare `JoinHandle` (dropping one detaches the task).
     #[tokio::test]
