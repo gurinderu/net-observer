@@ -638,21 +638,26 @@ pub(crate) fn spawn_event_collector(
         // Batches dropped since the current pause began; the pause edge is derived
         // from the flag itself, so no extra shared state is needed.
         let mut dropped_while_paused: u64 = 0;
-        while let Some(samples) = src.next() {
-            // Paused: drop this batch (still drained from the source above).
-            if !observing.load(Ordering::Acquire) {
-                if dropped_while_paused == 0 {
-                    tracing::debug!(
-                        collector = name,
-                        dropped = samples.len(),
-                        "paused: dropping event batch"
-                    );
+        while let Some(mut samples) = src.next() {
+            // Paused: drop this batch (still drained from the source above) —
+            // all but a listener's end bracket, which is not an observation
+            // but the row that says the listener stopped, and the record
+            // needs it whether or not the operator was collecting at the
+            // time (realm net-observer, node #92).
+            let paused = !observing.load(Ordering::Acquire);
+            if paused {
+                samples.retain(|s| matches!(s, Sample::Neighbors(n) if n.is_listener_bracket()));
+                if samples.is_empty() {
+                    if dropped_while_paused == 0 {
+                        tracing::debug!(collector = name, "paused: dropping event batch");
+                    }
+                    dropped_while_paused += 1;
+                    continue;
                 }
-                dropped_while_paused += 1;
-                continue;
             }
-            // Resume edge: report what the pause cost, once, then re-arm.
-            if dropped_while_paused > 0 {
+            // Resume edge: report what the pause cost, once, then re-arm. A
+            // bracket let through mid-pause is not a resume.
+            if !paused && dropped_while_paused > 0 {
                 tracing::info!(
                     collector = name,
                     dropped = dropped_while_paused,
@@ -1955,7 +1960,10 @@ mod tests {
                 kind: AnnounceKind::Mdns,
                 detail: None,
             }],
-            heard: Some(HeardFrames { total: 5, own: 1 }),
+            heard: Some(HeardFrames {
+                total: 5,
+                own: Some(1),
+            }),
         });
 
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
@@ -2453,6 +2461,74 @@ mod tests {
 
         // Dropping the sender makes `next()` return `None`, so the detached thread
         // ends with the test rather than outliving it.
+        drop(batch_tx);
+        drop(rx);
+    }
+
+    /// The one batch a pause does not swallow: the listener's end bracket.
+    /// A paused daemon drops a listener flush like any event batch, but the
+    /// SKIP row that says the listener stopped is the bracket the record
+    /// needs, so it passes — alone, without the flush beside it, and
+    /// without counting as a resume.
+    #[tokio::test]
+    async fn a_paused_event_collector_still_forwards_the_listener_bracket() {
+        use collector_announce::AnnounceCollector;
+        use types::{HeardFrames, NeighborsSample, NeighborsVerdict};
+        let listener = |ts_us: i64, verdict: NeighborsVerdict| {
+            Sample::Neighbors(NeighborsSample {
+                ts_us,
+                verdict,
+                reason: (verdict == NeighborsVerdict::Skip)
+                    .then(|| "announce listener stopped: capture stream ended".to_string()),
+                network_key: None,
+                iface: Some("en0".into()),
+                neighbors: Vec::new(),
+                services: Vec::new(),
+                heard: Some(HeardFrames {
+                    total: 0,
+                    own: Some(0),
+                }),
+            })
+        };
+        let (batch_tx, batches) = std::sync::mpsc::channel::<Vec<Sample>>();
+        let drained = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = AnyCollector::Announce(AnnounceCollector::new(
+            Box::new(FakeRouteSource {
+                batches,
+                drained: drained.clone(),
+            }),
+            Readiness::Ready,
+        ));
+        let (tx, mut rx) = mpsc::channel(16);
+        let observing = Arc::new(AtomicBool::new(false));
+        let _handle = spawn_event_collector(c, tx, observing.clone());
+
+        // Paused: a flush is dropped; the final batch's flush is dropped too
+        // and only its bracket comes through.
+        batch_tx
+            .send(vec![listener(1, NeighborsVerdict::Ok)])
+            .unwrap();
+        batch_tx
+            .send(vec![
+                listener(2, NeighborsVerdict::Ok),
+                listener(2, NeighborsVerdict::Skip),
+            ])
+            .unwrap();
+        let got = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the bracket must pass a pause within 5s")
+            .expect("channel open");
+        let Sample::Neighbors(n) = &got else {
+            panic!("expected the bracket, got {got:?}")
+        };
+        assert!(n.is_listener_bracket());
+        assert_eq!(n.ts_us, 2);
+        assert!(
+            time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "nothing but the bracket passes a pause"
+        );
         drop(batch_tx);
         drop(rx);
     }
