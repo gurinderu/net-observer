@@ -156,7 +156,10 @@ mod tests {
             assert_eq!(SingboxLogClass::from_str(token).unwrap(), class);
             let json = serde_json::to_string(&class).unwrap();
             assert_eq!(json, format!("\"{token}\""), "{class:?}");
-            assert_eq!(serde_json::from_str::<SingboxLogClass>(&json).unwrap(), class);
+            assert_eq!(
+                serde_json::from_str::<SingboxLogClass>(&json).unwrap(),
+                class
+            );
         }
         assert_eq!(SingboxLogClass::NoRoute.as_str(), "no-route");
         assert_eq!(SingboxLogClass::NoDefaultIface.as_str(), "no-default-iface");
@@ -175,7 +178,10 @@ mod tests {
         };
         let json = serde_json::to_string(&full).unwrap();
         assert!(json.contains("\"class\":\"dial-timeout\""), "{json}");
-        assert_eq!(serde_json::from_str::<SingboxLogSample>(&json).unwrap(), full);
+        assert_eq!(
+            serde_json::from_str::<SingboxLogSample>(&json).unwrap(),
+            full
+        );
 
         // A row without the optional fields still decodes: absent is `None`.
         let bare = r#"{"ts_us":7,"class":"unreadable","count":0}"#;
