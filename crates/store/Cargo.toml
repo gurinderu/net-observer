@@ -6,3 +6,4 @@ edition.workspace = true
 types.workspace = true
 duckdb.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
