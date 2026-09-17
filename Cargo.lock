@@ -6275,6 +6275,7 @@ version = "0.0.0"
 dependencies = [
  "duckdb",
  "thiserror 2.0.19",
+ "tracing",
  "types",
 ]
 

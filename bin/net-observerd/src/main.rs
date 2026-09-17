@@ -75,6 +75,11 @@ const TOPOLOGY_PATROL_INTERVAL: Duration = Duration::from_secs(300);
 /// capture is plainly bounded.
 const TOPOLOGY_CAPTURE_BUDGET: Duration = Duration::from_secs(65);
 
+/// How often the record's retention sweep runs after the one at startup: once
+/// a day, the unit the retention window is counted in (realm net-observer,
+/// node #130).
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Minimum interval between fires for one trigger (5 minutes, in microseconds),
 /// mirroring net-observer so a captive portal can't storm the incident log.
 const BACKOFF_US: i64 = 300_000_000;
@@ -303,6 +308,132 @@ fn spawn_topology_patrol(
     })
 }
 
+/// The retention plan a configuration asks for: `None` for keep-forever
+/// (`retention_days == 0`) or an empty table list, otherwise the window and
+/// the tables the sweep will prune — each name checked against the store's
+/// own allow-list, the air slice made whole, duplicates folded (realm
+/// net-observer, node #130).
+///
+/// A name outside `store::PRUNABLE_TABLES` is an error and the daemon refuses
+/// to start: an unknown name is never a silent fall-back, as an unknown
+/// probing tier is not — and the five sample tables the gap derivation reads
+/// are outside that list by design, so a config asking to prune them is
+/// refused here, before the store is even opened. Checked whether or not a
+/// window is set. Naming either half of the air slice (`air_sample` /
+/// `air_ap`) names both; the half added is logged so the operator sees the
+/// list the daemon actually runs.
+fn retention_plan(record: &config::RecordCfg) -> anyhow::Result<Option<config::RecordCfg>> {
+    let mut tables: Vec<String> = Vec::new();
+    for name in &record.retention_tables {
+        if !store::PRUNABLE_TABLES.contains(&name.as_str()) {
+            anyhow::bail!(
+                "record retention: `{name}` is not a prunable table; \
+                 [record] retention_tables may name only {:?}",
+                store::PRUNABLE_TABLES
+            );
+        }
+        if !tables.contains(name) {
+            tables.push(name.clone());
+        }
+    }
+    if record.retention_days == 0 {
+        tracing::info!("record retention: keep forever");
+        return Ok(None);
+    }
+    if tables.is_empty() {
+        tracing::info!("record retention: no tables listed");
+        return Ok(None);
+    }
+    if store::AIR_SLICE
+        .iter()
+        .any(|half| tables.iter().any(|t| t == half))
+    {
+        for half in store::AIR_SLICE {
+            if !tables.iter().any(|t| t == half) {
+                tracing::info!(
+                    "record retention: air_sample and air_ap are one scan slice; \
+                     pruning {half} with its pair"
+                );
+                tables.push(half.to_string());
+            }
+        }
+    }
+    Ok(Some(config::RecordCfg {
+        retention_days: record.retention_days,
+        retention_tables: tables,
+    }))
+}
+
+/// One retention sweep of the record: for each table of a plan
+/// [`retention_plan`] returned, delete every row older than
+/// `record.retention_days` through the store's own allow-list (realm
+/// net-observer, node #130). A window of `0` returns at once: that is
+/// keep-forever, and a cutoff computed from it would be "everything before
+/// now" — the whole record — so the guard lives here, in the function whose
+/// failure mode that is, not only in its caller.
+///
+/// Each prune runs on the blocking pool: a `DELETE` over a table with months
+/// of ticks holds the connection mutex for as long as it takes, and the
+/// reactor must not wait with it. A failure — a name the store refuses, a
+/// driver error — is logged and the next table is tried; it never
+/// propagates: a table that could not be pruned is a fuller record, not a
+/// broken one.
+async fn prune_record(store: &Arc<DuckdbStore>, record: &config::RecordCfg) {
+    use store::Store as _;
+
+    let days = record.retention_days;
+    if days == 0 {
+        return;
+    }
+    // Saturating on purpose: an absurd `retention_days` must land the cutoff
+    // before every row (nothing pruned), never wrap it past them all.
+    let cutoff_us = types::now_us().saturating_sub(i64::from(days).saturating_mul(86_400_000_000));
+    for table in &record.retention_tables {
+        let store = Arc::clone(store);
+        let name = table.clone();
+        // The failure crosses the pool as words, as the diagnoses' do.
+        let pruned = tokio::task::spawn_blocking(move || {
+            store
+                .prune_older_than(&name, cutoff_us)
+                .map_err(|e| e.to_string())
+        })
+        .await;
+        match pruned {
+            Ok(Ok(0)) => tracing::debug!("pruned 0 rows older than {days} d from {table}"),
+            Ok(Ok(n)) => tracing::info!("pruned {n} rows older than {days} d from {table}"),
+            Ok(Err(e)) => tracing::warn!(
+                error = %e,
+                table = %table,
+                "record prune failed; table left as it is (gap logged)"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                table = %table,
+                "record prune task failed to join; table left as it is (gap logged)"
+            ),
+        }
+    }
+}
+
+/// Spawn the daily retention sweep. The startup sweep has already run by the
+/// time this is called, so the interval's immediate first tick is consumed
+/// before the loop. The interval counts AWAKE time: tokio's timer does not
+/// advance while the Mac sleeps, so a laptop awake eight hours a day sweeps
+/// every three wall days or so — a later sweep, never a missed one. `Delay`
+/// keeps consecutive sweeps a full interval apart even after a late tick,
+/// rather than firing a burst to catch up.
+fn spawn_retention_sweep(store: Arc<DuckdbStore>, record: config::RecordCfg) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RETENTION_SWEEP_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            prune_record(&store, &record).await;
+        }
+    })
+}
+
 fn record_startup_edge(
     store: &DuckdbStore,
     events_tx: &tokio::sync::broadcast::Sender<EncodedFrame>,
@@ -392,6 +523,12 @@ async fn run_daemon() -> anyhow::Result<()> {
     let cfg = Config::load(cli.config.as_deref()).context("loading config")?;
     tracing::info!(db = %cfg.db_path, "starting net-observerd");
 
+    // The record's retention plan, validated BEFORE the store is opened: a
+    // config naming a table the store will not prune refuses to start here,
+    // having written nothing (realm net-observer, node #130). `None` is
+    // keep-forever or an empty list — no sweep at all.
+    let retention = retention_plan(&cfg.record)?;
+
     // Ensure the store + blob directories exist before opening the database.
     if let Some(parent) = Path::new(&cfg.db_path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -451,6 +588,22 @@ async fn run_daemon() -> anyhow::Result<()> {
         Ok(0) => {}
         Ok(n) => tracing::info!(n, "closed stale open incidents from a previous run"),
         Err(e) => tracing::warn!(error = %e, "failed to close stale open incidents"),
+    }
+
+    // The record's retention sweep, for the plan validated above (the policy
+    // is the owner's; this is the mechanism — realm net-observer, node #130).
+    // The first sweep runs HERE, before any collector can write, and the
+    // daily one is spawned; its handle joins the collectors' below so shutdown
+    // aborts it with them.
+    let mut retention_sweep = None;
+    if let Some(record) = retention {
+        tracing::info!(
+            days = record.retention_days,
+            tables = ?record.retention_tables,
+            "record retention: pruning at startup and then every 24 h awake"
+        );
+        prune_record(&store, &record).await;
+        retention_sweep = Some(spawn_retention_sweep(store.clone(), record));
     }
 
     // The OUI registry for neighbour ROLE inference, loaded ONCE here and shared
@@ -711,6 +864,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     // Filter by OS meta + preflight, then spawn survivors with one uniform loop.
     let os = Os::current();
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    handles.extend(retention_sweep);
     for c in collectors {
         let name = c.meta().name;
         if !c.meta().supports(os) {
@@ -3444,5 +3598,66 @@ mod tests {
             }
         }
         ids
+    }
+
+    /// A `[record]` section as `retention_plan` reads it.
+    fn record(days: u32, tables: &[&str]) -> config::RecordCfg {
+        config::RecordCfg {
+            retention_days: days,
+            retention_tables: tables.iter().map(|t| (*t).to_string()).collect(),
+        }
+    }
+
+    /// A name outside `store::PRUNABLE_TABLES` — here one the gap derivation
+    /// reads, and one evidence table — is an error naming the table, and it
+    /// is one whether or not a window is set: an inert list is still a config
+    /// error, as an unknown probing tier is (realm net-observer, node #130).
+    #[test]
+    fn retention_plan_refuses_a_table_outside_the_prunable_list_and_names_it() {
+        let err = retention_plan(&record(7, &["link_sample"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`link_sample` is not a prunable table"),
+            "{err}"
+        );
+        let err = retention_plan(&record(0, &["incident"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`incident`"), "{err}");
+    }
+
+    /// Keep-forever (`retention_days = 0`) and a window over no tables are
+    /// both no plan at all: nothing is pruned and no sweep is spawned.
+    #[test]
+    fn retention_plan_is_none_for_keep_forever_and_for_an_empty_list() {
+        assert!(
+            retention_plan(&record(0, &["connection_sample"]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(retention_plan(&record(7, &[])).unwrap().is_none());
+    }
+
+    /// A table named twice is pruned once; naming either half of the air
+    /// slice names both, appended after the configured names; a list with
+    /// neither half gains nothing.
+    #[test]
+    fn retention_plan_folds_duplicates_and_makes_the_air_slice_whole() {
+        let plan = retention_plan(&record(
+            7,
+            &["air_ap", "connection_sample", "connection_sample"],
+        ))
+        .unwrap()
+        .expect("a window over a list is a plan");
+        assert_eq!(plan.retention_days, 7);
+        assert_eq!(
+            plan.retention_tables,
+            ["air_ap", "connection_sample", "air_sample"]
+        );
+        let plan = retention_plan(&record(7, &["wifi_sample"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.retention_tables, ["wifi_sample"]);
     }
 }

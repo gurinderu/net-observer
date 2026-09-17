@@ -7,6 +7,7 @@ pub use duckdb_store::{
     DuckdbStore, ExperimentRecord, NeighborPort, NeighborScan, NeighborVuln, QueryTable,
     SchemaDrift, StoreError,
 };
+pub use schema::{AIR_SLICE, PRUNABLE_TABLES, SAMPLE_TABLES};
 use types::{
     BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, TopologyLifetime,
     TopologyLink, TriggerFired,
@@ -118,4 +119,16 @@ pub trait Store {
     /// (realm net-observer, node #150). Read once at startup, so the daemon
     /// can say so in one line per table rather than one per dropped write.
     fn schema_drift(&self) -> Result<Vec<SchemaDrift>, StoreError>;
+    /// Delete every row of `table` whose `ts_us` is older than `cutoff_us`,
+    /// returning how many went — the record's retention mechanism (realm
+    /// net-observer, node #130). `table` must be one of [`PRUNABLE_TABLES`]:
+    /// any other name is [`StoreError::NotPrunable`], and the name reaches
+    /// the SQL only as the allow-list's own literal, never as given — the
+    /// list comes from config. A prune that deleted rows writes one
+    /// `record_prune` row in the same transaction — the bracket that says the
+    /// stretch before `cutoff_us` is pruned time, not a silence — and then
+    /// asks for a `CHECKPOINT`, since DuckDB frees the rows' blocks for reuse
+    /// only then; the rows are committed by then, so a checkpoint that fails
+    /// is logged with the count and the count still returned.
+    fn prune_older_than(&self, table: &str, cutoff_us: i64) -> Result<u64, StoreError>;
 }

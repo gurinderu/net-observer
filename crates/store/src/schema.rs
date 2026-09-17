@@ -242,7 +242,9 @@ CREATE TABLE IF NOT EXISTS topology_link (
 -- tick with NO rows — the API did not answer (`SKIP`) or it listed nothing
 -- (`OK`) — writes ONE row with every key column NULL, carrying the verdict:
 -- so "could not look" and "nothing is talking" are different rows, and both
--- are rows rather than an absent tick. `network` is NULL only on that row.
+-- are rows rather than an absent tick. A stretch with no rows at all before
+-- some instant is pruned time, not absent ticks, exactly when a `record_prune`
+-- row (below) brackets it. `network` is NULL only on that row.
 -- `chain` is the outbound that actually carried the flow — the first element
 -- of the Clash API's `chains` (sing-box lists them node-first; the last is the
 -- constant top-level selector).
@@ -306,4 +308,69 @@ CREATE TABLE IF NOT EXISTS experiment (
 -- before read back NULL — no path was recorded, not an empty one.
 ALTER TABLE experiment ADD COLUMN IF NOT EXISTS freeze_start_dir VARCHAR;
 ALTER TABLE experiment ADD COLUMN IF NOT EXISTS freeze_end_dir VARCHAR;
+-- One row per retention prune that deleted anything (realm net-observer,
+-- node #130): which table, the cutoff it cut at, how many rows went. The
+-- bracket for pruned time, as `observing_edge` is for a pause: a table that
+-- holds nothing before some instant is either a record that started there or
+-- one that was pruned there, and this row is what tells the two apart. A
+-- prune that deleted nothing leaves no row. Added after the store first
+-- shipped, so an older DB file gains the table on open like `probing_edge`.
+CREATE TABLE IF NOT EXISTS record_prune (
+  ts_us BIGINT, "table" VARCHAR, cutoff_us BIGINT, deleted UBIGINT);
 "#;
+
+/// The record's SAMPLE tables — the ones that take a row per tick (or per
+/// event, or per scan slice) and grow without bound. Every table here has a
+/// `ts_us` column, and the record's own observation bound
+/// ([`crate::DuckdbStore::latest_sample_ts_us`]) is the newest `ts_us`
+/// across all of them.
+///
+/// Not here: `incident`, `blob_ref`, `trigger_fired` (evidence),
+/// `observing_edge` / `probing_edge` / `record_prune` (brackets),
+/// `neighbor_scan` (the record of the daemon having spoken on the segment),
+/// `experiment`, and the keyed entity tables (`neighbor*`, `topology_link`),
+/// which hold one row per thing seen and do not grow per tick.
+pub const SAMPLE_TABLES: &[&str] = &[
+    "link_sample",
+    "proxy_sample",
+    "dns_sample",
+    "route_event",
+    "host_sample",
+    "wifi_sample",
+    "air_sample",
+    "air_ap",
+    "neighbor_sample",
+    "connection_sample",
+    "singbox_log_sample",
+];
+
+/// The subset of [`SAMPLE_TABLES`] a retention prune may touch — the only
+/// names [`crate::Store::prune_older_than`] accepts (realm net-observer, node
+/// #130).
+///
+/// The complement of what the gap derivation reads: `diagnosis::SAMPLE_TS_CTE`
+/// takes a tick of `link_sample`, `proxy_sample`, `host_sample`, `dns_sample`
+/// or `route_event` as "the daemon was collecting at this instant", and from
+/// those instants derives every stop and sleep. Prune one of the five and
+/// the derivation reads the pruned stretch as a silence — a fabricated stop
+/// or sleep that poisons `verdict_at` and `incident_context` for the
+/// incidents the prune kept. So those five are never prunable, whatever
+/// config says. `air_sample` and `air_ap` are one scan slice joined by
+/// `ts_us`; naming either prunes both halves, each in its own transaction and
+/// bracketed by its own `record_prune` row (see [`AIR_SLICE`]).
+pub const PRUNABLE_TABLES: &[&str] = &[
+    "connection_sample",
+    "air_sample",
+    "air_ap",
+    "wifi_sample",
+    "neighbor_sample",
+    "singbox_log_sample",
+];
+
+/// The two halves of one air scan — the scan row and the access points it
+/// heard, joined by `ts_us`. Cutting one without the other leaves orphan
+/// `air_ap` rows or scans that read as having heard nobody, so config naming
+/// either half makes the sweep prune both, each bracketed by its own
+/// `record_prune` row; a failure between the two leaves the slice half-pruned
+/// until the next sweep, which is what the two brackets then show.
+pub const AIR_SLICE: [&str; 2] = ["air_sample", "air_ap"];

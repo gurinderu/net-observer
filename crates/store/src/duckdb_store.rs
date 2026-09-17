@@ -1,4 +1,8 @@
-use crate::{Store, diagnosis::PreparedSql, schema::SCHEMA_SQL};
+use crate::{
+    Store,
+    diagnosis::PreparedSql,
+    schema::{PRUNABLE_TABLES, SAMPLE_TABLES, SCHEMA_SQL},
+};
 use duckdb::{Connection, InterruptHandle, params};
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -107,6 +111,11 @@ pub enum StoreError {
     /// The message is the panic's own payload.
     #[error("store panicked under its connection lock: {0}")]
     Panicked(String),
+    /// [`Store::prune_older_than`] was asked for a table that is not one of
+    /// the record's sample tables ([`SAMPLE_TABLES`]) — a config typo, or a
+    /// table whose rows a prune must never touch. Nothing was run.
+    #[error("`{table}` is not a sample table of the record; nothing pruned")]
+    NotPrunable { table: String },
 }
 
 pub struct DuckdbStore {
@@ -173,10 +182,11 @@ impl DuckdbStore {
         Ok(n)
     }
 
-    /// The newest `ts_us` across every SAMPLE table — the record's own
-    /// observation bound, distinct from whatever the wall clock reads when a
-    /// fresh process asks. `None` when the record holds no samples at all (a
-    /// freshly created database file).
+    /// The newest `ts_us` across every SAMPLE table ([`SAMPLE_TABLES`], the
+    /// UNION built from the list so a table added there is counted here) —
+    /// the record's own observation bound, distinct from whatever the wall
+    /// clock reads when a fresh process asks. `None` when the record holds no
+    /// samples at all (a freshly created database file).
     ///
     /// The pairing for [`Self::close_open_incidents`] at startup: a crashed
     /// process's open incidents must close at the last instant this record
@@ -185,18 +195,13 @@ impl DuckdbStore {
     /// crashed run's incidents as having lasted until this later moment
     /// (realm net-observer, node #124).
     pub fn latest_sample_ts_us(&self) -> Result<Option<i64>, StoreError> {
+        let union = SAMPLE_TABLES
+            .iter()
+            .map(|t| format!("SELECT MAX(ts_us) AS m FROM {t}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
         let max: Option<i64> = self.conn.lock().unwrap().query_row(
-            "SELECT MAX(m) FROM (
-                SELECT MAX(ts_us) AS m FROM link_sample
-                UNION ALL SELECT MAX(ts_us) FROM proxy_sample
-                UNION ALL SELECT MAX(ts_us) FROM dns_sample
-                UNION ALL SELECT MAX(ts_us) FROM route_event
-                UNION ALL SELECT MAX(ts_us) FROM host_sample
-                UNION ALL SELECT MAX(ts_us) FROM wifi_sample
-                UNION ALL SELECT MAX(ts_us) FROM air_sample
-                UNION ALL SELECT MAX(ts_us) FROM neighbor_sample
-                UNION ALL SELECT MAX(ts_us) FROM singbox_log_sample
-            )",
+            &format!("SELECT MAX(m) FROM ({union})"),
             [],
             |r| r.get(0),
         )?;
@@ -964,6 +969,51 @@ impl Store for DuckdbStore {
             }
         }
         Ok(drift)
+    }
+
+    fn prune_older_than(&self, table: &str, cutoff_us: i64) -> Result<u64, StoreError> {
+        // The name that reaches the SQL is the allow-list's own literal, found
+        // by equality — the configured string itself is never interpolated
+        // (realm net-observer, node #130).
+        let Some(table) = PRUNABLE_TABLES.iter().copied().find(|t| *t == table) else {
+            return Err(StoreError::NotPrunable {
+                table: table.to_string(),
+            });
+        };
+        self.with_conn(|conn| {
+            // The DELETE and its bracket are ONE transaction: the rows must
+            // never be gone without the `record_prune` row that says so, and
+            // the row must never claim a prune that rolled back.
+            let tx = conn.unchecked_transaction()?;
+            let deleted = tx.execute(
+                &format!("DELETE FROM {table} WHERE ts_us < ?"),
+                params![cutoff_us],
+            )?;
+            if deleted == 0 {
+                tx.commit()?;
+                return Ok(0);
+            }
+            tx.execute(
+                "INSERT INTO record_prune (ts_us, \"table\", cutoff_us, deleted) VALUES (?,?,?,?)",
+                params![types::now_us(), table, cutoff_us, deleted as u64],
+            )?;
+            tx.commit()?;
+            // DuckDB keeps a deleted row's blocks until the next checkpoint;
+            // nothing else in this store checkpoints, so a prune that freed
+            // rows asks for one here rather than waiting for the WAL to fill.
+            // The rows and their bracket are committed by now, so a checkpoint
+            // that fails is a warning with the count, never a failed prune.
+            if let Err(e) = conn.execute_batch("CHECKPOINT") {
+                tracing::warn!(
+                    error = %e,
+                    table,
+                    deleted,
+                    "checkpoint after the prune failed; the rows are deleted and \
+                     recorded, their blocks are reclaimed at the next checkpoint"
+                );
+            }
+            Ok(deleted as u64)
+        })
     }
 }
 
@@ -2099,6 +2149,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(s.latest_sample_ts_us().unwrap(), Some(5000));
+
+        // The flow table is a sample table too — the UNION is built from
+        // `SAMPLE_TABLES`, so a tick there moves the bound like any other.
+        s.write_sample(&connections_tick(7000, 1)).unwrap();
+        assert_eq!(s.latest_sample_ts_us().unwrap(), Some(7000));
     }
 
     /// A freshly created database file holds no samples at all: the sweep must
@@ -3040,6 +3095,216 @@ mod tests {
             s.query_table("SELECT 4").unwrap().rows,
             vec![vec!["4".to_string()]]
         );
+    }
+
+    /// One flow-table tick with `n` aggregate rows at `ts_us`.
+    fn connections_tick(ts_us: i64, n: u32) -> Sample {
+        use types::{ConnectionsSample, ConnectionsVerdict};
+        Sample::Connections(ConnectionsSample {
+            ts_us,
+            verdict: ConnectionsVerdict::Ok,
+            rows: (0..n)
+                .map(|i| connection_row(Some(&format!("host-{i}")), None, None, 1))
+                .collect(),
+        })
+    }
+
+    fn host_tick(ts_us: i64) -> Sample {
+        Sample::Host(types::HostSample {
+            ts_us,
+            load1: 1.0,
+            load5: 1.0,
+            load15: 1.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        })
+    }
+
+    /// The prune cuts strictly BEFORE the cutoff, on the named table only,
+    /// returns exactly the rows it deleted — the count the daemon logs — and
+    /// brackets them with one `record_prune` row; a pass that deletes nothing
+    /// writes no bracket. The deleting path also runs the checkpoint (realm
+    /// net-observer, node #130).
+    #[test]
+    fn prune_deletes_only_the_named_tables_rows_before_the_cutoff_and_brackets_them() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&connections_tick(1000, 2)).unwrap();
+        s.write_sample(&connections_tick(2000, 1)).unwrap();
+        s.write_sample(&connections_tick(3000, 1)).unwrap();
+        s.write_sample(&host_tick(1000)).unwrap();
+
+        let before = types::now_us();
+        assert_eq!(s.prune_older_than("connection_sample", 2000).unwrap(), 2);
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM connection_sample")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT min(ts_us) FROM connection_sample")
+                .unwrap(),
+            2000,
+            "the row AT the cutoff stays"
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM host_sample")
+                .unwrap(),
+            1,
+            "a table the prune was not asked about is untouched"
+        );
+        // The bracket: one row naming the table, the cutoff and the count,
+        // stamped at the prune's own instant.
+        let bracket = s
+            .query_table("SELECT \"table\", cutoff_us, deleted FROM record_prune")
+            .unwrap();
+        assert_eq!(
+            bracket.rows,
+            vec![vec![
+                "connection_sample".to_string(),
+                "2000".to_string(),
+                "2".to_string()
+            ]]
+        );
+        let stamped = s
+            .query_scalar_i64("SELECT ts_us FROM record_prune")
+            .unwrap();
+        assert!(stamped >= before, "{stamped} < {before}");
+        // Nothing left before the cutoff: a second pass deletes nothing, says
+        // so, and writes no second bracket.
+        assert_eq!(s.prune_older_than("connection_sample", 2000).unwrap(), 0);
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM record_prune")
+                .unwrap(),
+            1
+        );
+        // The store is still whole after the checkpoint the first pass ran.
+        s.write_sample(&connections_tick(4000, 1)).unwrap();
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM connection_sample")
+                .unwrap(),
+            3
+        );
+    }
+
+    /// A name outside the allow-list — a table the gap derivation reads, an
+    /// evidence table, a bracket table, a typo, an injection — is refused
+    /// before any SQL runs, and the refusal names the table. The record is
+    /// exactly as it was, and no bracket claims otherwise.
+    #[test]
+    fn prune_refuses_a_table_that_is_not_prunable() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.open_incident(&types::Incident {
+            id: "gw-drop-1".into(),
+            opened_us: 10,
+            closed_us: None,
+            trigger_id: "gw-drop".into(),
+            signature: "gw=FAIL".into(),
+        })
+        .unwrap();
+        s.write_sample(&host_tick(1000)).unwrap();
+        for name in [
+            "link_sample",
+            "proxy_sample",
+            "host_sample",
+            "dns_sample",
+            "route_event",
+            "incident",
+            "observing_edge",
+            "probing_edge",
+            "record_prune",
+            "trigger_fired",
+            "neighbor",
+            "connection_sample; DROP TABLE incident",
+            "CONNECTION_SAMPLE",
+            "",
+        ] {
+            match s.prune_older_than(name, i64::MAX) {
+                Err(StoreError::NotPrunable { table }) => assert_eq!(table, name),
+                other => panic!("`{name}` must be refused, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM incident").unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM host_sample")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM record_prune")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Every prunable name is a real table with a `ts_us` column: a prune on
+    /// each runs, so a table renamed in the schema without the list following
+    /// it fails here rather than in the daemon's log. And every sample table
+    /// answers the observation bound — the UNION is built from that list.
+    #[test]
+    fn every_prunable_table_prunes_and_every_sample_table_bounds() {
+        let s = DuckdbStore::in_memory().unwrap();
+        for table in PRUNABLE_TABLES {
+            assert_eq!(
+                s.prune_older_than(table, i64::MAX)
+                    .unwrap_or_else(|e| panic!("{table}: {e}")),
+                0
+            );
+        }
+        assert_eq!(s.latest_sample_ts_us().unwrap(), None);
+    }
+
+    /// Whether `sql` reads `table` — a `FROM <table>` whose next character is
+    /// not part of an identifier, so `FROM air_sample` never matches
+    /// `air_sample_x`, and a `WHERE` clause or a trailing space after the
+    /// name is read the same as a newline.
+    fn reads_table(sql: &str, table: &str) -> bool {
+        let needle = format!("FROM {table}");
+        sql.match_indices(&needle).any(|(at, _)| {
+            sql[at + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        })
+    }
+
+    /// The prunable set is the complement of what the gap derivation reads:
+    /// every prunable table is a sample table, and none of them feeds
+    /// `SAMPLE_TS_CTE` — the five that do are exactly the sample tables left
+    /// out, so a table added to the CTE without leaving this list fails here.
+    #[test]
+    fn prunable_tables_are_the_sample_tables_the_gap_derivation_never_reads() {
+        // The matcher itself: a bare name, a name before a clause, and a
+        // name that is only a prefix of the one read.
+        assert!(reads_table(
+            "SELECT ts_us FROM link_sample\n",
+            "link_sample"
+        ));
+        assert!(reads_table("SELECT 1 FROM air_ap WHERE x", "air_ap"));
+        assert!(reads_table("SELECT 1 FROM air_ap", "air_ap"));
+        assert!(!reads_table("SELECT 1 FROM air_ap_extra\n", "air_ap"));
+        for table in PRUNABLE_TABLES {
+            assert!(
+                SAMPLE_TABLES.contains(table),
+                "{table} is not a sample table"
+            );
+            assert!(
+                !reads_table(crate::diagnosis::SAMPLE_TS_CTE, table),
+                "{table} feeds the gap derivation and must not be prunable"
+            );
+        }
+        for table in SAMPLE_TABLES
+            .iter()
+            .filter(|t| !PRUNABLE_TABLES.contains(t))
+        {
+            assert!(
+                reads_table(crate::diagnosis::SAMPLE_TS_CTE, table),
+                "{table} is neither prunable nor read by the gap derivation"
+            );
+        }
     }
 
     /// A file this build itself shaped has no drift: every positional INSERT

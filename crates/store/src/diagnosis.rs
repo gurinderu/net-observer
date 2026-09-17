@@ -209,7 +209,12 @@ proxy_tick AS (
 
 /// Every stream's tick timestamps in one column — the evidence that the daemon
 /// was collecting at all. Used to close a pause that has no resume edge.
-const SAMPLE_TS_CTE: &str = "\
+///
+/// These five tables are therefore never pruned (`schema::PRUNABLE_TABLES` is
+/// their complement): a pruned stretch of any of them would read here as a
+/// silence and fabricate a stop or a sleep. Pruned time in the tables that
+/// ARE prunable is bracketed by a `record_prune` row, not by absence.
+pub(crate) const SAMPLE_TS_CTE: &str = "\
 sample_ts AS (
   SELECT ts_us FROM link_sample
   UNION ALL SELECT ts_us FROM proxy_sample

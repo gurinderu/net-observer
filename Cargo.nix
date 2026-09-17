@@ -21123,6 +21123,10 @@ rec {
             packageId = "thiserror 2.0.19";
           }
           {
+            name = "tracing";
+            packageId = "tracing";
+          }
+          {
             name = "types";
             packageId = "types";
           }
