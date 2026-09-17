@@ -14,8 +14,9 @@
 //! Each window opens with ONE [`SegmentIdentity`] read: the segment's key and
 //! the interface's own MAC as they are at that moment. The own MAC is what
 //! the window recognises this machine's own filter-matching traffic by (the
-//! OS's ARP, mDNS, SSDP and DHCP — never the daemon's probes, which do not
-//! pass the filter), counts and drops; it is re-read per window because a
+//! OS's own traffic and, during an operator-pressed scan, the sweep's ARP and
+//! the mDNS browse — never the periodic probes, which do not pass the
+//! filter), counts and drops; it is re-read per window because a
 //! Private Wi-Fi Address rotates it per network.
 //!
 //! When the stream ends — `tcpdump` exited, the pipe broke, the bytes

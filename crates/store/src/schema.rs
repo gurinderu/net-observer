@@ -124,10 +124,10 @@ CREATE TABLE IF NOT EXISTS neighbor_sample (
 -- The announce listener's frame counts for the window this reading flushed:
 -- `heard_frames` is every frame the capture delivered; `own_frames` is, of
 -- those, the frames this machine itself sent that match the capture filter —
--- the OS's own ARP, mDNS, SSDP and DHCP traffic, never the daemon's probes
--- (ICMP, TCP and DNS do not pass the filter) — recognised by the interface's
--- own MAC as read at that window's start, counted and dropped from the
--- neighbour map. It says the listener saw itself and ignored it, nothing
+-- the OS's own traffic and, during an operator-pressed scan, the sweep's
+-- ARP and the mDNS browse; never the periodic probes (ICMP, TCP and DNS do
+-- not pass the filter) — recognised by the interface's own MAC as read at
+-- that window's start, counted and dropped from the neighbour map. It says the listener saw itself and ignored it, nothing
 -- more: the passivity proof stays the frozen pcap slice (realm net-observer,
 -- node #88). Both NULL on a neighbour-cache tick and on a scan (they count no
 -- frames), never a zero; `heard_frames = 0` is a window in which the segment

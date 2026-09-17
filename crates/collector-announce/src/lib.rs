@@ -12,9 +12,9 @@
 //! **Passive by construction.** Nothing here opens a socket or addresses a
 //! packet at anybody. The bytes come from a pcap stream — on the daemon, a
 //! second `tcpdump` child's stdout, spawned by the `macos` crate — and this
-//! crate only reads. This machine's own frames — the OS's ARP, mDNS, SSDP
-//! and DHCP that match the filter, never the daemon's probes, which do not
-//! — it recognises by the interface's own MAC, read afresh for every window,
+//! crate only reads. This machine's own frames — the OS's own traffic and,
+//! during an operator-pressed scan, the sweep's ARP and the mDNS browse;
+//! never the periodic probes, which do not pass the filter — it recognises by the interface's own MAC, read afresh for every window,
 //! counts and drops: a machine is not its own neighbour, and the count says
 //! the listener saw itself and ignored it. The passivity proof is elsewhere
 //! (the frozen pcap slice, realm net-observer, node #88).

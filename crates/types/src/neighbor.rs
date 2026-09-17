@@ -191,8 +191,9 @@ pub struct HeardFrames {
     /// Every frame the capture delivered in the window, our own included.
     pub total: u32,
     /// Of those, the frames this machine itself sent that match the capture
-    /// filter — the OS's own ARP, mDNS, SSDP and DHCP traffic, never the
-    /// daemon's probes (ICMP, TCP and DNS do not pass the filter). Recognised
+    /// filter — the OS's own traffic and, during an operator-pressed scan,
+    /// the sweep's ARP and the mDNS browse; never the periodic probes (ICMP,
+    /// TCP and DNS do not pass the filter). Recognised
     /// by the interface's own MAC, re-read at every window's start because a
     /// Private Wi-Fi Address rotates it per network; dropped from the
     /// neighbour map — a machine is not its own neighbour — but counted, so
