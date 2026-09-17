@@ -283,13 +283,21 @@ mod tests {
             window: types::ExperimentWindow {
                 start_us: 7,
                 end_us: 7 + 60_000_000,
+                requested_minutes: 1,
+                link_interval_us: 15_000_000,
                 tier_before: types::ProbingTier::Active,
+                tier_at_end: types::ProbingTier::Active,
+                restore: types::TierRestore::Restored,
+                freeze_start_dir: None,
+                freeze_end_dir: None,
                 frames_pcap_start: None,
                 frames_pcap_end: None,
             },
+            ring_filter: "arp or icmp".into(),
             own_mac: None,
             our_frames: None,
             network: Some(types::NetworkFacts::default()),
+            edges: types::WindowEdges::default(),
             notes: Vec::new(),
         };
         store
@@ -298,6 +306,8 @@ mod tests {
                 start_us: 7,
                 end_us: 7 + 60_000_000,
                 tier_before: types::ProbingTier::Active,
+                freeze_start_dir: None,
+                freeze_end_dir: None,
                 report_json: net_observer_ipc::experiment_report_json(&report).unwrap(),
             })
             .unwrap();
