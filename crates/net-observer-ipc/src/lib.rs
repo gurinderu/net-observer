@@ -1799,6 +1799,9 @@ mod tests {
                 bssid: None,
                 if_mac: None,
                 medium: None,
+                lease_start_us: None,
+                lease_secs: None,
+                if_mac_private: None,
                 wifi_capture_present: false,
                 lan_probed: None,
                 lan_alive: None,
@@ -1908,6 +1911,10 @@ mod tests {
         assert_eq!(l.singbox_tun_if, None);
         assert_eq!(l.bssid, None);
         assert_eq!(l.if_mac, None);
+        assert_eq!(l.medium, None);
+        assert_eq!(l.lease_start_us, None);
+        assert_eq!(l.lease_secs, None);
+        assert_eq!(l.if_mac_private, None);
     }
 
     /// Same guarantee for the proxy sample: a frame from before the
@@ -2105,6 +2112,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

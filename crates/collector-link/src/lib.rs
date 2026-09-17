@@ -10,5 +10,5 @@ pub mod facts;
 pub mod sample;
 
 pub use collector::{LinkCollector, META};
-pub use facts::LinkFacts;
+pub use facts::{LinkFacts, LinkSummary};
 pub use sample::build_link_sample;

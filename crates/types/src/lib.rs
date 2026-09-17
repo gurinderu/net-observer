@@ -1,5 +1,6 @@
 pub mod air;
 pub mod incident;
+pub mod mac;
 pub mod neighbor;
 pub mod observing;
 pub mod probing;
@@ -12,6 +13,7 @@ pub use air::{
     FrequencyExtent, Grade, OverlapConfidence, Signal, overlap_hypothesis,
 };
 pub use incident::{BlobRef, Incident, TriggerFired};
+pub use mac::mac_is_private;
 pub use neighbor::{
     HistoryWindow, NeighborLifetime, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence,
 };

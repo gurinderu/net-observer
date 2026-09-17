@@ -6,6 +6,27 @@
 use collector_core::Readiness;
 use types::LinkMedium;
 
+/// One parse of `ipconfig getsummary <iface>` (the macOS adapter's own name
+/// for the same bundle is `macos::wifi::Summary`), carrying the three facts
+/// the daemon reads out of that single call: the associated AP's BSSID and
+/// the current DHCP lease's start and length. Bundled because the source
+/// command is one and the same, so [`LinkFacts::summary`] replaces what used
+/// to be a separate `bssid` method (realm net-observer, node #93 item 1; node
+/// #109 item 1).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LinkSummary {
+    /// BSSID of the access point `iface` is associated with, lowercase;
+    /// `None` = not associated or not determinable.
+    pub bssid: Option<String>,
+    /// Start of the current DHCP lease, epoch microseconds. `None` = absent,
+    /// unparseable, or the local time was ambiguous/nonexistent (a DST
+    /// fold/gap).
+    pub lease_start_us: Option<i64>,
+    /// Length of the current DHCP lease, seconds. `None` = absent or
+    /// unparseable.
+    pub lease_secs: Option<u32>,
+}
+
 /// Static/link facts gathered from the OS (route table, DHCP lease, ARP, Wi-Fi).
 ///
 /// Native `async fn` in a trait (no `async-trait` macro); the daemon drives it
@@ -40,9 +61,11 @@ pub trait LinkFacts: Send + Sync {
     /// The SSID `iface` is joined to; `None` = not associated, not readable
     /// (a root reader gets `<redacted>`), or not determinable.
     async fn ssid(&self, iface: &str) -> Option<String>;
-    /// BSSID of the access point `iface` is associated with, lowercase;
-    /// `None` = not associated or not determinable.
-    async fn bssid(&self, iface: &str) -> Option<String>;
+    /// [`LinkSummary`] parsed from ONE `ipconfig getsummary <iface>` call:
+    /// the BSSID `iface` is associated with plus the DHCP lease's start and
+    /// length. `LinkSummary::default()` (every field `None`) when nothing is
+    /// determinable — never a fabricated value.
+    async fn summary(&self, iface: &str) -> LinkSummary;
     /// `iface`'s own MAC as currently assigned, lowercase; `None` = not
     /// determinable. Private Wi-Fi Address rotates it per SSID.
     async fn if_mac(&self, iface: &str) -> Option<String>;
