@@ -491,6 +491,22 @@ graph TD
   daemon built before `Request::Query` existed). Each finding is a hypothesis
   carrying its confidence, and the caption says so. (realm net-observer, node
   #90)
+  **The connections window shows what this machine talks to, grouped the
+  operator's way.** A third normal window (`bin/net-observer-bar/src/connections.rs`,
+  the menu's **Connections** entry, its handle stashed on `Glance` like the
+  map's) whose toolbar is a grouping switch — `host · ip · ip:port · process`,
+  the four `ConnectionsGroupBy` values — and a `refresh` button. Every press is
+  one read-only `Query(Connections { group_by })` over the socket on the
+  background executor (`fetch_connections`, the same outcome mapping as the
+  findings read): the window fetches when it opens, on `refresh`, and on every
+  switch of the grouping — never on a timer, and never from the snapshot. The
+  daemon's table (the newest tick, one row per group: `key · flows · up · down ·
+  hosts`, bytes spelled `12.3 KB`, the hosts cell cut to three names `+N`) is
+  drawn under a line that dates the tick absolutely and names the grouping; a
+  tick that listed nothing is drawn as `no flows in the last tick (<verdict>)`,
+  so `SKIP` (the API did not answer) and `OK` (nothing is talking) stay two
+  different answers, and a daemon that could not answer shows its own words.
+  (realm net-observer, node #75)
   gpui's build script runs **bindgen over `dispatch.h`** (libclang plus the SDK
   headers), so the crate is a full workspace member but is excluded from
   `default-members` — a bare `cargo build` needs no GUI toolchain. Build the bar
