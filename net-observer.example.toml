@@ -130,9 +130,17 @@ interval = "15s"
 # log could not be read writes an `unreadable` row.
 [collectors.singbox_log]
 enabled = true
-# The file launchd points sing-box's stdout/stderr at (rotated in place by a
-# launchd agent; the reader follows the rotation).
+# The file launchd points sing-box's stdout/stderr at. The launchd agent
+# `org.nixos.sing-box-logrotate` rotates it every 900 s once it passes 20 MB
+# by `copytruncate` -- copied to `.1`, truncated in place, the same inode --
+# and the reader follows that (the few lines written between the copy and the
+# truncate are the agent's loss, not ours).
 path = "/var/log/sing-box.log"
+# Keep this equal to [collectors.link].interval (both default to 15 s): the
+# `singbox-no-route` and `singbox-dial-timeout` signatures clear after two
+# LINK ticks with no such line, because this reader writes nothing on a quiet
+# tick and the link collector is the daemon's tick clock -- a faster link
+# cadence clears them early, a slower one holds them open.
 interval = "15s"
 
 # The `pcap_ring` collector keeps a rolling in-memory capture (via tcpdump) so a

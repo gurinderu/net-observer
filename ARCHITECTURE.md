@@ -156,13 +156,21 @@ flowchart LR
 - **`singbox-log`** — what sing-box itself says. Under the passive tier the
   daemon records `SKIP` for the proxy and cannot say why the network died
   through sing-box; sing-box's own log (`/var/log/sing-box.log`, launchd's
-  stdout/stderr file, world-readable, rotated in place by a launchd agent —
+  stdout/stderr file, world-readable; the launchd agent
+  `org.nixos.sing-box-logrotate` rotates it every 900 s once it passes 20 MB
+  by `copytruncate` — copied to `.1`, truncated in place, the same inode —
   realm net-observer, node #140) is the one place its dial failures and its
   "missing default interface" are written. The collector tails it from its
   end each tick (`collector-singbox-log`: `LogTail` reads the bytes appended
-  since the last tick, keeps a partial trailing line, follows a rotation by
-  reopening from the new file's start and counts it), admits a line by a
-  byte scan before parsing anything (the log is DEBUG-level and large): a
+  since the last tick, keeps a partial trailing line up to 1 MiB, follows
+  the copytruncate by seeking to 0 on the handle it holds — a changed inode,
+  a hand `mv`, is drained first and then reopened, as a defence — counts
+  each rotation, and after a gap longer than two intervals since its last
+  read, an operator pause, re-attaches at the end rather than reading the
+  backlog into the tick after the pause, logging the gap and the bytes
+  skipped; a line whose own instant is older than two intervals is dropped
+  and counted the same way), admits a line by a byte scan on the raw bytes
+  before parsing or allocating anything (the log is DEBUG-level and large): a
   WARN-or-above level token, or one of the two INFO lines that are evidence
   — `sing-box started` and `updated default interface` — strips the ANSI
   colours, parses the line (`<offset> <date> <time> <LEVEL> [<conn-id>
@@ -215,12 +223,14 @@ flowchart LR
   — since a restart tears the TUN down and explains the burst),
   `singbox-dial-timeout` (three or
   more `dial-timeout` lines through one node within a minute while raw TCP to
-  that node's endpoint answers on the newest proxy tick — the endpoint read
-  through the URL-test reading the proxy collector rides on the node's
-  endpoint row (`urltest_node`, node #62): a `FAIL` there is `endpoint-block`'s,
-  a `SKIP` no measurement; a node the proxy collector carries no reading for
-  falls back to the whole fleet answering, and the detail then says the
-  node's own endpoint is unmapped; both clear after two link ticks with no
+  that node's endpoint answers — the endpoint read through the URL-test
+  reading the proxy collector rides on the node's endpoint row
+  (`urltest_node`, node #62), consulting the newest TWO proxy ticks since the
+  newest may still be being written: a `FAIL` there is `endpoint-block`'s, a
+  `SKIP` no measurement; a node the proxy collector carries no reading for
+  falls back to the whole fleet of the NEWEST tick answering (at least one
+  measured endpoint, reading-only rows not counted), and the detail then says
+  the node's own endpoint is unmapped; both clear after two link ticks with no
   such line, the link
   collector being the tick clock since the reader writes nothing on a quiet
   tick; realm net-observer, node #141), `starvation`.
