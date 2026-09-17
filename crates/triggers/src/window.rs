@@ -338,6 +338,9 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            dial_ip_ms: None,
+            dial_name_ms: None,
+            dial_target: None,
         })
     }
 
