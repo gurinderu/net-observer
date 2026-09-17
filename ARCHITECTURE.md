@@ -150,7 +150,13 @@ flowchart LR
   `endpoint-block` (whole upstream fleet dead from the underlay while the
   direct reference answers), `established-stall` (a held long-lived stream
   through the tunnel stops carrying while fresh probes succeed; the direct
-  underlay stream's fate scopes the verdict), `starvation`. Each fires at most
+  underlay stream's fate scopes the verdict), `endpoint-dial-stall`
+  (sing-box's own dial through the selected node dead by IP for three dialled
+  ticks while raw TCP to that node's listener answers — the listener is
+  reachable, what sing-box does through it is not), `proxy-dns-stall`
+  (the same dial answers by IP but not by name for three dialled ticks —
+  sing-box's DNS path is dead; the 2026-09-17 signature, realm net-observer,
+  node #62), `starvation`. Each fires at most
   once per 5 min (backoff) — except `roam`, which has no backoff so that each
   hop at the field cadence is its own incident (hops on consecutive ticks
   merge into one under the engine's latch; the rows still record both) — and
@@ -464,8 +470,11 @@ graph TD
 - `macos` implements every port trait with the real adapters, all on
   **async-native I/O** on the daemon's tokio runtime: `surge-ping` (raw ICMP),
   `socket2` + `tokio::net::TcpStream` with `IP_BOUND_IF` (bound TCP probes),
-  `reqwest`'s **async** client (Clash API — the selector and the live flow
-  list, TUN 204 probe, DoH), and
+  `reqwest`'s **async** client (Clash API — the selector group's selection
+  and members, the live flow list and the per-node delay test behind the
+  dial probe, whose request waits 2 s longer than the test's own 5 s timeout
+  so a `Timeout` body is read as "no answer" and never as "the API did not
+  answer"; TUN 204 probe; DoH), and
   `tokio::process::Command` (DHCP/ARP + Wi-Fi subprocesses); `getloadavg` stays
   an inline syscall inside its `async fn`, as does the CoreWLAN read behind
   `WifiFacts` (hand-declared `objc2` message sends — no subprocess and no text
@@ -618,7 +627,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | Table | Columns | Notes |
 | --- | --- | --- |
 | `link_sample` | `ts_us, gw, gw_rtt_ms, direct, direct_rtt_ms, dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present, lan_probed, lan_alive, fakeip_route_if, singbox_tun_if, bssid, if_mac, medium, lease_start_us, lease_secs, if_mac_private` | Local path: gateway ping, direct TCP (bound to phys iface), DHCP/ARP facts, Wi-Fi SSID + CoreCapture presence. `lan_probed`/`lan_alive` are the probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL tick (NULL = not probed). `fakeip_route_if` is the egress interface the route table resolves for a fakeip-pool address; `singbox_tun_if` is the interface carrying sing-box's own TUN address (present only while sing-box runs — the sing-box-alive fact, not "any utun", so a foreign VPN's utun does not read as sing-box being up). Both NULL = could not be determined. `gw_arp_mac` is normalised (`aa:bb:cc:dd:ee:ff`); rows written before the normalisation may carry `arp -n`'s raw form. `bssid` is the BSSID of the access point associated with and `if_mac` the interface's own MAC as currently assigned (Private Wi-Fi Address rotates it per SSID), both lowercase; a BSSID change at the same SSID is a roam the SSID alone cannot show, an `if_mac` change a new DHCP identity toward the network. NULL = not associated / not determinable. `medium` is the medium of the default-route interface (`wifi` or `wired`), measured from the hardware-port table so an `if_mac` change can be judged as a Wi-Fi roam or a dock/undock without a readable SSID or BSSID; NULL = not determinable. `lease_start_us` is the current DHCP lease's start (epoch microseconds, from the same `ipconfig getsummary` parse as `bssid`, resolved against the machine's local zone) — a change is a fresh DHCP exchange, an INIT-REBOOT every few minutes a roam; NULL = absent, unparseable, or a DST fold/gap left the local time ambiguous. `lease_secs` is that lease's length in seconds; NULL = absent or unparseable. `if_mac_private` is whether `if_mac`'s U/L bit reads as an administratively-assigned (Private Wi-Fi) address rather than the hardware-burned one; NULL exactly when `if_mac` is. |
-| `proxy_sample` | `ts_us, server_ip, tcp, rtt_ms, tun_code, selector, est_direct_alive, est_direct_age_s, est_tun_alive, est_tun_age_s` | Per-VLESS TCP reachability, tun HTTP 204 (`tun_code`), Clash selector. `tun_code` is the HTTP status the probe got; `0` = probed, no HTTP status (connect refused, timeout, transport error — the shell oracle's curl `000`), the value every reading, live (`starvation`) and offline (`why`, `wedge-or-starvation`), takes as the dead tun; `NULL` = not probed (the passive tier, a preflight skip), neither health nor fault. The `est_*` columns are the established-flow discriminator (held reference streams: direct underlay / through the tunnel), per-tick facts replicated across the tick's rows like `tun_code`; NULL = no measurement. |
+| `proxy_sample` | `ts_us, server_ip, tcp, rtt_ms, tun_code, selector, est_direct_alive, est_direct_age_s, est_tun_alive, est_tun_age_s, dial_ip_ms, dial_name_ms, dial_target` | Per-VLESS TCP reachability, tun HTTP 204 (`tun_code`), Clash selector. `tun_code` is the HTTP status the probe got; `0` = probed, no HTTP status (connect refused, timeout, transport error — the shell oracle's curl `000`), the value every reading, live (`starvation`) and offline (`why`, `wedge-or-starvation`), takes as the dead tun; `NULL` = not probed (the passive tier, a preflight skip), neither health nor fault. The `est_*` columns are the established-flow discriminator (held reference streams: direct underlay / through the tunnel), per-tick facts replicated across the tick's rows like `tun_code`; NULL = no measurement. The `dial_*` columns are the **dial probe** (realm net-observer, node #62): sing-box's own dial through one node of the selector group, asked of its Clash API (`GET /proxies/<node>/delay`, 5 s timeout), by IP (`dial_ip_ms` — transport through the node) and by name (`dial_name_ms` — transport plus sing-box's DNS path); `dial_target` names the node. The selected node is dialled every tick, the other members one per tick round-robin. A dial rides the row of its node's endpoint (so `tcp` beside it is that listener's raw reachability), or a **dial-only row** (`tcp = SKIP`, no rtt, under a named `dial_target`) when that row is taken by another dialled node or the endpoint is unknown; the selected node's row is the tick's last, so the live snapshot carries its dial. `NULL` target = no dial on this row (the passive tier, not this node's turn); a `*_ms` of `0` = attempted, no answer; `NULL` `*_ms` under a named target = the API could not run that test. |
 | `dns_sample` | `ts_us, probe, server, verdict, ip, rtt_ms` | One row per resolver probe (name label × resolver path); `verdict` drives the `fakeip` trigger. |
 | `route_event` | `ts_us, kind, iface, detail` | PF_ROUTE event stream (`kind` = `iface` / `addr` / `route`): iface up/down, addr add/loss, default-route change. |
 | `host_sample` | `ts_us, load1, load5, load15, disk_used_pct, disk_free_mb, swap_used_mb` | Host load averages — the `starvation` discriminator — plus the usage of the volume holding the record (`disk_used_pct` as `df` computes capacity, `disk_free_mb` what a writer can still take, in MiB) and the swap in use in MiB: the ENOSPC and memory-pressure discriminators the shell oracle carried. A store write that fails for want of space is logged as a gap; these columns let the record name the cause. NULL = not measured, never a zero. |
@@ -679,8 +688,13 @@ carries, lives in `types` for the same reason.
 | `silences()` | every pause, stop, and sleep, plus every stretch the daemon spent withholding its probes, all told apart by `kind` |
 | `connections(group_by)` | the newest `connection_sample` tick, grouped by `host` / `ip` / `ip-port` / `process` (`ConnectionsGroupBy`, in `types` like `HistoryWindow`): `ts_us, verdict, key, count, upload, download, hosts`, ordered by `count DESC`, `hosts` the distinct names seen behind the key; a tick with no rows answers one row carrying only `ts_us` and `verdict`, so a `SKIP` is never an empty table |
 
-The `layer` vocabulary is `link` / `vless` / `proxy` / `host` / `healthy` /
-`unknown` / `gap`. **The refusals are the point.** No query counts a `SKIP` as
+The `layer` vocabulary is `link` / `vless` / `proxy-dns` / `proxy` / `host` /
+`healthy` / `unknown` / `gap`. `proxy-dns` is read off the selected node's
+dial pair — `dial_ip_ms > 0` and `dial_name_ms = 0`: sing-box reaches the
+world through the node but cannot resolve a name — and is judged BEFORE the
+tun arms, because the tun probe fetches a name too and dies of the same cause
+(realm net-observer, node #62); `why` prints the pair beside the tun code.
+**The refusals are the point.** No query counts a `SKIP` as
 health or as fault, and two situations make a query decline outright rather than
 answer:
 
@@ -1247,7 +1261,8 @@ already-authorised command:
    net-observer, node #88): `passive` puts **nothing on the wire** — every
    emission class of the link, proxy and dns collectors (gateway echo, direct
    probe, neighbour pings, TUN 204, endpoint connects, the held reference
-   streams, resolver queries; `types::EmissionClass`) is withheld, each tick
+   streams, the dial probe asked of sing-box, resolver queries;
+   `types::EmissionClass`) is withheld, each tick
    still lands with its probe verdicts `SKIP`, and the held streams are closed —
    while `active` runs every class. The daemon boots into the tier `[probing]
    default` names, `passive` when absent, and never changes tier by itself. The
