@@ -651,8 +651,8 @@ carries, lives in `types` for the same reason.
 | `gw_drops()` | the first link sample of each run of `FAIL`/`NOGW` (`SKIP` ticks removed first, so a quiet run cannot manufacture an edge) |
 | `gateway_ramp(drop_ts_us)` | gateway RTT over the window before a drop, with a least-squares `slope_ms_per_s` over the answered ticks — the ~40 s coworking climb as data |
 | `fakeip_bugs()` | `FAKEIP` on a `.ru` name, which is always a bug |
-| `observation_gaps()` | one row per interval the record cannot vouch for — an operator pause, a stop before a startup, or a sleep between ticks — each named by `kind` |
-| `silences()` | the same pause/stop/sleep gaps, plus every stretch the daemon spent withholding its probes, all told apart by `kind` |
+| `observation_gaps()` | one row per operator pause — frozen shape, pauses only, no `kind` column |
+| `silences()` | every pause, stop, and sleep, plus every stretch the daemon spent withholding its probes, all told apart by `kind` |
 | `connections(group_by)` | the newest `connection_sample` tick, grouped by `host` / `ip` / `ip-port` / `process` (`ConnectionsGroupBy`, in `types` like `HistoryWindow`): `ts_us, verdict, key, count, upload, download, hosts`, ordered by `count DESC`, `hosts` the distinct names seen behind the key; a tick with no rows answers one row carrying only `ts_us` and `verdict`, so a `SKIP` is never an empty table |
 
 The `layer` vocabulary is `link` / `vless` / `proxy` / `host` / `healthy` /
@@ -736,9 +736,10 @@ active) — never at a sample, because samples keep landing under passive. It is
 deliberately not folded into `observation_gap`: a moment inside a stretch has a
 row and reads `unknown` from its `SKIP`s, never `gap`. `silences_sql` lists
 every bracket under a `kind` column (`pause` | `stop` | `sleep` | `passive`);
-`observation_gaps_sql` carries the same `kind` column but never `passive` — a
-passive stretch still writes a sample every tick, so it is not a hole in the
-record the way the other three are. (realm net-observer, node #88, node #109)
+`observation_gaps_sql` keeps the frozen, pauses-only shape it shipped with —
+three columns, no `kind`, `WHERE cause = 'pause'` — so a stop, a sleep, or a
+passive stretch never rides along there, only in `silences_sql`. (realm
+net-observer, node #88, node #109)
 
 ### Air scan
 
@@ -814,9 +815,9 @@ the durable record; the socket is the live, low-latency read path.
     `incident-context`, `wedge-or-starvation`, `gateway-ramp` and the drop list
     it defaults from, `gaps` and `silences` — the latter every bracketed
     silence with a `kind` column: pause, stop, sleep, and passive stretches;
-    `Gaps` carries the same `kind` column but never `passive`, because a
-    reader built before the tier asks for it by that id and would print a
-    stretch as a pause — `neighbors`, `vulns`,
+    `Gaps` keeps its frozen, pauses-only shape (no `kind` column at all),
+    because a reader built before the tier asks for it by that id and would
+    print a stop, a sleep, or a stretch as a pause — `neighbors`, `vulns`,
     `segments`, `history`, `topology`, `connections`, `air` (three variants —
     `AirScan`, `AirAps`, `AirSelfChannel`, see [Air scan](#air-scan) — routed
     from `AirScan` and reused for the other two, one `source:` line for the
@@ -1249,10 +1250,10 @@ already-authorised command:
    after it. Clients: the bar menu's **Probe network**/**Stop probing**
    row and `net-observer-cli probe passive|active`; `gaps` asks the `Silences`
    diagnosis, which lists passive stretches as `kind = passive` next to the
-   pause/stop/sleep gaps (`Gaps` itself never carries `passive`, for readers
-   built before the tier; when an older daemon answers `Gaps` the CLI says so
-   on stderr, and when it reads the file it runs `silences_sql` and prints
-   only its usual source line).
+   pause/stop/sleep gaps (`Gaps` itself stays frozen and pauses-only, for
+   readers built before the tier; when an older daemon answers `Gaps` the CLI
+   says so on stderr, and when it reads the file it runs `silences_sql` and
+   prints only its usual source line).
 
    Passive is deliberately **not** a refusal on a manual scan. Passive
    promises **no emission the daemon makes on its own** — nothing on a timer;

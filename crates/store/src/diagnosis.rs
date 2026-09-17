@@ -446,26 +446,25 @@ probing_stretch AS (
   WHERE rn = 1
 )";
 
-/// **Observation gaps** — every interval the record cannot vouch for at all:
-/// an operator pause, a stop before a startup, or a sleep between ticks.
+/// **Observation gaps** — every operator pause, and PAUSES ONLY.
 ///
-/// The read side of [`observation_gap_cte`]: one row per gap, carrying `kind`
-/// (`pause` | `stop` | `sleep`), open-ended (`gap_closed_us` `NULL`) only when
-/// the record ends inside it.
-///
-/// Never `passive`: a passive stretch still writes a sample every tick (its
-/// probe verdicts `SKIP`), so it is not a hole in the record the way these
-/// three are — this is what a reader built before the probing tier asks for
-/// as `DiagnosticQuery::Gaps`, and a passive stretch listed here would be
-/// printed by that reader as a pause. The passive stretches ride alongside in
-/// [`silences_sql`], under a query id that reader has never heard of.
+/// Frozen in both shape and meaning, decided when the probing tiers landed
+/// (realm net-observer, node #88) and unchanged by the `stop`/`sleep` openers
+/// that [`observation_gap_cte`] gained later (realm net-observer, node #109):
+/// three columns (`gap_opened_us`, `gap_closed_us`, `gap_closed_by`), no
+/// `kind`, and `WHERE cause = 'pause'` so a `stop` or a `sleep` never rides
+/// along. This is what a reader built before the probing tier asks for as
+/// `DiagnosticQuery::Gaps` and prints every row as a pause — a stop, a sleep,
+/// or a passive stretch listed here would all be misread as one. Every kind
+/// (`pause` | `stop` | `sleep` | `passive`) lives in [`silences_sql`]
+/// instead, under a query id that reader has never heard of.
 pub fn observation_gaps_sql() -> String {
     let gap = observation_gap_cte(DEFAULT_SLEEP_THRESHOLD_US);
     format!(
         "WITH {SAMPLE_TS_CTE},
 {gap}
-SELECT cause AS kind, gap_opened_us, gap_closed_us, gap_closed_by
-FROM observation_gap ORDER BY gap_opened_us"
+SELECT gap_opened_us, gap_closed_us, gap_closed_by
+FROM observation_gap WHERE cause = 'pause' ORDER BY gap_opened_us"
     )
 }
 
@@ -474,11 +473,12 @@ FROM observation_gap ORDER BY gap_opened_us"
 /// daemon spent withholding its probes.
 ///
 /// The read side of both brackets, told apart by `kind`: `pause`/`stop`/
-/// `sleep` rows are [`observation_gap_cte`]'s own `cause` (no samples at
-/// all — exactly the rows of [`observation_gaps_sql`]), `passive` rows the
-/// withheld probes of [`PROBING_STRETCH_CTE`] (samples every tick, verdicts
-/// `SKIP`). Each is open-ended (`gap_closed_us` `NULL`) only when the record
-/// ends inside it. (realm net-observer, node #88, node #109)
+/// `sleep` rows are every one of [`observation_gap_cte`]'s own `cause`
+/// values (no samples at all — a strict superset of [`observation_gaps_sql`],
+/// which is `WHERE cause = 'pause'` only), `passive` rows the withheld probes
+/// of [`PROBING_STRETCH_CTE`] (samples every tick, verdicts `SKIP`). Each is
+/// open-ended (`gap_closed_us` `NULL`) only when the record ends inside it.
+/// (realm net-observer, node #88, node #109)
 pub fn silences_sql() -> String {
     let gap = observation_gap_cte(DEFAULT_SLEEP_THRESHOLD_US);
     format!(
@@ -1942,7 +1942,7 @@ mod tests {
         assert_eq!(cell(&t, 0, "slope_ms_per_s"), "");
         assert_eq!(cell(&t, 0, "observation_gap_us"), "80000000");
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 1, "{:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "sleep");
     }
@@ -2172,7 +2172,7 @@ mod tests {
         startup_edge(&s, 100 * SEC);
         healthy_tick(&s, 110 * SEC);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 1, "{:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "stop");
         assert_eq!(cell(&g, 0, "gap_opened_us"), (20 * SEC).to_string());
@@ -2195,7 +2195,7 @@ mod tests {
         startup_edge(&s, 100 * SEC);
         healthy_tick(&s, 110 * SEC);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 1, "no separate stop gap: {:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "pause");
         assert_eq!(cell(&g, 0, "gap_opened_us"), (25 * SEC).to_string());
@@ -2223,7 +2223,7 @@ mod tests {
         // first, not on the sample the first one already used, so each
         // unbridged hop is its own stop rather than the second vanishing
         // into the first's shadow (realm net-observer, node #109).
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 2, "{:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "stop");
         assert_eq!(cell(&g, 0, "gap_opened_us"), (20 * SEC).to_string());
@@ -2252,7 +2252,7 @@ mod tests {
         startup_edge(&s, 130 * SEC);
         healthy_tick(&s, 140 * SEC);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 2, "{:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "pause");
         assert_eq!(cell(&g, 0, "gap_opened_us"), (50 * SEC).to_string());
@@ -2277,7 +2277,7 @@ mod tests {
         healthy_tick(&s, 100_000_000);
         healthy_tick(&s, 100_000_010);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 1, "{:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "sleep");
         assert_eq!(cell(&g, 0, "gap_opened_us"), (20 * SEC).to_string());
@@ -2296,7 +2296,7 @@ mod tests {
         edge(&s, 100_000_000, true);
         healthy_tick(&s, 100_000_010);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(
             g.rows.len(),
             1,
@@ -2319,7 +2319,7 @@ mod tests {
         edge(&s, 1000 * SEC, false);
         startup_edge(&s, 2000 * SEC);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 2, "{:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "sleep");
         assert_eq!(cell(&g, 0, "gap_opened_us"), "0");
@@ -2344,7 +2344,7 @@ mod tests {
         edge(&s, 15 * SEC, true);
         healthy_tick(&s, 200 * SEC);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 2, "{:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "pause");
         assert_eq!(cell(&g, 0, "gap_opened_us"), (10 * SEC).to_string());
@@ -2369,7 +2369,7 @@ mod tests {
         edge(&s, 410 * SEC, true);
         healthy_tick(&s, 1000 * SEC);
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 3, "{:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "sleep");
         assert_eq!(cell(&g, 0, "gap_opened_us"), "0");
@@ -2517,7 +2517,7 @@ mod tests {
         assert_eq!(cell(&t, 0, "fitted_samples"), "");
         assert_eq!(cell(&t, 0, "slope_ms_per_s"), "");
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(
             g.rows.len(),
             2,
@@ -2551,7 +2551,7 @@ mod tests {
         let slope: f64 = cell(&t, 0, "slope_ms_per_s").parse().unwrap();
         assert!((slope - 20.0).abs() < 0.001, "slope was {slope}");
 
-        let g = s.observation_gaps().unwrap();
+        let g = s.silences().unwrap();
         assert_eq!(g.rows.len(), 1, "only the pause itself: {:?}", g.rows);
         assert_eq!(cell(&g, 0, "kind"), "pause");
     }
@@ -2594,8 +2594,10 @@ mod tests {
     /// never `gap`.
     ///
     /// `observation_gaps` (the `Gaps` query a pre-tier reader still asks for)
-    /// carries `kind` too (pause/stop/sleep), but the stretch is NOT among its
-    /// rows — that reader would print it as a pause.
+    /// is frozen in both shape and meaning: three columns, no `kind`, pauses
+    /// only — a stop, a sleep, or this stretch would all be misread as a
+    /// pause by that reader, so none of them ride along (realm net-observer,
+    /// node #88, node #109).
     #[test]
     fn a_passive_stretch_is_a_silence_of_its_own_kind_and_is_not_a_gap() {
         let s = DuckdbStore::in_memory().unwrap();
@@ -2615,8 +2617,8 @@ mod tests {
         let gaps = s.observation_gaps().unwrap();
         assert_eq!(
             gaps.columns,
-            vec!["kind", "gap_opened_us", "gap_closed_us", "gap_closed_by"],
-            "`Gaps` now carries `kind` (pause/stop/sleep), but never `passive`"
+            vec!["gap_opened_us", "gap_closed_us", "gap_closed_by"],
+            "`Gaps` keeps the frozen shape it shipped with — no `kind`"
         );
         assert!(
             gaps.rows.is_empty(),
