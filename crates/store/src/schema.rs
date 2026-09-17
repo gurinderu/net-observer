@@ -259,5 +259,11 @@ ALTER TABLE probing_edge ADD COLUMN IF NOT EXISTS reason VARCHAR;
 -- (reason 'experiment') without a closing one is the trace.
 CREATE TABLE IF NOT EXISTS experiment (
   id VARCHAR PRIMARY KEY, start_us BIGINT, end_us BIGINT, tier_before VARCHAR,
-  freeze_start_dir VARCHAR, freeze_end_dir VARCHAR, report_json VARCHAR);
+  report_json VARCHAR);
+-- Where the two freezes landed, added after the table first shipped with the
+-- five columns above: a file written by that daemon keeps its column set until
+-- these ALTERs run on open, exactly like `probing_edge.reason`. Rows from
+-- before read back NULL — no path was recorded, not an empty one.
+ALTER TABLE experiment ADD COLUMN IF NOT EXISTS freeze_start_dir VARCHAR;
+ALTER TABLE experiment ADD COLUMN IF NOT EXISTS freeze_end_dir VARCHAR;
 "#;

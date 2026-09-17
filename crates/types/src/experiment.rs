@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ObservingEdge, ProbingEdge, ProbingReason, ProbingTier};
+use crate::{ObservingEdge, ProbingEdge, ProbingReason, ProbingTier, local_instant};
 
 /// The bounds of one window and the two pcap freezes that bracket it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,25 +27,36 @@ pub struct ExperimentWindow {
     pub end_us: i64,
     /// The length the operator asked for. The window's real length is
     /// `end_us - start_us`; the difference is the machine's sleep.
+    /// `serde(default)` on this and the five fields below: a report stored
+    /// before they existed still reads, each absent value as its default.
+    #[serde(default)]
     pub requested_minutes: u32,
     /// The link collector's tick, as configured — the yardstick for a sleep
     /// inside the window and for the straddling tick (see
     /// [`OwnFrames::first_echo_us`]).
+    #[serde(default)]
     pub link_interval_us: i64,
     /// The tier in force before the window, read under the same lock that
     /// switched to passive.
     pub tier_before: ProbingTier,
-    /// The tier in force after the window's closing edge.
+    /// The tier in force after the window's closing edge; unrecorded, it
+    /// reads as the daemon's default tier, like every unrecorded tier.
+    #[serde(default)]
     pub tier_at_end: ProbingTier,
-    /// What the closing edge did about `tier_before`.
+    /// What the closing edge did about `tier_before`; unrecorded, it reads
+    /// as unverified, never as restored.
+    #[serde(default)]
     pub restore: TierRestore,
     /// Where the START freeze copied the ring (`blob_dir/freeze-experiment-
     /// <start_us>-start`); `None` when nothing was copied. Each copied file
     /// also has a `blob_ref` row (`kind = pcap`) against the window's id, and
-    /// the freeze pruner leaves `freeze-experiment-*` alone, so the slice
-    /// the report was read from stays on disk.
+    /// the freeze pruner keeps `freeze-experiment-*` on its own budget, so
+    /// the slice the report was read from outlives the incident freezes'
+    /// churn.
+    #[serde(default)]
     pub freeze_start_dir: Option<String>,
     /// The same for the END freeze.
+    #[serde(default)]
     pub freeze_end_dir: Option<String>,
     /// Every record the START freeze's ring files held, inside the window or
     /// not; `None` when the ring was not running or its files could not be
@@ -95,6 +106,16 @@ pub enum TierRestore {
     /// restore skipped, `why` naming the gap. A restore it cannot vouch for
     /// would be a switch the operator did not ask for.
     Unverified { why: String },
+}
+
+impl Default for TierRestore {
+    /// A report from before the field existed recorded nothing about its
+    /// closing edge; it reads as unverified, never as restored.
+    fn default() -> Self {
+        Self::Unverified {
+            why: "not recorded".into(),
+        }
+    }
 }
 
 /// What one frozen pcap slice held, and how many of its frames inside the
@@ -259,6 +280,14 @@ impl NetworkFacts {
 /// against an unbroken window.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WindowEdges {
+    /// The collection state in force AT `start_us`: the newest
+    /// `observing_edge` at or before it, `None` when the record holds none
+    /// that early. `Some(false)` is a window that opened inside a pause — the
+    /// daemon refuses to open one while paused, but a pause landing between
+    /// that check and the opening edge writes its row BEFORE `start_us`,
+    /// where the list below cannot see it (realm net-observer, node #61).
+    #[serde(default)]
+    pub observing_at_start: Option<bool>,
     /// `observing_edge` rows with `ts_us` inside `[start_us, end_us]`.
     pub observing: Vec<ObservingEdge>,
     /// `probing_edge` rows inside the same bounds — the window's own opening
@@ -332,7 +361,7 @@ impl ExperimentReport {
             Some(f) => {
                 let mut s = format!(
                     "our ICMP echo requests in the ring: {} in {minutes} minutes \
-                     (the ring does not carry TCP/DNS; the shell oracle and a hand-run ping share this MAC)",
+                     (what the ring's filter passes — see ring_filter; the shell oracle and a hand-run ping share this MAC)",
                     f.icmp_echo
                 );
                 if let Some(first) = f.first_echo_us {
@@ -372,6 +401,9 @@ impl ExperimentReport {
             ),
         };
         let mut integrity = Vec::new();
+        if self.edges.observing_at_start == Some(false) {
+            integrity.push("paused at the start".to_string());
+        }
         let pauses = self.edges.pauses().count();
         if pauses > 0 {
             integrity.push(format!("{pauses} pauses inside the window"));
@@ -379,7 +411,7 @@ impl ExperimentReport {
         if let Some(e) = self.edges.operator_probing().next() {
             integrity.push(format!(
                 "the tier was moved inside the window at {}",
-                e.ts_us
+                local_instant(e.ts_us)
             ));
         }
         if let Some(s) = w.slept_s() {
@@ -439,8 +471,9 @@ impl ExperimentReport {
                     w.tier_at_end.as_str()
                 ),
                 TierRestore::OperatorMoved { at_us } => format!(
-                    "{} (changed by the operator at {at_us}; restore skipped)",
-                    w.tier_at_end.as_str()
+                    "{} (changed by the operator at {}; restore skipped)",
+                    w.tier_at_end.as_str(),
+                    local_instant(*at_us)
                 ),
                 TierRestore::NotPassive { found } => format!(
                     "{} (found {} at the end, not the window's passive; restore skipped)",
@@ -535,12 +568,20 @@ impl ExperimentReport {
         }
         put(
             "pauses_inside_window",
-            edges_text(
-                self.edges.pauses().count(),
-                self.edges
-                    .pauses()
-                    .map(|e| e.ts_us.to_string())
-                    .collect::<Vec<_>>(),
+            format!(
+                "{}{}",
+                if self.edges.observing_at_start == Some(false) {
+                    "paused at the start; "
+                } else {
+                    ""
+                },
+                edges_text(
+                    self.edges.pauses().count(),
+                    self.edges
+                        .pauses()
+                        .map(|e| local_instant(e.ts_us))
+                        .collect::<Vec<_>>(),
+                )
             ),
         );
         put(
@@ -549,7 +590,14 @@ impl ExperimentReport {
                 self.edges.operator_probing().count(),
                 self.edges
                     .operator_probing()
-                    .map(|e| format!("{} {} ({})", e.ts_us, e.tier.as_str(), e.reason.as_str()))
+                    .map(|e| {
+                        format!(
+                            "{} {} ({})",
+                            local_instant(e.ts_us),
+                            e.tier.as_str(),
+                            e.reason.as_str()
+                        )
+                    })
                     .collect::<Vec<_>>(),
             ),
         );
@@ -739,7 +787,7 @@ mod tests {
         assert_eq!(
             r.verdict(),
             "our ICMP echo requests in the ring: 0 in 5.0 minutes \
-             (the ring does not carry TCP/DNS; the shell oracle and a hand-run ping share this MAC); \
+             (what the ring's filter passes — see ring_filter; the shell oracle and a hand-run ping share this MAC); \
              the OS sent 2 ARP, 1 DHCP, 0 other; \
              the network showed: 2 route events, 1 incidents (gw-drop-1 [gw-drop]), 0 roams"
         );
@@ -845,7 +893,10 @@ mod tests {
         r.window.tier_at_end = ProbingTier::Active;
         assert_eq!(
             cell(&r.rows(), "tier_at_end"),
-            "active (changed by the operator at 777; restore skipped)"
+            format!(
+                "active (changed by the operator at {}; restore skipped)",
+                local_instant(777)
+            )
         );
         r.window.restore = TierRestore::NotPassive {
             found: ProbingTier::Active,
@@ -871,6 +922,7 @@ mod tests {
     fn edges_inside_the_window_are_named_with_their_instants() {
         let mut r = report(Some(frames(0)), Some(quiet_network()));
         r.edges = WindowEdges {
+            observing_at_start: Some(true),
             observing: vec![
                 ObservingEdge {
                     ts_us: 150,
@@ -900,25 +952,77 @@ mod tests {
                 },
             ],
         };
+        // Instants on the human rows are clocks, not epochs (the raw
+        // `start_us` / `end_us` rows stay pastable).
         let rows = r.rows();
-        assert_eq!(cell(&rows, "pauses_inside_window"), "1 (150)");
+        assert_eq!(
+            cell(&rows, "pauses_inside_window"),
+            format!("1 ({})", local_instant(150))
+        );
+        assert!(!cell(&rows, "pauses_inside_window").contains("(150)"));
         assert_eq!(
             cell(&rows, "probing_edges_inside_window"),
-            "1 (170 active (control))"
+            format!("1 ({} active (control))", local_instant(170))
         );
         let v = r.verdict();
         assert!(
-            v.ends_with(
-                "[1 pauses inside the window; the tier was moved inside the window at 170]"
-            ),
+            v.ends_with(&format!(
+                "[1 pauses inside the window; the tier was moved inside the window at {}]",
+                local_instant(170)
+            )),
             "{v}"
         );
+
+        // A window that opened inside a pause — the pause's row sits before
+        // `start_us`, so only the state at the start can say so.
+        r.edges = WindowEdges {
+            observing_at_start: Some(false),
+            ..WindowEdges::default()
+        };
+        assert_eq!(
+            cell(&r.rows(), "pauses_inside_window"),
+            "paused at the start; 0"
+        );
+        assert!(
+            r.verdict().ends_with("[paused at the start]"),
+            "{}",
+            r.verdict()
+        );
+
         r.edges = WindowEdges::default();
         assert_eq!(cell(&r.rows(), "pauses_inside_window"), "0");
         assert!(
-            !r.verdict().contains("inside the window"),
+            !r.verdict().contains("inside the window") && !r.verdict().contains("paused"),
             "{}",
             r.verdict()
+        );
+    }
+
+    /// A report stored before the round-two fields existed still reads: the
+    /// absent fields take their defaults, and none of them claims a
+    /// restore or a recorded tier that never was.
+    #[test]
+    fn a_report_without_the_newer_window_fields_still_reads() {
+        let json = r#"{"id":"experiment-1","window":{"start_us":1,"end_us":2,
+            "tier_before":"active","frames_pcap_start":null,"frames_pcap_end":null},
+            "own_mac":null,"our_frames":null,"network":null,"notes":[]}"#;
+        let r: ExperimentReport = serde_json::from_str(json).unwrap();
+        assert_eq!(r.window.requested_minutes, 0);
+        assert_eq!(r.window.link_interval_us, 0);
+        assert_eq!(r.window.tier_at_end, ProbingTier::Passive);
+        assert_eq!(
+            r.window.restore,
+            TierRestore::Unverified {
+                why: "not recorded".into()
+            }
+        );
+        assert_eq!(r.window.freeze_start_dir, None);
+        assert_eq!(r.ring_filter, "");
+        assert_eq!(r.edges, WindowEdges::default());
+        assert_eq!(r.edges.observing_at_start, None);
+        assert_eq!(
+            cell(&r.rows(), "tier_at_end"),
+            "passive (restore skipped: not recorded)"
         );
     }
 

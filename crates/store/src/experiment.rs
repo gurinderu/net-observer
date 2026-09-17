@@ -50,7 +50,18 @@ pub fn window_edges(
         ),
         budget,
     )?;
+    // The state in force at the start: a pause that landed just before the
+    // opening edge is a row the bounded list above cannot see.
+    let at_start = store.query_prepared_within(
+        &PreparedSql::bound(
+            "SELECT observing FROM observing_edge WHERE ts_us <= ?
+             ORDER BY ts_us DESC LIMIT 1",
+            vec![Value::BigInt(start_us)],
+        ),
+        budget,
+    )?;
     Ok(WindowEdges {
+        observing_at_start: at_start.rows.first().map(|r| cell(r, 0) == "true"),
         observing: observing
             .rows
             .iter()
@@ -507,8 +518,56 @@ mod tests {
         );
         assert_eq!(
             window_edges(&s, END + 10, END + 20, BUDGET).unwrap(),
-            WindowEdges::default()
+            WindowEdges {
+                observing_at_start: Some(true),
+                ..WindowEdges::default()
+            },
+            "the state at a later start is the resume at END"
         );
+    }
+
+    /// The state in force at the start is the newest `observing_edge` at or
+    /// before `start_us`: a pause landing just before the opening edge is
+    /// seen there and nowhere in the bounded list; a pause after the start
+    /// is in the list, not the state at the start; and a record with no edge
+    /// that early says so with `None`, never a fabricated state.
+    #[test]
+    fn observing_at_start_is_the_newest_edge_at_or_before_the_start() {
+        use types::{ObservingCause, ObservingEdge};
+        let s = DuckdbStore::in_memory().unwrap();
+        let observing = |ts_us, observing| ObservingEdge {
+            ts_us,
+            observing,
+            peer_uid: Some(501),
+            cause: ObservingCause::Control,
+        };
+        assert_eq!(
+            window_edges(&s, START, END, BUDGET)
+                .unwrap()
+                .observing_at_start,
+            None,
+            "no edge that early"
+        );
+        // A pause one microsecond before the start: seen as the state, not
+        // as a row inside the window.
+        s.write_observing_edge(&observing(START - 1, false))
+            .unwrap();
+        let e = window_edges(&s, START, END, BUDGET).unwrap();
+        assert_eq!(e.observing_at_start, Some(false));
+        assert!(e.observing.is_empty());
+        assert_eq!(e.pauses().count(), 0);
+        // A resume exactly at the start is at-or-before: the state is on.
+        s.write_observing_edge(&observing(START, true)).unwrap();
+        let e = window_edges(&s, START, END, BUDGET).unwrap();
+        assert_eq!(e.observing_at_start, Some(true));
+        assert_eq!(e.observing.len(), 1);
+        // A pause after the start is inside the window, and does not move
+        // the state at the start.
+        s.write_observing_edge(&observing(START + 5, false))
+            .unwrap();
+        let e = window_edges(&s, START, END, BUDGET).unwrap();
+        assert_eq!(e.observing_at_start, Some(true));
+        assert_eq!(e.pauses().count(), 1);
     }
 
     /// The flow readings are the newest tick at or before each bound — a

@@ -53,11 +53,14 @@ pub enum EmissionClass {
 ///
 /// Serialised lowercase (`"passive"` / `"active"`): the same token travels the
 /// socket, sits in the config file and lands in the `probing_edge.tier` column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProbingTier {
     /// Nothing on the wire. Every probe is withheld and its verdict lands as
-    /// `SKIP`; the passive collectors keep reading.
+    /// `SKIP`; the passive collectors keep reading. The daemon's own default
+    /// tier (`config::ProbingCfg::default`), and so this type's: an
+    /// unrecorded tier reads as the one the daemon boots into.
+    #[default]
     Passive,
     /// Every emission class runs.
     Active,

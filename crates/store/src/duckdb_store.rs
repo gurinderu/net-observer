@@ -2395,12 +2395,18 @@ mod tests {
         ));
         let path_str = path.to_str().unwrap().to_string();
 
-        // The pre-`cause` table, written by the daemon of the day.
+        // The pre-`cause` table, written by the daemon of the day — and the
+        // five-column `experiment` table of the daemon that shipped the window
+        // before its freeze directories were recorded.
         {
             let conn = Connection::open(&path_str).unwrap();
             conn.execute_batch(
                 "CREATE TABLE observing_edge (ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT);
-                 INSERT INTO observing_edge VALUES (1000, false, 501);",
+                 INSERT INTO observing_edge VALUES (1000, false, 501);
+                 CREATE TABLE experiment (
+                   id VARCHAR PRIMARY KEY, start_us BIGINT, end_us BIGINT,
+                   tier_before VARCHAR, report_json VARCHAR);
+                 INSERT INTO experiment VALUES ('experiment-1', 1, 2, 'active', '{}');",
             )
             .unwrap();
         }
@@ -2423,6 +2429,32 @@ mod tests {
         assert_eq!(
             s.query_scalar_i64("SELECT count(*) FROM observing_edge WHERE cause = 'startup'")
                 .unwrap(),
+            1
+        );
+        // The five-column window reads back with no freeze directory — none
+        // was recorded — and the migrated table takes a full row.
+        let old = s
+            .experiment("experiment-1")
+            .unwrap()
+            .expect("the old window must survive the added columns");
+        assert_eq!(old.freeze_start_dir, None);
+        assert_eq!(old.freeze_end_dir, None);
+        assert_eq!(old.report_json, "{}");
+        s.write_experiment(&ExperimentRecord {
+            id: "experiment-2".into(),
+            start_us: 3,
+            end_us: 4,
+            tier_before: ProbingTier::Passive,
+            freeze_start_dir: Some("/blobs/freeze-experiment-3-start".into()),
+            freeze_end_dir: None,
+            report_json: "{}".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM experiment WHERE freeze_start_dir IS NOT NULL"
+            )
+            .unwrap(),
             1
         );
         drop(s);
