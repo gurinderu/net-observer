@@ -1318,18 +1318,27 @@ fn set_probing(
     authorized: PeerAuthorized,
     cx: &ControlCtx<'_>,
 ) -> ControlResult {
-    let Some(switched) = switch_probing(
-        |_| tier,
+    // An operator's switch refuses nothing from inside the lock: `Ok` always,
+    // so the `Err` arm cannot be reached and is written out rather than
+    // unwrapped.
+    let switched = match switch_probing(
+        |_| Ok(tier),
         Some(authorized.uid()),
         ProbingReason::Control,
         EdgePolicy::OnChange,
         &cx.tier_sinks(),
-    ) else {
-        tracing::info!(probing = %tier, changed = false, "probing tier unchanged");
-        return ControlResult {
-            ok: true,
-            message: format!("probing {tier}"),
-        };
+    ) {
+        Ok(Some(switched)) => switched,
+        Ok(None) => {
+            tracing::info!(probing = %tier, changed = false, "probing tier unchanged");
+            return ControlResult {
+                ok: true,
+                message: format!("probing {tier}"),
+            };
+        }
+        Err(message) => {
+            return ControlResult { ok: false, message };
+        }
     };
     tracing::info!(
         probing = %tier,
@@ -1357,11 +1366,16 @@ fn set_probing(
 ///
 /// `target` names the tier to move into FROM the tier in force, decided
 /// under the lock that flips it: an operator's switch ignores what it finds
-/// (`|_| tier`), an experiment window's close moves back only if what it
-/// finds is still its own passive. The tier found is returned as
-/// [`Switched::was`] — the one reading of "before" that cannot be stale.
+/// (`|_| Ok(tier)`), an experiment window's close moves back only if what it
+/// finds is still its own passive, and a window's OPENING refuses from in
+/// here when collection is paused — the same lock `SetObserving` flips the
+/// flag under, so a pause cannot land between the check and the edge. An
+/// `Err` from `target` is that refusal: nothing is stamped, flipped or
+/// written, and the message is the caller's to return. The tier found is
+/// returned as [`Switched::was`] — the one reading of "before" that cannot
+/// be stale.
 ///
-/// `None` when the tier was already in force and `policy` is
+/// `Ok(None)` when the tier was already in force and `policy` is
 /// [`EdgePolicy::OnChange`]; under [`EdgePolicy::Always`] such a switch
 /// still stamps and writes the edge (an experiment window's bracket, realm
 /// net-observer, node #61) but flips nothing — no epoch moves, no session
@@ -1391,22 +1405,22 @@ fn set_probing(
 /// `None` at once and the engine closed open incidents as "recovered" at the
 /// FIRST POST-SWITCH sample instead of at the switch itself.
 fn switch_probing(
-    target: impl FnOnce(ProbingTier) -> ProbingTier,
+    target: impl FnOnce(ProbingTier) -> Result<ProbingTier, String>,
     peer_uid: Option<u32>,
     reason: ProbingReason,
     policy: EdgePolicy,
     s: &TierSinks<'_>,
-) -> Option<Switched> {
+) -> Result<Option<Switched>, String> {
     let (edge, was) = {
         let mut snap = s.snapshot.lock().unwrap_or_else(|e| e.into_inner());
         // Read-then-set is safe: the snapshot lock serialises every control
         // connection and the experiment end task, and these are the tier's
         // only writers.
         let was = s.probing.tier();
-        let tier = target(was);
+        let tier = target(was)?;
         let changed = was != tier;
         if !changed && policy == EdgePolicy::OnChange {
-            return None;
+            return Ok(None);
         }
         let ts_us = types::now_us();
         if changed {
@@ -1458,7 +1472,7 @@ fn switch_probing(
             "store write failed; probing edge not recorded (gap logged)");
         note = format!(" (boundary record failed: {e})");
     }
-    Some(Switched { edge, was, note })
+    Ok(Some(Switched { edge, was, note }))
 }
 
 /// Go and look for neighbours on operator demand.
@@ -1736,16 +1750,6 @@ fn start_experiment(
             ),
         };
     }
-    // Paused: the pause is bracketed silence — `observing_edge` says the
-    // daemon deliberately collected nothing between two instants — and a
-    // window measured inside it would read its zeros against no record at
-    // all. Refused for the reason a scan is (`scan_now`).
-    if !cx.observing.load(Ordering::Acquire) {
-        return ControlResult {
-            ok: false,
-            message: "observation is paused; resume before starting an experiment".to_string(),
-        };
-    }
     let h = &cx.experiment;
     let peer_uid = authorized.uid();
     let (id, start_us, ends_at_us, tier_before, start_note) = {
@@ -1759,18 +1763,38 @@ fn start_experiment(
                 message: experiment_running_message(running, *ends_at_us),
             };
         }
-        let Some(switched) = switch_probing(
-            |_| ProbingTier::Passive,
+        // Paused: the pause is bracketed silence — `observing_edge` says the
+        // daemon deliberately collected nothing between two instants — and a
+        // window measured inside it would read its zeros against no record
+        // at all. Refused for the reason a scan is (`scan_now`), and read
+        // INSIDE the switch's lock: `SetObserving` flips the flag under that
+        // same lock, so a pause cannot slip between this check and the
+        // opening edge and write its row just before `start_us`.
+        let observing = cx.observing;
+        let switched = match switch_probing(
+            |_| {
+                if observing.load(Ordering::Acquire) {
+                    Ok(ProbingTier::Passive)
+                } else {
+                    Err("observation is paused; resume before starting an experiment".to_string())
+                }
+            },
             Some(peer_uid),
             ProbingReason::Experiment,
             EdgePolicy::Always,
             &h.tier_sinks(),
-        ) else {
+        ) {
+            Ok(Some(switched)) => switched,
+            Err(message) => {
+                return ControlResult { ok: false, message };
+            }
             // Unreachable under `Always`; said rather than unwrapped.
-            return ControlResult {
-                ok: false,
-                message: "experiment could not open: no opening edge".to_string(),
-            };
+            Ok(None) => {
+                return ControlResult {
+                    ok: false,
+                    message: "experiment could not open: no opening edge".to_string(),
+                };
+            }
         };
         // The tier in force before the window is the one the switch found
         // under its lock — never a separate read that a racing control
@@ -1928,13 +1952,15 @@ async fn finish_experiment(h: ExperimentHandles, id: String, open: ExperimentOpe
     // rows could not be read cannot vouch for that, so it keeps its hands
     // off too. Decided under the switch's own lock, from the tier it finds.
     let may_restore = operator_moved_at.is_none() && edges_read;
+    // The closing edge refuses nothing: `Ok` always, so `Err` is unreachable
+    // and folded into the "no closing edge" arm below rather than unwrapped.
     let closing = switch_probing(
         |was| {
-            if was == ProbingTier::Passive && may_restore {
+            Ok(if was == ProbingTier::Passive && may_restore {
                 tier_before
             } else {
                 was
-            }
+            })
         },
         Some(peer_uid),
         ProbingReason::ExperimentEnd,
@@ -1942,7 +1968,7 @@ async fn finish_experiment(h: ExperimentHandles, id: String, open: ExperimentOpe
         &h.tier_sinks(),
     );
     let (tier_at_end, restore) = match closing {
-        Some(Switched { edge, was, note }) => {
+        Ok(Some(Switched { edge, was, note })) => {
             if !note.is_empty() {
                 notes.push(format!("closing edge{note}"));
             }
@@ -1962,8 +1988,9 @@ async fn finish_experiment(h: ExperimentHandles, id: String, open: ExperimentOpe
             };
             (edge.tier, restore)
         }
-        // Unreachable under `Always`; recorded rather than unwrapped.
-        None => {
+        // Unreachable under `Always` with an `Ok` target; recorded rather
+        // than unwrapped.
+        Ok(None) | Err(_) => {
             notes.push("closing edge: none written".into());
             (
                 h.probing.tier(),
@@ -3791,20 +3818,27 @@ mod tests {
                 .map(|r| r[1].clone())
                 .unwrap_or_else(|| panic!("no row {k}"))
         };
+        // The instant is a clock on the human rows, never a raw epoch.
+        let moved_at_clock = types::local_instant(moved_at);
         assert_eq!(
             cell("tier_at_end"),
-            format!("active (changed by the operator at {moved_at}; restore skipped)")
+            format!("active (changed by the operator at {moved_at_clock}; restore skipped)")
         );
         assert_eq!(
             cell("probing_edges_inside_window"),
-            format!("1 ({moved_at} active (control))")
+            format!("1 ({moved_at_clock} active (control))")
         );
         assert!(
             cell("verdict").contains(&format!(
-                "the tier was moved inside the window at {moved_at}"
+                "the tier was moved inside the window at {moved_at_clock}"
             )),
             "{}",
             cell("verdict")
+        );
+        assert_eq!(
+            cell("pauses_inside_window"),
+            "0",
+            "collection was on at the start and stayed on"
         );
         let _ = std::fs::remove_dir_all(&srv.blob_dir);
     }

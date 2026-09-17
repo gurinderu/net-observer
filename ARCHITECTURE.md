@@ -661,7 +661,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `trigger_fired` | `ts_us, trigger_id, incident_id, detail` | One row per trigger fire. |
 | `observing_edge` | `ts_us, observing, peer_uid, cause` | One row per collection boundary — the one sanctioned gap in "SKIP, never silence"; `observing` is the state entered, so `false` opens a gap and `true` closes one. `peer_uid` attributes it to the control-socket peer that asked (SQL `NULL` when nobody did), and `cause` (`control` / `startup`) says what produced it. |
 | `probing_edge` | `ts_us, tier, peer_uid, reason` | One row per switch of the probing tier (`tier` is the tier entered, `passive` / `active`). Not a gap — a passive daemon keeps writing a row per tick with every probe verdict `SKIP` — but the bracket that says those `SKIP`s were *withheld*, not failed, and by whom. `peer_uid` is `NULL` for the startup edge, which records the configured default so a record that begins passive says so. `reason` (`control` / `startup` / `experiment` / `experiment-end`) says what produced the edge; added with the experiment window, so older rows read back `NULL`, which means `control` — what they were (realm net-observer, nodes #88, #61). The experiment pair is the one place an edge may repeat the tier already in force: a window on an already-passive daemon still marks its bounds. |
-| `experiment` | `id PK, start_us, end_us, tier_before, freeze_start_dir, freeze_end_dir, report_json` | One row per finished experiment window (realm net-observer, node #61): its bounds, the tier in force before it, where its two pcap freezes landed (NULL when a freeze copied nothing; each copied file also has a `blob_ref` row, `kind = pcap`, `incident_id` = the window's id, and the freeze pruner leaves `freeze-experiment-*` alone), and the whole `types::ExperimentReport` as JSON — the same report the daemon answers `Query(Experiment { id })` with, kept so it outlives the process that computed it. A window the daemon was restarted under leaves no row; its opening `probing_edge` (`reason = experiment`) without a closing one is the trace. |
+| `experiment` | `id PK, start_us, end_us, tier_before, freeze_start_dir, freeze_end_dir, report_json` | One row per finished experiment window (realm net-observer, node #61): its bounds, the tier in force before it, where its two pcap freezes landed (NULL when a freeze copied nothing, and NULL on rows from before the columns existed — they are `ALTER`ed in on open like `probing_edge.reason`; each copied file also has a `blob_ref` row, `kind = pcap`, `incident_id` = the window's id, and the freeze pruner keeps `freeze-experiment-*` on its own budget of twelve), and the whole `types::ExperimentReport` as JSON — the same report the daemon answers `Query(Experiment { id })` with, kept so it outlives the process that computed it. A window the daemon was restarted under leaves no row; its opening `probing_edge` (`reason = experiment`) without a closing one is the trace. |
 
 `dns_sample`, `route_event`, and `host_sample` are created by the v1.1 `dns`,
 `route-events`, and `host-metrics` collectors respectively.
@@ -1332,9 +1332,11 @@ already-authorised command:
    procedure — switch everything off, watch `tcpdump`, count by hand — run by
    the daemon for a window of 1 to 60 minutes. Refused while paused, for the
    reason a scan is: a window measured inside bracketed silence would read
-   its zeros against no record. The arm switches to the passive tier with a
-   `probing_edge` whose `reason` is `experiment`, written even if the daemon
-   was passive already (the window is marked either way;
+   its zeros against no record — and read INSIDE the lock the opening switch
+   holds, the same one `SetObserving` flips the flag under, so a pause cannot
+   slip between the check and the edge. The arm switches to the passive tier
+   with a `probing_edge` whose `reason` is `experiment`, written even if the
+   daemon was passive already (the window is marked either way;
    `api::EdgePolicy::Always`) — the tier it found under that same lock is the
    window's `tier_before` — freezes the pcap ring into
    `blob_dir/freeze-experiment-<start_us>-start` (one `blob_ref` row per
@@ -1345,9 +1347,12 @@ already-authorised command:
    loses nothing. One window at a time: a second `StartExperiment` is refused
    with the running id and its end. A missing ring does not refuse the window
    — the record's half of the report needs no ring — the message and the
-   report say the freeze was not taken. The freeze pruner (`macos::pcap`,
-   newest twelve directories kept) leaves `freeze-experiment-*` alone and
-   does not count them: the report was read from that slice and names it.
+   report say the freeze was not taken. The freeze pruner (`macos::pcap`)
+   keeps `freeze-experiment-*` on a budget of its own — the newest twelve,
+   six windows, pruned apart from the incident freezes' twelve — so neither
+   kind spends the other's: the report was read from that slice and names
+   it, and a season of windows still cannot grow the blob directory without
+   bound.
 
    When the window elapses the task takes the end instant on the **wall
    clock** (the sleep that timed the window is monotonic, which a sleeping
@@ -1356,8 +1361,12 @@ already-authorised command:
    window`), freezes the ring again (`…-end`, blob rows likewise), reads the
    boundary rows inside the window (`store::experiment::window_edges`: every
    `observing_edge` and `probing_edge` between the bounds, so the report
-   names each pause and each operator switch with its instant), and writes
-   the closing edge (`reason = experiment-end`, again under `Always`). That
+   names each pause and each operator switch with its instant as a local
+   clock, plus the collection state in force AT the start — the newest
+   `observing_edge` at or before it — so a window that opened inside a pause
+   says `paused at the start` even though that pause's row sits before
+   `start_us`), and writes the closing edge (`reason = experiment-end`, again
+   under `Always`). That
    edge restores `tier_before` **only if** the tier it finds under its lock
    is still the window's passive AND no operator edge landed inside the
    window; otherwise the operator's choice stands, the edge merely marks the
@@ -1388,9 +1397,10 @@ already-authorised command:
    never a zero. Its verdict line is derived from the counts on render and
    claims only what the ring's filter (recorded on the report as `ring
    filter`) can show: `our ICMP echo requests in the ring: 0 in 5.0 minutes
-   (the ring does not carry TCP/DNS; the shell oracle and a hand-run ping
-   share this MAC); the OS sent 2 ARP, 1 DHCP, 0 other; the network showed: 2
-   route events, 1 incidents (…), 0 roams` — never "the daemon was silent".
+   (what the ring's filter passes — see ring_filter; the shell oracle and a
+   hand-run ping share this MAC); the OS sent 2 ARP, 1 DHCP, 0 other; the
+   network showed: 2 route events, 1 incidents (…), 0 roams` — never "the
+   daemon was silent".
 
    Reading it: `Request::Query(DiagnosticQuery::Experiment { id })`. A window
    this process holds in memory answers from there without the query gate —
