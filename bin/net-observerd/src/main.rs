@@ -349,6 +349,7 @@ fn record_startup_probing_edge(
         ts_us,
         tier,
         peer_uid: None,
+        reason: types::ProbingReason::Startup,
     };
     match EncodedFrame::encode(&net_observer_ipc::StreamFrame::Probing(edge)) {
         Ok(frame) => {
@@ -1609,6 +1610,10 @@ fn build_api_server(
         // writes through, and the socket is world-connectable.
         query_gate: Arc::new(tokio::sync::Semaphore::new(api::MAX_QUERIES_IN_FLIGHT)),
         events_tx,
+        // Empty at boot on purpose: a window is process-scoped like the tier
+        // it withholds, and a finished one is read back from the `experiment`
+        // table (realm net-observer, node #61).
+        experiments: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }
 }
 
