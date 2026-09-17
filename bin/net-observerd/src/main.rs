@@ -1764,6 +1764,10 @@ fn build_api_server(
         // it withholds, and a finished one is read back from the `experiment`
         // table (realm net-observer, node #61).
         experiments: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        // What a window's report can see of our own frames, and the tick it
+        // measures a sleep and a straddling echo against.
+        ring_filter: cfg.collectors.pcap_ring.filter.clone(),
+        link_interval: cfg.collectors.link.interval,
     }
 }
 

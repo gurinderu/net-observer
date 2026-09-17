@@ -390,6 +390,12 @@ pub struct ExperimentHandles {
     pub resume_at_us: Arc<AtomicI64>,
     pub session_end_us: Arc<AtomicI64>,
     pub experiments: Arc<Experiments>,
+    /// The pcap ring's BPF filter, as configured — recorded on the report
+    /// as the whole of what its own-frame count can see.
+    pub ring_filter: String,
+    /// The link collector's tick, as configured — the yardstick for a sleep
+    /// inside the window and for the tick that straddled the flip.
+    pub link_interval: Duration,
 }
 
 impl ExperimentHandles {
@@ -508,6 +514,12 @@ pub struct ApiServer {
     /// `Query(Experiment { id })` reads a running or just-finished one here
     /// before the `experiment` table.
     pub experiments: Arc<Experiments>,
+    /// The pcap ring's BPF filter, as configured (`collectors.pcap_ring.filter`)
+    /// — what an experiment report says its own-frame count can see.
+    pub ring_filter: String,
+    /// The link collector's tick, as configured (`collectors.link.interval`)
+    /// — an experiment report's yardstick for a sleep and a straddling tick.
+    pub link_interval: Duration,
 }
 
 impl ApiServer {
@@ -523,6 +535,8 @@ impl ApiServer {
             resume_at_us: Arc::clone(&self.resume_at_us),
             session_end_us: Arc::clone(&self.session_end_us),
             experiments: Arc::clone(&self.experiments),
+            ring_filter: self.ring_filter.clone(),
+            link_interval: self.link_interval,
         }
     }
 
@@ -1115,6 +1129,10 @@ enum EdgePolicy {
 /// A tier switch that wrote an edge.
 struct Switched {
     edge: ProbingEdge,
+    /// The tier in force when the switch was decided, read under the same
+    /// lock that flipped it — the one reading of "before" that cannot be
+    /// stale.
+    was: ProbingTier,
     /// The store-failure note for the operator's message; empty when the
     /// row landed.
     note: String,
@@ -1301,7 +1319,7 @@ fn set_probing(
     cx: &ControlCtx<'_>,
 ) -> ControlResult {
     let Some(switched) = switch_probing(
-        tier,
+        |_| tier,
         Some(authorized.uid()),
         ProbingReason::Control,
         EdgePolicy::OnChange,
@@ -1337,6 +1355,12 @@ fn set_probing(
 /// back claim the daemon was probing while it was not. No `.await` and no
 /// store write under the guard.
 ///
+/// `target` names the tier to move into FROM the tier in force, decided
+/// under the lock that flips it: an operator's switch ignores what it finds
+/// (`|_| tier`), an experiment window's close moves back only if what it
+/// finds is still its own passive. The tier found is returned as
+/// [`Switched::was`] — the one reading of "before" that cannot be stale.
+///
 /// `None` when the tier was already in force and `policy` is
 /// [`EdgePolicy::OnChange`]; under [`EdgePolicy::Always`] such a switch
 /// still stamps and writes the edge (an experiment window's bracket, realm
@@ -1367,18 +1391,19 @@ fn set_probing(
 /// `None` at once and the engine closed open incidents as "recovered" at the
 /// FIRST POST-SWITCH sample instead of at the switch itself.
 fn switch_probing(
-    tier: ProbingTier,
+    target: impl FnOnce(ProbingTier) -> ProbingTier,
     peer_uid: Option<u32>,
     reason: ProbingReason,
     policy: EdgePolicy,
     s: &TierSinks<'_>,
 ) -> Option<Switched> {
-    let edge = {
+    let (edge, was) = {
         let mut snap = s.snapshot.lock().unwrap_or_else(|e| e.into_inner());
         // Read-then-set is safe: the snapshot lock serialises every control
         // connection and the experiment end task, and these are the tier's
         // only writers.
         let was = s.probing.tier();
+        let tier = target(was);
         let changed = was != tier;
         if !changed && policy == EdgePolicy::OnChange {
             return None;
@@ -1424,16 +1449,16 @@ fn switch_probing(
             }
             Err(e) => tracing::warn!(error = %e, "failed to encode probing frame"),
         }
-        edge
+        (edge, was)
     };
 
     let mut note = String::new();
     if let Err(e) = s.store.write_probing_edge(&edge) {
-        tracing::error!(error = %e, probing = %tier, reason = reason.as_str(),
+        tracing::error!(error = %e, probing = %edge.tier, reason = reason.as_str(),
             "store write failed; probing edge not recorded (gap logged)");
         note = format!(" (boundary record failed: {e})");
     }
-    Some(Switched { edge, note })
+    Some(Switched { edge, was, note })
 }
 
 /// Go and look for neighbours on operator demand.
@@ -1711,6 +1736,16 @@ fn start_experiment(
             ),
         };
     }
+    // Paused: the pause is bracketed silence — `observing_edge` says the
+    // daemon deliberately collected nothing between two instants — and a
+    // window measured inside it would read its zeros against no record at
+    // all. Refused for the reason a scan is (`scan_now`).
+    if !cx.observing.load(Ordering::Acquire) {
+        return ControlResult {
+            ok: false,
+            message: "observation is paused; resume before starting an experiment".to_string(),
+        };
+    }
     let h = &cx.experiment;
     let peer_uid = authorized.uid();
     let (id, start_us, ends_at_us, tier_before, start_note) = {
@@ -1724,9 +1759,8 @@ fn start_experiment(
                 message: experiment_running_message(running, *ends_at_us),
             };
         }
-        let tier_before = h.probing.tier();
         let Some(switched) = switch_probing(
-            ProbingTier::Passive,
+            |_| ProbingTier::Passive,
             Some(peer_uid),
             ProbingReason::Experiment,
             EdgePolicy::Always,
@@ -1738,6 +1772,10 @@ fn start_experiment(
                 message: "experiment could not open: no opening edge".to_string(),
             };
         };
+        // The tier in force before the window is the one the switch found
+        // under its lock — never a separate read that a racing control
+        // could sit between.
+        let tier_before = switched.was;
         let start_us = switched.edge.ts_us;
         let id = experiment_id(start_us);
         let ends_at_us = start_us + i64::from(minutes) * 60_000_000;
@@ -1750,7 +1788,10 @@ fn start_experiment(
         .join(format!("freeze-experiment-{start_us}-start"));
     let start_freeze = freeze_ring(&h.freezer, &start_dir);
     let freeze_note = match &start_freeze {
-        Ok(paths) => format!("froze {} pcap file(s) at the start", paths.len()),
+        Ok(paths) => {
+            record_freeze_blobs(h.store.as_ref(), &id, "start", start_us, paths);
+            format!("froze {} pcap file(s) at the start", paths.len())
+        }
         Err(why) => format!("start freeze: {why}"),
     };
 
@@ -1761,15 +1802,19 @@ fn start_experiment(
 
     let handles = h.clone();
     let task_id = id.clone();
+    let start_freeze = start_freeze.ok().map(|paths| (start_dir, paths));
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(u64::from(minutes) * 60)).await;
         finish_experiment(
             handles,
             task_id,
-            start_us,
-            tier_before,
-            peer_uid,
-            start_freeze.ok(),
+            ExperimentOpen {
+                start_us,
+                requested_minutes: minutes,
+                tier_before,
+                peer_uid,
+                start_freeze,
+            },
         )
         .await;
     });
@@ -1782,45 +1827,152 @@ fn start_experiment(
     }
 }
 
-/// Close an experiment window (realm net-observer, node #61): freeze the ring
-/// again, restore the tier that was in force, count what the two freezes and
-/// the record hold, and keep the report in memory and in the `experiment`
-/// table.
-///
-/// The end instant is taken BEFORE the end freeze, so the slice holds no
-/// frame from after the window; the restoring edge follows the freeze and
-/// is written under [`EdgePolicy::Always`], so a daemon that was passive
-/// before the window still marks where it ended. This machine's own MAC is
-/// read ONCE here, from the newest link sample the snapshot holds — the same
-/// value the link collector read on its last tick, which the passive tier
-/// keeps reading. The pcap walk and the store's counts run on the blocking
-/// pool. Nothing here fails the window: every count that could not be taken
-/// is a note in the report, never a zero and never a missing report.
-async fn finish_experiment(
-    h: ExperimentHandles,
-    id: String,
+/// What `start_experiment` hands its end task: the window as it opened.
+struct ExperimentOpen {
+    /// The opening edge's `ts_us`.
     start_us: i64,
+    /// The length the operator asked for.
+    requested_minutes: u32,
+    /// The tier the opening switch found in force, under its lock.
     tier_before: ProbingTier,
+    /// The operator who opened the window; both edges carry it.
     peer_uid: u32,
-    start_paths: Option<Vec<PathBuf>>,
-) {
+    /// The start freeze's directory and copied files, when it copied any.
+    start_freeze: Option<(PathBuf, Vec<PathBuf>)>,
+}
+
+/// One `blob_ref` row per copied ring file, against the window's id — the
+/// shape the incident freeze writes (`pipeline::FreezePcapHandler`), so the
+/// record refers to the slice the report was read from. A write that fails
+/// is logged as a gap; the files are on disk either way.
+fn record_freeze_blobs(store: &dyn Store, id: &str, which: &str, ts_us: i64, paths: &[PathBuf]) {
+    for (i, path) in paths.iter().enumerate() {
+        let blob = types::BlobRef {
+            id: format!("{id}-pcap-{which}-{i}"),
+            incident_id: id.to_string(),
+            ts_us,
+            kind: "pcap".into(),
+            path: path.display().to_string(),
+        };
+        if let Err(e) = store.write_blob_ref(&blob) {
+            tracing::warn!(%id, which, error = %e, "failed to write experiment pcap blob_ref");
+        }
+    }
+}
+
+/// Close an experiment window (realm net-observer, node #61): freeze the ring
+/// again, read the boundary rows the window holds, restore the tier that was
+/// in force — only if it is still the window's own to restore — count what
+/// the two freezes and the record hold, and keep the report in memory and in
+/// the `experiment` table.
+///
+/// The end instant is the wall clock, taken BEFORE the end freeze so the
+/// slice holds no frame from after the window; against the requested length
+/// it is what says the machine slept. The boundary rows are read next:
+/// every `observing_edge` and `probing_edge` inside the window, so the
+/// report names each, and so the closing edge knows whether an operator
+/// moved the tier meanwhile. The closing edge then restores `tier_before`
+/// only when the tier it finds is still the passive the window set AND no
+/// operator edge landed inside the window — otherwise the operator's choice
+/// stands, the edge (reason `experiment-end`, written under
+/// [`EdgePolicy::Always`]) merely marks the end, and the report says which.
+/// This machine's own MAC is read ONCE here, from the newest link sample the
+/// snapshot holds — the same value the link collector read on its last tick,
+/// which the passive tier keeps reading. The pcap walk and the store's
+/// counts run on the blocking pool. Nothing here fails the window: every
+/// count that could not be taken is a note in the report, never a zero and
+/// never a missing report.
+async fn finish_experiment(h: ExperimentHandles, id: String, open: ExperimentOpen) {
+    let ExperimentOpen {
+        start_us,
+        requested_minutes,
+        tier_before,
+        peer_uid,
+        start_freeze,
+    } = open;
     let end_us = types::now_us();
     let end_dir = h.blob_dir.join(format!("freeze-experiment-{start_us}-end"));
     let end_freeze = freeze_ring(&h.freezer, &end_dir);
-
     let mut notes = Vec::new();
-    let restored = switch_probing(
-        tier_before,
+    let end_paths = match end_freeze {
+        Ok(paths) => {
+            record_freeze_blobs(h.store.as_ref(), &id, "end", end_us, &paths);
+            Some(paths)
+        }
+        Err(why) => {
+            notes.push(format!("end freeze: {why}"));
+            None
+        }
+    };
+
+    // The boundary rows inside the window, read before the closing edge is
+    // written so that edge is not among them.
+    let edge_store = Arc::clone(&h.store);
+    let edges = tokio::task::spawn_blocking(move || {
+        store::experiment::window_edges(edge_store.as_ref(), start_us, end_us, QUERY_DEADLINE)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("edge read task failed: {e}")));
+    let (edges, edges_read) = match edges {
+        Ok(edges) => (edges, true),
+        Err(why) => {
+            notes.push(format!("boundary rows: {why}"));
+            (types::WindowEdges::default(), false)
+        }
+    };
+    let operator_moved_at = edges.operator_probing().next().map(|e| e.ts_us);
+
+    // The closing edge: back to `tier_before` only if the tier is still the
+    // window's own passive and nobody moved it meanwhile — a window whose
+    // rows could not be read cannot vouch for that, so it keeps its hands
+    // off too. Decided under the switch's own lock, from the tier it finds.
+    let may_restore = operator_moved_at.is_none() && edges_read;
+    let closing = switch_probing(
+        |was| {
+            if was == ProbingTier::Passive && may_restore {
+                tier_before
+            } else {
+                was
+            }
+        },
         Some(peer_uid),
         ProbingReason::ExperimentEnd,
         EdgePolicy::Always,
         &h.tier_sinks(),
     );
-    if let Some(Switched { note, .. }) = restored
-        && !note.is_empty()
-    {
-        notes.push(format!("closing edge{note}"));
-    }
+    let (tier_at_end, restore) = match closing {
+        Some(Switched { edge, was, note }) => {
+            if !note.is_empty() {
+                notes.push(format!("closing edge{note}"));
+            }
+            // The operator's switch is named first: it is the usual way the
+            // tier stops being the window's passive, and the instant is what
+            // the operator will look for.
+            let restore = if let Some(at_us) = operator_moved_at {
+                types::TierRestore::OperatorMoved { at_us }
+            } else if was != ProbingTier::Passive {
+                types::TierRestore::NotPassive { found: was }
+            } else if !edges_read {
+                types::TierRestore::Unverified {
+                    why: "the window's boundary rows could not be read".into(),
+                }
+            } else {
+                types::TierRestore::Restored
+            };
+            (edge.tier, restore)
+        }
+        // Unreachable under `Always`; recorded rather than unwrapped.
+        None => {
+            notes.push("closing edge: none written".into());
+            (
+                h.probing.tier(),
+                types::TierRestore::Unverified {
+                    why: "no closing edge".into(),
+                },
+            )
+        }
+    };
 
     let own_mac = h
         .snapshot
@@ -1829,17 +1981,14 @@ async fn finish_experiment(
         .link
         .as_ref()
         .and_then(|l| l.if_mac.clone());
-
-    let end_paths = match end_freeze {
-        Ok(paths) => Some(paths),
-        Err(why) => {
-            notes.push(format!("end freeze: {why}"));
-            None
-        }
-    };
-    if start_paths.is_none() {
+    if start_freeze.is_none() {
         notes.push("start freeze: none taken".to_string());
     }
+    let (freeze_start_dir, start_paths) = match start_freeze {
+        Some((dir, paths)) => (Some(dir.display().to_string()), Some(paths)),
+        None => (None, None),
+    };
+    let freeze_end_dir = end_paths.as_ref().map(|_| end_dir.display().to_string());
 
     let record_store = Arc::clone(&h.store);
     let mac_for_count = own_mac.clone();
@@ -1904,13 +2053,21 @@ async fn finish_experiment(
         window: ExperimentWindow {
             start_us,
             end_us,
+            requested_minutes,
+            link_interval_us: i64::try_from(h.link_interval.as_micros()).unwrap_or(i64::MAX),
             tier_before,
+            tier_at_end,
+            restore,
+            freeze_start_dir: freeze_start_dir.clone(),
+            freeze_end_dir: freeze_end_dir.clone(),
             frames_pcap_start,
             frames_pcap_end,
         },
+        ring_filter: h.ring_filter.clone(),
         own_mac,
         our_frames,
         network,
+        edges,
         notes,
     };
     tracing::info!(%id, verdict = %report.verdict(), "experiment window closed");
@@ -1922,6 +2079,8 @@ async fn finish_experiment(
                 start_us,
                 end_us,
                 tier_before,
+                freeze_start_dir,
+                freeze_end_dir,
                 report_json,
             };
             if let Err(e) = h.store.write_experiment(&record) {
@@ -2156,6 +2315,8 @@ mod tests {
             control_refusals: RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
             sub_refusals: RateLimitedLog::new(REFUSAL_LOG_INTERVAL),
             experiments: Arc::new(Mutex::new(HashMap::new())),
+            ring_filter: "arp or icmp or udp port 67 or udp port 68 or ether broadcast".into(),
+            link_interval: Duration::from_secs(15),
         }
     }
 
@@ -3410,10 +3571,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&srv.blob_dir);
     }
 
+    /// A paused daemon refuses to open a window, for the reason it refuses a
+    /// scan: the pause is bracketed silence, and a window measured inside it
+    /// would read its zeros against no record. Nothing moves.
+    #[test]
+    fn a_paused_daemon_refuses_an_experiment() {
+        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        srv.observing.store(false, Ordering::Release);
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::StartExperiment { minutes: 1 },
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(!res.ok, "{}", res.message);
+        assert_eq!(
+            res.message,
+            "observation is paused; resume before starting an experiment"
+        );
+        assert_eq!(srv.probing.tier(), ProbingTier::Active);
+        assert_eq!(
+            srv.store
+                .query_scalar_i64("SELECT count(*) FROM probing_edge")
+                .unwrap(),
+            0
+        );
+        assert!(srv.experiments.lock().unwrap().is_empty());
+    }
+
+    /// The window as `start_experiment` hands it to the end task, for a
+    /// window the test opens by hand.
+    fn opened(start_us: i64, tier_before: ProbingTier) -> ExperimentOpen {
+        ExperimentOpen {
+            start_us,
+            requested_minutes: 1,
+            tier_before,
+            peer_uid: TEST_DAEMON_UID,
+            start_freeze: None,
+        }
+    }
+
     /// Closing a window restores the tier in force before it with an
     /// `experiment-end` edge — written even when that restoration changes
     /// nothing — and leaves the report in memory and in the `experiment`
-    /// table, with every count that could not be taken named in it.
+    /// table, with every count that could not be taken named in it, the
+    /// ring's filter recorded, and no boundary row inside the window.
     #[tokio::test]
     async fn finishing_an_experiment_restores_the_tier_and_records_the_report() {
         let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
@@ -3425,10 +3627,7 @@ mod tests {
         finish_experiment(
             srv.experiment_handles(),
             id.clone(),
-            start_us,
-            ProbingTier::Passive,
-            TEST_DAEMON_UID,
-            None,
+            opened(start_us, ProbingTier::Passive),
         )
         .await;
 
@@ -3450,6 +3649,8 @@ mod tests {
             .expect("the report is durable");
         assert_eq!(record.start_us, start_us);
         assert_eq!(record.tier_before, ProbingTier::Passive);
+        assert_eq!(record.freeze_start_dir, None);
+        assert_eq!(record.freeze_end_dir, None, "no ring: nothing was copied");
         let from_table = net_observer_ipc::experiment_table_from_json(&record.report_json).unwrap();
 
         let live = match experiment_in_memory(&srv.experiments, &id) {
@@ -3467,9 +3668,20 @@ mod tests {
         };
         assert_eq!(cell("id"), id);
         assert_eq!(cell("tier_before"), "passive");
+        assert_eq!(
+            cell("tier_at_end"),
+            "passive (restored from the window's passive)"
+        );
+        assert_eq!(cell("requested_minutes"), "1");
+        assert_eq!(cell("machine_slept"), "no");
+        assert_eq!(cell("ring_filter"), srv.ring_filter);
+        assert_eq!(cell("freeze_start_dir"), "none");
+        assert_eq!(cell("freeze_end_dir"), "none");
         assert_eq!(cell("own_mac"), "unreadable");
         assert_eq!(cell("our_icmp_echo"), "not counted: own MAC unreadable");
         assert_eq!(cell("route_events"), "0");
+        assert_eq!(cell("pauses_inside_window"), "0");
+        assert_eq!(cell("probing_edges_inside_window"), "0");
         assert!(
             cell("notes").contains("end freeze: pcap ring not running"),
             "{}",
@@ -3481,10 +3693,11 @@ mod tests {
             cell("notes")
         );
         assert!(
-            cell("verdict").starts_with("our probes: not counted"),
+            cell("verdict").starts_with("our ICMP echo requests in the ring: not counted"),
             "{}",
             cell("verdict")
         );
+        assert!(!cell("verdict").contains("silent"), "{}", cell("verdict"));
 
         // A window that finished is not a running one: a new window may open.
         let cx = test_ctx(&srv);
@@ -3494,6 +3707,225 @@ mod tests {
             &cx,
         );
         assert!(next.ok, "{}", next.message);
+        let _ = std::fs::remove_dir_all(&srv.blob_dir);
+    }
+
+    /// An operator's `probe active` inside the window is theirs to keep: the
+    /// closing edge marks the end without moving the tier, and the report
+    /// names the switch and the skipped restore — with a window opened from
+    /// passive, where an unconditional restore would have flipped the
+    /// operator's `active` back.
+    #[tokio::test]
+    async fn an_operator_switch_inside_the_window_is_kept_and_named() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        srv.blob_dir = temp_dir("experiment-operator-moved");
+        srv.probing.set(ProbingTier::Passive);
+        let cx = test_ctx(&srv);
+
+        let res = control_request(
+            ControlCmd::StartExperiment { minutes: 1 },
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(res.message.contains("(was passive)"), "{}", res.message);
+        let start_us: i64 = srv
+            .store
+            .query_table("SELECT ts_us FROM probing_edge WHERE reason = 'experiment'")
+            .unwrap()
+            .rows[0][0]
+            .parse()
+            .unwrap();
+        let id = experiment_id(start_us);
+
+        // The operator, mid-window.
+        let moved = control_request(
+            ControlCmd::SetProbing(ProbingTier::Active),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(moved.ok, "{}", moved.message);
+        let moved_at: i64 = srv
+            .store
+            .query_table("SELECT ts_us FROM probing_edge WHERE reason = 'control'")
+            .unwrap()
+            .rows[0][0]
+            .parse()
+            .unwrap();
+        assert!(moved_at >= start_us);
+
+        // The end task, run by hand instead of after the sleep.
+        finish_experiment(
+            srv.experiment_handles(),
+            id.clone(),
+            opened(start_us, ProbingTier::Passive),
+        )
+        .await;
+
+        assert_eq!(
+            srv.probing.tier(),
+            ProbingTier::Active,
+            "the operator's choice stands; an unconditional restore would have flipped it back"
+        );
+        let t = srv
+            .store
+            .query_table("SELECT tier, reason FROM probing_edge ORDER BY ts_us")
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec!["passive".to_string(), "experiment".to_string()],
+                vec!["active".to_string(), "control".to_string()],
+                vec!["active".to_string(), "experiment-end".to_string()],
+            ],
+            "the closing edge marks the end at the tier found"
+        );
+        let live = match experiment_in_memory(&srv.experiments, &id) {
+            Some(Response::Table(t)) => t,
+            other => panic!("a finished window answers its table: {other:?}"),
+        };
+        let cell = |k: &str| {
+            live.rows
+                .iter()
+                .find(|r| r[0] == k)
+                .map(|r| r[1].clone())
+                .unwrap_or_else(|| panic!("no row {k}"))
+        };
+        assert_eq!(
+            cell("tier_at_end"),
+            format!("active (changed by the operator at {moved_at}; restore skipped)")
+        );
+        assert_eq!(
+            cell("probing_edges_inside_window"),
+            format!("1 ({moved_at} active (control))")
+        );
+        assert!(
+            cell("verdict").contains(&format!(
+                "the tier was moved inside the window at {moved_at}"
+            )),
+            "{}",
+            cell("verdict")
+        );
+        let _ = std::fs::remove_dir_all(&srv.blob_dir);
+    }
+
+    /// A ring that is running is frozen at both ends into the window's own
+    /// directories, each copied file gets a `blob_ref` row against the
+    /// window's id, and the report names both directories.
+    #[tokio::test]
+    async fn an_experiments_freezes_are_recorded_as_blobs_and_named() {
+        struct TwoFiles;
+        impl crate::pipeline::PcapFreezer for TwoFiles {
+            fn freeze(&self, dest_dir: &Path) -> Vec<std::path::PathBuf> {
+                std::fs::create_dir_all(dest_dir).unwrap();
+                let mut out = Vec::new();
+                for name in ["ring.pcap0", "ring.pcap1"] {
+                    let p = dest_dir.join(name);
+                    // A classic pcap header and no record: readable, empty.
+                    let mut header = vec![0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00];
+                    header.extend_from_slice(&[0u8; 8]);
+                    header.extend_from_slice(&262_144u32.to_le_bytes());
+                    header.extend_from_slice(&1u32.to_le_bytes());
+                    std::fs::write(&p, header).unwrap();
+                    out.push(p);
+                }
+                out
+            }
+        }
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        srv.blob_dir = temp_dir("experiment-freezes");
+        srv.freezer = Arc::new(PcapRingSlot::with_ring(
+            Arc::new(TwoFiles) as Arc<dyn crate::pipeline::PcapFreezer>
+        ));
+        let cx = test_ctx(&srv);
+
+        let res = control_request(
+            ControlCmd::StartExperiment { minutes: 1 },
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(
+            res.message.contains("froze 2 pcap file(s) at the start"),
+            "{}",
+            res.message
+        );
+        let start_us: i64 = srv
+            .store
+            .query_table("SELECT ts_us FROM probing_edge WHERE reason = 'experiment'")
+            .unwrap()
+            .rows[0][0]
+            .parse()
+            .unwrap();
+        let id = experiment_id(start_us);
+        let start_dir = srv
+            .blob_dir
+            .join(format!("freeze-experiment-{start_us}-start"));
+        let start_paths = vec![start_dir.join("ring.pcap0"), start_dir.join("ring.pcap1")];
+
+        finish_experiment(
+            srv.experiment_handles(),
+            id.clone(),
+            ExperimentOpen {
+                start_freeze: Some((start_dir.clone(), start_paths)),
+                ..opened(start_us, ProbingTier::Active)
+            },
+        )
+        .await;
+
+        let blobs = srv
+            .store
+            .query_table(&format!(
+                "SELECT id, kind, path FROM blob_ref WHERE incident_id = '{id}' ORDER BY id"
+            ))
+            .unwrap();
+        assert_eq!(blobs.rows.len(), 4, "{:?}", blobs.rows);
+        assert!(blobs.rows.iter().all(|r| r[1] == "pcap"));
+        assert!(
+            blobs
+                .rows
+                .iter()
+                .any(|r| r[0] == format!("{id}-pcap-start-0"))
+        );
+        assert!(
+            blobs
+                .rows
+                .iter()
+                .any(|r| r[0] == format!("{id}-pcap-end-1"))
+        );
+        assert!(
+            blobs.rows.iter().any(|r| r[2].ends_with("-end/ring.pcap0")),
+            "{:?}",
+            blobs.rows
+        );
+
+        let record = srv.store.experiment(&id).unwrap().expect("durable");
+        assert_eq!(
+            record.freeze_start_dir.as_deref(),
+            Some(start_dir.display().to_string().as_str())
+        );
+        assert!(
+            record
+                .freeze_end_dir
+                .as_deref()
+                .is_some_and(|d| d.ends_with(&format!("freeze-experiment-{start_us}-end"))),
+            "{:?}",
+            record.freeze_end_dir
+        );
+        let live = match experiment_in_memory(&srv.experiments, &id) {
+            Some(Response::Table(t)) => t,
+            other => panic!("a finished window answers its table: {other:?}"),
+        };
+        let cell = |k: &str| {
+            live.rows
+                .iter()
+                .find(|r| r[0] == k)
+                .map(|r| r[1].clone())
+                .unwrap_or_else(|| panic!("no row {k}"))
+        };
+        assert_eq!(cell("freeze_start_dir"), start_dir.display().to_string());
+        assert_eq!(cell("frames_pcap_start"), "0");
+        assert_eq!(cell("frames_pcap_end"), "0");
         let _ = std::fs::remove_dir_all(&srv.blob_dir);
     }
 
