@@ -227,18 +227,20 @@ pub enum DiagnosticQuery {
     /// live answer from silently plotting a different interval than the one
     /// asked for.
     GatewayRamp { drop_ts_us: i64, window_us: i64 },
-    /// Every observation gap the record contains (`observation_gaps_sql`) —
-    /// pauses only, in the shape this variant has had since it shipped. A
-    /// reader built before the probing tier asks for this and prints every
-    /// row as a pause, so the rows must stay pauses; the passive stretches
-    /// live under [`DiagnosticQuery::Silences`], a variant that reader has
-    /// never heard of.
+    /// Every observation gap the record contains (`observation_gaps_sql`):
+    /// an operator pause, a stop before a startup, or a sleep between ticks,
+    /// told apart by a `kind` column — never `passive`. A reader built before
+    /// the probing tier asks for this and prints every row as a pause, so a
+    /// passive stretch never rides along here; it lives under
+    /// [`DiagnosticQuery::Silences`], a variant that reader has never heard
+    /// of. (realm net-observer, node #109)
     Gaps,
     /// Every bracketed silence the record contains (`silences_sql`): the
-    /// pauses of `Gaps` plus the stretches the probing tier was passive for,
-    /// told apart by a `kind` column (`pause` | `passive`). A daemon built
-    /// before it answers `Unsupported`, and the CLI's `gaps` command then asks
-    /// `Gaps` instead, saying so. (realm net-observer, node #88)
+    /// pause/stop/sleep gaps of `Gaps` plus the stretches the probing tier was
+    /// passive for, told apart by a `kind` column (`pause` | `stop` |
+    /// `sleep` | `passive`). A daemon built before it answers `Unsupported`,
+    /// and the CLI's `gaps` command then asks `Gaps` instead, saying so.
+    /// (realm net-observer, node #88, node #109)
     Silences,
     /// The neighbours on every segment, or on `network` (`neighbors_sql`).
     Neighbors { network: Option<String> },
