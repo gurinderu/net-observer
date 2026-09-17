@@ -129,6 +129,17 @@ pub struct QueryTable {
     pub rows: Vec<Vec<String>>,
 }
 
+/// One table the opened file shapes differently from what this build's
+/// positional INSERT supplies (see [`Store::schema_drift`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaDrift {
+    pub table: String,
+    /// Values this build's `INSERT INTO <table> VALUES (?,…)` binds.
+    pub expected: usize,
+    /// Columns the file's table has.
+    pub actual: usize,
+}
+
 impl DuckdbStore {
     pub fn in_memory() -> Result<Self, StoreError> {
         Self::from_conn(Connection::open_in_memory()?)
@@ -362,12 +373,69 @@ fn value_to_string(v: &duckdb::types::Value) -> String {
     }
 }
 
+/// The statements this build writes with POSITIONAL values — `INSERT INTO t
+/// VALUES (?,…)`, one `?` per column in the order `SCHEMA_SQL` gives the
+/// table — named here so [`Store::schema_drift`] can count what each supplies
+/// against what the opened file has. The statement IS the count: a column
+/// added to a table is one `?` added here and one value added to the
+/// `params!` beside its use, nothing else to keep in step. A table written
+/// through a named column list (`neighbor_service`, `neighbor_port`,
+/// `neighbor_vuln`, `topology_link`, `observing_edge`, `probing_edge`,
+/// `experiment`) is absent on purpose: a column a newer build appended to it
+/// is NULL-filled by that INSERT, not refused (realm net-observer, node #150).
+const INSERT_LINK_SAMPLE: &str =
+    "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+const INSERT_PROXY_SAMPLE: &str = "INSERT INTO proxy_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+const INSERT_DNS_SAMPLE: &str = "INSERT INTO dns_sample VALUES (?,?,?,?,?,?)";
+const INSERT_ROUTE_EVENT: &str = "INSERT INTO route_event VALUES (?,?,?,?)";
+const INSERT_HOST_SAMPLE: &str = "INSERT INTO host_sample VALUES (?,?,?,?,?,?,?)";
+const INSERT_WIFI_SAMPLE: &str = "INSERT INTO wifi_sample VALUES (?,?,?,?,?,?,?,?,?,?,?)";
+const INSERT_AIR_SAMPLE: &str = "INSERT INTO air_sample VALUES (?,?,?,?)";
+const INSERT_AIR_AP: &str = "INSERT INTO air_ap VALUES (?,?,?,?,?,?,?,?)";
+const INSERT_NEIGHBOR_SAMPLE: &str = "INSERT INTO neighbor_sample VALUES (?,?,?,?,?,?,?,?,?)";
+/// `first_seen_us` is never overwritten — it is the whole point of the row. A
+/// hostname already known is kept when the new sighting carries none (a
+/// passive ARP read never has one, and must not erase what a scan learned).
+const INSERT_NEIGHBOR: &str = "INSERT INTO neighbor VALUES (?,?,?,?,?,?,?,?,?)
+     ON CONFLICT (network_key, mac) DO UPDATE SET
+       ip = excluded.ip,
+       iface = excluded.iface,
+       hostname = coalesce(excluded.hostname, neighbor.hostname),
+       source = excluded.source,
+       last_seen_us = excluded.last_seen_us";
+const INSERT_CONNECTION_SAMPLE: &str =
+    "INSERT INTO connection_sample VALUES (?,?,?,?,?,?,?,?,?,?,?)";
+const INSERT_NEIGHBOR_SCAN: &str = "INSERT INTO neighbor_scan VALUES (?,?,?,?,?,?,?,?)";
+const INSERT_INCIDENT: &str = "INSERT INTO incident VALUES (?,?,?,?,?)";
+const INSERT_BLOB_REF: &str = "INSERT INTO blob_ref VALUES (?,?,?,?,?)";
+const INSERT_TRIGGER_FIRED: &str = "INSERT INTO trigger_fired VALUES (?,?,?,?)";
+
+/// `(table, statement)` for every positional INSERT above — what
+/// [`Store::schema_drift`] walks.
+const POSITIONAL_INSERTS: &[(&str, &str)] = &[
+    ("link_sample", INSERT_LINK_SAMPLE),
+    ("proxy_sample", INSERT_PROXY_SAMPLE),
+    ("dns_sample", INSERT_DNS_SAMPLE),
+    ("route_event", INSERT_ROUTE_EVENT),
+    ("host_sample", INSERT_HOST_SAMPLE),
+    ("wifi_sample", INSERT_WIFI_SAMPLE),
+    ("air_sample", INSERT_AIR_SAMPLE),
+    ("air_ap", INSERT_AIR_AP),
+    ("neighbor_sample", INSERT_NEIGHBOR_SAMPLE),
+    ("neighbor", INSERT_NEIGHBOR),
+    ("connection_sample", INSERT_CONNECTION_SAMPLE),
+    ("neighbor_scan", INSERT_NEIGHBOR_SCAN),
+    ("incident", INSERT_INCIDENT),
+    ("blob_ref", INSERT_BLOB_REF),
+    ("trigger_fired", INSERT_TRIGGER_FIRED),
+];
+
 impl Store for DuckdbStore {
     fn write_sample(&self, s: &Sample) -> Result<(), StoreError> {
         let mut c = self.conn.lock().unwrap();
         match s {
             Sample::Link(l) => c.execute(
-                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                INSERT_LINK_SAMPLE,
                 params![
                     l.ts_us,
                     l.gw.to_string(),
@@ -392,7 +460,7 @@ impl Store for DuckdbStore {
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
-                "INSERT INTO proxy_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                INSERT_PROXY_SAMPLE,
                 params![
                     p.ts_us,
                     p.server_ip,
@@ -411,7 +479,7 @@ impl Store for DuckdbStore {
                 ],
             )?,
             Sample::Dns(d) => c.execute(
-                "INSERT INTO dns_sample VALUES (?,?,?,?,?,?)",
+                INSERT_DNS_SAMPLE,
                 params![
                     d.ts_us,
                     d.probe,
@@ -422,11 +490,11 @@ impl Store for DuckdbStore {
                 ],
             )?,
             Sample::Route(r) => c.execute(
-                "INSERT INTO route_event VALUES (?,?,?,?)",
+                INSERT_ROUTE_EVENT,
                 params![r.ts_us, r.kind, r.iface, r.detail],
             )?,
             Sample::Host(h) => c.execute(
-                "INSERT INTO host_sample VALUES (?,?,?,?,?,?,?)",
+                INSERT_HOST_SAMPLE,
                 params![
                     h.ts_us,
                     h.load1,
@@ -438,7 +506,7 @@ impl Store for DuckdbStore {
                 ],
             )?,
             Sample::Wifi(w) => c.execute(
-                "INSERT INTO wifi_sample VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                INSERT_WIFI_SAMPLE,
                 params![
                     w.ts_us,
                     w.wifi.to_string(),
@@ -460,7 +528,7 @@ impl Store for DuckdbStore {
             // is a SKIP, so "could not look" never renders as clear air.
             Sample::Air(a) => {
                 c.execute(
-                    "INSERT INTO air_sample VALUES (?,?,?,?)",
+                    INSERT_AIR_SAMPLE,
                     params![
                         a.ts_us,
                         a.air.to_string(),
@@ -470,7 +538,7 @@ impl Store for DuckdbStore {
                 )?;
                 for ap in &a.aps {
                     c.execute(
-                        "INSERT INTO air_ap VALUES (?,?,?,?,?,?,?,?)",
+                        INSERT_AIR_AP,
                         params![
                             a.ts_us,
                             ap.channel,
@@ -492,7 +560,7 @@ impl Store for DuckdbStore {
             // flush (realm net-observer, node #92).
             Sample::Neighbors(n) => {
                 c.execute(
-                    "INSERT INTO neighbor_sample VALUES (?,?,?,?,?,?,?,?,?)",
+                    INSERT_NEIGHBOR_SAMPLE,
                     params![
                         n.ts_us,
                         n.network_key,
@@ -508,17 +576,7 @@ impl Store for DuckdbStore {
                 let key = n.network_key.as_deref().unwrap_or(UNKNOWN_NETWORK);
                 for nb in &n.neighbors {
                     c.execute(
-                        // `first_seen_us` is never overwritten — it is the whole
-                        // point of the row. A hostname already known is kept when
-                        // the new sighting carries none (a passive ARP read never
-                        // has one, and must not erase what a scan learned).
-                        "INSERT INTO neighbor VALUES (?,?,?,?,?,?,?,?,?)
-                         ON CONFLICT (network_key, mac) DO UPDATE SET
-                           ip = excluded.ip,
-                           iface = excluded.iface,
-                           hostname = coalesce(excluded.hostname, neighbor.hostname),
-                           source = excluded.source,
-                           last_seen_us = excluded.last_seen_us",
+                        INSERT_NEIGHBOR,
                         params![
                             key,
                             nb.mac,
@@ -582,7 +640,7 @@ impl Store for DuckdbStore {
                 }
                 for r in &cs.rows {
                     tx.execute(
-                        "INSERT INTO connection_sample VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        INSERT_CONNECTION_SAMPLE,
                         params![
                             cs.ts_us, verdict, r.host, r.dst_ip, r.dst_port, r.process, r.network,
                             r.chain, r.count, r.upload, r.download
@@ -598,7 +656,7 @@ impl Store for DuckdbStore {
 
     fn write_neighbor_scan(&self, s: &NeighborScan) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO neighbor_scan VALUES (?,?,?,?,?,?,?,?)",
+            INSERT_NEIGHBOR_SCAN,
             params![
                 s.ts_us,
                 s.network_key,
@@ -696,7 +754,7 @@ impl Store for DuckdbStore {
     }
     fn open_incident(&self, i: &Incident) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO incident VALUES (?,?,?,?,?)",
+            INSERT_INCIDENT,
             params![i.id, i.opened_us, i.closed_us, i.trigger_id, i.signature],
         )?;
         Ok(())
@@ -710,14 +768,14 @@ impl Store for DuckdbStore {
     }
     fn write_blob_ref(&self, b: &BlobRef) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO blob_ref VALUES (?,?,?,?,?)",
+            INSERT_BLOB_REF,
             params![b.id, b.incident_id, b.ts_us, b.kind, b.path],
         )?;
         Ok(())
     }
     fn write_trigger_fired(&self, t: &TriggerFired) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO trigger_fired VALUES (?,?,?,?)",
+            INSERT_TRIGGER_FIRED,
             params![t.ts_us, t.trigger_id, t.incident_id, t.detail],
         )?;
         Ok(())
@@ -865,6 +923,25 @@ impl Store for DuckdbStore {
                 other => other,
             }
         })
+    }
+
+    fn schema_drift(&self) -> Result<Vec<SchemaDrift>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT count(*) FROM information_schema.columns WHERE table_name = ?")?;
+        let mut drift = Vec::new();
+        for (table, insert) in POSITIONAL_INSERTS {
+            let expected = insert.matches('?').count();
+            let actual: usize = stmt.query_row(params![table], |r| r.get(0))?;
+            if actual != expected {
+                drift.push(SchemaDrift {
+                    table: (*table).to_string(),
+                    expected,
+                    actual,
+                });
+            }
+        }
+        Ok(drift)
     }
 }
 
@@ -2871,5 +2948,68 @@ mod tests {
             s.query_table("SELECT 4").unwrap().rows,
             vec![vec!["4".to_string()]]
         );
+    }
+
+    /// A file this build itself shaped has no drift: every positional INSERT
+    /// binds exactly the columns `SCHEMA_SQL` gives its table — which also
+    /// pins that `information_schema.columns` answers, per table, on this
+    /// DuckDB. The pairing guard is what lets the count stand for the table
+    /// it names: two four-column tables would otherwise cover each other.
+    #[test]
+    fn a_store_this_build_shaped_reports_no_schema_drift() {
+        for (table, insert) in POSITIONAL_INSERTS {
+            assert!(
+                insert.starts_with(&format!("INSERT INTO {table} VALUES (")),
+                "{table} is paired with another table's statement: {insert}"
+            );
+        }
+        let s = DuckdbStore::in_memory().unwrap();
+        assert_eq!(s.schema_drift().unwrap(), Vec::new());
+        // The count reads the table, not the whole catalogue.
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM information_schema.columns WHERE table_name = 'host_sample'"
+            )
+            .unwrap(),
+            i64::try_from(INSERT_HOST_SAMPLE.matches('?').count()).unwrap()
+        );
+    }
+
+    /// The failure observed live (realm net-observer, node #150): a newer
+    /// build's ALTER widened a table, and this build's positional INSERT no
+    /// longer binds. The drift names that table and only it, with the count
+    /// the file has against the count this build writes — and the write it
+    /// foretells really is refused.
+    #[test]
+    fn a_table_a_newer_build_widened_is_reported_as_drift_and_its_writes_are_refused() {
+        use types::HostSample;
+        let s = DuckdbStore::in_memory().unwrap();
+        s.with_conn(|c| Ok(c.execute_batch("ALTER TABLE host_sample ADD COLUMN extra INTEGER")?))
+            .unwrap();
+        let expected = INSERT_HOST_SAMPLE.matches('?').count();
+        assert_eq!(
+            s.schema_drift().unwrap(),
+            vec![SchemaDrift {
+                table: "host_sample".to_string(),
+                expected,
+                actual: expected + 1,
+            }]
+        );
+        let refused = s.write_sample(&Sample::Host(HostSample {
+            ts_us: 1,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }));
+        match refused {
+            Err(StoreError::Duckdb(e)) => assert!(
+                e.to_string().contains("columns but"),
+                "the binder's own refusal, not another failure: {e}"
+            ),
+            other => panic!("a widened table must refuse the positional write, got {other:?}"),
+        }
     }
 }
