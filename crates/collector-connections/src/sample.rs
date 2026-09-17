@@ -70,7 +70,7 @@ mod tests {
             dst_port: Some(port),
             process: Some("stable".into()),
             network: "tcp".into(),
-            chain: Some("vless-main".into()),
+            chain: Some("vless-out-6".into()),
             upload,
             download: 2 * upload,
         }

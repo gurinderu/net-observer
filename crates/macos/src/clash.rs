@@ -148,8 +148,10 @@ struct WireMetadata {
 /// the body is not that shape at all; an answered, empty list is `Some(vec![])`.
 ///
 /// Per flow: empty strings become `None` (an absent fact is not an empty
-/// name), `chain` is the LAST element of `chains` (the node the flow actually
-/// left through; the earlier elements are the selector and the group), and
+/// name), `chain` is the FIRST element of `chains` — the outbound that actually
+/// carried the flow: sing-box lists them node-first (`vless-out-6`, then the
+/// group, then the top-level selector; `common.Reverse(chain)` in its tracker),
+/// so the last element is a constant selector name — and
 /// `process` is the last path component of `processPath` with its ` (user)`
 /// suffix stripped — `/Applications/Warp.app/Contents/MacOS/stable (gurinderu)`
 /// is `stable`.
@@ -159,13 +161,13 @@ fn parse_connections(body: &str) -> Option<Vec<LiveConnection>> {
         body.connections
             .unwrap_or_default()
             .into_iter()
-            .map(|mut c| LiveConnection {
+            .map(|c| LiveConnection {
                 host: non_empty(c.metadata.host),
                 dst_ip: non_empty(c.metadata.destination_ip),
                 dst_port: c.metadata.destination_port.trim().parse().ok(),
                 process: process_name(&c.metadata.process_path),
                 network: c.metadata.network,
-                chain: c.chains.pop(),
+                chain: c.chains.into_iter().next(),
                 upload: c.upload,
                 download: c.download,
             })
@@ -529,7 +531,7 @@ mod tests {
     const CONNECTIONS_FIXTURE: &str = r#"{"connections":[{"chains":["vless-out-6","vless-auto","vless-main"],"download":0,"id":"549ec5ea-1d3d-4a87-94cf-7791e4088bab","metadata":{"destinationIP":"149.154.167.41","destinationPort":"80","dnsMode":"normal","host":"","network":"tcp","processPath":"","sourceIP":"172.19.0.1","sourcePort":"57420","type":"tun/0"},"rule":"final","rulePayload":"","start":"2026-09-16T19:57:06.925224+03:00","upload":0},{"chains":["vless-out-6","vless-auto","vless-main"],"download":0,"id":"d72b62b1-c27b-4114-85b2-92d15b625c7b","metadata":{"destinationIP":"194.221.250.50","destinationPort":"5222","dnsMode":"normal","host":"www.google.com","network":"tcp","processPath":"","sourceIP":"172.19.0.1","sourcePort":"53598","type":"tun/0"},"rule":"final","rulePayload":"","start":"2026-09-16T19:42:24.816839+03:00","upload":0},{"chains":["vless-out-6","vless-auto","vless-main"],"download":0,"id":"b3f1e891-eb73-4736-9669-16930fe93eac","metadata":{"destinationIP":"","destinationPort":"443","dnsMode":"normal","host":"claude.ai","network":"tcp","processPath":"","sourceIP":"172.19.0.1","sourcePort":"58299","type":"tun/0"},"rule":"final","rulePayload":"","start":"2026-09-16T19:57:15.494335+03:00","upload":0},{"chains":["vless-out-6","vless-auto","vless-main"],"download":5006,"id":"a92b3f11-b58c-45fb-b005-7374211c1572","metadata":{"destinationIP":"","destinationPort":"443","dnsMode":"normal","host":"o540343.ingest.sentry.io","network":"tcp","processPath":"/Applications/Warp.app/Contents/MacOS/stable (gurinderu)","sourceIP":"172.19.0.1","sourcePort":"63428","type":"tun/0"},"rule":"final","rulePayload":"","start":"2026-09-17T00:01:47.501601+03:00","upload":4}]}"#;
 
     /// The fixture's four flows, each field read the way the daemon keeps it:
-    /// empty strings as `None`, the port parsed, the chain's LAST element, the
+    /// empty strings as `None`, the port parsed, the chain's FIRST element, the
     /// process name without its path and user.
     #[test]
     fn parses_the_observed_connections_body() {
@@ -542,7 +544,7 @@ mod tests {
         assert_eq!(direct.dst_port, Some(80));
         assert_eq!(direct.process, None);
         assert_eq!(direct.network, "tcp");
-        assert_eq!(direct.chain.as_deref(), Some("vless-main"));
+        assert_eq!(direct.chain.as_deref(), Some("vless-out-6"));
 
         let spoofed = &flows[1];
         assert_eq!(spoofed.host.as_deref(), Some("www.google.com"));

@@ -97,7 +97,7 @@ mod tests {
             dst_port: Some(443),
             process: None,
             network: "tcp".into(),
-            chain: Some("vless-main".into()),
+            chain: Some("vless-out-6".into()),
             upload: 1,
             download: 1,
         }

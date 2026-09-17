@@ -30,10 +30,11 @@ pub struct LiveConnection {
     pub process: Option<String>,
     /// `tcp` | `udp`.
     pub network: String,
-    /// The outbound the flow actually left through — the LAST element of the
-    /// API's `chains` (`["vless-out-6","vless-auto","vless-main"]` names the
-    /// selector, the group and, last, the node: `vless-main`). `None` when the
-    /// API listed no chain.
+    /// The outbound that actually carried the flow — the FIRST element of the
+    /// Clash API's `chains`: sing-box lists them node-first, so
+    /// `["vless-out-6","vless-auto","vless-main"]` is the node, its group and,
+    /// last, the top-level selector (`vless-main` is the same on every flow).
+    /// `None` when the API listed no chain.
     pub chain: Option<String>,
     /// Bytes sent so far on this flow.
     pub upload: u64,

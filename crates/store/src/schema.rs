@@ -164,6 +164,9 @@ CREATE TABLE IF NOT EXISTS topology_link (
 -- (`OK`) — writes ONE row with every key column NULL, carrying the verdict:
 -- so "could not look" and "nothing is talking" are different rows, and both
 -- are rows rather than an absent tick. `network` is NULL only on that row.
+-- `chain` is the outbound that actually carried the flow — the first element
+-- of the Clash API's `chains` (sing-box lists them node-first; the last is the
+-- constant top-level selector).
 CREATE TABLE IF NOT EXISTS connection_sample (
   ts_us BIGINT, verdict VARCHAR, host VARCHAR, dst_ip VARCHAR, dst_port USMALLINT,
   process VARCHAR, network VARCHAR, chain VARCHAR, count UINTEGER, upload UBIGINT,
