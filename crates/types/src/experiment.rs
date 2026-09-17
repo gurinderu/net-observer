@@ -73,12 +73,27 @@ impl ExperimentWindow {
         (self.end_us - self.start_us) as f64 / 60_000_000.0
     }
 
+    /// Whether the window was recorded with the two fields the sleep
+    /// comparison needs. A report stored before `requested_minutes` and
+    /// `link_interval_us` existed decodes both as `0` (`serde(default)`),
+    /// and against a zero request the whole window would read as an
+    /// overrun — a fabricated sleep. Such a window says "not recorded".
+    #[must_use]
+    pub fn sleep_recorded(&self) -> bool {
+        self.requested_minutes > 0 && self.link_interval_us > 0
+    }
+
     /// Seconds the machine slept inside the window, when the wall clock ran
     /// past the requested length by more than one link interval — the
     /// window's end task sleeps on a monotonic clock, which a sleeping
-    /// machine does not advance. `None` when the overrun is within a tick.
+    /// machine does not advance. `None` when the overrun is within a tick,
+    /// and `None` when the window was not recorded with the fields that make
+    /// the comparison meaningful ([`ExperimentWindow::sleep_recorded`]).
     #[must_use]
     pub fn slept_s(&self) -> Option<i64> {
+        if !self.sleep_recorded() {
+            return None;
+        }
         let overrun_us =
             (self.end_us - self.start_us) - i64::from(self.requested_minutes) * 60_000_000;
         (overrun_us > self.link_interval_us).then_some(overrun_us / 1_000_000)
@@ -459,8 +474,11 @@ impl ExperimentReport {
         put("minutes", format!("{:.1}", self.minutes()));
         put(
             "machine_slept",
-            w.slept_s()
-                .map_or_else(|| "no".into(), |s| format!("~{s} s inside the window")),
+            match w.slept_s() {
+                Some(s) => format!("~{s} s inside the window"),
+                None if w.sleep_recorded() => "no".into(),
+                None => "not recorded".into(),
+            },
         );
         put("tier_before", w.tier_before.as_str().to_string());
         put(
@@ -1024,6 +1042,22 @@ mod tests {
             cell(&r.rows(), "tier_at_end"),
             "passive (restore skipped: not recorded)"
         );
+        // A zero request and a zero tick are not a request and a tick: the
+        // sleep comparison is not made, so a window that never slept is not
+        // told it slept for its whole length.
+        assert!(!r.window.sleep_recorded());
+        assert_eq!(r.window.slept_s(), None);
+        assert_eq!(cell(&r.rows(), "machine_slept"), "not recorded");
+        assert!(!r.verdict().contains("slept"), "{}", r.verdict());
+        // Either field alone is not enough to make the comparison.
+        let mut w = r.window.clone();
+        w.requested_minutes = 5;
+        assert!(!w.sleep_recorded());
+        assert_eq!(w.slept_s(), None);
+        w.link_interval_us = 15_000_000;
+        w.requested_minutes = 0;
+        assert!(!w.sleep_recorded());
+        assert_eq!(w.slept_s(), None);
     }
 
     /// The window is measured on the wall clock: an end more than one link
