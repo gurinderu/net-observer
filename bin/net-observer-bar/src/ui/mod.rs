@@ -43,8 +43,9 @@ mod theme;
 
 pub(crate) use control::{ControlRoundTrip, spawn_control_on, spawn_control_then};
 pub use control::{
-    GlanceError, fetch_findings, freeze_round_trip, probing_round_trip, read_fresh,
-    scan_round_trip_banners, scan_round_trip_base, scan_round_trip_cve, scan_round_trip_ports,
+    GlanceError, fetch_connections, fetch_findings, freeze_round_trip, probing_round_trip,
+    read_fresh, scan_round_trip_banners, scan_round_trip_base, scan_round_trip_cve,
+    scan_round_trip_ports,
 };
 pub use model::Glance;
 pub use panel::PanelView;
@@ -53,7 +54,7 @@ pub use panel::PanelView;
 pub(crate) use parts::HINT_TIP_SELECTOR;
 pub use parts::now_us;
 pub(crate) use parts::{
-    Dating, PROVENANCE_TEXT, age_str, clock, dated, gap_label, hint, moments_diverge, row,
+    Dating, PROVENANCE_TEXT, age_str, clock, dated, gap_label, hint, moments_diverge, note, row,
     separator,
 };
 /// How a headless test names the two halves of a shared key-value row.

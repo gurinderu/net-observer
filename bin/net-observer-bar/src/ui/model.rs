@@ -88,6 +88,10 @@ pub struct Glance {
     /// second "Air" click focuses the existing window instead of opening a
     /// second subscription (see [`crate::air`]).
     pub air_window: Option<gpui::AnyWindowHandle>,
+    /// The live connections window, if one is open. Stashed like `map_window`
+    /// so a second "Connections" click focuses the existing window instead of
+    /// opening a duplicate (see [`crate::connections`]).
+    pub connections_window: Option<gpui::AnyWindowHandle>,
     /// The open actions menu, if any. It is its own window — a menu that flies
     /// out past the panel's edge cannot be an element inside it, because gpui
     /// draws nothing outside a window.
@@ -124,6 +128,7 @@ impl Glance {
             events_window: None,
             map_window: None,
             air_window: None,
+            connections_window: None,
             menu_window: None,
             menu_focus_guard: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             panel_window: None,
