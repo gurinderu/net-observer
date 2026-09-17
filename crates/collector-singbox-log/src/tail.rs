@@ -66,18 +66,22 @@ pub struct TailRead {
 /// and the next read drains the same bytes again. Every rotation followed is
 /// counted in [`LogTail::rotations`], on success only.
 ///
-/// **Gaps.** The tail remembers when it last read. When the SAME file
-/// continued and the gap since the previous read reaches `max_gap` (the ticks
-/// did not run: an operator pause, a sleep), the backlog is not read — the
-/// rows it produced would be stamped with this tick and read as a burst that
+/// **Gaps.** The tail remembers when it last read. When the SAME file only
+/// GREW and the gap since the previous read reaches `max_gap` (the ticks did
+/// not run: an operator pause, a sleep), the backlog is not read — the rows
+/// it produced would be stamped with this tick and read as a burst that
 /// happened now — and the tail re-attaches at the end, reporting the gap and
 /// the bytes skipped ([`TailRead::reattached`]); the pause is already
 /// bracketed by the observing edge, and the skipped stretch belongs to it. A
 /// gap short of that (one missed tick) reads the backlog, and the reader's
-/// stale-line belt drops what is too old. A file that is NEW since the last
-/// read — absent then present, or another inode — is read from its start
-/// whatever the gap: its opening is the evidence (sing-box respawned, and its
-/// first lines say so). A tick dropped whole at a probing-tier switch (the
+/// stale-line belt drops what is too old. Truncation beats the gap: a file
+/// the agent rotated during the pause (copytruncate runs on its own clock)
+/// is read from its start whatever the gap — at most one rotation's worth,
+/// and a respawned sing-box's first lines may be in it. Likewise a file that
+/// is NEW since the last read — absent then present, or another inode — is
+/// read from its start whatever the gap: its opening is the evidence
+/// (sing-box respawned, and its first lines say so). A tick dropped whole at
+/// a probing-tier switch (the
 /// interval loop drops the in-flight tick's samples at the source) has
 /// already consumed its bytes: those lines are gone, bracketed by the
 /// `probing_edge` row.
@@ -154,18 +158,18 @@ impl LogTail {
         self.last_read = Some(now);
         let meta = fs::metadata(&self.path)?;
 
-        // The same file continued across a gap the ticks did not cover: the
-        // backlog is the gap's, not this tick's.
+        // The same file only GREW across a gap the ticks did not cover: the
+        // backlog is the gap's, not this tick's. A file truncated during the
+        // gap (the agent rotates on its own clock) is handled below instead:
+        // its post-truncation content is at most one rotation's worth, and a
+        // respawned sing-box's first lines may be in it.
         if let Some(gap) = gap
             && gap >= self.max_gap
             && let Some(o) = &self.open
             && o.ino == meta.ino()
+            && meta.len() >= o.offset
         {
-            let skipped = if meta.len() >= o.offset {
-                meta.len() - o.offset
-            } else {
-                meta.len()
-            };
+            let skipped = meta.len() - o.offset;
             self.reopen(true)?;
             self.partial.clear();
             self.discarding = false;
@@ -421,8 +425,13 @@ mod tests {
         assert_eq!(tail.buffered(), 4);
 
         // The new file at the path is unreadable: metadata succeeds, the
-        // open fails (this test runs unprivileged; root would open it).
+        // open fails. Root opens a mode-000 file all the same, so under root
+        // this test has nothing to inject and says so.
         use std::os::unix::fs::PermissionsExt;
+        if fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
+            eprintln!("skipped: running as root, a mode-000 file is still readable");
+            return;
+        }
         let moved = dir.path().join("sing-box.log.1");
         fs::rename(&path, &moved).unwrap();
         append(&moved, " of a line\ntail");
@@ -462,6 +471,33 @@ mod tests {
 
         append(&path, "after\n");
         assert_eq!(lines(&mut tail, t0 + 8 * TICK), vec!["after"]);
+    }
+
+    /// Truncation beats the gap: the agent rotated the file during a pause
+    /// (same inode, the length below the offset), and a respawned sing-box
+    /// wrote its first line after the truncation — read from the start,
+    /// rotation counted, nothing re-attached.
+    #[test]
+    fn a_file_truncated_during_a_long_gap_is_read_from_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sing-box.log");
+        fs::write(&path, "").unwrap();
+        let mut tail = LogTail::open_at_end(&path, MAX_GAP, all);
+        let t0 = Instant::now();
+        append(&path, "seen before the pause, long enough to matter\n");
+        assert_eq!(
+            lines(&mut tail, t0),
+            vec!["seen before the pause, long enough to matter"]
+        );
+        let ino = fs::metadata(&path).unwrap().ino();
+
+        fs::write(&path, "sing-box started\n").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), ino);
+        let read = tail.read_new(t0 + 10 * TICK).unwrap();
+        assert_eq!(read.reattached, None);
+        assert_eq!(read.lines, vec!["sing-box started"]);
+        assert!(read.rotated);
+        assert_eq!(tail.rotations(), 1);
     }
 
     /// A file that is new since the last read is read from its start

@@ -1735,6 +1735,32 @@ mod tests {
         assert_eq!(cell(&t, 0, "singbox_log"), "");
     }
 
+    /// Rows of one tick and one class through different nodes — the row key
+    /// is `(class, node)` — list in a defined order: by node after the class.
+    #[test]
+    fn verdict_at_orders_equal_instants_by_class_then_node() {
+        use types::SingboxLogClass as C;
+        let s = DuckdbStore::in_memory().unwrap();
+        let at = 1_789_667_785 * SEC;
+        healthy_tick(&s, at - 5 * SEC);
+        singbox_log(&s, at, C::DialTimeout, 2, Some("vless-out-6"));
+        singbox_log(&s, at, C::DialTimeout, 1, Some("vless-out-2"));
+        singbox_log(&s, at, C::Canceled, 1, Some("vless-out-9"));
+        let t = s.verdict_at(at).unwrap();
+        let lines: Vec<String> = cell(&t, 0, "singbox_log")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "canceled ×1 via vless-out-9 at 2026-09-17T17:56:25Z",
+                "dial-timeout ×1 via vless-out-2 at 2026-09-17T17:56:25Z",
+                "dial-timeout ×2 via vless-out-6 at 2026-09-17T17:56:25Z",
+            ]
+        );
+    }
+
     // ---- 2. incident with its context --------------------------------------
 
     #[test]
