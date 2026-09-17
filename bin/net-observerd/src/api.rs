@@ -2699,6 +2699,9 @@ mod tests {
                 .recv();
             self.inner.query_prepared_within(p, budget)
         }
+        fn prune_older_than(&self, table: &str, cutoff_us: i64) -> Result<u64, store::StoreError> {
+            self.inner.prune_older_than(table, cutoff_us)
+        }
     }
 
     /// One diagnosis in flight, and a second is refused AT ONCE with
