@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::window::{LinkProvenance, RecentWindow};
 use types::{
     DnsVerdict, GwVerdict, LinkMedium, LinkSample, NeighborsVerdict, ProxySample, SingboxLogClass,
-    SingboxLogSample, TcpVerdict, normalize_mac,
+    SingboxLogSample, TcpVerdict, local_instant, normalize_mac,
 };
 
 /// How many recent DNS samples the `fakeip` condition scans (one polling tick
@@ -1397,18 +1397,6 @@ fn singbox_restart_in(w: &RecentWindow, burst: &SingboxBurst<'_>) -> Option<i64>
         .map(|r| r.ts_us)
 }
 
-/// `HH:MM:SSZ` — the time of day of an epoch-microsecond instant, in UTC.
-/// The row's `ts_us` is the tick's, so this names the tick that saw the line.
-fn utc_clock(ts_us: i64) -> String {
-    let secs = ts_us.div_euclid(1_000_000).rem_euclid(86_400);
-    format!(
-        "{:02}:{:02}:{:02}Z",
-        secs / 3_600,
-        secs % 3_600 / 60,
-        secs % 60
-    )
-}
-
 /// Fires when sing-box's own log says it has no route — `no-route`,
 /// `unreachable` or `no-default-iface` lines, [`SINGBOX_MIN_LINES`] or more
 /// within [`SINGBOX_SPAN_US`] — while the newest link sample shows the
@@ -1423,7 +1411,9 @@ fn utc_clock(ts_us: i64) -> String {
 /// Clears after [`SINGBOX_CLEAR_TICKS`] link ticks with no such line. A
 /// `started` row inside the span (sing-box restarted, tearing the TUN down —
 /// the reload agent and the shell oracle's watchdog both kickstart it) is
-/// ignored by the count and named in the detail: the burst is explained.
+/// ignored by the count and named in the detail — `after a sing-box restart at
+/// <instant>`, the restart tick as [`local_instant`] renders it, the same
+/// spelling the CLI stamps — so the burst is explained.
 pub struct SingboxNoRoute;
 impl Condition for SingboxNoRoute {
     fn id(&self) -> &'static str {
@@ -1455,7 +1445,7 @@ impl Condition for SingboxNoRoute {
         if let Some(restart_us) = singbox_restart_in(w, &burst) {
             detail.push_str(&format!(
                 " after a sing-box restart at {}",
-                utc_clock(restart_us)
+                local_instant(restart_us)
             ));
         }
         Some(Fire { detail })
@@ -4491,10 +4481,21 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             Some("vless-out-6"),
         ));
         let fire = c.eval(&w).expect("three route-loss lines fire");
+        // The instant is the restart TICK's, spelled by `types::local_instant`
+        // (the machine's zone: `2026-09-17T21:37:02+03:00` on the Mac that
+        // observed it), so the pin asks the same function rather than a zone.
         assert_eq!(
             fire.detail,
-            "sing-box reports no route (3 lines in 60 s: no-route ×1, unreachable ×2) \
-             while the link holds router 10.20.0.1 after a sing-box restart at 18:37:02Z"
+            format!(
+                "sing-box reports no route (3 lines in 60 s: no-route ×1, unreachable ×2) \
+                 while the link holds router 10.20.0.1 after a sing-box restart at {}",
+                local_instant(restart)
+            )
+        );
+        assert!(
+            fire.detail.contains("restart at 2026-09-1"),
+            "the instant carries the date the restart was observed on: {}",
+            fire.detail
         );
 
         // A restart older than the span is not the explanation.

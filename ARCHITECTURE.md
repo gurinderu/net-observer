@@ -210,7 +210,8 @@ flowchart LR
   log within a minute while the newest link sample still holds a DHCP router
   with an `OK` or `SKIP` gateway — the OS has a network and sing-box cannot
   see it; `NOGW`/`FAIL` are `gw-drop`'s; a `started` row inside the minute is
-  not counted but named in the detail — `after a sing-box restart at <clock>`
+  not counted but named in the detail — `after a sing-box restart at <instant>`,
+  the restart tick as `types::local_instant` spells it
   — since a restart tears the TUN down and explains the burst),
   `singbox-dial-timeout` (three or
   more `dial-timeout` lines through one node within a minute while every
