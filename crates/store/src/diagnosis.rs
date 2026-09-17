@@ -78,12 +78,16 @@
 //! killed outright, so the record simply stops, and the gap runs from the
 //! newest sample before that edge to the edge itself — unless a pause gap
 //! already closes at that same edge, in which case the pause already names
-//! the hole. A **sleep** is two consecutive samples of any stream further
-//! apart than [`DEFAULT_SLEEP_THRESHOLD_US`], outside every pause/stop gap:
-//! the machine slept while the daemon kept running. Both are derived the same
-//! way as a pause — in SQL, never stored — and read as `gap` identically; only
-//! `observation_gaps`/`silences`'s `kind` column tells the three apart (realm
-//! net-observer, node #109).
+//! the hole. A **sleep** is two consecutive POINTS — a sample of any
+//! stream, or a recorded pause/resume/startup edge — further apart than
+//! [`DEFAULT_SLEEP_THRESHOLD_US`] and not both inside one recorded
+//! pause/stop gap: the machine slept while the daemon kept running. Edges
+//! count as points so a stride can never straddle a gap's own boundary,
+//! which is what lets the residual after a short pause still surface as its
+//! own sleep instead of being swallowed whole. Both are derived the same
+//! way as a pause — in SQL, never stored — and read as `gap` identically;
+//! only `observation_gaps`/`silences`'s `kind` column tells the three apart
+//! (realm net-observer, node #109).
 //!
 //! ## Passive stretches
 //!
@@ -216,11 +220,20 @@ sample_ts AS (
 ///   closes an open `pause` gap opens nothing here (the pause already names
 ///   the hole), and neither does the very first startup a record ever sees —
 ///   no earlier sample means no "before" to bound.
-/// - **`sleep`** — two consecutive samples of any stream more than
-///   `sleep_threshold_us` apart, outside every `pause`/`stop` gap: nothing
-///   paused or stopped the daemon, but the clock between two ticks jumped
-///   further than a lost tick explains. Always closes `sample` at the later
-///   of the pair.
+/// - **`sleep`** — two consecutive POINTS more than `sleep_threshold_us`
+///   apart and not both inside one recorded `pause`/`stop` gap, where a point
+///   is a sample of any stream OR a recorded `observing_edge` (pause, resume,
+///   or startup). Edges are points, not just interval endpoints elsewhere, so
+///   a stride between two consecutive points can never straddle a gap's own
+///   boundary — it is either fully inside one gap (excluded: the gap already
+///   names it) or fully outside every one (a real sleep). That is why the
+///   exclusion is containment (`gap.opened <= a AND gap.closed >= b`), not
+///   mere overlap: a 185 s residual right after a 5 s pause is still a sleep
+///   of its own, not swallowed by the pause that happens to sit inside the
+///   same wider stride between two real samples. Always closes `sample` at
+///   the later of the pair — even when that point happens to be an edge, the
+///   sleep itself has no dedicated closing edge, only the record's next
+///   instant.
 ///
 /// A function rather than a `const`, because the sleep opener embeds its
 /// threshold as a SQL literal — no new `?` placeholder, so the four call
@@ -278,16 +291,28 @@ closed_gap AS (
   SELECT gap_opened_us, gap_closed_us FROM pauses
   UNION ALL SELECT gap_opened_us, gap_closed_us FROM stops
 ),
+-- Every instant the record can anchor a stride to: a sample OF ANY STREAM,
+-- or a recorded pause/resume/startup edge. Edges are points too (not just
+-- interval endpoints elsewhere), so a stride between two consecutive points
+-- can never straddle a gap's own boundary — it either sits entirely inside
+-- one recorded pause/stop gap, or entirely outside every one (realm
+-- net-observer, node #109): excluding only the strides fully CONTAINED by a
+-- gap, rather than merely overlapping one, is what lets the residual after a
+-- pause or a stop still surface as its own sleep.
+points AS (
+  SELECT ts_us FROM sample_ts
+  UNION SELECT ts_us FROM observing_edge
+),
 sleeps AS (
   SELECT a AS gap_opened_us, b AS gap_closed_us, 'sample' AS gap_closed_by, 'sleep' AS cause
   FROM (
     SELECT ts_us AS b, lag(ts_us) OVER (ORDER BY ts_us) AS a
-    FROM (SELECT DISTINCT ts_us FROM sample_ts)
-  )
+    FROM points
+  ) stride
   WHERE a IS NOT NULL AND b - a > {sleep_threshold_us}
     AND NOT EXISTS (
       SELECT 1 FROM closed_gap c
-      WHERE c.gap_opened_us < b AND (c.gap_closed_us IS NULL OR c.gap_closed_us > a)
+      WHERE c.gap_opened_us <= stride.a AND c.gap_closed_us >= stride.b
     )
 ),
 observation_gap AS (
@@ -2156,6 +2181,58 @@ mod tests {
         assert_eq!(cell(&g, 0, "gap_closed_us"), "100000000");
     }
 
+    /// A pause does not swallow the whole stride it happens to sit inside:
+    /// the residual after it resumes still surfaces as its own sleep, because
+    /// the sleep opener strides over points (samples AND edges), so a stride
+    /// can never straddle a gap's own boundary — only lie fully inside one
+    /// (excluded) or fully outside every one (a sleep of its own) (realm
+    /// net-observer, node #109).
+    #[test]
+    fn a_residual_stride_after_a_short_pause_is_still_a_sleep() {
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, 0);
+        edge(&s, 10 * SEC, false);
+        edge(&s, 15 * SEC, true);
+        healthy_tick(&s, 200 * SEC);
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(g.rows.len(), 2, "{:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "pause");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), (10 * SEC).to_string());
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (15 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "kind"), "sleep");
+        assert_eq!(cell(&g, 1, "gap_opened_us"), (15 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "gap_closed_us"), (200 * SEC).to_string());
+
+        // The moment squarely inside the residual answers `gap`, exactly as
+        // inside the pause itself.
+        assert_eq!(cell(&s.verdict_at(100 * SEC).unwrap(), 0, "layer"), "gap");
+    }
+
+    /// The two residuals around a short pause are named separately, and only
+    /// where each on its own exceeds the threshold — not one sleep spanning
+    /// the whole stride the pause sits inside.
+    #[test]
+    fn a_pause_inside_a_long_stride_leaves_two_sleeps_when_both_residuals_exceed_the_threshold() {
+        let s = DuckdbStore::in_memory().unwrap();
+        healthy_tick(&s, 0);
+        edge(&s, 400 * SEC, false);
+        edge(&s, 410 * SEC, true);
+        healthy_tick(&s, 1000 * SEC);
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(g.rows.len(), 3, "{:?}", g.rows);
+        assert_eq!(cell(&g, 0, "kind"), "sleep");
+        assert_eq!(cell(&g, 0, "gap_opened_us"), "0");
+        assert_eq!(cell(&g, 0, "gap_closed_us"), (400 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "kind"), "pause");
+        assert_eq!(cell(&g, 1, "gap_opened_us"), (400 * SEC).to_string());
+        assert_eq!(cell(&g, 1, "gap_closed_us"), (410 * SEC).to_string());
+        assert_eq!(cell(&g, 2, "kind"), "sleep");
+        assert_eq!(cell(&g, 2, "gap_opened_us"), (410 * SEC).to_string());
+        assert_eq!(cell(&g, 2, "gap_closed_us"), (1000 * SEC).to_string());
+    }
+
     /// All four causes together, in one record: `silences` lists a passive
     /// stretch, a pause, a stop and a sleep, each under its own `kind`.
     #[test]
@@ -2272,19 +2349,35 @@ mod tests {
         assert_eq!(cell(&t, 0, "observation_gap_us"), (10 * SEC).to_string());
     }
 
-    /// The negative twin: a pause entirely outside the window changes nothing.
+    /// A pause entirely outside the window used to leave the slope alone —
+    /// before the sleep opener counted edges as points, nothing bridged its
+    /// 8 s resume to the ramp's first sample 92 s later. Now that residual is
+    /// itself a named `sleep` (realm net-observer, node #109), and its tail
+    /// reaches into the window: the slope is withheld for the same reason a
+    /// gap reaching into the window always withholds it. The pause itself
+    /// still never touches the window — only the sleep after it does.
     #[test]
-    fn a_pause_outside_the_ramp_window_leaves_the_slope_alone() {
+    fn a_pause_outside_the_ramp_window_still_leaves_a_sleep_that_reaches_into_it() {
         let s = DuckdbStore::in_memory().unwrap();
         edge(&s, 5 * SEC, false);
         edge(&s, 8 * SEC, true);
         let drop_ts = coworking_ramp(&s, 100 * SEC);
 
         let t = s.gateway_ramp(drop_ts).unwrap();
-        assert_eq!(cell(&t, 0, "observation_gap_us"), "0");
-        assert_eq!(cell(&t, 0, "fitted_samples"), "40");
-        let slope: f64 = cell(&t, 0, "slope_ms_per_s").parse().unwrap();
-        assert!((slope - 20.0).abs() < 0.001, "slope was {slope}");
+        assert_eq!(cell(&t, 0, "observation_gap_us"), "80000000");
+        assert_eq!(cell(&t, 0, "fitted_samples"), "");
+        assert_eq!(cell(&t, 0, "slope_ms_per_s"), "");
+
+        let g = s.observation_gaps().unwrap();
+        assert_eq!(
+            g.rows.len(),
+            2,
+            "the pause itself, and the sleep after it: {:?}",
+            g.rows
+        );
+        assert_eq!(cell(&g, 0, "kind"), "pause");
+        assert_eq!(cell(&g, 1, "kind"), "sleep");
+        assert_eq!(cell(&g, 1, "gap_opened_us"), (8 * SEC).to_string());
     }
 
     /// Consecutive gaps are listed in order and stay separate.
