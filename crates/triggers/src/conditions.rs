@@ -1258,6 +1258,10 @@ const SINGBOX_CLEAR_TICKS: usize = 2;
 /// inside [`SINGBOX_SPAN_US`] ending at the newest of them.
 struct SingboxBurst<'w> {
     rows: Vec<&'w SingboxLogSample>,
+    /// The span's bounds: the newest qualifying row's `ts_us`, and
+    /// [`SINGBOX_SPAN_US`] before it.
+    newest_ts_us: i64,
+    horizon_us: i64,
 }
 
 impl SingboxBurst<'_> {
@@ -1308,7 +1312,39 @@ fn singbox_burst<'w>(
         .into_iter()
         .filter(|r| pick(r) && r.ts_us >= horizon)
         .collect();
-    Some(SingboxBurst { rows })
+    Some(SingboxBurst {
+        rows,
+        newest_ts_us: newest.ts_us,
+        horizon_us: horizon,
+    })
+}
+
+/// The tick at which sing-box (re)started inside the burst's span, if one
+/// did: a `started` row with `ts_us` in `[horizon, newest]`. A restart tears
+/// the TUN down, so the route-loss lines that follow it are explained by it —
+/// the incident still stands, its detail says so (realm net-observer, node
+/// #141).
+fn singbox_restart_in(w: &RecentWindow, burst: &SingboxBurst<'_>) -> Option<i64> {
+    w.recent_singbox_log(SINGBOX_LOG_SCAN)
+        .into_iter()
+        .find(|r| {
+            r.class == SingboxLogClass::Started
+                && r.ts_us >= burst.horizon_us
+                && r.ts_us <= burst.newest_ts_us
+        })
+        .map(|r| r.ts_us)
+}
+
+/// `HH:MM:SSZ` — the time of day of an epoch-microsecond instant, in UTC.
+/// The row's `ts_us` is the tick's, so this names the tick that saw the line.
+fn utc_clock(ts_us: i64) -> String {
+    let secs = ts_us.div_euclid(1_000_000).rem_euclid(86_400);
+    format!(
+        "{:02}:{:02}:{:02}Z",
+        secs / 3_600,
+        secs % 3_600 / 60,
+        secs % 60
+    )
 }
 
 /// Fires when sing-box's own log says it has no route — `no-route`,
@@ -1322,7 +1358,10 @@ fn singbox_burst<'w>(
 /// tier's withheld echo) both leave the router held; `NoGw` means the OS
 /// agrees there is no route and `gw-drop` owns it; `Fail` is `gw-drop`'s as
 /// well — the gateway is dead, so sing-box's complaint is not a discrepancy.
-/// Clears after [`SINGBOX_CLEAR_TICKS`] link ticks with no such line.
+/// Clears after [`SINGBOX_CLEAR_TICKS`] link ticks with no such line. A
+/// `started` row inside the span (sing-box restarted, tearing the TUN down —
+/// the reload agent and the shell oracle's watchdog both kickstart it) is
+/// ignored by the count and named in the detail: the burst is explained.
 pub struct SingboxNoRoute;
 impl Condition for SingboxNoRoute {
     fn id(&self) -> &'static str {
@@ -1347,12 +1386,17 @@ impl Condition for SingboxNoRoute {
         if lines < SINGBOX_MIN_LINES {
             return None;
         }
-        Some(Fire {
-            detail: format!(
-                "sing-box reports no route ({lines} lines in 60 s: {}) while the link holds router {router}",
-                burst.classes()
-            ),
-        })
+        let mut detail = format!(
+            "sing-box reports no route ({lines} lines in 60 s: {}) while the link holds router {router}",
+            burst.classes()
+        );
+        if let Some(restart_us) = singbox_restart_in(w, &burst) {
+            detail.push_str(&format!(
+                " after a sing-box restart at {}",
+                utc_clock(restart_us)
+            ));
+        }
+        Some(Fire { detail })
     }
 }
 
@@ -4246,6 +4290,64 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         assert!(c.eval(&w).is_some(), "a new line reset the quiet count");
         w.push(link_with_router(45 * S, GwVerdict::Skip));
         assert!(c.eval(&w).is_none(), "two quiet ticks clear");
+    }
+
+    /// The field's most frequent shape: sing-box restarted (the reload agent,
+    /// the watchdog), the TUN went down, and the route-loss burst followed.
+    /// The rule still fires — the burst is real — but its detail names the
+    /// restart; `started` rows are not counted, and one outside the span is
+    /// not mentioned.
+    #[test]
+    fn singbox_no_route_names_a_restart_inside_the_span() {
+        let c = SingboxNoRoute;
+        // 18:37:02Z on the day observed: a restart on the tick before the burst.
+        let restart = 1_789_670_222 * S;
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(restart - 1, GwVerdict::Skip));
+        w.push(singbox_row(restart, SingboxLogClass::Started, 1, None));
+        w.push(singbox_row(
+            restart,
+            SingboxLogClass::DefaultIfaceUpdated,
+            1,
+            Some("en0"),
+        ));
+        w.push(link_with_router(restart + 15 * S, GwVerdict::Skip));
+        w.push(singbox_row(
+            restart + 15 * S + 1,
+            SingboxLogClass::Unreachable,
+            2,
+            Some("vless-out-6"),
+        ));
+        assert!(
+            c.eval(&w).is_none(),
+            "the restart rows are not route-loss lines: two lines are not a burst"
+        );
+        w.push(singbox_row(
+            restart + 15 * S + 1,
+            SingboxLogClass::NoRoute,
+            1,
+            Some("vless-out-6"),
+        ));
+        let fire = c.eval(&w).expect("three route-loss lines fire");
+        assert_eq!(
+            fire.detail,
+            "sing-box reports no route (3 lines in 60 s: no-route ×1, unreachable ×2) \
+             while the link holds router 10.20.0.1 after a sing-box restart at 18:37:02Z"
+        );
+
+        // A restart older than the span is not the explanation.
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(0, GwVerdict::Skip));
+        w.push(singbox_row(1, SingboxLogClass::Started, 1, None));
+        w.push(link_with_router(90 * S, GwVerdict::Skip));
+        w.push(singbox_row(
+            90 * S + 1,
+            SingboxLogClass::NoRoute,
+            3,
+            Some("vless-out-6"),
+        ));
+        let fire = c.eval(&w).expect("three lines fire");
+        assert!(!fire.detail.contains("restart"), "{}", fire.detail);
     }
 
     /// Three dial timeouts through one node inside a minute, while raw TCP

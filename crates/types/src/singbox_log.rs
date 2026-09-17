@@ -17,9 +17,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::verdict::ParseVerdictError;
 
-/// One class of ERROR/WARN line in sing-box's log — its observed vocabulary
+/// One class of line in sing-box's log — the observed ERROR/WARN vocabulary
 /// (sing-box 1.13.19, realm net-observer, node #140), plus [`Self::Other`] for
-/// a line at those levels the classifier does not name and
+/// a line at those levels the classifier does not name, two INFO lines that
+/// are evidence all the same ([`Self::Started`], [`Self::DefaultIfaceUpdated`]:
+/// a restart tears the TUN down and explains the burst that follows it), and
 /// [`Self::Unreadable`] for a tick on which the log itself could not be read.
 ///
 /// Serialised in kebab-case, the same token [`fmt::Display`] prints and the
@@ -54,6 +56,15 @@ pub enum SingboxLogClass {
     IcmpUnsupported,
     /// Any other ERROR/WARN line; the sample carries its message.
     Other,
+    /// INFO `sing-box started (0.05s)`: a (re)start of sing-box — the reload
+    /// agent kickstarts it on every config write, the shell oracle's watchdog
+    /// on "tunnel dead" — each tearing the TUN down. The message is the sample.
+    Started,
+    /// INFO `network: updated default interface en0, index 11`: sing-box's
+    /// network monitor took a default interface (right after every start, and
+    /// on every change). For THIS class `node` carries the interface name
+    /// (`en0`, `en13`, …) — the one free string column.
+    DefaultIfaceUpdated,
     /// Not a log class: the reader could not open or read the log this tick.
     /// Written with `count: 0` and the I/O error as the sample message, one
     /// row per tick while it lasts — SKIP's spirit, never silence.
@@ -62,7 +73,7 @@ pub enum SingboxLogClass {
 
 impl SingboxLogClass {
     /// Every class, in declaration order.
-    pub const ALL: [SingboxLogClass; 13] = [
+    pub const ALL: [SingboxLogClass; 15] = [
         Self::NoRoute,
         Self::Unreachable,
         Self::DialTimeout,
@@ -75,6 +86,8 @@ impl SingboxLogClass {
         Self::StreamClosed,
         Self::IcmpUnsupported,
         Self::Other,
+        Self::Started,
+        Self::DefaultIfaceUpdated,
         Self::Unreadable,
     ];
 
@@ -94,6 +107,8 @@ impl SingboxLogClass {
             Self::StreamClosed => "stream-closed",
             Self::IcmpUnsupported => "icmp-unsupported",
             Self::Other => "other",
+            Self::Started => "started",
+            Self::DefaultIfaceUpdated => "default-iface-updated",
             Self::Unreadable => "unreadable",
         }
     }
@@ -133,7 +148,8 @@ pub struct SingboxLogSample {
     pub class: SingboxLogClass,
     pub count: u32,
     /// The outbound node the line names (`using outbound/vless[<node>]`),
-    /// when it names one.
+    /// when it names one — or, for [`SingboxLogClass::DefaultIfaceUpdated`],
+    /// the interface the line names.
     #[serde(default)]
     pub node: Option<String>,
     /// The first message of the class in this tick, ANSI stripped, truncated;
@@ -163,6 +179,11 @@ mod tests {
         }
         assert_eq!(SingboxLogClass::NoRoute.as_str(), "no-route");
         assert_eq!(SingboxLogClass::NoDefaultIface.as_str(), "no-default-iface");
+        assert_eq!(SingboxLogClass::Started.as_str(), "started");
+        assert_eq!(
+            SingboxLogClass::DefaultIfaceUpdated.as_str(),
+            "default-iface-updated"
+        );
         assert!(SingboxLogClass::from_str("NoRoute").is_err());
         assert!(SingboxLogClass::from_str("").is_err());
     }

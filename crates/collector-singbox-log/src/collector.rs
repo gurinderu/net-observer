@@ -24,9 +24,18 @@ pub const META: CollectorMeta = CollectorMeta {
 /// The longest `sample_message` a row carries, in characters.
 const SAMPLE_MESSAGE_MAX: usize = 200;
 
-/// The level tokens a line must carry to be parsed at all — a byte scan
-/// before any parsing, since the log is DEBUG-level and large.
-const ALERT_TOKENS: [&str; 4] = ["ERROR", "WARN", "FATAL", "PANIC"];
+/// The substrings a line must carry to be parsed at all — a byte scan before
+/// any parsing, since the log is DEBUG-level and large: a WARN-or-above level
+/// token, or one of the two INFO lines that are evidence (a restart, and the
+/// default interface taken — realm net-observer, node #141).
+const ADMIT_TOKENS: [&str; 6] = [
+    "ERROR",
+    "WARN",
+    "FATAL",
+    "PANIC",
+    "sing-box started",
+    "updated default interface",
+];
 
 /// Where the collector's lines come from: the real [`LogTail`], or a scripted
 /// fake in tests. `read_new` is `&mut self` because a tail advances; the
@@ -175,16 +184,16 @@ impl<T: TailSource> Collector for SingboxLogCollector<T> {
 /// Fold the raw lines of one tick into one [`SingboxLogSample`] per
 /// `(class, node)`, in first-seen order, each stamped `ts_us` and carrying the
 /// first message of its class (ANSI stripped, at most 200 characters). Lines
-/// without a WARN-or-above level token are skipped before parsing; lines that
-/// do not parse, or parse to INFO/DEBUG, are skipped after. No alert line, no
-/// rows.
+/// without an [`ADMIT_TOKENS`] substring are skipped before parsing; lines
+/// that do not parse, or parse to an INFO/DEBUG line that is no class, are
+/// skipped after. No such line, no rows.
 pub fn fold_lines<'a>(
     ts_us: i64,
     lines: impl IntoIterator<Item = &'a str>,
 ) -> Vec<SingboxLogSample> {
     let mut rows: Vec<SingboxLogSample> = Vec::new();
     for raw in lines {
-        if !ALERT_TOKENS.iter().any(|t| raw.contains(t)) {
+        if !ADMIT_TOKENS.iter().any(|t| raw.contains(t)) {
             continue;
         }
         let Some(line) = parse_line(raw) else {
@@ -233,7 +242,10 @@ mod tests {
     const NO_ROUTE: &str = "+0300 2026-09-17 20:56:25 \x1b[31mERROR\x1b[0m [\x1b[38;5;38m1\x1b[0m 0ms] connection: open connection to 1.2.3.4:443 using outbound/vless[vless-out-6]: dial tcp 1.2.3.4:443: no route to internet";
     const NO_ROUTE_OTHER_NODE: &str = "+0300 2026-09-17 20:56:26 ERROR [2 0ms] connection: open connection to 5.6.7.8:443 using outbound/vless[vless-out-2]: dial tcp 5.6.7.8:443: no route to internet";
     const NO_IFACE: &str = "+0300 2026-09-17 20:56:26 ERROR network: missing default interface";
-    const INFO: &str = "+0300 2026-09-17 20:25:52 \x1b[36mINFO\x1b[0m network: updated default interface en0, index 11";
+    const INFO: &str =
+        "+0300 2026-09-17 20:25:52 \x1b[36mINFO\x1b[0m inbound/tun[0]: tun started at utun6";
+    const STARTED: &str = "+0300 2026-09-17 20:25:52 \x1b[36mINFO\x1b[0m sing-box started (0.05s)";
+    const IFACE_UPDATED: &str = "+0300 2026-09-17 20:25:52 \x1b[36mINFO\x1b[0m network: updated default interface en0, index 11";
     const DEBUG_WITH_TOKEN: &str =
         "+0300 2026-09-17 20:25:52 DEBUG [3 0ms] connection: an ERROR in a debug line is not one";
 
@@ -277,6 +289,26 @@ mod tests {
     #[test]
     fn fold_of_info_and_debug_only_is_empty() {
         assert!(fold_lines(1, [INFO, DEBUG_WITH_TOKEN, "", "garbage"]).is_empty());
+    }
+
+    /// The two INFO lines that are evidence pass the byte scan and fold like
+    /// any class: a restart with its message, the interface taken in `node`.
+    #[test]
+    fn fold_admits_the_restart_and_default_iface_lines_at_info() {
+        let rows = fold_lines(7, [STARTED, IFACE_UPDATED, INFO]);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].class, SingboxLogClass::Started);
+        assert_eq!(rows[0].node, None);
+        assert_eq!(
+            rows[0].sample_message.as_deref(),
+            Some("sing-box started (0.05s)")
+        );
+        assert_eq!(rows[1].class, SingboxLogClass::DefaultIfaceUpdated);
+        assert_eq!(rows[1].node.as_deref(), Some("en0"));
+        assert_eq!(
+            rows[1].sample_message.as_deref(),
+            Some("network: updated default interface en0, index 11")
+        );
     }
 
     #[test]

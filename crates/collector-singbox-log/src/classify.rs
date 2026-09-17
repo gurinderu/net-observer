@@ -1,21 +1,40 @@
 //! From a parsed ERROR/WARN line to its [`SingboxLogClass`] — the observed
 //! vocabulary of sing-box 1.13.19's log (realm net-observer, node #140), each
 //! message shape one class. Anything else at those levels is
-//! [`SingboxLogClass::Other`]; INFO and DEBUG lines are no class at all.
+//! [`SingboxLogClass::Other`]. INFO and DEBUG lines are no class at all — with
+//! two exceptions that are evidence: `sing-box started` (a restart, which
+//! tears the TUN down and explains the burst that follows) and `network:
+//! updated default interface <if>` (realm net-observer, node #141).
 
 use types::SingboxLogClass;
 
 use crate::parse::LogLine;
 
 /// The class of `line` and, for an outbound dial, the node it went through
-/// (`using outbound/vless[<node>]`). `None` for a line below WARN.
+/// (`using outbound/vless[<node>]`) — or, for `default-iface-updated`, the
+/// interface named. `None` for a line below WARN, except the two INFO lines
+/// that are classes of their own.
 #[must_use]
 pub fn classify(line: &LogLine) -> Option<(SingboxLogClass, Option<String>)> {
     use SingboxLogClass as C;
+    let msg = line.message.as_str();
+    // The two INFO lines that are evidence, whatever their level says.
+    if line.component.is_empty() && msg.starts_with("sing-box started") {
+        return Some((C::Started, None));
+    }
+    if line.component == "network"
+        && let Some(rest) = msg.strip_prefix("updated default interface ")
+    {
+        let iface = rest
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        return Some((C::DefaultIfaceUpdated, iface));
+    }
     if !line.level.is_alert() {
         return None;
     }
-    let msg = line.message.as_str();
     let class = match line.component.as_str() {
         // `connection: open connection to <ip:port> using outbound/vless[<node>]: dial tcp <ip:port>: <error>`
         "connection" if msg.starts_with("open connection to") => {
@@ -241,12 +260,38 @@ mod tests {
         );
     }
 
+    /// The restart line, INFO though it is: the reload agent and the shell
+    /// oracle's watchdog kickstart sing-box, and each start tears the TUN down
+    /// — the burst that follows is explained by this line alone.
+    #[test]
+    fn started_is_a_class_of_its_own_at_info() {
+        assert_eq!(
+            class_of("+0300 2026-09-17 20:25:52 \x1b[36mINFO\x1b[0m sing-box started (0.05s)"),
+            Some((SingboxLogClass::Started, None))
+        );
+    }
+
+    /// The default-interface line, INFO too; the interface rides in `node`.
+    #[test]
+    fn default_iface_updated_names_the_interface_in_node() {
+        assert_eq!(
+            class_of(
+                "+0300 2026-09-17 20:25:52 \x1b[36mINFO\x1b[0m network: updated default interface en0, index 11"
+            ),
+            Some((SingboxLogClass::DefaultIfaceUpdated, Some("en0".into())))
+        );
+        assert_eq!(
+            class_of(
+                "+0300 2026-09-17 20:25:52 INFO network: updated default interface en13, index 27"
+            ),
+            Some((SingboxLogClass::DefaultIfaceUpdated, Some("en13".into())))
+        );
+    }
+
     #[test]
     fn info_and_debug_lines_are_no_class() {
         assert_eq!(
-            class_of(
-                "+0300 2026-09-17 20:25:52 INFO network: updated default interface en0, index 11"
-            ),
+            class_of("+0300 2026-09-17 20:25:52 INFO inbound/tun[0]: tun started at utun6"),
             None
         );
         assert_eq!(
