@@ -1379,7 +1379,11 @@ The flake ships all three binaries and owns the launchd job that runs the daemon
   reuses. `net-observerd`, `net-observer-cli` and `net-observer-bar` are the
   `build` outputs of the three workspace members; `net-observer` (also
   `default`) is a `symlinkJoin` of the daemon and the CLI, the shape the old
-  single `buildRustPackage` derivation had. The derivations come out of
+  single `buildRustPackage` derivation had — and the darwin module's
+  `services.net-observer.package` defaults to it, so a host that lists that
+  option in `environment.systemPackages` keeps the operator's CLI (the
+  daemon-only `net-observerd` once stood there and the CLI vanished from the
+  owner's Mac on the first crate2nix switch). The derivations come out of
   `buildRustCrateForPkgs`: `buildRustCrate` overridden to compile with the
   channel `rust-toolchain.toml` pins — otherwise it would take nixpkgs' rustc
   and "works in the dev shell" would stop meaning anything — and to merge the
