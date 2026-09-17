@@ -117,7 +117,10 @@ impl FromStr for ProbingTier {
 /// say WHY a stretch of ticks carries no measurement, and which peer asked for
 /// it; this row is that statement. The startup default is written as an edge
 /// too, so a record that begins passive says so rather than leaving the
-/// reader to infer it from a run of `SKIP`s.
+/// reader to infer it from a run of `SKIP`s. The one row that may repeat the
+/// tier already in force is an experiment window's bracket
+/// ([`ProbingReason::Experiment`] / [`ProbingReason::ExperimentEnd`]): a
+/// window on an already-passive daemon still marks where it began and ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbingEdge {
     /// When the transition took effect (epoch microseconds).
@@ -128,6 +131,51 @@ pub struct ProbingEdge {
     /// transition no peer asked for — the startup edge, which applies the
     /// configured default. Stores as SQL `NULL`.
     pub peer_uid: Option<u32>,
+    /// What produced the edge. Defaults to [`ProbingReason::Control`], so a
+    /// row written before this field existed — a `NULL` `reason` — or a frame
+    /// from an older daemon still decodes, and reads as what it in fact was:
+    /// an operator's tier switch. An experiment window's two edges name
+    /// themselves here, so a passive stretch the operator asked for as a
+    /// measurement is told apart from one they asked for as a state.
+    #[serde(default)]
+    pub reason: ProbingReason,
+}
+
+/// What produced a [`ProbingEdge`] — the probing counterpart of
+/// [`ObservingCause`](crate::ObservingCause).
+///
+/// Serialised in kebab-case: the same token travels the socket and lands in
+/// the `probing_edge.reason` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbingReason {
+    /// An operator's `ControlCmd::SetProbing` over the control socket.
+    #[default]
+    Control,
+    /// The daemon started up in its configured default tier. Always
+    /// `peer_uid: None`: nobody asked, the process booted.
+    Startup,
+    /// An experiment window opened (realm net-observer, node #61): the daemon
+    /// went passive for a measured stretch. Written even when the tier was
+    /// already passive, so the window is marked in the record either way.
+    Experiment,
+    /// An experiment window closed and the tier in force before it was
+    /// restored — again written whether or not that restoration changed
+    /// anything.
+    ExperimentEnd,
+}
+
+impl ProbingReason {
+    /// The token stored in the `probing_edge.reason` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Startup => "startup",
+            Self::Experiment => "experiment",
+            Self::ExperimentEnd => "experiment-end",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -197,9 +245,43 @@ mod tests {
             ts_us: 42,
             tier: ProbingTier::Passive,
             peer_uid: None,
+            reason: ProbingReason::Startup,
         };
         let json = serde_json::to_string(&edge).unwrap();
         assert!(json.contains("\"tier\":\"passive\""), "{json}");
+        assert!(json.contains("\"reason\":\"startup\""), "{json}");
         assert_eq!(serde_json::from_str::<ProbingEdge>(&json).unwrap(), edge);
+    }
+
+    /// A frame from a daemon built before `reason` existed decodes — and
+    /// reads as an operator's switch, which is what every pre-experiment
+    /// edge was.
+    #[test]
+    fn a_probing_edge_without_a_reason_reads_as_control() {
+        let edge: ProbingEdge =
+            serde_json::from_str(r#"{"ts_us":7,"tier":"active","peer_uid":501}"#).unwrap();
+        assert_eq!(edge.reason, ProbingReason::Control);
+    }
+
+    /// The token is the wire spelling and the column value: one vocabulary,
+    /// round-tripped, with the experiment pair spelled as the record names it.
+    #[test]
+    fn probing_reason_token_round_trips() {
+        for (reason, token) in [
+            (ProbingReason::Control, "control"),
+            (ProbingReason::Startup, "startup"),
+            (ProbingReason::Experiment, "experiment"),
+            (ProbingReason::ExperimentEnd, "experiment-end"),
+        ] {
+            assert_eq!(reason.as_str(), token);
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{token}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<ProbingReason>(&format!("\"{token}\"")).unwrap(),
+                reason
+            );
+        }
     }
 }
