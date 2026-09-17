@@ -4,7 +4,8 @@ pub mod experiment;
 mod schema;
 
 pub use duckdb_store::{
-    DuckdbStore, ExperimentRecord, NeighborPort, NeighborScan, NeighborVuln, QueryTable, StoreError,
+    DuckdbStore, ExperimentRecord, NeighborPort, NeighborScan, NeighborVuln, QueryTable,
+    SchemaDrift, StoreError,
 };
 pub use schema::SAMPLE_TABLES;
 use types::{
@@ -106,6 +107,18 @@ pub trait Store {
         p: &diagnosis::PreparedSql,
         budget: std::time::Duration,
     ) -> Result<QueryTable, StoreError>;
+    /// The tables whose column count in the opened file differs from the
+    /// number of values this build's positional INSERT supplies — empty when
+    /// every such write this build makes will bind.
+    ///
+    /// The schema migrates forward only: the schema SQL adds columns on open
+    /// and never removes one, so a file a NEWER build has opened keeps its
+    /// wider tables when an OLDER build opens it next, and that build's
+    /// `INSERT INTO t VALUES (?,…)` is refused by the binder on every write —
+    /// observed live as a whole stretch of dropped samples, one gap line each
+    /// (realm net-observer, node #150). Read once at startup, so the daemon
+    /// can say so in one line per table rather than one per dropped write.
+    fn schema_drift(&self) -> Result<Vec<SchemaDrift>, StoreError>;
     /// Delete every row of `table` whose `ts_us` is older than `cutoff_us`,
     /// returning how many went — the record's retention mechanism (realm
     /// net-observer, node #130). `table` must be one of [`SAMPLE_TABLES`]:

@@ -7,6 +7,24 @@ use crate::conditions::Condition;
 use crate::handlers::Handler;
 use crate::window::RecentWindow;
 
+/// Mint an incident id from the rule that fired and the firing instant:
+/// `"{trigger_id}-{opened_us}"`. The ONE place the shape is written; every
+/// reader takes it apart through [`incident_id_parts`], so a handler that
+/// needs the rule or the opening instant back never keeps its own copy of
+/// the format (realm net-observer, node #135).
+pub fn mint_incident_id(trigger_id: &str, opened_us: i64) -> String {
+    format!("{trigger_id}-{opened_us}")
+}
+
+/// Read an id minted by [`mint_incident_id`] back into its rule and its
+/// opening instant. A trigger id may itself carry `-` (`gw-drop`), so the
+/// split is on the LAST one; the instant is epoch microseconds, so a
+/// non-numeric tail means the id was not minted here and yields `None`.
+pub fn incident_id_parts(id: &str) -> Option<(&str, i64)> {
+    let (trigger_id, opened_us) = id.rsplit_once('-')?;
+    Some((trigger_id, opened_us.parse().ok()?))
+}
+
 /// One rule: a [`Condition`] plus the [`Handler`]s to run when it fires, guarded by a
 /// re-arm latch and a backoff so a persistent fault fires at most once per `backoff_us`.
 pub struct Trigger {
@@ -76,7 +94,7 @@ impl TriggerEngine {
             match trig.condition.eval(w) {
                 Some(fire) => {
                     if trig.armed && now_us.saturating_sub(trig.last_fire_us) >= trig.backoff_us {
-                        let incident_id = format!("{}-{}", trig.condition.id(), now_us);
+                        let incident_id = mint_incident_id(trig.condition.id(), now_us);
                         for h in &trig.handlers {
                             h.on_fire(&incident_id, now_us, &fire.detail);
                         }
@@ -235,6 +253,23 @@ mod tests {
             fakeip_route_if: None,
             singbox_tun_if: None,
         })
+    }
+
+    /// The id's two halves survive the round trip through the one minting
+    /// shape, a dash inside the rule's own name included; an id not minted
+    /// here (no numeric tail) is refused rather than misread.
+    #[test]
+    fn incident_id_parts_reads_back_what_mint_wrote() {
+        let id = mint_incident_id("gw-drop", 1_700_000_000_000_000);
+        assert_eq!(id, "gw-drop-1700000000000000");
+        assert_eq!(
+            incident_id_parts(&id),
+            Some(("gw-drop", 1_700_000_000_000_000))
+        );
+        assert_eq!(incident_id_parts("wedge-7"), Some(("wedge", 7)));
+        assert_eq!(incident_id_parts("wedge"), None, "no instant at all");
+        assert_eq!(incident_id_parts("gw-drop"), None, "the tail is a word");
+        assert_eq!(incident_id_parts("gw-drop-"), None, "an empty tail");
     }
 
     #[test]

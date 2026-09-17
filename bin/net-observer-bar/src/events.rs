@@ -65,8 +65,8 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     AnyWindowHandle, App, AsyncApp, Context, Entity, ScrollStrategy, SharedString, Subscription,
-    Timer, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions, div, px, rgb, size, uniform_list,
+    Timer, TitlebarOptions, UniformListScrollHandle, WeakEntity, Window, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions, div, px, rgb, size, uniform_list,
 };
 
 use net_observer_ipc::{Event, EventKind, StreamFrame, SubscriptionHandle};
@@ -198,9 +198,14 @@ impl Row {
 ///
 /// The predicate the list render uses, kept as one named function so the rule —
 /// a stream-integrity frame (`kind: None`) is admitted whatever the filter is —
-/// is stated once and testable directly.
+/// is stated once and testable directly. Which kinds a chip lets through is
+/// [`EventKind::admits`], shared with the CLI: the `incident` chip shows the
+/// closes too (realm net-observer, node #135).
 fn admits(filter: Option<EventKind>, row: &Row) -> bool {
-    row.kind.is_none() || filter.is_none_or(|k| row.kind == Some(k))
+    match (filter, row.kind) {
+        (_, None) | (None, _) => true,
+        (Some(chip), Some(kind)) => chip.admits(kind),
+    }
 }
 
 /// The shared, window-scoped model: the capped live row list plus the current
@@ -492,6 +497,21 @@ pub(crate) fn format_frame(f: &StreamFrame) -> String {
     format!("{}  {}", f.label(), f.detail())
 }
 
+/// The `(id, closed_us)` an incident-closed frame carries; `None` for every
+/// other message. The one frame the event log feeds back into the panel's
+/// incident list (realm net-observer, node #135).
+fn incident_close(msg: &BridgeMsg) -> Option<(String, i64)> {
+    match msg {
+        BridgeMsg::Frame(frame) => match &**frame {
+            StreamFrame::Event(Event::IncidentClosed { id, closed_us, .. }) => {
+                Some((id.clone(), *closed_us))
+            }
+            _ => None,
+        },
+        BridgeMsg::Offline(_) => None,
+    }
+}
+
 /// Open the event-log window, or bring the already-open one to the front.
 ///
 /// The live window handle is stashed on the shared [`Glance`] so a second click
@@ -510,7 +530,7 @@ pub(crate) fn open_or_focus(cx: &mut App, glance: &Entity<Glance>, socket_path: 
         }
     }
 
-    if let Some(handle) = open_window(cx, socket_path) {
+    if let Some(handle) = open_window(cx, glance.downgrade(), socket_path) {
         let any: AnyWindowHandle = handle.into();
         glance.update(cx, |g, _| g.events_window = Some(any));
         // Accessory apps don't get key focus for free; bring the new window forward.
@@ -520,7 +540,15 @@ pub(crate) fn open_or_focus(cx: &mut App, glance: &Entity<Glance>, socket_path: 
 
 /// Create the event-log window and wire its subscription bridge. Returns the
 /// window handle, or `None` if the window failed to open.
-fn open_window(cx: &mut App, socket_path: String) -> Option<WindowHandle<EventLogView>> {
+///
+/// `glance` is the panel's model: the one frame this window feeds back into it
+/// is an incident's close, so the panel's incident list moves the entry to
+/// "closed" on the frame rather than on its next poll (see [`incident_close`]).
+fn open_window(
+    cx: &mut App,
+    glance: WeakEntity<Glance>,
+    socket_path: String,
+) -> Option<WindowHandle<EventLogView>> {
     let log = cx.new(|_| EventLog::new());
     // Bounded on purpose: the reader thread drains the socket at full speed while
     // the drain below runs only every DRAIN_POLL, and the model keeps just
@@ -560,6 +588,8 @@ fn open_window(cx: &mut App, socket_path: String) -> Option<WindowHandle<EventLo
                     }
                 }
             }
+            // The closes in this batch, read before the batch moves into the log.
+            let closes: Vec<(String, i64)> = batch.iter().filter_map(incident_close).collect();
             let alive = weak.update(acx, |log, cx| {
                 if !batch.is_empty() {
                     for msg in batch {
@@ -570,6 +600,19 @@ fn open_window(cx: &mut App, socket_path: String) -> Option<WindowHandle<EventLo
             });
             if alive.is_err() {
                 break; // window closed or app shutting down
+            }
+            // The panel's incident list is a polled snapshot; a close moves its
+            // entry to "closed" on the frame instead of on the next poll, by the
+            // same id the opening carried. A model already dropped (the app is
+            // shutting down) is not an error: the list went with it (realm
+            // net-observer, node #135).
+            if !closes.is_empty() {
+                let _ = glance.update(acx, |g, cx| {
+                    for (id, closed_us) in &closes {
+                        crate::status::close_incident(&mut g.snapshot.incidents, id, *closed_us);
+                    }
+                    cx.notify();
+                });
             }
             if disconnected {
                 // Say so rather than leaving an empty list looking live and idle.
@@ -832,6 +875,31 @@ mod tests {
         })
     }
 
+    /// The close of [`incident_event`], as its own frame.
+    fn incident_closed_event() -> Event {
+        Event::IncidentClosed {
+            id: "i1".into(),
+            trigger_id: "wedge".into(),
+            opened_us: Some(5),
+            closed_us: 9,
+        }
+    }
+
+    /// Only an incident-closed frame feeds the panel's incident list: the
+    /// opening, a sample and an offline note all yield nothing (realm
+    /// net-observer, node #135).
+    #[test]
+    fn incident_close_reads_only_the_closing_frame() {
+        let closed = BridgeMsg::Frame(Box::new(StreamFrame::Event(incident_closed_event())));
+        assert_eq!(incident_close(&closed), Some(("i1".to_string(), 9)));
+
+        let opened = BridgeMsg::Frame(Box::new(StreamFrame::Event(incident_event())));
+        assert_eq!(incident_close(&opened), None);
+        let link = BridgeMsg::Frame(Box::new(StreamFrame::Event(link_event())));
+        assert_eq!(incident_close(&link), None);
+        assert_eq!(incident_close(&BridgeMsg::Offline("down".into())), None);
+    }
+
     #[test]
     fn format_frame_renders_label_and_detail() {
         assert_eq!(
@@ -996,6 +1064,22 @@ mod tests {
         assert!(!admits(Some(EventKind::Dns), &link));
     }
 
+    /// The `incident` chip shows an incident's close as well as its opening —
+    /// a reader watching the chip must see each incident end — while the
+    /// close is not an incident for any other chip (realm net-observer,
+    /// node #135).
+    #[test]
+    fn the_incident_chip_admits_closes_too() {
+        let opened = Row::new(&StreamFrame::Event(incident_event()));
+        let closed = Row::new(&StreamFrame::Event(incident_closed_event()));
+        assert!(admits(Some(EventKind::Incident), &opened));
+        assert!(admits(Some(EventKind::Incident), &closed));
+        assert!(admits(Some(EventKind::IncidentClosed), &closed));
+        assert!(!admits(Some(EventKind::IncidentClosed), &opened));
+        assert!(!admits(Some(EventKind::Link), &closed));
+        assert!(admits(None, &closed));
+    }
+
     /// The first row of a (re)connected log states whether the daemon is
     /// collecting, so a paused daemon reads as paused rather than as an idle one.
     #[test]
@@ -1033,6 +1117,12 @@ mod tests {
 
         let inc = Row::new(&StreamFrame::Event(incident_event()));
         assert!(inc.alert, "incidents keep their attention colour");
+
+        // The close ends the alarm; it is not one.
+        let closed = Row::new(&StreamFrame::Event(incident_closed_event()));
+        assert!(!closed.alert, "an incident's close is not an alert");
+        assert_eq!(closed.kind, Some(EventKind::IncidentClosed));
+        assert_eq!(closed.line, "incident-closed  i1 (wedge) after 0s");
 
         let link = Row::new(&StreamFrame::Event(link_event()));
         assert!(!link.alert, "an ordinary sample is not an alert");
