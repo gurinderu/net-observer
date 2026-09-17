@@ -257,7 +257,8 @@ enum Command {
         /// The SQL statement to run against the store.
         sql: String,
     },
-    /// Which layer failed at a moment: the state of link, proxy server, tun and
+    /// Which layer failed at a moment: the state of link, proxy server, tun,
+    /// sing-box's own dial through the selected node (by IP / by name) and
     /// host load as the record has it, plus the layer it blames. Asks the
     /// running daemon first, reads the DB file only when no daemon answers.
     ///
@@ -1349,8 +1350,12 @@ fn format_status(snap: &StatusSnapshot) -> String {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "-".to_string());
             let sel = p.selector.as_deref().unwrap_or("-");
+            // The dial probe (realm net-observer, node #62): the newest row of
+            // a tick is the selected node's, so this is its dial; `-` = not
+            // dialled (the passive tier, a pre-dial daemon).
+            let dial = p.dial_label().unwrap_or_else(|| "-".to_string());
             out.push_str(&format!(
-                "proxy          tun={tun} selector={sel} ts_us={}\n",
+                "proxy          tun={tun} selector={sel} dial={dial} ts_us={}\n",
                 diagnose::stamp_us(p.ts_us)
             ));
         }
@@ -1543,6 +1548,9 @@ mod tests {
                 est_direct_age_s: None,
                 est_tun_alive: None,
                 est_tun_age_s: None,
+                dial_ip_ms: Some(202),
+                dial_name_ms: Some(0),
+                dial_target: Some("auto".into()),
             }),
             dns: None,
             host: None,
@@ -1572,7 +1580,7 @@ mod tests {
             diagnose::stamp_us(42)
         )));
         assert!(out.contains(&format!(
-            "proxy          tun=204 selector=auto ts_us={}",
+            "proxy          tun=204 selector=auto dial=auto:202/0ms ts_us={}",
             diagnose::stamp_us(43)
         )));
         assert!(out.contains("dns            (no data)"));

@@ -32,8 +32,11 @@ pub fn render_status(snap: &StatusSnapshot) -> String {
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "-".to_string());
             let sel = p.selector.clone().unwrap_or_else(|| "-".to_string());
+            // The selected node's dial (realm net-observer, node #62), the
+            // same rendering the CLI's `status` uses; `-` = not dialled.
+            let dial = p.dial_label().unwrap_or_else(|| "-".to_string());
             out.push_str(&format!(
-                "proxy  tun={tun} selector={sel} ts_us={}\n",
+                "proxy  tun={tun} selector={sel} dial={dial} ts_us={}\n",
                 p.ts_us
             ));
         }
@@ -200,6 +203,9 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            dial_ip_ms: None,
+            dial_name_ms: None,
+            dial_target: None,
         }
     }
 
@@ -323,8 +329,24 @@ mod tests {
         };
         let out = render_status(&snap);
         assert!(out.contains("gw=OK direct=OK"));
-        assert!(out.contains("tun=204 selector=auto"));
+        assert!(out.contains("tun=204 selector=auto dial=-"));
         assert!(out.contains("wedge opened=80 closed=open"));
+    }
+
+    /// The selected node's dial renders as the CLI renders it (realm
+    /// net-observer, node #62): `<node>:<ip>/<name>ms`, a dead side as `0`.
+    #[test]
+    fn render_shows_the_dial() {
+        let snap = StatusSnapshot {
+            proxy: Some(ProxySample {
+                dial_ip_ms: Some(202),
+                dial_name_ms: Some(0),
+                dial_target: Some("auto".into()),
+                ..proxy(Some(204), Some("auto"))
+            }),
+            ..Default::default()
+        };
+        assert!(render_status(&snap).contains("dial=auto:202/0ms"));
     }
 
     #[test]
