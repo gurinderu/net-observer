@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
 
-use types::{DnsSample, HostSample, LinkSample, NeighborsSample, ProxySample, Sample, WifiSample};
+use types::{
+    DnsSample, HostSample, LinkSample, NeighborsSample, ProxySample, Sample, SingboxLogSample,
+    WifiSample,
+};
 
 /// Capacity of the recent-sample window the daemon hands to the trigger
 /// engine, in samples of every kind the daemon lets in — the conditions'
@@ -10,7 +13,9 @@ use types::{DnsSample, HostSample, LinkSample, NeighborsSample, ProxySample, Sam
 /// consumer refuses before `push` (realm net-observer, nodes #75, #92). Of
 /// what does enter, per 15 s tick the daemon's defaults emit 1 link + up to
 /// 7 proxy rows + 3 dns + 1 host + 1 wifi ≈ 13 samples (the neighbour-cache
-/// tick and the air scan are minutes apart and add a fraction), so 2048 ≈
+/// tick and the air scan are minutes apart and add a fraction; the sing-box
+/// log reader adds nothing on a healthy tick and a row per error class
+/// while sing-box complains, realm net-observer, node #141), so 2048 ≈
 /// 157 ticks ≈ 40 min: enough for `ban-cycle` to hold three field rounds at
 /// a 2–4 min period, where the previous 64 (≈ 5 ticks) held none. The
 /// memory is trivial.
@@ -127,7 +132,8 @@ impl RecentWindow {
                 | Sample::Wifi(_)
                 | Sample::Neighbors(_)
                 | Sample::Air(_)
-                | Sample::Connections(_) => None,
+                | Sample::Connections(_)
+                | Sample::SingboxLog(_) => None,
             })
             .take(n)
             .collect()
@@ -147,7 +153,8 @@ impl RecentWindow {
                 | Sample::Wifi(_)
                 | Sample::Neighbors(_)
                 | Sample::Air(_)
-                | Sample::Connections(_) => None,
+                | Sample::Connections(_)
+                | Sample::SingboxLog(_) => None,
             })
             .take(n)
             .collect()
@@ -164,7 +171,8 @@ impl RecentWindow {
             | Sample::Wifi(_)
             | Sample::Neighbors(_)
             | Sample::Air(_)
-            | Sample::Connections(_) => None,
+            | Sample::Connections(_)
+            | Sample::SingboxLog(_) => None,
         })
     }
 
@@ -185,7 +193,8 @@ impl RecentWindow {
             | Sample::Host(_)
             | Sample::Neighbors(_)
             | Sample::Air(_)
-            | Sample::Connections(_) => None,
+            | Sample::Connections(_)
+            | Sample::SingboxLog(_) => None,
         })
     }
 
@@ -200,7 +209,8 @@ impl RecentWindow {
             | Sample::Wifi(_)
             | Sample::Neighbors(_)
             | Sample::Air(_)
-            | Sample::Connections(_) => None,
+            | Sample::Connections(_)
+            | Sample::SingboxLog(_) => None,
         })
     }
 
@@ -218,7 +228,8 @@ impl RecentWindow {
                 | Sample::Wifi(_)
                 | Sample::Neighbors(_)
                 | Sample::Air(_)
-                | Sample::Connections(_) => None,
+                | Sample::Connections(_)
+                | Sample::SingboxLog(_) => None,
             })
             .take(n)
             .collect()
@@ -235,7 +246,8 @@ impl RecentWindow {
             | Sample::Wifi(_)
             | Sample::Neighbors(_)
             | Sample::Air(_)
-            | Sample::Connections(_) => None,
+            | Sample::Connections(_)
+            | Sample::SingboxLog(_) => None,
         })
     }
 
@@ -250,7 +262,8 @@ impl RecentWindow {
             | Sample::Wifi(_)
             | Sample::Neighbors(_)
             | Sample::Air(_)
-            | Sample::Connections(_) => None,
+            | Sample::Connections(_)
+            | Sample::SingboxLog(_) => None,
         })
     }
 
@@ -273,8 +286,32 @@ impl RecentWindow {
             | Sample::Host(_)
             | Sample::Wifi(_)
             | Sample::Air(_)
-            | Sample::Connections(_) => None,
+            | Sample::Connections(_)
+            | Sample::SingboxLog(_) => None,
         })
+    }
+
+    /// The most recent `n` rows of sing-box's own log, newest first — one row
+    /// per `(class, node)` per tick of the log reader; a tick that saw no
+    /// ERROR/WARN line left none (realm net-observer, node #141).
+    pub fn recent_singbox_log(&self, n: usize) -> Vec<&SingboxLogSample> {
+        self.buf
+            .iter()
+            .rev()
+            .filter_map(|s| match s {
+                Sample::SingboxLog(r) => Some(r),
+                Sample::Link(_)
+                | Sample::Proxy(_)
+                | Sample::Dns(_)
+                | Sample::Route(_)
+                | Sample::Host(_)
+                | Sample::Wifi(_)
+                | Sample::Neighbors(_)
+                | Sample::Air(_)
+                | Sample::Connections(_) => None,
+            })
+            .take(n)
+            .collect()
     }
 
     /// The link sample the newest one should be compared against, with the
@@ -298,7 +335,8 @@ impl RecentWindow {
             | Sample::Wifi(_)
             | Sample::Neighbors(_)
             | Sample::Air(_)
-            | Sample::Connections(_) => None,
+            | Sample::Connections(_)
+            | Sample::SingboxLog(_) => None,
         });
         links.next()?;
         match links.next() {

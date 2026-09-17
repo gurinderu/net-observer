@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::window::{LinkProvenance, RecentWindow};
 use types::{
-    DnsVerdict, GwVerdict, LinkMedium, LinkSample, NeighborsVerdict, ProxySample, TcpVerdict,
-    normalize_mac,
+    DnsVerdict, GwVerdict, LinkMedium, LinkSample, NeighborsVerdict, ProxySample, SingboxLogClass,
+    SingboxLogSample, TcpVerdict, normalize_mac,
 };
 
 /// How many recent DNS samples the `fakeip` condition scans (one polling tick
@@ -1232,6 +1232,191 @@ direct underlay stream unmeasured"
             ),
         };
         Some(Fire { detail })
+    }
+}
+
+/// How many recent rows of sing-box's log the two sing-box signatures scan:
+/// the rows they count lie within [`SINGBOX_SPAN_US`] of the newest one,
+/// a few ticks, and a tick leaves one row per `(class, node)` — 128 reaches
+/// past that several times over.
+const SINGBOX_LOG_SCAN: usize = 128;
+
+/// The span the sing-box signatures count lines over: 60 s, ending at the
+/// newest qualifying row.
+const SINGBOX_SPAN_US: i64 = 60_000_000;
+
+/// How many lines inside that span fire either signature.
+const SINGBOX_MIN_LINES: u32 = 3;
+
+/// How many link ticks with no qualifying row clear either signature. The
+/// log reader writes nothing on a tick that saw no error, so "two ticks with
+/// no such row" is measured on the link collector's samples — the daemon's
+/// tick clock, at the same default cadence as the reader.
+const SINGBOX_CLEAR_TICKS: usize = 2;
+
+/// The rows of sing-box's log one signature reads: the ones `pick` accepts,
+/// inside [`SINGBOX_SPAN_US`] ending at the newest of them.
+struct SingboxBurst<'w> {
+    rows: Vec<&'w SingboxLogSample>,
+}
+
+impl SingboxBurst<'_> {
+    /// Lines in the span: the rows' counts summed.
+    fn lines(&self) -> u32 {
+        self.rows
+            .iter()
+            .map(|r| r.count)
+            .fold(0, u32::saturating_add)
+    }
+
+    /// `no-route ×3, no-default-iface ×1` — the classes seen, in first-seen
+    /// order, each with its lines.
+    fn classes(&self) -> String {
+        let mut seen: Vec<(SingboxLogClass, u32)> = Vec::new();
+        for r in &self.rows {
+            match seen.iter_mut().find(|(c, _)| *c == r.class) {
+                Some((_, n)) => *n = n.saturating_add(r.count),
+                None => seen.push((r.class, r.count)),
+            }
+        }
+        seen.iter()
+            .map(|(c, n)| format!("{c} ×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The burst of rows `pick` accepts, or `None` when there is none — or when
+/// [`SINGBOX_CLEAR_TICKS`] link ticks have passed since the newest one: the
+/// assertion has cleared, whatever the span still holds.
+fn singbox_burst<'w>(
+    w: &'w RecentWindow,
+    pick: impl Fn(&SingboxLogSample) -> bool,
+) -> Option<SingboxBurst<'w>> {
+    let all = w.recent_singbox_log(SINGBOX_LOG_SCAN);
+    let newest = all.iter().copied().find(|r| pick(r))?;
+    let ticks_since = w
+        .recent_link(SINGBOX_CLEAR_TICKS)
+        .into_iter()
+        .filter(|l| l.ts_us > newest.ts_us)
+        .count();
+    if ticks_since >= SINGBOX_CLEAR_TICKS {
+        return None;
+    }
+    let horizon = newest.ts_us.saturating_sub(SINGBOX_SPAN_US);
+    let rows = all
+        .into_iter()
+        .filter(|r| pick(r) && r.ts_us >= horizon)
+        .collect();
+    Some(SingboxBurst { rows })
+}
+
+/// Fires when sing-box's own log says it has no route — `no-route`,
+/// `unreachable` or `no-default-iface` lines, [`SINGBOX_MIN_LINES`] or more
+/// within [`SINGBOX_SPAN_US`] — while the newest link sample shows the
+/// interface still holding a DHCP router: the OS has a network and sing-box
+/// cannot see it. This is the signature the passive tier could not name
+/// before the log was read (realm net-observer, node #141).
+///
+/// The gateway verdict is read exhaustively: `Ok` and `Skip` (the passive
+/// tier's withheld echo) both leave the router held; `NoGw` means the OS
+/// agrees there is no route and `gw-drop` owns it; `Fail` is `gw-drop`'s as
+/// well — the gateway is dead, so sing-box's complaint is not a discrepancy.
+/// Clears after [`SINGBOX_CLEAR_TICKS`] link ticks with no such line.
+pub struct SingboxNoRoute;
+impl Condition for SingboxNoRoute {
+    fn id(&self) -> &'static str {
+        "singbox-no-route"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        let last = w.last_link()?;
+        let router = last.dhcp_router.as_deref()?;
+        match last.gw {
+            GwVerdict::Ok | GwVerdict::Skip => {}
+            GwVerdict::Fail | GwVerdict::NoGw => return None,
+        }
+        let burst = singbox_burst(w, |r| {
+            matches!(
+                r.class,
+                SingboxLogClass::NoRoute
+                    | SingboxLogClass::Unreachable
+                    | SingboxLogClass::NoDefaultIface
+            )
+        })?;
+        let lines = burst.lines();
+        if lines < SINGBOX_MIN_LINES {
+            return None;
+        }
+        Some(Fire {
+            detail: format!(
+                "sing-box reports no route ({lines} lines in 60 s: {}) while the link holds router {router}",
+                burst.classes()
+            ),
+        })
+    }
+}
+
+/// Fires when sing-box's dial through one node times out —
+/// [`SINGBOX_MIN_LINES`] or more `dial-timeout` lines via that node within
+/// [`SINGBOX_SPAN_US`] — while the newest measured proxy tick reaches every
+/// upstream endpoint by raw TCP: the path is open and sing-box's own dial is
+/// not (realm net-observer, node #141).
+///
+/// The window cannot map a node to its endpoint: a proxy row carries the
+/// endpoint address and the tick-wide selector name, never the node each
+/// address belongs to. So the context gate is the whole fleet — every
+/// measured endpoint of the newest tick `Ok`; a tick with a `Fail` is
+/// `endpoint-block`'s question, a tick of `Skip`s no measurement — and the
+/// detail says the node's own endpoint is unmapped. Clears after
+/// [`SINGBOX_CLEAR_TICKS`] link ticks with no such line.
+pub struct SingboxDialTimeout;
+impl Condition for SingboxDialTimeout {
+    fn id(&self) -> &'static str {
+        "singbox-dial-timeout"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        // The newest proxy tick: the rows sharing the newest row's `ts_us`.
+        // Exhaustive over the verdict: `Skip` is no measurement.
+        let proxy = w.recent_proxy(ENDPOINT_BLOCK_SCAN);
+        let tick_ts = proxy.first()?.ts_us;
+        let mut endpoints = 0usize;
+        for p in proxy.iter().take_while(|p| p.ts_us == tick_ts) {
+            match p.tcp {
+                TcpVerdict::Ok => endpoints += 1,
+                TcpVerdict::Fail | TcpVerdict::Skip => return None,
+            }
+        }
+        // Each node with a dial-timeout row, newest first; the first whose
+        // own burst reaches the threshold fires. A row naming no node is not
+        // attributable to one and is skipped.
+        let all = w.recent_singbox_log(SINGBOX_LOG_SCAN);
+        let mut seen: Vec<&str> = Vec::new();
+        for node in all
+            .iter()
+            .filter(|r| r.class == SingboxLogClass::DialTimeout)
+            .filter_map(|r| r.node.as_deref())
+        {
+            if seen.contains(&node) {
+                continue;
+            }
+            seen.push(node);
+            let Some(burst) = singbox_burst(w, |r| {
+                r.class == SingboxLogClass::DialTimeout && r.node.as_deref() == Some(node)
+            }) else {
+                continue;
+            };
+            let lines = burst.lines();
+            if lines < SINGBOX_MIN_LINES {
+                continue;
+            }
+            return Some(Fire {
+                detail: format!(
+                    "sing-box's dial through {node} times out ({lines} in 60 s) while raw TCP \
+to all {endpoints} endpoints answers (the node's own endpoint is not in the window)"
+                ),
+            });
+        }
+        None
     }
 }
 
@@ -3904,5 +4089,273 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             c.eval(&fill(64)).is_none(),
             "a 64-sample window holds a handful of ticks and cannot see a cycle"
         );
+    }
+
+    // ---- sing-box's own log ------------------------------------------------
+
+    const S: i64 = 1_000_000;
+
+    /// One row of the log reader: `count` lines of `class` via `node` on the
+    /// tick at `ts`.
+    fn singbox_row(ts: i64, class: SingboxLogClass, count: u32, node: Option<&str>) -> Sample {
+        Sample::SingboxLog(SingboxLogSample {
+            ts_us: ts,
+            class,
+            count,
+            node: node.map(str::to_string),
+            sample_message: Some("…".into()),
+        })
+    }
+
+    /// A link tick with an explicit gateway verdict that still holds a DHCP
+    /// router — the passive tier's shape when `gw` is `Skip`.
+    fn link_with_router(ts: i64, gw: GwVerdict) -> Sample {
+        match link_gw(ts, gw) {
+            Sample::Link(mut l) => {
+                l.dhcp_router = Some("10.20.0.1".into());
+                Sample::Link(l)
+            }
+            other => other,
+        }
+    }
+
+    /// The field shape under the passive tier: the echo withheld, the router
+    /// held, and sing-box writing `no route to internet` on every dial —
+    /// three lines inside a minute fire, two do not.
+    #[test]
+    fn singbox_no_route_fires_on_three_lines_in_a_minute_while_the_router_is_held() {
+        let c = SingboxNoRoute;
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(0, GwVerdict::Skip));
+        w.push(singbox_row(
+            1,
+            SingboxLogClass::NoRoute,
+            2,
+            Some("vless-out-6"),
+        ));
+        assert!(c.eval(&w).is_none(), "two lines are not yet a burst");
+        w.push(link_with_router(15 * S, GwVerdict::Skip));
+        w.push(singbox_row(
+            15 * S + 1,
+            SingboxLogClass::NoDefaultIface,
+            1,
+            None,
+        ));
+        let fire = c.eval(&w).expect("three lines in a minute fire");
+        assert_eq!(
+            fire.detail,
+            "sing-box reports no route (3 lines in 60 s: no-default-iface ×1, no-route ×2) \
+             while the link holds router 10.20.0.1"
+        );
+        // The same lines with an OK gateway (the active tier) fire too.
+        w.push(link_with_router(16 * S, GwVerdict::Ok));
+        assert!(c.eval(&w).is_some());
+    }
+
+    /// Lines older than the minute ending at the newest one do not count:
+    /// three lines spread over two minutes are not a burst.
+    #[test]
+    fn singbox_no_route_counts_only_the_minute_ending_at_the_newest_line() {
+        let c = SingboxNoRoute;
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(0, GwVerdict::Skip));
+        w.push(singbox_row(
+            1,
+            SingboxLogClass::NoRoute,
+            2,
+            Some("vless-out-6"),
+        ));
+        w.push(link_with_router(75 * S, GwVerdict::Skip));
+        w.push(singbox_row(
+            75 * S + 1,
+            SingboxLogClass::Unreachable,
+            1,
+            None,
+        ));
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// Without the link context there is no discrepancy to name: no router
+    /// held (nothing to contrast sing-box's view with), or a gateway the OS
+    /// itself calls gone or dead — `gw-drop`'s incident, not this one.
+    #[test]
+    fn singbox_no_route_is_silent_without_a_held_router() {
+        let c = SingboxNoRoute;
+        let burst = |w: &mut RecentWindow| {
+            w.push(singbox_row(
+                1,
+                SingboxLogClass::NoRoute,
+                3,
+                Some("vless-out-6"),
+            ));
+        };
+
+        let mut w = RecentWindow::new(64);
+        burst(&mut w);
+        assert!(c.eval(&w).is_none(), "no link sample at all");
+
+        let mut w = RecentWindow::new(64);
+        w.push(link_gw(0, GwVerdict::Skip));
+        burst(&mut w);
+        assert!(c.eval(&w).is_none(), "no DHCP router held");
+
+        for gw in [GwVerdict::NoGw, GwVerdict::Fail] {
+            let mut w = RecentWindow::new(64);
+            w.push(link_with_router(0, gw));
+            burst(&mut w);
+            assert!(c.eval(&w).is_none(), "{gw:?} is gw-drop's");
+        }
+
+        // Other classes of the log are not this signature.
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(0, GwVerdict::Skip));
+        w.push(singbox_row(
+            1,
+            SingboxLogClass::DialTimeout,
+            5,
+            Some("vless-out-6"),
+        ));
+        w.push(singbox_row(1, SingboxLogClass::Unreadable, 0, None));
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// The reader writes nothing on a quiet tick, so the clear is measured on
+    /// the link ticks: one tick after the last line still asserts, the second
+    /// clears — and a new line resets the count.
+    #[test]
+    fn singbox_no_route_clears_after_two_link_ticks_with_no_line() {
+        let c = SingboxNoRoute;
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(0, GwVerdict::Skip));
+        w.push(singbox_row(
+            1,
+            SingboxLogClass::NoRoute,
+            3,
+            Some("vless-out-6"),
+        ));
+        assert!(c.eval(&w).is_some());
+        w.push(link_with_router(15 * S, GwVerdict::Skip));
+        assert!(c.eval(&w).is_some(), "one quiet tick still asserts");
+        w.push(singbox_row(
+            15 * S + 1,
+            SingboxLogClass::NoRoute,
+            1,
+            Some("vless-out-6"),
+        ));
+        w.push(link_with_router(30 * S, GwVerdict::Skip));
+        assert!(c.eval(&w).is_some(), "a new line reset the quiet count");
+        w.push(link_with_router(45 * S, GwVerdict::Skip));
+        assert!(c.eval(&w).is_none(), "two quiet ticks clear");
+    }
+
+    /// Three dial timeouts through one node inside a minute, while raw TCP
+    /// reaches every endpoint of the newest proxy tick: the path is open and
+    /// sing-box's own dial is not.
+    #[test]
+    fn singbox_dial_timeout_fires_when_raw_tcp_answers_everywhere() {
+        let c = SingboxDialTimeout;
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(proxy_ep(1, "2.2.2.2:2053", TcpVerdict::Ok));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            2,
+            Some("vless-out-6"),
+        ));
+        assert!(c.eval(&w).is_none(), "two lines are not yet a burst");
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            4,
+            Some("vless-out-2"),
+        ));
+        let fire = c.eval(&w).expect("four timeouts via one node fire");
+        assert_eq!(
+            fire.detail,
+            "sing-box's dial through vless-out-2 times out (4 in 60 s) while raw TCP to all \
+             2 endpoints answers (the node's own endpoint is not in the window)"
+        );
+        // Counts are per node: two nodes with two lines each do not add up,
+        // and a node that did reach three fires even when another node's
+        // single line is the newest row.
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(singbox_row(2, SingboxLogClass::DialTimeout, 2, Some("a")));
+        w.push(singbox_row(2, SingboxLogClass::DialTimeout, 1, Some("b")));
+        assert!(c.eval(&w).is_none());
+        w.push(singbox_row(3, SingboxLogClass::DialTimeout, 1, Some("a")));
+        w.push(singbox_row(4, SingboxLogClass::DialTimeout, 1, Some("b")));
+        let fire = c.eval(&w).expect("node a reached three");
+        assert!(
+            fire.detail
+                .starts_with("sing-box's dial through a times out (3 in 60 s)"),
+            "{}",
+            fire.detail
+        );
+    }
+
+    /// Without the measurement context the timeouts are not this signature:
+    /// no proxy tick at all, a tick the passive tier withheld (`Skip`), or an
+    /// endpoint the underlay itself cannot reach (`endpoint-block`'s question).
+    #[test]
+    fn singbox_dial_timeout_is_silent_without_a_measured_open_underlay() {
+        let c = SingboxDialTimeout;
+        let burst = |w: &mut RecentWindow| {
+            w.push(singbox_row(
+                2,
+                SingboxLogClass::DialTimeout,
+                3,
+                Some("vless-out-6"),
+            ));
+        };
+
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        burst(&mut w);
+        assert!(c.eval(&w).is_none(), "no proxy tick");
+
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "-", TcpVerdict::Skip));
+        burst(&mut w);
+        assert!(c.eval(&w).is_none(), "a withheld tick is no measurement");
+
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(proxy_ep(1, "2.2.2.2:2053", TcpVerdict::Fail));
+        burst(&mut w);
+        assert!(c.eval(&w).is_none(), "an endpoint dead from the underlay");
+
+        // A timeout row that names no node is not attributable.
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(singbox_row(2, SingboxLogClass::DialTimeout, 3, None));
+        assert!(c.eval(&w).is_none());
+    }
+
+    #[test]
+    fn singbox_dial_timeout_clears_after_two_link_ticks_with_no_line() {
+        let c = SingboxDialTimeout;
+        let mut w = RecentWindow::new(64);
+        w.push(link(0, TcpVerdict::Ok));
+        w.push(proxy_ep(1, "1.1.1.1:443", TcpVerdict::Ok));
+        w.push(singbox_row(
+            2,
+            SingboxLogClass::DialTimeout,
+            3,
+            Some("vless-out-6"),
+        ));
+        assert!(c.eval(&w).is_some());
+        w.push(link(15 * S, TcpVerdict::Ok));
+        w.push(proxy_ep(15 * S + 1, "1.1.1.1:443", TcpVerdict::Ok));
+        assert!(c.eval(&w).is_some(), "one quiet tick still asserts");
+        w.push(link(30 * S, TcpVerdict::Ok));
+        w.push(proxy_ep(30 * S + 1, "1.1.1.1:443", TcpVerdict::Ok));
+        assert!(c.eval(&w).is_none(), "two quiet ticks clear");
     }
 }
