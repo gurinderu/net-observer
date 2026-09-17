@@ -1312,9 +1312,10 @@ fn collector_switch(kind: EventKind, c: &config::Collectors) -> Option<bool> {
         EventKind::Neighbors => c.neighbors.enabled,
         EventKind::Connections => c.connections.enabled,
         // Not a collector: incidents are what the triggers write about the
-        // collectors' samples. `pcap_ring` is absent for the same reason from the
-        // other side — it produces no event kind at all.
-        EventKind::Incident => return None,
+        // collectors' samples, and a close is the end of one (realm
+        // net-observer, node #135). `pcap_ring` is absent for the same reason
+        // from the other side — it produces no event kind at all.
+        EventKind::Incident | EventKind::IncidentClosed => return None,
     })
 }
 
@@ -2058,9 +2059,14 @@ mod tests {
             snap.collector(EventKind::Link),
             CollectorAvailability::Enabled
         );
-        // Not a collector, and deliberately never declared as one.
+        // Not a collector, and deliberately never declared as one — nor is
+        // the close of one.
         assert_eq!(
             snap.collector(EventKind::Incident),
+            CollectorAvailability::Absent
+        );
+        assert_eq!(
+            snap.collector(EventKind::IncidentClosed),
             CollectorAvailability::Absent
         );
     }
