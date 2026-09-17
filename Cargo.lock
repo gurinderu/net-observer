@@ -4135,6 +4135,7 @@ dependencies = [
  "anyhow",
  "clap",
  "collector-air",
+ "collector-announce",
  "collector-connections",
  "collector-core",
  "collector-dns",
