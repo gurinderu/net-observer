@@ -7,7 +7,7 @@ use net_observer_ipc::{
     ControlCmd, ControlResult, DiagnosticQuery, QueryOutcome, Request, Response, ScanOptions,
     StatusSnapshot, Table,
 };
-use types::ProbingTier;
+use types::{ConnectionsGroupBy, ProbingTier};
 
 use super::model::Glance;
 
@@ -314,20 +314,40 @@ pub fn scan_round_trip_cve(
 /// read and could not run, a daemon built before `Request::Query` existed, or
 /// a transport failure.
 pub fn fetch_findings(socket_path: &str) -> Result<Table, String> {
-    classify_findings(net_observer_ipc::diagnose(
-        socket_path,
-        DiagnosticQuery::Vulns { network: None },
-    ))
+    classify_diagnosis(
+        "Vulns",
+        net_observer_ipc::diagnose(socket_path, DiagnosticQuery::Vulns { network: None }),
+    )
 }
 
-/// The pure half of [`fetch_findings`]: what each outcome means for the window.
-/// Separated so the mapping is testable without a socket.
-fn classify_findings(outcome: std::io::Result<QueryOutcome>) -> Result<Table, String> {
+/// Read what this machine talks to right now: the newest tick of the live
+/// flow table, folded by `group_by`
+/// (`DiagnosticQuery::Connections { group_by }`), as the table the daemon
+/// answered with (realm net-observer, node #75).
+///
+/// The same blocking [`net_observer_ipc::diagnose`] round-trip as
+/// [`fetch_findings`], with the same rule — **never on the gpui main thread**
+/// (the connections window runs it on the background executor) — and the
+/// same mapping of every non-table outcome to the daemon's own words.
+pub fn fetch_connections(socket_path: &str, group_by: ConnectionsGroupBy) -> Result<Table, String> {
+    classify_diagnosis(
+        "Connections",
+        net_observer_ipc::diagnose(socket_path, DiagnosticQuery::Connections { group_by }),
+    )
+}
+
+/// The pure half of [`fetch_findings`] and [`fetch_connections`]: what each
+/// outcome means for a window. `query` names the diagnosis in the line an
+/// older daemon earns. Separated so the mapping is testable without a socket.
+fn classify_diagnosis(
+    query: &str,
+    outcome: std::io::Result<QueryOutcome>,
+) -> Result<Table, String> {
     match outcome {
         Ok(QueryOutcome::Table(table)) => Ok(table),
         Ok(QueryOutcome::Failed(message)) => Err(message),
         Ok(QueryOutcome::Unsupported(message)) => Err(format!(
-            "daemon cannot answer Vulns (older daemon): {message}"
+            "daemon cannot answer {query} (older daemon): {message}"
         )),
         Err(e) => Err(e.to_string()),
     }
@@ -520,16 +540,22 @@ mod tests {
             rows: vec![vec!["aa".to_string()]],
         };
         assert_eq!(
-            classify_findings(Ok(QueryOutcome::Table(table.clone()))),
+            classify_diagnosis("Vulns", Ok(QueryOutcome::Table(table.clone()))),
             Ok(table)
         );
         assert_eq!(
-            classify_findings(Ok(QueryOutcome::Failed("bad segment key".to_string()))),
+            classify_diagnosis(
+                "Vulns",
+                Ok(QueryOutcome::Failed("bad segment key".to_string()))
+            ),
             Err("bad segment key".to_string())
         );
-        let unsupported = classify_findings(Ok(QueryOutcome::Unsupported(
-            "bad request: unknown variant".to_string(),
-        )))
+        let unsupported = classify_diagnosis(
+            "Vulns",
+            Ok(QueryOutcome::Unsupported(
+                "bad request: unknown variant".to_string(),
+            )),
+        )
         .expect_err("an older daemon is an error line, not a table");
         assert!(
             unsupported.starts_with("daemon cannot answer Vulns (older daemon)"),
@@ -539,12 +565,70 @@ mod tests {
             unsupported.ends_with("bad request: unknown variant"),
             "must keep the daemon's words: {unsupported}"
         );
-        let io = classify_findings(Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no socket",
-        )))
+        let io = classify_diagnosis(
+            "Vulns",
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no socket",
+            )),
+        )
         .expect_err("a transport failure is an error line");
         assert_eq!(io, "no socket");
+    }
+
+    /// The connections read shares the mapping, and names ITS diagnosis in the
+    /// older-daemon line — a window must not tell the operator the daemon
+    /// cannot answer `Vulns` when it was asked about connections.
+    #[test]
+    fn classify_connections_names_its_own_diagnosis() {
+        let table = Table {
+            columns: vec!["key".to_string()],
+            rows: vec![vec!["claude.ai".to_string()]],
+        };
+        assert_eq!(
+            classify_diagnosis("Connections", Ok(QueryOutcome::Table(table.clone()))),
+            Ok(table)
+        );
+        assert_eq!(
+            classify_diagnosis(
+                "Connections",
+                Ok(QueryOutcome::Failed(
+                    "another diagnosis is running; retry".to_string()
+                ))
+            ),
+            Err("another diagnosis is running; retry".to_string())
+        );
+        let unsupported = classify_diagnosis(
+            "Connections",
+            Ok(QueryOutcome::Unsupported(
+                "bad request: unknown variant `Connections`".to_string(),
+            )),
+        )
+        .expect_err("an older daemon is an error line, not a table");
+        assert_eq!(
+            unsupported,
+            "daemon cannot answer Connections (older daemon): bad request: unknown variant `Connections`"
+        );
+    }
+
+    /// The connections read degrades like every other socket call: an absent
+    /// socket is an `Err`, never a panic, so the window shows a line instead
+    /// of dying — for every grouping, since each is its own request.
+    #[test]
+    fn fetch_connections_offline_when_socket_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sock");
+        for group_by in [
+            ConnectionsGroupBy::Host,
+            ConnectionsGroupBy::Ip,
+            ConnectionsGroupBy::IpPort,
+            ConnectionsGroupBy::Process,
+        ] {
+            assert!(
+                fetch_connections(missing.to_str().unwrap(), group_by).is_err(),
+                "absent socket must yield a connections Err for {group_by:?}"
+            );
+        }
     }
 
     /// The findings read degrades like every other socket call: an absent socket
