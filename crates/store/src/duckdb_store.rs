@@ -5,8 +5,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use types::{
-    BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, TopologyLifetime,
-    TopologyLink, TriggerFired,
+    BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, SingboxLogSample,
+    TopologyLifetime, TopologyLink, TriggerFired,
 };
 
 /// `network_key` for a segment whose gateway MAC could not be read. Neighbours
@@ -160,6 +160,7 @@ impl DuckdbStore {
                 UNION ALL SELECT MAX(ts_us) FROM wifi_sample
                 UNION ALL SELECT MAX(ts_us) FROM air_sample
                 UNION ALL SELECT MAX(ts_us) FROM neighbor_sample
+                UNION ALL SELECT MAX(ts_us) FROM singbox_log_sample
             )",
             [],
             |r| r.get(0),
@@ -243,6 +244,22 @@ fn run_statement(
         columns,
         rows: out_rows,
     })
+}
+
+/// One `singbox_log_sample` row (realm net-observer, node #141). Takes the
+/// connection — or a transaction, which derefs to one — so the single-sample
+/// and the per-tick batch paths write the same statement.
+fn insert_singbox_log_row(conn: &Connection, r: &SingboxLogSample) -> Result<usize, duckdb::Error> {
+    conn.execute(
+        "INSERT INTO singbox_log_sample VALUES (?,?,?,?,?)",
+        params![
+            r.ts_us,
+            r.class.to_string(),
+            r.count,
+            r.node,
+            r.sample_message
+        ],
+    )
 }
 
 /// The text a panic payload carries, for [`StoreError::Panicked`]: `panic!`
@@ -564,7 +581,22 @@ impl Store for DuckdbStore {
                 tx.commit()?;
                 0
             }
+            // One row: the pipeline delivers a tick's rows one sample at a
+            // time. The batch path is `write_singbox_log_samples`.
+            Sample::SingboxLog(r) => insert_singbox_log_row(&c, r)?,
         };
+        Ok(())
+    }
+
+    fn write_singbox_log_samples(&self, rows: &[SingboxLogSample]) -> Result<(), StoreError> {
+        let mut c = self.conn.lock().unwrap();
+        // The tick is ONE transaction, like a connections tick: a failure on
+        // any row rolls the whole tick back rather than leaving half of it.
+        let tx = c.transaction()?;
+        for r in rows {
+            insert_singbox_log_row(&tx, r)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2113,6 +2145,75 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    /// One row per (class, node) with the class as its kebab-case token, an
+    /// absent node NULL; the batch path writes a whole tick, the single path
+    /// one row, into the same table — and an `unreadable` tick is a row with
+    /// count 0, never a missing row.
+    #[test]
+    fn write_and_read_back_singbox_log_samples() {
+        use types::{SingboxLogClass, SingboxLogSample};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_singbox_log_samples(&[
+            SingboxLogSample {
+                ts_us: 9000,
+                class: SingboxLogClass::NoRoute,
+                count: 3,
+                node: Some("vless-out-6".into()),
+                sample_message: Some("connection: open connection to 1.2.3.4:443 …".into()),
+            },
+            SingboxLogSample {
+                ts_us: 9000,
+                class: SingboxLogClass::NoDefaultIface,
+                count: 1,
+                node: None,
+                sample_message: Some("network: missing default interface".into()),
+            },
+        ])
+        .unwrap();
+        s.write_sample(&Sample::SingboxLog(SingboxLogSample {
+            ts_us: 9015,
+            class: SingboxLogClass::Unreadable,
+            count: 0,
+            node: None,
+            sample_message: Some("/var/log/sing-box.log: No such file or directory".into()),
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM singbox_log_sample WHERE ts_us=9000 AND class='no-route' \
+                 AND count=3 AND node='vless-out-6' \
+                 AND sample_message LIKE 'connection: open connection%'"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM singbox_log_sample WHERE ts_us=9000 \
+                 AND class='no-default-iface' AND count=1 AND node IS NULL"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM singbox_log_sample WHERE ts_us=9015 \
+                 AND class='unreadable' AND count=0 AND node IS NULL \
+                 AND sample_message LIKE '%No such file%'"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM singbox_log_sample")
+                .unwrap(),
+            3
+        );
+        // The table is a sample table: it counts toward the record's newest
+        // observation, which the startup sweep closes stale incidents at.
+        assert_eq!(s.latest_sample_ts_us().unwrap(), Some(9015));
     }
 
     /// The raw pair and the derived margin all reach their own columns, and a

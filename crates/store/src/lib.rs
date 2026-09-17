@@ -6,12 +6,18 @@ pub use duckdb_store::{
     DuckdbStore, NeighborPort, NeighborScan, NeighborVuln, QueryTable, StoreError,
 };
 use types::{
-    BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, TopologyLifetime,
-    TopologyLink, TriggerFired,
+    BlobRef, Incident, NeighborLifetime, ObservingEdge, ProbingEdge, Sample, SingboxLogSample,
+    TopologyLifetime, TopologyLink, TriggerFired,
 };
 
 pub trait Store {
     fn write_sample(&self, s: &Sample) -> Result<(), StoreError>;
+    /// Record one tick's rows of sing-box's own log, classed (see the
+    /// `singbox_log_sample` table), in one transaction — so a tick is never
+    /// half a tick. [`Store::write_sample`] on a `Sample::SingboxLog` writes
+    /// the same row one at a time, which is how the pipeline's stream
+    /// delivers them (realm net-observer, node #141).
+    fn write_singbox_log_samples(&self, rows: &[SingboxLogSample]) -> Result<(), StoreError>;
     fn open_incident(&self, i: &Incident) -> Result<(), StoreError>;
     fn close_incident(&self, id: &str, closed_us: i64) -> Result<(), StoreError>;
     fn write_blob_ref(&self, b: &BlobRef) -> Result<(), StoreError>;

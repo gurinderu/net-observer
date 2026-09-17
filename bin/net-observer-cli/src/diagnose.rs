@@ -255,6 +255,15 @@ pub(crate) fn format_verdict_at(table: &Table, asked_ts_us: i64) -> Result<Strin
         let i = c.idx(col)?;
         kv(&mut out, col, &measured(row, i, ABSENT));
     }
+    // What sing-box's own log said within ±30 s of the moment, one line per
+    // row, newest first (realm net-observer, node #141). The column is
+    // optional: a daemon built before the log reader answers without it, and
+    // a moment the log said nothing about carries NULL — either way no line.
+    if let Ok(i) = c.idx("singbox_log") {
+        for line in at(row, i).lines() {
+            kv(&mut out, "sing-box log", line);
+        }
+    }
     let verdict = at(row, layer);
     if verdict == "unknown" {
         kv(
@@ -1099,6 +1108,73 @@ mod tests {
     fn verdict_at_says_so_when_the_record_holds_nothing() {
         let out = format_verdict_at(&table(VERDICT_COLS, &[]), 42).unwrap();
         assert!(out.contains("(no record)"), "{out}");
+    }
+
+    /// The sing-box log lines ride the answer as one newline-joined cell and
+    /// render one `sing-box log` line each, between the measurements and the
+    /// verdict; a NULL cell (the log said nothing then) and a table without the
+    /// column (an older daemon) both render no such line.
+    #[test]
+    fn verdict_at_renders_the_sing_box_log_lines_when_present() {
+        let cols: Vec<&str> = VERDICT_COLS
+            .iter()
+            .copied()
+            .chain(["singbox_log"])
+            .collect();
+        let t = table(
+            &cols,
+            &[&[
+                "1000",
+                "OK",
+                "3.5",
+                "OK",
+                "OK",
+                "204",
+                "1.2",
+                "healthy",
+                "",
+                "",
+                "no-route ×3 via vless-out-6 at 2026-09-17T17:56:05Z\nunreadable ×0 at 2026-09-17T17:56:35Z",
+            ]],
+        );
+        let out = format_verdict_at(&t, 1500).unwrap();
+        assert!(
+            out.contains("sing-box log   no-route ×3 via vless-out-6 at 2026-09-17T17:56:05Z\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("sing-box log   unreadable ×0 at 2026-09-17T17:56:35Z\n"),
+            "{out}"
+        );
+        let log_at = out.find("sing-box log").unwrap();
+        assert!(out.find("load1").unwrap() < log_at, "{out}");
+        assert!(
+            log_at < out.find("layer          healthy").unwrap(),
+            "{out}"
+        );
+
+        let t = table(
+            &cols,
+            &[&[
+                "1000", "OK", "3.5", "OK", "OK", "204", "1.2", "healthy", "", "", "",
+            ]],
+        );
+        assert!(
+            !format_verdict_at(&t, 1500)
+                .unwrap()
+                .contains("sing-box log")
+        );
+        let t = table(
+            VERDICT_COLS,
+            &[&[
+                "1000", "OK", "3.5", "OK", "OK", "204", "1.2", "healthy", "", "",
+            ]],
+        );
+        assert!(
+            !format_verdict_at(&t, 1500)
+                .unwrap()
+                .contains("sing-box log")
+        );
     }
 
     const CTX_COLS: &[&str] = &[
