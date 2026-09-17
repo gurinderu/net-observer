@@ -13,6 +13,10 @@
 //!   restart cures it (realm net-observer, node #122).
 //! - `vless=FAIL` with the rest OK ⇒ that proxy server is dead or blocked from
 //!   this path.
+//! - sing-box's own dial through the selected node answers by IP but not by
+//!   name (`dial_ip_ms > 0`, `dial_name_ms = 0`) ⇒ sing-box's DNS path is
+//!   dead, whatever the tun probe says — it fetches a name too (realm
+//!   net-observer, node #62).
 //! - `tun=000` **with `load1` in the tens** ⇒ host starvation, NOT a wedge: a
 //!   restart does not cure it and tears down live flows. Only a silent probe
 //!   reads as starvation — an answered non-204 under load is still the proxy's.
@@ -34,6 +38,7 @@
 //! | --- | --- |
 //! | `link` | gateway `FAIL`/`NOGW` — local network or Wi-Fi |
 //! | `vless` | the proxy server is unreachable from this path |
+//! | `proxy-dns` | sing-box dials through the selected node by IP but not by name — its DNS path is dead |
 //! | `proxy` | tun dead while every layer under it is healthy — a wedge |
 //! | `host` | tun dead under host load — starvation, not a wedge |
 //! | `healthy` | every measured layer answered |
@@ -185,6 +190,10 @@ pub const DEFAULT_SLEEP_THRESHOLD_US: i64 = 45_000_000;
 /// `vless` is `OK` if any server answered, `FAIL` if none did and at least one
 /// failed, `SKIP` if the probe did not run, `NULL` if the tick has no verdict at
 /// all. `tun_code` is tun-wide, so any non-null row of the tick carries it.
+/// `dial_ip_ms` / `dial_name_ms` are the SELECTED node's dial (the row whose
+/// `dial_target` is the tick's `selector`; the rotating member's dial is
+/// the record's, not the verdict's): `NULL` when no such dial was made
+/// (realm net-observer, node #62).
 const PROXY_TICK_CTE: &str = "\
 proxy_tick AS (
   SELECT ts_us,
@@ -192,7 +201,9 @@ proxy_tick AS (
               WHEN max(CASE WHEN tcp = 'FAIL' THEN 1 ELSE 0 END) = 1 THEN 'FAIL'
               WHEN max(CASE WHEN tcp = 'SKIP' THEN 1 ELSE 0 END) = 1 THEN 'SKIP'
               ELSE NULL END AS vless,
-         max(tun_code) AS tun_code
+         max(tun_code) AS tun_code,
+         max(CASE WHEN dial_target = selector THEN dial_ip_ms END) AS dial_ip_ms,
+         max(CASE WHEN dial_target = selector THEN dial_name_ms END) AS dial_name_ms
   FROM proxy_sample
   GROUP BY ts_us
 )";
@@ -508,6 +519,8 @@ layer_state AS (
          l.direct,
          p.vless,
          p.tun_code,
+         p.dial_ip_ms,
+         p.dial_name_ms,
          h.load1,
          CASE
            -- The local network died: infrastructure, not us.
@@ -517,6 +530,11 @@ layer_state AS (
            WHEN p.vless IS NULL OR p.vless = 'SKIP' OR p.tun_code IS NULL THEN 'unknown'
            -- The proxy server is dead or blocked from this path.
            WHEN p.vless = 'FAIL' THEN 'vless'
+           -- sing-box's own dial through the selected node answers by IP but
+           -- not by name: its DNS path is dead. Read BEFORE the tun arms,
+           -- because the tun probe fetches a name too and dies of the same
+           -- cause (realm net-observer, node #62).
+           WHEN p.dial_name_ms = 0 AND p.dial_ip_ms > 0 THEN 'proxy-dns'
            -- tun=000, but without load there is no telling wedge from starvation.
            WHEN p.tun_code = 0 AND h.load1 IS NULL THEN 'unknown'
            WHEN p.tun_code = 0 AND h.load1 > ? THEN 'host'
@@ -552,10 +570,10 @@ pub fn verdict_at_sql(ts_us: i64, load_threshold: f64) -> PreparedSql {
     let sql = format!(
         "{},
 {GAP_AT_CTE}
-SELECT ts_us, gw, gw_rtt_ms, direct, vless, tun_code, load1, layer,
+SELECT ts_us, gw, gw_rtt_ms, direct, vless, tun_code, dial_ip_ms, dial_name_ms, load1, layer,
        CAST(NULL AS BIGINT) AS gap_opened_us, CAST(NULL AS BIGINT) AS gap_closed_us
 FROM (
-  SELECT ts_us, gw, gw_rtt_ms, direct, vless, tun_code, load1, layer
+  SELECT ts_us, gw, gw_rtt_ms, direct, vless, tun_code, dial_ip_ms, dial_name_ms, load1, layer
   FROM layer_state
   WHERE ts_us <= ?
   ORDER BY ts_us DESC
@@ -565,6 +583,7 @@ WHERE NOT EXISTS (SELECT 1 FROM gap_at)
 UNION ALL
 SELECT CAST(NULL AS BIGINT), CAST(NULL AS VARCHAR), CAST(NULL AS DOUBLE),
        CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), CAST(NULL AS USMALLINT),
+       CAST(NULL AS UINTEGER), CAST(NULL AS UINTEGER),
        CAST(NULL AS DOUBLE), 'gap', gap_opened_us, gap_closed_us
 FROM gap_at",
         layer_state_with(),
@@ -1338,6 +1357,38 @@ mod tests {
             est_direct_age_s: None,
             est_tun_alive: None,
             est_tun_age_s: None,
+            dial_ip_ms: None,
+            dial_name_ms: None,
+            dial_target: None,
+        }))
+        .unwrap();
+    }
+
+    /// One proxy row carrying a dial through `target` (the tick's selector is
+    /// `auto`, so a target of `auto` is the selected node's dial and any
+    /// other name the rotating member's), over a healthy endpoint.
+    fn proxy_dial(
+        s: &DuckdbStore,
+        ts_us: i64,
+        tun: Option<u16>,
+        target: &str,
+        dial_ip: Option<u32>,
+        dial_name: Option<u32>,
+    ) {
+        s.write_sample(&Sample::Proxy(ProxySample {
+            ts_us,
+            server_ip: "1.2.3.4".into(),
+            tcp: TcpVerdict::Ok,
+            rtt_ms: None,
+            tun_code: tun,
+            selector: Some("auto".into()),
+            est_direct_alive: None,
+            est_direct_age_s: None,
+            est_tun_alive: None,
+            est_tun_age_s: None,
+            dial_ip_ms: dial_ip,
+            dial_name_ms: dial_name,
+            dial_target: Some(target.into()),
         }))
         .unwrap();
     }
@@ -1497,6 +1548,62 @@ mod tests {
         let t = s.verdict_at(20 * SEC).unwrap();
         assert_eq!(cell(&t, 0, "layer"), "proxy");
         assert_ne!(cell(&t, 0, "layer"), "host");
+    }
+
+    /// The 2026-09-17 signature (realm net-observer, node #62): every layer
+    /// under sing-box healthy, the tun probe timing out, and sing-box's own
+    /// dial through the selected node answering by IP but not by name. The
+    /// tun arms would call it `proxy`; the dial says the DNS path, and the
+    /// tun probe (a name too) died of that. The dial columns reach the row.
+    #[test]
+    fn verdict_at_blames_the_proxy_dns_path_when_the_dial_answers_by_ip_only() {
+        let s = DuckdbStore::in_memory().unwrap();
+        link(&s, 20 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy_dial(&s, 20 * SEC, Some(0), "auto", Some(202), Some(0));
+        host(&s, 20 * SEC, 1.2);
+
+        let t = s.verdict_at(20 * SEC).unwrap();
+        assert_eq!(cell(&t, 0, "layer"), "proxy-dns");
+        assert_ne!(cell(&t, 0, "layer"), "proxy");
+        assert_eq!(cell(&t, 0, "dial_ip_ms"), "202");
+        assert_eq!(cell(&t, 0, "dial_name_ms"), "0");
+    }
+
+    /// The negative twins: a dial dead on BOTH sides is not a DNS verdict (the
+    /// transport itself is dead — the tun arms keep it); a dial that answered
+    /// on both sides beside a dead tun is still a wedge; and the rotating
+    /// member's dial never speaks for the tick — only the selected node's.
+    #[test]
+    fn verdict_at_does_not_call_proxy_dns_without_the_exact_dial_shape() {
+        let s = DuckdbStore::in_memory().unwrap();
+        // Both sides dead: transport, not DNS.
+        link(&s, 20 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy_dial(&s, 20 * SEC, Some(0), "auto", Some(0), Some(0));
+        host(&s, 20 * SEC, 1.2);
+        assert_eq!(cell(&s.verdict_at(20 * SEC).unwrap(), 0, "layer"), "proxy");
+        // Both sides answered under a dead tun: a wedge, with the dial visible.
+        link(&s, 30 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy_dial(&s, 30 * SEC, Some(0), "auto", Some(202), Some(210));
+        host(&s, 30 * SEC, 1.2);
+        let t = s.verdict_at(30 * SEC).unwrap();
+        assert_eq!(cell(&t, 0, "layer"), "proxy");
+        assert_eq!(cell(&t, 0, "dial_name_ms"), "210");
+        // The rotating member's DNS-dead dial does not speak for the tick.
+        link(&s, 40 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy(&s, 40 * SEC, TcpVerdict::Ok, Some(204));
+        proxy_dial(&s, 40 * SEC, Some(204), "other", Some(202), Some(0));
+        host(&s, 40 * SEC, 1.2);
+        let t = s.verdict_at(40 * SEC).unwrap();
+        assert_eq!(cell(&t, 0, "layer"), "healthy");
+        assert_eq!(cell(&t, 0, "dial_ip_ms"), "", "no selected-node dial: NULL");
+        // A healthy dial on the selected node beside a healthy tun: healthy.
+        link(&s, 50 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy_dial(&s, 50 * SEC, Some(204), "auto", Some(202), Some(210));
+        host(&s, 50 * SEC, 1.2);
+        assert_eq!(
+            cell(&s.verdict_at(50 * SEC).unwrap(), 0, "layer"),
+            "healthy"
+        );
     }
 
     /// A tun code that never arrived (not `SKIP`, just absent) is unknown,

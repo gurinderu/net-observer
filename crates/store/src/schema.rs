@@ -54,6 +54,20 @@ ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_direct_alive BOOLEAN;
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_direct_age_s UINTEGER;
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_tun_alive BOOLEAN;
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_tun_age_s UINTEGER;
+-- The dial probe (realm net-observer, node #62): sing-box's own dial through
+-- one node of the selector group, asked of its Clash API, by IP (transport
+-- through the node) and by name (transport plus sing-box's DNS path).
+-- `dial_target` names the node whose dial this row carries; a row carries at
+-- most one, on the row of the node's own endpoint (server_ip), so `tcp`
+-- beside it is that listener's raw reachability -- or on a dial-only row
+-- (tcp = SKIP, no rtt) when the endpoint's row is taken or unknown. The
+-- selected node is dialled every tick, the other members one per tick in
+-- turn. NULL target = no dial on this row; a `*_ms` of 0 = attempted, no
+-- answer (the record's 0, like tun_code); NULL `*_ms` under a named target
+-- = the API could not run that test. Same migration treatment.
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS dial_ip_ms UINTEGER;
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS dial_name_ms UINTEGER;
+ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS dial_target VARCHAR;
 CREATE TABLE IF NOT EXISTS incident (
   id VARCHAR PRIMARY KEY, opened_us BIGINT, closed_us BIGINT, trigger_id VARCHAR, signature VARCHAR);
 CREATE TABLE IF NOT EXISTS blob_ref (
