@@ -2201,6 +2201,8 @@ mod tests {
                 hostname: None,
                 role: NeighborRole::Unknown,
             }],
+            services: Vec::new(),
+            heard: None,
         }))
         .unwrap();
     }

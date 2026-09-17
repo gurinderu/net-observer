@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::verdict::{NeighborSource, NeighborsVerdict};
+use crate::verdict::{AnnounceKind, NeighborSource, NeighborsVerdict};
 
 /// A confidence-rated hypothesis about what kind of device a neighbour is.
 ///
@@ -149,11 +149,63 @@ pub enum HistoryWindow {
     Range { since: i64, until: i64 },
 }
 
+/// A service a neighbour announced on the segment, heard passively by the
+/// `announce` listener (realm net-observer, node #92).
+///
+/// `service` is WHAT was announced — an mDNS service type
+/// (`_companion-link._tcp`), an SSDP notification type
+/// (`urn:schemas-upnp-org:device:MediaRenderer:1`, `upnp:rootdevice`), or a
+/// DHCP role (`dhcp-server`, `vendor-class`) — and `detail` the specifics that
+/// came with it (the mDNS instance name, the SSDP `SERVER` string, the DHCP
+/// message type or vendor class). The store keys a service by
+/// `(network_key, mac, service)`, so the same announcement repeated every few
+/// seconds is one row with first/last seen, never a row per frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnouncedService {
+    /// The announcer, by the same normalised MAC [`NeighborObs::mac`] carries.
+    pub mac: String,
+    /// The address the announcement came from, when the frame carried one a
+    /// device can be reached at (`None` for a DHCP client still without one).
+    pub ip: Option<String>,
+    /// The announced type — see the struct doc.
+    pub service: String,
+    /// Which protocol carried the announcement.
+    pub kind: AnnounceKind,
+    /// The specifics that came with the announcement, when any.
+    pub detail: Option<String>,
+}
+
+/// What the `announce` listener heard in one window, counted at the frame
+/// level so the record can show the listener was alive AND that the daemon
+/// itself stayed quiet (realm net-observer, node #92).
+///
+/// Present on a [`NeighborsSample`] exactly when the reading is a listener
+/// flush rather than a neighbour-cache tick or a scan — that is how the daemon
+/// tells the two apart, and why it is an `Option` on the sample instead of two
+/// zero-defaulting counters: `None` is "this reading counted no frames because
+/// it is not a listener's", `Some(0 / 0)` is "the listener heard nothing".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeardFrames {
+    /// Every frame the capture delivered in the window, our own included.
+    pub total: u32,
+    /// The frames whose Ethernet source was this interface's own MAC. They are
+    /// dropped from the neighbour map — a machine is not its own neighbour —
+    /// but counted, because "zero frames of ours" under the passive tier is a
+    /// claim the record must be able to check.
+    pub own: u32,
+}
+
 /// One tick of the `neighbors` collector.
 ///
 /// `network_key` is what separates the coworking segment from the home one: the
 /// gateway's MAC, which survives a duplicated `192.168.1.0/24` that an SSID or a
 /// subnet does not. `None` when no gateway ARP entry was readable.
+///
+/// Three readings share this shape: the per-tick neighbour-cache read, an
+/// operator-pressed scan's findings, and the passive `announce` listener's
+/// flush — the last carries `heard = Some(_)` and announced `services`, the
+/// first two never do. The `serde(default)` fields keep a sample from a daemon
+/// that predates the listener decodable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NeighborsSample {
     pub ts_us: i64,
@@ -163,6 +215,26 @@ pub struct NeighborsSample {
     pub network_key: Option<String>,
     pub iface: Option<String>,
     pub neighbors: Vec<NeighborObs>,
+    /// Services heard announced in this reading. Only the `announce` listener
+    /// fills it; every other reading leaves it empty.
+    #[serde(default)]
+    pub services: Vec<AnnouncedService>,
+    /// The listener's frame counts — `Some` iff this reading is a listener
+    /// flush (see [`HeardFrames`]).
+    #[serde(default)]
+    pub heard: Option<HeardFrames>,
+}
+
+impl NeighborsSample {
+    /// Whether this reading is a flush of the passive `announce` listener
+    /// rather than a neighbour-cache tick or a scan. A listener flush is the
+    /// segment's last few seconds of announcements, not the whole neighbour
+    /// table, so the daemon writes and publishes it but never lets it replace
+    /// the live snapshot's cache reading (realm net-observer, node #92).
+    #[must_use]
+    pub fn is_listener_flush(&self) -> bool {
+        self.heard.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +285,41 @@ mod tests {
         let obs = r#"{"mac":"a4:83:e7:1b:2c:3d","ip":"192.168.1.5","source":"Arp","hostname":null,"role":{"kind":"future_variant","confidence":"high"}}"#;
         let n: NeighborObs = serde_json::from_str(obs).expect("an unknown role tag must not fail");
         assert_eq!(n.role, NeighborRole::Unknown);
+    }
+
+    /// A sample from a daemon that predates the `announce` listener carries
+    /// neither `services` nor `heard`; it must decode as a cache reading, not
+    /// fail — and a listener flush round-trips with both.
+    #[test]
+    fn an_older_sample_without_listener_fields_is_a_cache_reading() {
+        let older = r#"{"ts_us":1,"verdict":"Ok","reason":null,"network_key":null,"iface":"en0","neighbors":[]}"#;
+        let s: NeighborsSample = serde_json::from_str(older).expect("older sample must decode");
+        assert!(s.services.is_empty());
+        assert_eq!(s.heard, None);
+        assert!(!s.is_listener_flush());
+
+        let flush = NeighborsSample {
+            ts_us: 2,
+            verdict: NeighborsVerdict::Ok,
+            reason: None,
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            iface: Some("en0".into()),
+            neighbors: vec![],
+            services: vec![AnnouncedService {
+                mac: "11:22:33:44:55:66".into(),
+                ip: Some("192.168.1.6".into()),
+                service: "_companion-link._tcp".into(),
+                kind: AnnounceKind::Mdns,
+                detail: Some("0xFF".into()),
+            }],
+            heard: Some(HeardFrames { total: 7, own: 2 }),
+        };
+        assert!(flush.is_listener_flush());
+        let json = serde_json::to_string(&flush).unwrap();
+        assert_eq!(
+            serde_json::from_str::<NeighborsSample>(&json).unwrap(),
+            flush
+        );
     }
 
     /// The role is internally tagged: `{"kind": ...}`, with the confidence carried

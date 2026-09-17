@@ -785,6 +785,8 @@ mod tests {
                 hostname: hostname.map(str::to_string),
                 role: NeighborRole::Unknown,
             }],
+            services: Vec::new(),
+            heard: None,
         })
     }
 
@@ -845,6 +847,8 @@ mod tests {
                 hostname: None,
                 role: NeighborRole::Unknown,
             }],
+            services: Vec::new(),
+            heard: None,
         }))
         .unwrap();
         let lts = s.neighbor_lifetimes(None).unwrap();
@@ -961,6 +965,8 @@ mod tests {
             network_key: None,
             iface: None,
             neighbors: Vec::new(),
+            services: Vec::new(),
+            heard: None,
         }))
         .unwrap();
         assert_eq!(

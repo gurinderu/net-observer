@@ -1954,6 +1954,8 @@ mod tests {
             network_key: network_key.map(str::to_string),
             iface: Some("en0".to_string()),
             neighbors,
+            services: Vec::new(),
+            heard: None,
         }
     }
 
@@ -2651,6 +2653,8 @@ mod headless_tests {
                 network_key: Some(gateway_mac),
                 iface: Some("en0".to_string()),
                 neighbors,
+                services: Vec::new(),
+                heard: None,
             }),
             ..Default::default()
         };
@@ -2969,6 +2973,8 @@ mod headless_tests {
             network_key: None,
             iface: Some("en0".to_string()),
             neighbors: vec![],
+            services: Vec::new(),
+            heard: None,
         }
     }
 
@@ -3029,6 +3035,8 @@ mod headless_tests {
                 network_key: None,
                 iface: Some("en0".to_string()),
                 neighbors: vec![obs("alpha", 20)],
+                services: Vec::new(),
+                heard: None,
             }),
             ..Default::default()
         };
@@ -3060,6 +3068,8 @@ mod headless_tests {
                 network_key: None,
                 iface: Some("en0".to_string()),
                 neighbors: vec![obs("alpha", 20), obs("bravo", 21)],
+                services: Vec::new(),
+                heard: None,
             }),
             ..Default::default()
         };
@@ -3179,6 +3189,8 @@ mod headless_tests {
             network_key: None,
             iface: Some("en0".into()),
             neighbors: vec![obs("aa:bb:cc:dd:ee:01"), obs("aa:bb:cc:dd:ee:02")],
+            services: Vec::new(),
+            heard: None,
         };
         let none = StatusSnapshot::default();
         assert_eq!(
@@ -3247,6 +3259,8 @@ mod headless_tests {
                 network_key: Some(gateway_mac),
                 iface: Some("en0".to_string()),
                 neighbors,
+                services: Vec::new(),
+                heard: None,
             }),
             topology: vec![far],
             ..Default::default()

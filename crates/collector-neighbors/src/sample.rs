@@ -15,6 +15,8 @@ pub fn build_neighbors_sample(ts_us: i64, reading: Option<NeighborReading>) -> N
             network_key: r.network_key,
             iface: r.iface,
             neighbors: r.neighbors,
+            services: Vec::new(),
+            heard: None,
         },
         None => NeighborsSample {
             ts_us,
@@ -23,6 +25,8 @@ pub fn build_neighbors_sample(ts_us: i64, reading: Option<NeighborReading>) -> N
             network_key: None,
             iface: None,
             neighbors: Vec::new(),
+            services: Vec::new(),
+            heard: None,
         },
     }
 }

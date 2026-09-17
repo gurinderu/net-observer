@@ -1285,6 +1285,8 @@ mod tests {
             network_key: None,
             iface: None,
             neighbors: obs,
+            services: Vec::new(),
+            heard: None,
         })
     }
 

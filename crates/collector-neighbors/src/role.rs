@@ -267,6 +267,8 @@ mod tests {
                     role: NeighborRole::Unknown,
                 },
             ],
+            services: Vec::new(),
+            heard: None,
         };
         assign_passive_roles(&mut sample, Some(&db));
         assert_eq!(sample.neighbors[0].role, NeighborRole::Gateway);
