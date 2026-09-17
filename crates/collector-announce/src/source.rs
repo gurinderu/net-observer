@@ -289,24 +289,6 @@ mod tests {
         }
     }
 
-    /// A slow pipe: hands out its bytes, then blocks for `hold` before EOF —
-    /// long enough for a flush deadline to pass with the stream still open.
-    struct SlowEof {
-        bytes: Cursor<Vec<u8>>,
-        hold: Duration,
-        held: bool,
-    }
-    impl Read for SlowEof {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let n = self.bytes.read(buf)?;
-            if n == 0 && !self.held {
-                self.held = true;
-                std::thread::sleep(self.hold);
-            }
-            Ok(n)
-        }
-    }
-
     /// A pipe that releases its records one batch at a time, when told.
     struct Gated {
         batches: std::sync::mpsc::Receiver<Vec<u8>>,
@@ -406,11 +388,15 @@ mod tests {
     /// window so far, and the next window picks up where it left off.
     #[test]
     fn a_stream_still_open_at_the_deadline_flushes_what_it_heard() {
-        let reader = SlowEof {
-            bytes: Cursor::new(frames()),
-            hold: Duration::from_millis(350),
-            held: false,
+        // The stream stays open until the sender is dropped, so the end of
+        // the pipe is decided by the test, never by a timer racing the
+        // flush deadline on a loaded machine.
+        let (batch_tx, batches) = std::sync::mpsc::channel::<Vec<u8>>();
+        let reader = Gated {
+            batches,
+            pending: Cursor::new(Vec::new()),
         };
+        batch_tx.send(frames()).unwrap();
         let mut src = AnnounceSource::new(
             reader,
             None,
@@ -445,6 +431,7 @@ mod tests {
         );
         assert_eq!(s.verdict, NeighborsVerdict::Ok);
         // Then the EOF lands: an empty cut-short window yields only the bracket.
+        drop(batch_tx);
         let last = src.next().expect("the end");
         assert_eq!(last.len(), 1, "{last:?}");
         let Sample::Neighbors(s) = &last[0] else {
