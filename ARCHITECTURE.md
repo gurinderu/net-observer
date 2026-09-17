@@ -679,6 +679,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `observing_edge` | `ts_us, observing, peer_uid, cause` | One row per collection boundary — the one sanctioned gap in "SKIP, never silence"; `observing` is the state entered, so `false` opens a gap and `true` closes one. `peer_uid` attributes it to the control-socket peer that asked (SQL `NULL` when nobody did), and `cause` (`control` / `startup`) says what produced it. |
 | `probing_edge` | `ts_us, tier, peer_uid, reason` | One row per switch of the probing tier (`tier` is the tier entered, `passive` / `active`). Not a gap — a passive daemon keeps writing a row per tick with every probe verdict `SKIP` — but the bracket that says those `SKIP`s were *withheld*, not failed, and by whom. `peer_uid` is `NULL` for the startup edge, which records the configured default so a record that begins passive says so. `reason` (`control` / `startup` / `experiment` / `experiment-end`) says what produced the edge; added with the experiment window, so older rows read back `NULL`, which means `control` — what they were (realm net-observer, nodes #88, #61). The experiment pair is the one place an edge may repeat the tier already in force: a window on an already-passive daemon still marks its bounds. |
 | `experiment` | `id PK, start_us, end_us, tier_before, freeze_start_dir, freeze_end_dir, report_json` | One row per finished experiment window (realm net-observer, node #61): its bounds, the tier in force before it, where its two pcap freezes landed (NULL when a freeze copied nothing, and NULL on rows from before the columns existed — they are `ALTER`ed in on open like `probing_edge.reason`; each copied file also has a `blob_ref` row, `kind = pcap`, `incident_id` = the window's id, and the freeze pruner keeps `freeze-experiment-*` on its own budget of twelve), and the whole `types::ExperimentReport` as JSON — the same report the daemon answers `Query(Experiment { id })` with, kept so it outlives the process that computed it. A window the daemon was restarted under leaves no row; its opening `probing_edge` (`reason = experiment`) without a closing one is the trace. |
+| `record_prune` | `ts_us, "table", cutoff_us, deleted` | One row per retention prune that deleted anything (realm net-observer, node #130): the table, the cutoff it cut at (`ts_us < cutoff_us` went), how many rows, stamped at the prune's own instant. The bracket for pruned time, as `observing_edge` is for a pause: a table holding nothing before some instant is either a record that started there or one pruned there, and this row tells the two apart. Written in the same transaction as the `DELETE`, so the rows are never gone without it. A prune that deleted nothing leaves no row. |
 
 `dns_sample`, `route_event`, and `host_sample` are created by the v1.1 `dns`,
 `route-events`, and `host-metrics` collectors respectively.
@@ -704,25 +705,43 @@ daemon read back with a `NULL` cause, which the gap derivation treats as
 policy (how long to keep) is the owner's decision, and the shipped default is
 keep-forever — `[record] retention_days = 0` (realm net-observer, node #130).
 The mechanism is `Store::prune_older_than(table, cutoff_us)`: `DELETE FROM
-<table> WHERE ts_us < cutoff`, returning the deleted count, followed by a
-`CHECKPOINT` when anything went (DuckDB frees a deleted row's blocks for reuse
-only at a checkpoint; the file does not shrink, it stops growing). With a
-window set, the daemon runs one sweep at startup — after the store opens and
-the stale incidents close, before any collector writes — and then one every
-24 h, each table's prune on the blocking pool the way a diagnosis runs, each
-result logged (`pruned <n> rows older than <days> d from <table>`, `debug` when
-nothing went) and each failure logged as a gap and skipped, never fatal. The
-table names come from `[record] retention_tables` and are checked against
-`store::SAMPLE_TABLES` — the per-tick tables above (`link_sample` …
-`connection_sample`, plus `air_ap`) — so config can name nothing else: the
-evidence (`incident`, `blob_ref`, `trigger_fired`), the brackets
-(`observing_edge`, `probing_edge`), the record of the daemon having spoken
-(`neighbor_scan`), the experiments and the keyed entity tables are outside the
-list and are never pruned. The default list is `["connection_sample"]` alone:
-one row per flow key per 15 s tick, measured on the owner's Mac on 2026-09-17
-at ~3.3 k rows/hour (~80 k rows/day) — the whole file grew ~1.3 MB/day before
-that collector, ~8 MB/day is the estimate with it — an order of magnitude more
-than any other table; the owner widens the list by config.
+<table> WHERE ts_us < cutoff` and, in the same transaction, one `record_prune`
+row naming the table, the cutoff and the count — the bracket that says the
+stretch before the cutoff is pruned time, not a silence (`SKIP, never
+silence`: unbracketed silence is a bug, and a prune is a sanctioned
+withholding like a pause) — then a `CHECKPOINT` when anything went (DuckDB
+frees a deleted row's blocks for reuse only at a checkpoint; the file does not
+shrink, it stops growing). The rows are committed before the checkpoint, so a
+checkpoint that fails is logged with the count and the prune still reports it.
+With a window set, the daemon validates the table list at startup and refuses
+to start on a name outside `store::PRUNABLE_TABLES` (an unknown name is an
+error, never a silent fall-back — the precedent is an unknown probing tier);
+runs one sweep — after the store opens and the stale incidents close, before
+any collector writes — and then one every 24 h of awake time (tokio's timer
+does not advance while the Mac sleeps, so a laptop awake eight hours a day
+sweeps every three wall days or so). Each table's prune runs on the blocking
+pool and holds the store's connection for the duration of the DELETE,
+proportional to the rows deleted, so the writers wait exactly that long; each
+result is logged (`pruned <n> rows older than <days> d from <table>`, `debug`
+when nothing went) and each failure logged as a gap and skipped, never fatal.
+`PRUNABLE_TABLES` is `connection_sample`, `air_sample`, `air_ap`,
+`wifi_sample`, `neighbor_sample` — the complement of what the gap derivation
+reads: `link_sample`, `proxy_sample`, `host_sample`, `dns_sample` and
+`route_event` are the ticks `SAMPLE_TS_CTE` takes as "the daemon was
+collecting at this instant", from which every stop and sleep is derived, so
+pruning any of them would fabricate stops and sleeps and poison `verdict_at`
+and `incident_context` for the very incidents the prune kept; they are never
+prunable, whatever config says. `air_sample` and `air_ap` are one scan slice
+joined by `ts_us`, pruned both or neither: config naming one of the pair
+prunes both, and the daemon says so at startup. Outside both lists and never
+pruned: the evidence (`incident`, `blob_ref`, `trigger_fired`), the brackets
+(`observing_edge`, `probing_edge`, `record_prune`), the record of the daemon
+having spoken (`neighbor_scan`), the experiments and the keyed entity tables.
+The default list is `["connection_sample"]` alone: one row per flow key per
+15 s tick, measured on the owner's Mac 2026-09-17: ~3.3k rows/hour (~80k
+rows/day) — the whole file grew ~1.3 MB/day before that collector, ~8 MB/day
+is the estimate with it — an order of magnitude more than any other table; the
+owner widens the list by config.
 
 ### Diagnosis queries
 
