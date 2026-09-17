@@ -60,7 +60,7 @@ impl AnnounceCapture {
         let mut cmd = Command::new("tcpdump");
         cmd.arg("-i")
             .arg(iface)
-            .arg("-nn") // no name resolution: nothing of ours on the wire for a capture
+            .arg("-nn") // never resolve names: a capture must put nothing on the wire
             .arg("-s")
             .arg("0") // whole frames (see the module doc)
             .arg("-U") // packet-buffered: each frame reaches the pipe as it is captured

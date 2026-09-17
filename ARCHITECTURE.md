@@ -43,6 +43,7 @@ flowchart LR
         host["host\nInterval"]
         conns["connections\nInterval (Clash API)"]
         evt["route-events\nEvent (PF_ROUTE)"]
+        announce["announce\nEvent (tcpdump pcap pipe)"]
     end
 
     link -- "Sample::Link" --> stream
@@ -51,6 +52,7 @@ flowchart LR
     host -- "Sample::Host" --> stream
     conns -- "Sample::Connections" --> stream
     evt -- "Sample::Route (event)" --> stream
+    announce -- "Sample::Neighbors (every 15s)" --> stream
 
     stream(["mpsc stream (Sample)"]) --> consumer{{"consumer loop\n(pipeline::run)"}}
 
@@ -84,6 +86,28 @@ flowchart LR
   dedicated OS thread (`std::thread::spawn`, bridged to the async stream via
   `blocking_send`), forwarding samples as the kernel announces interface/route
   changes. See [Async collectors](#async-collectors) below.
+- **`announce`** — the second Event collector, and the passive tier's way of
+  keeping the neighbour map alive with no packet of ours (realm net-observer,
+  node #92). A segment talks unasked: the gateway answers ARP, a laptop
+  announces its mDNS services and name, phones ask DHCP for a lease and say
+  what they are called, a router notifies SSDP. A **second `tcpdump` child**
+  (`macos::AnnounceCapture`: `-w -` to a pipe, packet-buffered, filtered to
+  `arp or udp port 5353 or udp port 1900 or udp port 67 or udp port 68`) streams
+  raw pcap to the daemon, where `collector-announce` decodes every frame in
+  pure Rust — the classic pcap layout by hand, Ethernet/ARP/IP/UDP with
+  `etherparse`, mDNS with `simple-dns`, SSDP and DHCP by hand — and folds it
+  into a per-window accumulator. Every 15 s (wall time, so a silent segment
+  still yields its reading) the window flushes as one `Sample::Neighbors`:
+  the neighbours heard (`source = announce`, hostname from mDNS or DHCP
+  option 12), the services they announced (`NeighborsSample::services`), and
+  the frame counts (`heard`: every frame, and how many were our own — the
+  daemon's frames are recognised by the interface MAC, counted and dropped,
+  so the record can check that under the passive tier it emitted nothing).
+  Not the pcap ring: the ring's filter carries no multicast and its files are
+  read only on a freeze. The listener's end (child died, pipe broke) is
+  bracketed by a `SKIP` row naming why. A flush never replaces the
+  snapshot's cache reading (it is the last window, not the table); it is
+  written and published like any reading.
 - **Consumer** (`bin/net-observerd/src/pipeline.rs::run`) — drains the stream,
   writes each sample to the store (a write error is *logged as a gap*, never
   silently dropped), mirrors the sample into the live `StatusSnapshot`, pushes
@@ -181,7 +205,12 @@ collector, whether to run it at all:
   to re-probe per tick and no tick to re-probe on — an `Unavailable` event
   collector is logged and skipped for the life of the process ("event cadence:
   not retried"), and retrying it means a supervisor around
-  `spawn_event_collector` that reopens the socket. And the **pcap ring**: it is
+  `spawn_event_collector` that reopens the socket. The `announce` listener is
+  the same shape: its `tcpdump` child is started (and the interface's own MAC
+  read) before construction, and a child that will not start — no `tcpdump`,
+  no root, no BPF — or a MAC that cannot be read leaves it `Unavailable` for
+  the life of the process, the reason logged; a child that dies later ends
+  the source, bracketed by a `SKIP` row. And the **pcap ring**: it is
   a `tcpdump` child started once by `maybe_start_pcap_ring` and handed to the
   API server, so `FreezePcap` can answer about the ring that is actually
   running; a boot that resolves no physical interface leaves the daemon with no
@@ -326,6 +355,7 @@ graph TD
     chost["collector-host\nHostFacts, build_host_sample,\nHostCollector, META (Interval)"]
     cwifi["collector-wifi\nWifiFacts, build_wifi_sample,\nWifiCollector, META (Interval)"]
     cconns["collector-connections\nConnectionFacts, build_connections_sample,\nConnectionsCollector, META (Interval)"]
+    cannounce["collector-announce\npcap stream + ARP/mDNS/SSDP/DHCP decoders,\nAnnounceSource, AnnounceCollector, META (Event)"]
     triggers["triggers\nCondition/Handler/Trigger, engine"]
     config["config\nfigment per-subsystem toggles"]
     macos["macos\nreal adapters: ICMP, IP_BOUND_IF,\nClash API, DHCP/ARP, pcap ring,\nDNS resolve, PF_ROUTE, loadavg"]
@@ -344,12 +374,14 @@ graph TD
     ccore --> chost
     ccore --> cwifi
     ccore --> cconns
+    ccore --> cannounce
     types --> clink
     types --> cproxy
     types --> cdns
     types --> croute
     types --> chost
     types --> cconns
+    types --> cannounce
 
     ccore --> macos
     clink --> macos
@@ -358,6 +390,7 @@ graph TD
     croute --> macos
     chost --> macos
     cconns --> macos
+    cannounce --> macos
 
     store --> triggers
 
@@ -398,6 +431,18 @@ graph TD
   `Box<dyn EventSource>` (the real PF_ROUTE source lives in `macos`) and reports
   `Source::Event`; `net-observerd` drives its blocking `next()` loop on a dedicated
   OS thread (not the async runtime — its `read(2)` cannot be interrupted).
+- `collector-announce` is the second Event-cadence collector and, unlike
+  `route`, owns its whole source: `AnnounceSource` reads a classic pcap
+  stream over any `Read` (on the daemon, `macos::AnnounceCapture` — the
+  second `tcpdump` child's stdout) on a reader thread, and its `next()`
+  drains that thread's channel until the 15 s flush deadline, so a silent
+  segment still yields its reading. The decoders (`pcap`, `frame` via
+  `etherparse`, `mdns` via `simple-dns`, `ssdp`, `dhcp`) and the per-window
+  accumulator (`window`) are pure functions with tests on frames built from
+  their fields — the one collector whose entire path is exercised on Linux.
+  Its port is `SegmentIdentity` (the gateway's MAC, read at each window's
+  start), implemented in `macos` over the same `SystemFacts::network_key`
+  the neighbour-cache read and the scan use. (realm net-observer, node #92)
 - `macos` implements every port trait with the real adapters, all on
   **async-native I/O** on the daemon's tokio runtime: `surge-ping` (raw ICMP),
   `socket2` + `tokio::net::TcpStream` with `IP_BOUND_IF` (bound TCP probes),
@@ -406,8 +451,9 @@ graph TD
   `tokio::process::Command` (DHCP/ARP + Wi-Fi subprocesses); `getloadavg` stays
   an inline syscall inside its `async fn`, as does the CoreWLAN read behind
   `WifiFacts` (hand-declared `objc2` message sends — no subprocess and no text
-  parsing; see `macos::corewlan`). The blocking PF_ROUTE `EventSource`
-  and the pcap ring are the only non-async pieces. **`ureq` was dropped** in
+  parsing; see `macos::corewlan`). The blocking PF_ROUTE `EventSource`, the
+  pcap ring and the announce listener's `tcpdump` pipe (`macos::announce`)
+  are the only non-async pieces. **`ureq` was dropped** in
   favour of `reqwest` async — the earlier `reqwest::blocking`-inside-tokio
   startup panic cannot recur. `macos` also carries the per-collector
   `preflight()` checks.
@@ -515,6 +561,8 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `host_sample` | `ts_us, load1, load5, load15, disk_used_pct, disk_free_mb, swap_used_mb` | Host load averages — the `starvation` discriminator — plus the usage of the volume holding the record (`disk_used_pct` as `df` computes capacity, `disk_free_mb` what a writer can still take, in MiB) and the swap in use in MiB: the ENOSPC and memory-pressure discriminators the shell oracle carried. A store write that fails for want of space is logged as a gap; these columns let the record name the cause. NULL = not measured, never a zero. |
 | `wifi_sample` | `ts_us, wifi, reason, rssi_dbm, noise_dbm, snr_db, tx_rate_mbps, phy_mode, channel, channel_width_mhz, channel_band` | Wi-Fi air quality from CoreWLAN. `rssi_dbm`/`noise_dbm` are the raw pair and `snr_db` is derived (`rssi - noise`), so the derivation can be revisited from the columns actually measured. `wifi = SKIP` with a `reason` when the radio could not be read (no interface, powered off, not associated) — a row every tick, never an absent one. No SSID/BSSID: macOS gates them behind Location Services, which a LaunchDaemon cannot obtain. |
 | `connection_sample` | `ts_us, verdict, host, dst_ip, dst_port, process, network, chain, count, upload, download` | What this machine talks to: the live flows sing-box's Clash API lists (`GET /connections`, realm net-observer, node #127), aggregated per tick by `(host, dst_ip, dst_port, process, network, chain)` — `count` flows shared the key, `upload`/`download` their bytes summed. `host` is the name asked for (a sniffed SNI is whatever the client put there), `dst_ip` the real destination (NULL when the proxy resolves the name on the far side), `process` the client's executable name, `chain` the outbound that actually carried the flow — the first element of the Clash API's `chains` (sing-box lists them node-first; the last is the constant top-level selector). One row per aggregate row per tick with the tick's `verdict` on each; a tick with no rows — the API did not answer (`SKIP`) or it listed nothing (`OK`) — writes ONE row with every key column NULL, so "could not look" and "nothing is talking" are different rows and neither is an absent tick (realm net-observer, node #75). |
+| `neighbor_sample` | `ts_us, network_key, iface, verdict, reason, neighbor_count, heard_frames, own_frames` | One row per neighbour reading — a neighbour-cache tick, an operator-pressed scan, or an `announce` listener flush — including its `SKIP`s. `heard_frames` / `own_frames` are the listener's counts for the window it flushed: every frame the capture delivered and, of those, the ones whose Ethernet source was this interface's own MAC (counted, never recorded as a neighbour). NULL on a cache tick or a scan, never a zero: `heard_frames = 0` is a window in which the segment said nothing, and `own_frames` is the "zero frames of ours" check the passive tier is held to. The neighbour entity tables (`neighbor`, `neighbor_scan`, `neighbor_port`, `neighbor_vuln`) are documented in `crates/store/src/schema.rs`; `neighbor.source` now also takes `announce` — the device said so itself (realm net-observer, node #92). |
+| `neighbor_service` | `network_key, mac, ip, service, kind, detail, first_seen_us, last_seen_us` | A service a neighbour announced, heard passively by the `announce` listener. Keyed by `(network_key, mac, service)` with first/last seen like `neighbor_port`, so an announcement repeated every few seconds is one row: "this device has been announcing `_companion-link._tcp` since X". `service` is what was announced (an mDNS service type, an SSDP notification type, a DHCP role — `dhcp-server`, `vendor-class`), `kind` which protocol carried it (`mdns` / `ssdp` / `dhcp`), `detail` the specifics that came with it (the mDNS instance name, the SSDP `SERVER` string, the DHCP message type or vendor class), `ip` the address it was announced from (NULL for a DHCP client still without one). A later sighting that carries no `ip` or `detail` keeps the ones already learned. |
 | `incident` | `id PK, opened_us, closed_us, trigger_id, signature` | Open incident ⇒ `closed_us IS NULL`. |
 | `blob_ref` | `id, incident_id, ts_us, kind, path` | On-disk forensics blobs (pcap freeze, dumps) referenced by path. |
 | `trigger_fired` | `ts_us, trigger_id, incident_id, detail` | One row per trigger fire. |
