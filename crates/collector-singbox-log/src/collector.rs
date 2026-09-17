@@ -5,14 +5,14 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use collector_core::{Collector, CollectorMeta, Os, Readiness, Source};
 use types::{Sample, SingboxLogClass, SingboxLogSample};
 
 use crate::classify::classify;
 use crate::parse::parse_line;
-use crate::tail::LogTail;
+use crate::tail::{LogTail, TailRead};
 
 /// Static metadata for the `singbox-log` collector. The log it reads is the
 /// launchd-managed one of this deployment's sing-box, which runs on macOS.
@@ -25,44 +25,63 @@ pub const META: CollectorMeta = CollectorMeta {
 const SAMPLE_MESSAGE_MAX: usize = 200;
 
 /// The substrings a line must carry to be parsed at all — a byte scan before
-/// any parsing, since the log is DEBUG-level and large: a WARN-or-above level
-/// token, or one of the two INFO lines that are evidence (a restart, and the
-/// default interface taken — realm net-observer, node #141).
-const ADMIT_TOKENS: [&str; 6] = [
-    "ERROR",
-    "WARN",
-    "FATAL",
-    "PANIC",
-    "sing-box started",
-    "updated default interface",
+/// any parsing (and, in the tail, before any allocation), since the log is
+/// DEBUG-level and large: a WARN-or-above level token, or one of the two
+/// INFO lines that are evidence (a restart, and the default interface taken
+/// — realm net-observer, node #141).
+const ADMIT_TOKENS: [&[u8]; 6] = [
+    b"ERROR",
+    b"WARN",
+    b"FATAL",
+    b"PANIC",
+    b"sing-box started",
+    b"updated default interface",
 ];
+
+/// How many of the collector's own intervals a line may be older than the
+/// tick that reads it before it is dropped as stale — and how many intervals
+/// of silence between two reads make the tail skip its backlog rather than
+/// read it (both: a pause's lines belong to the pause, not to the tick after
+/// it; the observing edge brackets the pause).
+const STALE_INTERVALS: u32 = 2;
+
+/// Whether a raw line is worth parsing: it carries one of [`ADMIT_TOKENS`].
+#[must_use]
+pub fn admits(raw: &[u8]) -> bool {
+    ADMIT_TOKENS
+        .iter()
+        .any(|t| raw.windows(t.len()).any(|w| w == *t))
+}
 
 /// Where the collector's lines come from: the real [`LogTail`], or a scripted
 /// fake in tests. `read_new` is `&mut self` because a tail advances; the
 /// collector holds it behind a mutex, since `Collector::collect` takes
 /// `&self`.
 pub trait TailSource: Send {
-    /// The complete lines appended since the previous call; an error when
-    /// the log could not be read this time.
-    fn read_new(&mut self) -> io::Result<Vec<String>>;
+    /// The admitted complete lines appended since the previous call, with
+    /// what the tail skipped or dropped on the way; an error when the log
+    /// could not be read this time. `now` is the caller's monotonic clock.
+    fn read_new(&mut self, now: Instant) -> io::Result<TailRead>;
     /// How many rotations the source has followed so far.
     fn rotations(&self) -> u32;
 }
 
 impl TailSource for LogTail {
-    fn read_new(&mut self) -> io::Result<Vec<String>> {
-        LogTail::read_new(self)
+    fn read_new(&mut self, now: Instant) -> io::Result<TailRead> {
+        LogTail::read_new(self, now)
     }
     fn rotations(&self) -> u32 {
         LogTail::rotations(self)
     }
 }
 
-/// The tail and, beside it, the rotation count already reported — so a
-/// rotation is logged once, on the tick that saw it.
-struct State<T> {
-    tail: T,
-    rotations_reported: u32,
+/// The rows one tick folded, and the lines it dropped as stale.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Folded {
+    /// One row per `(class, node)`, in first-seen order.
+    pub rows: Vec<SingboxLogSample>,
+    /// Admitted lines whose own timestamp was older than the tick allows.
+    pub stale: u32,
 }
 
 /// The `singbox-log` collector: sing-box's own ERROR/WARN lines since the
@@ -77,7 +96,7 @@ struct State<T> {
 /// The read is synchronous inside the async `collect`: the bytes since the
 /// last tick are a local file's tail, a bounded read of milliseconds.
 pub struct SingboxLogCollector<T: TailSource = LogTail> {
-    state: Mutex<State<T>>,
+    tail: Mutex<T>,
     path: PathBuf,
     interval: Duration,
 }
@@ -88,7 +107,8 @@ impl SingboxLogCollector<LogTail> {
     /// retried every tick, each such tick an `Unreadable` row.
     pub fn new(path: impl Into<PathBuf>, interval: Duration) -> Self {
         let path = path.into();
-        Self::with_tail(LogTail::open_at_end(&path), path, interval)
+        let tail = LogTail::open_at_end(&path, interval * STALE_INTERVALS, admits);
+        Self::with_tail(tail, path, interval)
     }
 }
 
@@ -97,10 +117,7 @@ impl<T: TailSource> SingboxLogCollector<T> {
     /// preflight check and the rows' log lines.
     pub fn with_tail(tail: T, path: PathBuf, interval: Duration) -> Self {
         Self {
-            state: Mutex::new(State {
-                tail,
-                rotations_reported: 0,
-            }),
+            tail: Mutex::new(tail),
             path,
             interval,
         }
@@ -141,36 +158,53 @@ impl<T: TailSource> Collector for SingboxLogCollector<T> {
     }
 
     async fn collect(&self, ts_us: i64) -> Vec<Sample> {
-        let (read, rotations, reported) = {
-            let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let read = s.tail.read_new();
-            let rotations = s.tail.rotations();
-            let reported = std::mem::replace(&mut s.rotations_reported, rotations);
-            (read, rotations, reported)
+        let (read, rotations) = {
+            let mut tail = self.tail.lock().unwrap_or_else(PoisonError::into_inner);
+            let read = tail.read_new(Instant::now());
+            (read, tail.rotations())
         };
-        if rotations != reported {
-            tracing::info!(
-                collector = META.name,
-                rotations,
-                "the log was rotated; following the new file from its start (the old file's tail since the previous tick is lost)"
-            );
-        }
-        let lines = match read {
-            Ok(lines) => lines,
+        let read = match read {
+            Ok(read) => read,
             Err(e) => {
                 tracing::warn!(collector = META.name, path = %self.path.display(), error = %e, "log unreadable this tick");
                 return self.unreadable(ts_us, &e);
             }
         };
-        let rows = fold_lines(ts_us, lines.iter().map(String::as_str));
+        if let Some((gap, skipped)) = read.reattached {
+            tracing::info!(
+                collector = META.name,
+                gap_s = gap.as_secs(),
+                skipped_bytes = skipped,
+                "sing-box log: re-attached at end after {} s gap, {skipped} skipped",
+                gap.as_secs()
+            );
+        }
+        if read.rotated {
+            tracing::info!(
+                collector = META.name,
+                rotations,
+                "sing-box log: rotated; continuing from the start of the file"
+            );
+        }
+        let oldest_us =
+            ts_us.saturating_sub(interval_us(self.interval) * i64::from(STALE_INTERVALS));
+        let folded = fold_lines(ts_us, oldest_us, read.lines.iter().map(String::as_str));
+        if folded.stale > 0 || read.dropped_partials > 0 {
+            tracing::info!(
+                collector = META.name,
+                stale_lines = folded.stale,
+                dropped_partials = read.dropped_partials,
+                "sing-box log: dropped lines older than {STALE_INTERVALS} intervals and partial buffers"
+            );
+        }
         tracing::debug!(
             collector = META.name,
-            lines = lines.len(),
-            classes = rows.len(),
+            lines = read.lines.len(),
+            classes = folded.rows.len(),
             rotations,
             "tick"
         );
-        rows.into_iter().map(Sample::SingboxLog).collect()
+        folded.rows.into_iter().map(Sample::SingboxLog).collect()
     }
 
     fn skip(&self, ts_us: i64) -> Vec<Sample> {
@@ -181,28 +215,44 @@ impl<T: TailSource> Collector for SingboxLogCollector<T> {
     }
 }
 
+/// An interval as microseconds, saturating.
+fn interval_us(interval: Duration) -> i64 {
+    i64::try_from(interval.as_micros()).unwrap_or(i64::MAX)
+}
+
 /// Fold the raw lines of one tick into one [`SingboxLogSample`] per
 /// `(class, node)`, in first-seen order, each stamped `ts_us` and carrying the
 /// first message of its class (ANSI stripped, at most 200 characters). Lines
 /// without an [`ADMIT_TOKENS`] substring are skipped before parsing; lines
 /// that do not parse, or parse to an INFO/DEBUG line that is no class, are
-/// skipped after. No such line, no rows.
+/// skipped after. A line whose own timestamp is older than `oldest_us` is not
+/// this tick's evidence — a backlog a sleep left behind — and is counted as
+/// stale instead of stamped with the tick. No such line, no rows.
 pub fn fold_lines<'a>(
     ts_us: i64,
+    oldest_us: i64,
     lines: impl IntoIterator<Item = &'a str>,
-) -> Vec<SingboxLogSample> {
-    let mut rows: Vec<SingboxLogSample> = Vec::new();
+) -> Folded {
+    let mut folded = Folded::default();
     for raw in lines {
-        if !ADMIT_TOKENS.iter().any(|t| raw.contains(t)) {
+        if !admits(raw.as_bytes()) {
             continue;
         }
         let Some(line) = parse_line(raw) else {
             continue;
         };
+        if line.ts_us < oldest_us {
+            folded.stale = folded.stale.saturating_add(1);
+            continue;
+        }
         let Some((class, node)) = classify(&line) else {
             continue;
         };
-        match rows.iter_mut().find(|r| r.class == class && r.node == node) {
+        match folded
+            .rows
+            .iter_mut()
+            .find(|r| r.class == class && r.node == node)
+        {
             Some(r) => r.count = r.count.saturating_add(1),
             None => {
                 // The message keeps its component so an `other` row says
@@ -212,7 +262,7 @@ pub fn fold_lines<'a>(
                     (c, Some(tag)) => format!("{c}[{tag}]: {}", line.message),
                     (c, None) => format!("{c}: {}", line.message),
                 };
-                rows.push(SingboxLogSample {
+                folded.rows.push(SingboxLogSample {
                     ts_us,
                     class,
                     count: 1,
@@ -222,7 +272,7 @@ pub fn fold_lines<'a>(
             }
         }
     }
-    rows
+    folded
 }
 
 /// At most [`SAMPLE_MESSAGE_MAX`] characters, cut on a character boundary.
@@ -249,9 +299,32 @@ mod tests {
     const DEBUG_WITH_TOKEN: &str =
         "+0300 2026-09-17 20:25:52 DEBUG [3 0ms] connection: an ERROR in a debug line is not one";
 
+    /// 2026-09-17T17:56:25Z — `NO_ROUTE`'s own instant — as the tick.
+    const AT: i64 = 1_789_667_785_000_000;
+    const TICK_US: i64 = 15_000_000;
+
+    fn fold<'a>(ts_us: i64, lines: impl IntoIterator<Item = &'a str>) -> Vec<SingboxLogSample> {
+        let folded = fold_lines(ts_us, i64::MIN, lines);
+        assert_eq!(folded.stale, 0);
+        folded.rows
+    }
+
+    #[test]
+    fn admits_scans_the_bytes_for_the_tokens() {
+        assert!(admits(NO_ROUTE.as_bytes()));
+        assert!(admits(STARTED.as_bytes()));
+        assert!(admits(IFACE_UPDATED.as_bytes()));
+        assert!(
+            admits(DEBUG_WITH_TOKEN.as_bytes()),
+            "the scan is cheap; the parse decides"
+        );
+        assert!(!admits(INFO.as_bytes()));
+        assert!(!admits(b""));
+    }
+
     #[test]
     fn fold_counts_per_class_and_node_and_keeps_the_first_message() {
-        let rows = fold_lines(
+        let rows = fold(
             42,
             [
                 NO_ROUTE,
@@ -288,14 +361,14 @@ mod tests {
     /// Absence of errors is the healthy state: no rows, not an empty row.
     #[test]
     fn fold_of_info_and_debug_only_is_empty() {
-        assert!(fold_lines(1, [INFO, DEBUG_WITH_TOKEN, "", "garbage"]).is_empty());
+        assert!(fold(1, [INFO, DEBUG_WITH_TOKEN, "", "garbage"]).is_empty());
     }
 
     /// The two INFO lines that are evidence pass the byte scan and fold like
     /// any class: a restart with its message, the interface taken in `node`.
     #[test]
     fn fold_admits_the_restart_and_default_iface_lines_at_info() {
-        let rows = fold_lines(7, [STARTED, IFACE_UPDATED, INFO]);
+        let rows = fold(7, [STARTED, IFACE_UPDATED, INFO]);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].class, SingboxLogClass::Started);
         assert_eq!(rows[0].node, None);
@@ -317,28 +390,47 @@ mod tests {
             "+0300 2026-09-17 20:56:26 ERROR inbound/tun[0]: {}",
             "é".repeat(400)
         );
-        let rows = fold_lines(1, [long.as_str()]);
+        let rows = fold(1, [long.as_str()]);
         let msg = rows[0].sample_message.as_deref().unwrap();
         assert_eq!(msg.chars().count(), SAMPLE_MESSAGE_MAX);
         assert!(msg.starts_with("inbound/tun[0]: é"));
     }
 
+    /// The belt for a sleep that did not stop the tick: an admitted line whose
+    /// own instant is older than the tick allows is dropped and counted, not
+    /// stamped with the tick; a line exactly at the horizon, or newer, stays.
+    #[test]
+    fn fold_drops_and_counts_lines_older_than_the_horizon() {
+        // NO_IFACE's instant is 20:56:26+03:00, one second after `AT`.
+        let folded = fold_lines(AT + 31_000_000, AT + 1_000_000, [NO_ROUTE, NO_IFACE, INFO]);
+        assert_eq!(folded.stale, 1, "{folded:?}");
+        assert_eq!(folded.rows.len(), 1);
+        assert_eq!(folded.rows[0].class, SingboxLogClass::NoDefaultIface);
+        assert_eq!(folded.rows[0].ts_us, AT + 31_000_000);
+
+        let folded = fold_lines(AT, AT - 2 * TICK_US, [NO_ROUTE, NO_IFACE]);
+        assert_eq!(folded.stale, 0);
+        assert_eq!(folded.rows.len(), 2);
+    }
+
     /// A scripted tail: each `read_new` pops the next answer.
     struct FakeTail {
-        script: VecDeque<io::Result<Vec<String>>>,
+        script: VecDeque<io::Result<TailRead>>,
         rotations: u32,
     }
 
     impl TailSource for FakeTail {
-        fn read_new(&mut self) -> io::Result<Vec<String>> {
-            self.script.pop_front().unwrap_or_else(|| Ok(Vec::new()))
+        fn read_new(&mut self, _: Instant) -> io::Result<TailRead> {
+            self.script
+                .pop_front()
+                .unwrap_or_else(|| Ok(TailRead::default()))
         }
         fn rotations(&self) -> u32 {
             self.rotations
         }
     }
 
-    fn collector(script: Vec<io::Result<Vec<String>>>) -> SingboxLogCollector<FakeTail> {
+    fn collector(script: Vec<io::Result<TailRead>>) -> SingboxLogCollector<FakeTail> {
         SingboxLogCollector::with_tail(
             FakeTail {
                 script: script.into(),
@@ -349,30 +441,52 @@ mod tests {
         )
     }
 
-    fn lines(ls: &[&str]) -> io::Result<Vec<String>> {
-        Ok(ls.iter().map(|l| l.to_string()).collect())
+    fn lines(ls: &[&str]) -> io::Result<TailRead> {
+        Ok(TailRead {
+            lines: ls.iter().map(|l| l.to_string()).collect(),
+            ..TailRead::default()
+        })
     }
 
-    #[tokio::test]
-    async fn a_tick_with_alert_lines_collects_one_sample_per_class_and_node() {
-        let c = collector(vec![lines(&[NO_ROUTE, NO_IFACE, INFO]), lines(&[INFO])]);
-        let samples = c.collect(42).await;
-        let classes: Vec<_> = samples
+    fn classes(samples: &[Sample]) -> Vec<(i64, SingboxLogClass, u32)> {
+        samples
             .iter()
             .map(|s| match s {
                 Sample::SingboxLog(r) => (r.ts_us, r.class, r.count),
                 other => panic!("expected a sing-box log sample, got {other:?}"),
             })
-            .collect();
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_tick_with_alert_lines_collects_one_sample_per_class_and_node() {
+        let c = collector(vec![lines(&[NO_ROUTE, NO_IFACE, INFO]), lines(&[INFO])]);
         assert_eq!(
-            classes,
+            classes(&c.collect(AT).await),
             vec![
-                (42, SingboxLogClass::NoRoute, 1),
-                (42, SingboxLogClass::NoDefaultIface, 1)
+                (AT, SingboxLogClass::NoRoute, 1),
+                (AT, SingboxLogClass::NoDefaultIface, 1)
             ]
         );
         // A tick with nothing at WARN or above writes nothing.
-        assert!(c.collect(43).await.is_empty());
+        assert!(c.collect(AT + TICK_US).await.is_empty());
+    }
+
+    /// The tick after a pause: the tail re-attached at the end and returned
+    /// no lines — the backlog is the pause's, not this tick's — and a line
+    /// older than two intervals slipping through a normal read is dropped.
+    #[tokio::test]
+    async fn a_reattached_read_and_a_stale_line_write_nothing_for_them() {
+        let c = collector(vec![
+            Ok(TailRead {
+                reattached: Some((Duration::from_secs(3600), 1 << 20)),
+                ..TailRead::default()
+            }),
+            lines(&[NO_ROUTE, NO_IFACE]),
+        ]);
+        assert!(c.collect(AT + 3600 * 1_000_000).await.is_empty());
+        // The next normal tick sits 10 min past the lines' own instants.
+        assert!(c.collect(AT + 600 * 1_000_000).await.is_empty());
     }
 
     /// SKIP, never silence: a tick whose read failed leaves one row saying so.
@@ -417,7 +531,7 @@ mod tests {
             "{r:?}"
         );
         // The read path reports the same absence as a row, not a panic.
-        let collected = c.collect(2).await;
+        let collected = c.collect(AT).await;
         let [Sample::SingboxLog(r)] = collected.as_slice() else {
             panic!("expected one row");
         };
@@ -426,7 +540,7 @@ mod tests {
         std::fs::write(&path, format!("{NO_ROUTE}\n")).unwrap();
         assert!(c.preflight().await.is_ready());
         assert!(
-            c.collect(3).await.is_empty(),
+            c.collect(AT + TICK_US).await.is_empty(),
             "attached at the end: the pre-existing line is not read"
         );
         let mut f = std::fs::OpenOptions::new()
@@ -434,11 +548,11 @@ mod tests {
             .open(&path)
             .unwrap();
         std::io::Write::write_all(&mut f, format!("{NO_IFACE}\n").as_bytes()).unwrap();
-        let samples = c.collect(4).await;
+        let samples = c.collect(AT + 2 * TICK_US).await;
         let [Sample::SingboxLog(r)] = samples.as_slice() else {
             panic!("expected one row, got {samples:?}");
         };
         assert_eq!(r.class, SingboxLogClass::NoDefaultIface);
-        assert_eq!(r.ts_us, 4);
+        assert_eq!(r.ts_us, AT + 2 * TICK_US);
     }
 }
