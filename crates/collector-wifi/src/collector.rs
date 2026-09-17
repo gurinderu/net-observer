@@ -19,7 +19,7 @@ pub const META: CollectorMeta = CollectorMeta {
 /// The `wifi` collector: one air-quality reading per tick.
 ///
 /// Entirely passive — reading the radio's own statistics addresses no packet at
-/// anything and never scans, so there is no `quiet` switch to honour here.
+/// anything and never scans, so there is no probing-tier switch to honour here.
 ///
 /// Generic over its [`WifiFacts`] port for static dispatch: native `async fn` in
 /// the port rules out `dyn`, and the daemon enumerates the concrete collectors in

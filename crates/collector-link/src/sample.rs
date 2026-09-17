@@ -10,8 +10,8 @@ use types::{GwVerdict, LinkMedium, LinkSample, TcpVerdict};
 /// `(router, dns)` lease pair; `arp` is the gateway's ARP MAC.
 ///
 /// A probe arrives as `None` when it was deliberately NOT sent — the gateway
-/// echo under quiet or in the passive tier, the direct probe in the passive tier
-/// (realm net-observer, node #88) — and its verdict is then `SKIP` with no RTT.
+/// echo or the direct probe, both withheld in the passive tier (realm
+/// net-observer, node #88) — and its verdict is then `SKIP` with no RTT.
 /// The decision to withhold is the collector's; this mapping only reports it.
 /// The sample is still produced — SKIP, never silence — and every passive fact
 /// (DHCP lease, ARP, SSID) still flows through, because reading them puts
@@ -171,9 +171,9 @@ mod tests {
         assert_eq!(s.direct, TcpVerdict::Fail);
     }
 
-    /// A withheld echo (quiet, or the passive tier) suppresses the gateway
-    /// verdict, not the sample: the gateway reads `SKIP` with no RTT while
-    /// every passive fact still flows through.
+    /// A withheld echo (the passive tier) suppresses the gateway verdict, not
+    /// the sample: the gateway reads `SKIP` with no RTT while every passive
+    /// fact still flows through.
     #[test]
     fn a_withheld_echo_skips_the_gateway_verdict_but_still_emits_a_sample() {
         let s = build_link_sample(

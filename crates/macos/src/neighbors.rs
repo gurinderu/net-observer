@@ -2,8 +2,8 @@
 //! caches, read with `arp -an` and `ndp -an`.
 //!
 //! **Nothing here addresses a packet at anybody.** Both commands print tables the
-//! kernel already holds, which is why this collector keeps reading under quiet
-//! mode. Filling those tables on purpose is `ScanNeighbors`, a separate
+//! kernel already holds, which is why this collector keeps reading in the
+//! passive tier. Filling those tables on purpose is `ScanNeighbors`, a separate
 //! operator-pressed action.
 //!
 //! `arp -an` (BSD) prints one line per entry:
