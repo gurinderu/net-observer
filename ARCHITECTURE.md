@@ -165,11 +165,15 @@ flowchart LR
   since the last tick, keeps a partial trailing line up to 1 MiB, follows
   the copytruncate by seeking to 0 on the handle it holds — a changed inode,
   a hand `mv`, is drained first and then reopened, as a defence — counts
-  each rotation, and after a gap longer than two intervals since its last
-  read, an operator pause, re-attaches at the end rather than reading the
-  backlog into the tick after the pause, logging the gap and the bytes
-  skipped; a line whose own instant is older than two intervals is dropped
-  and counted the same way), admits a line by a byte scan on the raw bytes
+  each rotation, and when the same file continued across a gap of four
+  intervals or more since its last read — an operator pause, a sleep —
+  re-attaches at the end rather than reading the backlog into the tick after
+  the pause, logging the gap and the bytes skipped (a shorter gap, one
+  missed tick, reads the backlog; a file that is new since the last read is
+  read from its start whatever the gap, its opening being the evidence); a
+  line whose own instant is older than two intervals is dropped and counted
+  the same way, as is a line longer than 1 MiB), admits a line by a byte
+  scan on the raw bytes
   before parsing or allocating anything (the log is DEBUG-level and large): a
   WARN-or-above level token, or one of the two INFO lines that are evidence
   — `sing-box started` and `updated default interface` — strips the ANSI

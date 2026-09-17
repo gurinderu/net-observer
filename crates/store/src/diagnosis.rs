@@ -562,9 +562,9 @@ const SINGBOX_LOG_NEAR_MAX: i64 = 5;
 /// The `singbox_log_sample` rows within [`SINGBOX_LOG_NEAR_US`] of the asked
 /// moment, rendered as one line each — `<class> ×<count> via <node> at
 /// <RFC3339>` (`via` only when the row names a node) — newest first, ties by
-/// class, at most [`SINGBOX_LOG_NEAR_MAX`], joined by newlines into one
-/// `singbox_log` cell (realm net-observer, node #141). `NULL` when there is
-/// no such row, and
+/// class then node (the row key), at most [`SINGBOX_LOG_NEAR_MAX`], joined by
+/// newlines into one `singbox_log` cell (realm net-observer, node #141).
+/// `NULL` when there is no such row, and
 /// the reader prints nothing: an `unreadable` row IS listed (`unreadable ×0`),
 /// so a stretch where the log could not be read never reads as "no errors".
 /// Binds the moment twice. A function like [`observation_gap_cte`], because
@@ -576,7 +576,7 @@ singbox_log_near AS (
   SELECT ts_us, class, count, node
   FROM singbox_log_sample
   WHERE ts_us BETWEEN ? - {SINGBOX_LOG_NEAR_US} AND ? + {SINGBOX_LOG_NEAR_US}
-  ORDER BY ts_us DESC, class
+  ORDER BY ts_us DESC, class, node
   LIMIT {SINGBOX_LOG_NEAR_MAX}
 ),
 singbox_log_lines AS (
@@ -584,7 +584,7 @@ singbox_log_lines AS (
            class || ' ×' || count
              || CASE WHEN node IS NULL THEN '' ELSE ' via ' || node END
              || ' at ' || strftime(make_timestamp(ts_us), '%Y-%m-%dT%H:%M:%SZ'),
-           chr(10) ORDER BY ts_us DESC, class) AS singbox_log
+           chr(10) ORDER BY ts_us DESC, class, node) AS singbox_log
   FROM singbox_log_near
 )"
     )

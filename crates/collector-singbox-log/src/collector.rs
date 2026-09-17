@@ -37,13 +37,18 @@ const ADMIT_TOKENS: [&[u8]; 6] = [
     b"sing-box started",
     b"updated default interface",
 ];
-
 /// How many of the collector's own intervals a line may be older than the
-/// tick that reads it before it is dropped as stale — and how many intervals
-/// of silence between two reads make the tail skip its backlog rather than
-/// read it (both: a pause's lines belong to the pause, not to the tick after
-/// it; the observing edge brackets the pause).
+/// tick that reads it before it is dropped as stale: a pause's lines belong to
+/// the pause, not to the tick after it (the observing edge brackets the
+/// pause), and a sleep the tick survived leaves the same backlog.
 const STALE_INTERVALS: u32 = 2;
+
+/// How many intervals of silence between two reads of the same file make the
+/// tail skip its backlog rather than read it. Four, not two: one missed tick
+/// (`MissedTickBehavior::Skip`) lands the next read at two intervals plus
+/// jitter, and its backlog is still this tick's evidence — the stale belt
+/// above drops what is too old. Four intervals is a pause or a sleep.
+const REATTACH_INTERVALS: u32 = 4;
 
 /// Whether a raw line is worth parsing: it carries one of [`ADMIT_TOKENS`].
 #[must_use]
@@ -107,7 +112,7 @@ impl SingboxLogCollector<LogTail> {
     /// retried every tick, each such tick an `Unreadable` row.
     pub fn new(path: impl Into<PathBuf>, interval: Duration) -> Self {
         let path = path.into();
-        let tail = LogTail::open_at_end(&path, interval * STALE_INTERVALS, admits);
+        let tail = LogTail::open_at_end(&path, interval * REATTACH_INTERVALS, admits);
         Self::with_tail(tail, path, interval)
     }
 }
@@ -537,11 +542,18 @@ mod tests {
         };
         assert_eq!(r.class, SingboxLogClass::Unreadable);
 
-        std::fs::write(&path, format!("{NO_ROUTE}\n")).unwrap();
+        // The file that appears is new — its first lines are the evidence
+        // (a respawned sing-box says `started`), so they are read.
+        let started_now = "+0300 2026-09-17 20:56:25 INFO sing-box started (0.05s)";
+        std::fs::write(&path, format!("{started_now}\n{NO_ROUTE}\n")).unwrap();
         assert!(c.preflight().await.is_ready());
-        assert!(
-            c.collect(AT + TICK_US).await.is_empty(),
-            "attached at the end: the pre-existing line is not read"
+        assert_eq!(
+            classes(&c.collect(AT + TICK_US).await),
+            vec![
+                (AT + TICK_US, SingboxLogClass::Started, 1),
+                (AT + TICK_US, SingboxLogClass::NoRoute, 1)
+            ],
+            "a new file is read from its start"
         );
         let mut f = std::fs::OpenOptions::new()
             .append(true)
