@@ -41,6 +41,21 @@
 //! `DiagnosticQuery::Vulns` on the background executor, when the window opens
 //! and after each rung completes ([`crate::ui::fetch_findings`]). (realm
 //! net-observer, node #90)
+//!
+//! ## The announce overlay
+//!
+//! The snapshot's neighbour table is the cache reading, and a flush of the
+//! passive `announce` listener deliberately does not replace it — so a device
+//! the record knows only because it announced itself never reaches
+//! `snapshot.neighbors`. The window reads the record's `neighbor` table for
+//! itself (`DiagnosticQuery::Neighbors`, beside the findings read, at the same
+//! two moments) and folds the `announce`-sourced rows of the segment the star is
+//! drawing out of it ([`announced_neighbors`]). A device the reading already
+//! carries keeps its scanned node; one the record knows *only* from its
+//! announcements is drawn as an extra ring node in the announce ink and listed
+//! with `announce` in the `via` column. The record keeps history, the map shows
+//! presence: an announcement older than [`ANNOUNCE_STALE_US`] against the
+//! snapshot's clock is not drawn. (realm net-observer, node #92)
 
 use std::f32::consts::PI;
 
@@ -53,8 +68,8 @@ use gpui::{
 
 use net_observer_ipc::{StatusSnapshot, Table};
 use types::{
-    LearnedVia, NeighborLifetime, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence,
-    TopologyLink,
+    LearnedVia, NeighborLifetime, NeighborObs, NeighborRole, NeighborSource, NeighborsSample,
+    RoleConfidence, TopologyLink,
 };
 
 use crate::ui::{
@@ -174,6 +189,14 @@ struct MapNode {
     /// discriminator the accent seam colours by. A hypothesis, drawn as a subtle
     /// dot colour — never a hard "SWITCH" label. (realm net-observer, node #33)
     role: NeighborRole,
+    /// True for a device the record knows ONLY from its own announcements —
+    /// absent from the reading, folded in from the `neighbor` table by
+    /// [`announced_overlay`]. Drawn in the announce ink under its own glyph,
+    /// whatever `role` says (the record carries no role for it, so `role` is
+    /// `Unknown`), because "it said so itself" is a provenance the operator
+    /// must be able to tell from "the caches listed it" (realm net-observer,
+    /// node #92).
+    announced: bool,
 }
 
 impl MapNode {
@@ -183,7 +206,198 @@ impl MapNode {
             label: node_label(obs),
             ip: obs.ip.clone(),
             role: obs.role,
+            announced: false,
         }
+    }
+
+    /// The node for an announced-only device: labelled by the same preference
+    /// order as a scanned one ([`node_label`]), through the observation shape
+    /// the record's row amounts to, and flagged `announced`.
+    fn from_announced(announced: &AnnouncedNeighbor) -> Self {
+        let mut node = Self::from_obs(&announced.as_obs());
+        node.announced = true;
+        node
+    }
+}
+
+/// How long an announcement stays on the map after the record last heard it,
+/// in µs: ten minutes. The record keeps history — a `neighbor` row's
+/// `last_seen_us` is a bound, never erased — but the map shows presence, so an
+/// announced device whose last sighting is older than this against the
+/// snapshot's `generated_us` is not drawn. Ten minutes covers a device that
+/// announces only on a change (a DHCP renewal, an mDNS probe) without keeping
+/// one that left on the star for the rest of the day. (realm net-observer,
+/// node #92)
+const ANNOUNCE_STALE_US: i64 = 600_000_000;
+
+/// The glyph of an announced-only node: a dotted circle, "heard but not
+/// seen" — deliberately not the `?` of an unknown role, which would say the
+/// caches listed a device whose vendor is unreadable. Paired with the word
+/// `announced` wherever a role is paired with its label.
+const ANNOUNCE_GLYPH: &str = "\u{25CC}";
+
+/// The grounds an announced-only node rests on, in the slot [`role_basis`]
+/// fills for a scanned one.
+const ANNOUNCE_BASIS: &str = "it announced itself; the caches never listed it";
+
+/// A neighbour the record knows from its own announcements, reduced from one
+/// row of the daemon's `Neighbors` table to what the map draws: identity,
+/// address, name, and the record's bounds for it. The provenance is implied —
+/// only `announce`-sourced rows become one of these ([`announced_neighbors`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnnouncedNeighbor {
+    /// The row's MAC as the record spelt it (the store normalises to lowercase;
+    /// every join here is case-insensitive regardless).
+    mac: String,
+    /// The address the announcement carried, or empty when it carried none (a
+    /// DHCP client still without a lease announces a MAC and nothing else).
+    ip: String,
+    /// The name the announcement carried (mDNS, DHCP option 12), if any.
+    hostname: Option<String>,
+    /// When the record first wrote this `(network_key, mac)` — the list's
+    /// `first seen` cell.
+    first_seen_us: i64,
+    /// When the record last heard it — the staleness rule reads this against
+    /// the snapshot's `generated_us`.
+    last_seen_us: i64,
+}
+
+impl AnnouncedNeighbor {
+    /// The observation shape this row amounts to, so [`node_label`] applies
+    /// to it unchanged. No role: the record carries none for it.
+    fn as_obs(&self) -> NeighborObs {
+        NeighborObs {
+            mac: self.mac.clone(),
+            ip: self.ip.clone(),
+            source: NeighborSource::Announce,
+            hostname: self.hostname.clone(),
+            role: NeighborRole::Unknown,
+        }
+    }
+
+    /// Whether the map still shows this device at `now_us` — the snapshot's
+    /// `generated_us`: its last announcement is within [`ANNOUNCE_STALE_US`].
+    /// A sighting *after* `now_us` (a snapshot older than the read) is present,
+    /// not stale.
+    fn is_present(&self, now_us: i64) -> bool {
+        now_us.saturating_sub(self.last_seen_us) <= ANNOUNCE_STALE_US
+    }
+}
+
+/// Reduce the daemon's `Neighbors` table to the announced devices of ONE
+/// segment: the rows whose `source` is `announce` and whose `network_key` is
+/// `network_key`, in the table's order (newest sighting first). The star is one
+/// segment, so the rows of every other segment are ignored — and with no key
+/// (no neighbour reading yet, or a reading whose gateway MAC could not be read)
+/// nothing matches at all: the record files a keyless segment's devices under
+/// `unknown`, which every unidentified segment ever seen shares, and the star
+/// cannot tell whose they are.
+///
+/// Columns are found by NAME, never by position, like [`finding_lines`]: a
+/// table missing one of the seven the fold reads is an `Err` naming it, and a
+/// bound that does not parse is an `Err` naming the device — never a device
+/// drawn as fresh from a cell that was not a moment. A `hostname` cell the
+/// store spelt empty (SQL `NULL`) is `None`. Pure over its input so it is
+/// testable without a window. (realm net-observer, node #92)
+fn announced_neighbors(
+    table: &Table,
+    network_key: Option<&str>,
+) -> Result<Vec<AnnouncedNeighbor>, String> {
+    let col = |name: &str| {
+        table
+            .columns
+            .iter()
+            .position(|c| c == name)
+            .ok_or_else(|| format!("neighbours table has no `{name}` column"))
+    };
+    let key = col("network_key")?;
+    let mac = col("mac")?;
+    let ip = col("ip")?;
+    let hostname = col("hostname")?;
+    let source = col("source")?;
+    let first_seen = col("first_seen_us")?;
+    let last_seen = col("last_seen_us")?;
+
+    let Some(network_key) = network_key else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for row in &table.rows {
+        let cell = |i: usize| row.get(i).map_or("", String::as_str);
+        // The source token is the enum's own spelling (`types::NeighborSource`),
+        // parsed rather than compared to a retyped literal.
+        let announce = matches!(
+            cell(source).parse::<NeighborSource>(),
+            Ok(NeighborSource::Announce)
+        );
+        if !announce || !cell(key).eq_ignore_ascii_case(network_key) {
+            continue;
+        }
+        let bound = |i: usize, what: &str| {
+            cell(i).parse::<i64>().map_err(|_| {
+                format!(
+                    "neighbour {}: `{what}` is not a moment: `{}`",
+                    cell(mac),
+                    cell(i)
+                )
+            })
+        };
+        out.push(AnnouncedNeighbor {
+            mac: cell(mac).to_string(),
+            ip: cell(ip).to_string(),
+            hostname: Some(cell(hostname))
+                .filter(|h| !h.is_empty())
+                .map(str::to_string),
+            first_seen_us: bound(first_seen, "first_seen_us")?,
+            last_seen_us: bound(last_seen, "last_seen_us")?,
+        });
+    }
+    Ok(out)
+}
+
+/// The announced devices the star and the list add to the reading: those still
+/// present at `now_us` ([`AnnouncedNeighbor::is_present`]) that the reading
+/// does NOT already carry. A device in both keeps its scanned node and gets no
+/// second one — the reading outranks the record for a device it can see, and
+/// two chips for one MAC would draw a neighbour that is not there. The join is
+/// by MAC, case-insensitive, like every other join in this module. Pure, so
+/// the merge rule and the staleness rule are testable without a window.
+fn announced_overlay(
+    announced: &[AnnouncedNeighbor],
+    sample: &NeighborsSample,
+    now_us: i64,
+) -> Vec<AnnouncedNeighbor> {
+    announced
+        .iter()
+        .filter(|a| a.is_present(now_us))
+        .filter(|a| {
+            !sample
+                .neighbors
+                .iter()
+                .any(|obs| obs.mac.eq_ignore_ascii_case(&a.mac))
+        })
+        .cloned()
+        .collect()
+}
+
+/// What the window's last `Neighbors` read amounts to for THIS snapshot: the
+/// overlay, or the words for why there is none. `None` (not read yet) and a
+/// snapshot with no reading both fold to an empty overlay; a read the daemon
+/// refused, and a table the fold could not read, are the `Err` the sections
+/// draw as a line. Folded at paint time, not at read time, because both
+/// inputs the fold depends on — the segment key and the snapshot's clock —
+/// are live on the snapshot and change under an open window.
+fn announced_for(
+    announced: Option<&Result<Table, String>>,
+    snapshot: &StatusSnapshot,
+) -> Result<Vec<AnnouncedNeighbor>, String> {
+    match (announced, snapshot.neighbors.as_ref()) {
+        (Some(Ok(table)), Some(sample)) => {
+            announced_neighbors(table, sample.network_key.as_deref())
+                .map(|rows| announced_overlay(&rows, sample, snapshot.generated_us))
+        }
+        (Some(Err(why)), _) => Err(why.clone()),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -234,7 +448,16 @@ fn short_mac(mac: &str) -> String {
 /// the sample's `network_key` (the gateway's MAC is the segment's identity). When
 /// no such neighbour is present the gateway slot is `None` and the caller draws a
 /// placeholder — the ring is still the segment.
-fn partition(sample: &NeighborsSample, capacity: usize) -> (Option<MapNode>, Vec<MapNode>, usize) {
+///
+/// `announced` — the announce overlay ([`announced_overlay`]), already reduced
+/// to devices the sample does not carry — joins the ring AFTER the reading's
+/// own neighbours, so the one cap governs both and a scanned device is never
+/// the one summarised away to make room for an announced one.
+fn partition(
+    sample: &NeighborsSample,
+    announced: &[AnnouncedNeighbor],
+    capacity: usize,
+) -> (Option<MapNode>, Vec<MapNode>, usize) {
     let key = sample.network_key.as_deref();
     let mut gateway = None;
     let mut ring = Vec::new();
@@ -245,6 +468,7 @@ fn partition(sample: &NeighborsSample, capacity: usize) -> (Option<MapNode>, Vec
             ring.push(MapNode::from_obs(obs));
         }
     }
+    ring.extend(announced.iter().map(MapNode::from_announced));
     // Cap by what the ring at THIS window's radius can hold without overlap,
     // never above the first-version ceiling; the remainder is summarised as
     // "+N more" — and is always fully visible in the list view, which has no
@@ -293,9 +517,16 @@ fn ring_positions(n: usize, cx: f32, cy: f32, r: f32) -> Vec<(f32, f32)> {
 /// primary ink; an unknown role (randomized MAC, or no OUI snapshot to reason
 /// from) is muted, reading as least load-bearing. The role is a HYPOTHESIS: a
 /// colour, never an asserted "SWITCH". (realm net-observer, nodes #33, #34, #36)
+///
+/// An announced-only node takes the announce ink before its role is looked at:
+/// the record carries no role for it, and the ink says what the node is —
+/// a device that said so itself (realm net-observer, node #92).
 fn node_accent(node: &MapNode, is_gateway: bool, theme: Theme) -> Rgba {
     if is_gateway {
         return rgb(theme.accent);
+    }
+    if node.announced {
+        return rgb(theme.announce);
     }
     match node.role {
         NeighborRole::Gateway => rgb(theme.accent),
@@ -369,6 +600,34 @@ fn role_basis(role: NeighborRole, is_gateway: bool) -> &'static str {
     }
 }
 
+/// The glyph, the words and the grounds for one node — its role's, unless the
+/// node is announced-only, whose provenance outranks a role it does not have.
+/// The three are decided together so a chip and a list row can never pair an
+/// announce glyph with a role's words, or the reverse.
+fn node_glyph(node: &MapNode, is_gateway: bool) -> &'static str {
+    if node.announced && !is_gateway {
+        ANNOUNCE_GLYPH
+    } else {
+        role_glyph(node.role, is_gateway)
+    }
+}
+
+fn node_role_label(node: &MapNode, is_gateway: bool) -> String {
+    if node.announced && !is_gateway {
+        "announced".to_string()
+    } else {
+        role_label(node.role, is_gateway)
+    }
+}
+
+fn node_role_basis(node: &MapNode, is_gateway: bool) -> &'static str {
+    if node.announced && !is_gateway {
+        ANNOUNCE_BASIS
+    } else {
+        role_basis(node.role, is_gateway)
+    }
+}
+
 /// One node chip: a role glyph and a short label over the address. The gateway is
 /// filled and bold so the segment's identity reads first; a neighbour is a light
 /// outlined chip.
@@ -399,10 +658,17 @@ fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement
     if is_gateway {
         chip = chip.bg(rgb(theme.accent)).text_color(rgb(theme.knob));
     } else {
+        // An announced-only chip carries its ink on the outline too, so the
+        // provenance reads at a glance and not only from a 10px glyph.
+        let outline = if node.announced {
+            theme.announce
+        } else {
+            theme.separator
+        };
         chip = chip
             .bg(rgba(theme.surface))
             .border_1()
-            .border_color(rgb(theme.separator))
+            .border_color(rgb(outline))
             .text_color(rgb(theme.fg));
     }
     let dot_color = if is_gateway { rgb(theme.knob) } else { dot };
@@ -418,7 +684,7 @@ fn node_chip(node: &MapNode, is_gateway: bool, theme: Theme) -> impl IntoElement
             .flex_shrink_0()
             .text_size(px(10.0))
             .text_color(dot_color)
-            .child(role_glyph(node.role, is_gateway)),
+            .child(node_glyph(node, is_gateway)),
     )
     .child(
         // Identity on top, address beneath — the node is named AND addressed.
@@ -806,6 +1072,11 @@ fn uplink_card(node: &UplinkNode, now_us: i64, theme: Theme) -> impl IntoElement
 }
 
 /// Place a chip at a centre point inside the relative map area.
+///
+/// An announced-only node's wrapper carries `map-node-announce:<mac>` — a test
+/// handle only, distinct from the chip's own `map-chip:<label>` so a headless
+/// test can tell "this device is drawn" from "this device is drawn as
+/// announced", and can assert the second is absent while the first is not.
 fn placed_chip(
     node: &MapNode,
     is_gateway: bool,
@@ -813,20 +1084,44 @@ fn placed_chip(
     cy: f32,
     theme: Theme,
 ) -> impl IntoElement {
+    let announce_selector = node
+        .announced
+        .then(|| format!("map-node-announce:{}", node.mac));
     div()
         .absolute()
         .left(px(cx - CHIP_W / 2.0))
         .top(px(cy - CHIP_H / 2.0))
+        .when_some(announce_selector, |d, selector| {
+            d.debug_selector(move || selector)
+        })
         .child(node_chip(node, is_gateway, theme))
 }
 
+/// The line both readings draw when the announce overlay could not be read:
+/// the daemon's own words (or the fold's, naming the column or cell it could
+/// not read), under a selector carrying them. Warn ink: an absence the daemon
+/// caused, not the state of the record.
+fn announce_error_note(why: &str, theme: Theme) -> gpui::AnyElement {
+    note(
+        "map-announced-error",
+        format!("announced neighbours unavailable: {why}"),
+        theme.warn,
+    )
+}
+
 /// The network-map section, rendered from the latest neighbour sample already on
-/// the snapshot. No socket, no collection — a re-shape of `snapshot.neighbors`.
+/// the snapshot — a re-shape of `snapshot.neighbors` — plus the announce
+/// overlay folded from the window's last `Neighbors` read (`announced`, see
+/// [`announced_for`]): the devices the record heard announce themselves on
+/// this segment that the reading does not carry.
 ///
 /// Renders an honest empty state when there is no sample yet, the reading could
-/// not run, or nobody answered — never a blank panel.
+/// not run, or nobody answered — never a blank panel. A failed overlay read is
+/// a line in every state of the star, since the overlay would have been drawn
+/// in every state.
 pub(crate) fn network_map_section(
     snapshot: &StatusSnapshot,
+    announced: Option<&Result<Table, String>>,
     plot: Plot,
     theme: Theme,
 ) -> impl IntoElement {
@@ -837,8 +1132,15 @@ pub(crate) fn network_map_section(
     let (uplink_nodes_v, uplink_dropped) = uplinks(snapshot);
     let has_uplinks = !uplink_nodes_v.is_empty();
 
+    let (overlay, announce_note) = match announced_for(announced, snapshot) {
+        Ok(nodes) => (nodes, None),
+        Err(why) => (Vec::new(), Some(announce_error_note(&why, theme))),
+    };
+
     let sample = snapshot.neighbors.as_ref();
-    let neighbours_empty = sample.is_none_or(|s| s.neighbors.is_empty());
+    // An announced-only device is a star too: a reading that found nobody on
+    // a segment the record heard someone announce on still has a ring.
+    let neighbours_empty = sample.is_none_or(|s| s.neighbors.is_empty()) && overlay.is_empty();
 
     // Only a truly empty panel — no neighbours AND no uplinks — is the honest
     // empty state; uplinks alone are still worth drawing.
@@ -850,18 +1152,20 @@ pub(crate) fn network_map_section(
                 None => "no neighbours seen \u{00b7} press Scan to look".to_string(),
             },
         };
-        return empty_state(base, msg, theme);
+        return empty_state(base.children(announce_note), msg, theme);
     }
 
     // Uplinks but no neighbour star yet: draw just the uplink strip.
     if neighbours_empty {
         return base
+            .children(announce_note)
             .child(uplink_strip(&uplink_nodes_v, uplink_dropped, theme))
             .into_any_element();
     }
+    // Holds for the overlay too: `announced_for` folds nothing without a sample.
     let sample = sample.expect("neighbours non-empty implies a sample");
 
-    let (gateway, ring, dropped) = partition(sample, plot.capacity);
+    let (gateway, ring, dropped) = partition(sample, &overlay, plot.capacity);
 
     // Centre and radius come from the window's real size (see `plot_for`), so a
     // maximised window spreads the star over it instead of pinning a fixed-size
@@ -914,6 +1218,7 @@ pub(crate) fn network_map_section(
                             label: "gateway ?".to_string(),
                             ip: String::new(),
                             role: NeighborRole::Gateway,
+                            announced: false,
                         },
                         true,
                         theme,
@@ -943,6 +1248,10 @@ pub(crate) fn network_map_section(
                 .child(skew),
         );
     }
+    // The overlay's failure line sits with the other lines about the picture's
+    // provenance, above it — like the skew line, a conditional line the chrome
+    // estimate tolerates.
+    section = section.children(announce_note);
     section = section.child(area);
     if dropped > 0 {
         section = section.child(hint(
@@ -965,6 +1274,10 @@ pub(crate) fn network_map_section(
 /// Without this the glyphs are an unexplained alphabet, and a `▣` reads as a
 /// measured fact about a device. The roles are inferred from the OUI vendor and
 /// from behaviour, never measured. (realm net-observer, node #36)
+///
+/// The `announced` entry is the one drawn in its own ink, so the key names the
+/// colour as well as the glyph: a node in that ink is a device the record heard
+/// announce itself and the reading did not list (realm net-observer, node #92).
 fn role_legend(theme: Theme) -> impl IntoElement {
     div()
         .flex()
@@ -972,12 +1285,27 @@ fn role_legend(theme: Theme) -> impl IntoElement {
         .pt_1()
         .text_size(px(10.0))
         .text_color(rgb(theme.muted))
-        .child(div().child(join_parts(&[
-            "\u{21C5} gateway",
-            "\u{25A3} infra?",
-            "\u{25CF} host",
-            "? unknown",
-        ])))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .child(div().child(join_parts(&[
+                    "\u{21C5} gateway",
+                    "\u{25A3} infra?",
+                    "\u{25CF} host",
+                    "? unknown",
+                ])))
+                .child(
+                    div()
+                        // Test handle only: the legend entry is what names the
+                        // announce ink, so a headless test must find it.
+                        .debug_selector(|| "map-legend-announced".into())
+                        .text_color(rgb(theme.announce))
+                        .child(format!("\u{00b7} {ANNOUNCE_GLYPH} announced")),
+                ),
+        )
         .child(div().child(
             "role is inferred from vendor OUI and behaviour, not measured \u{00b7} \
                  the list gives the grounds for each",
@@ -1121,17 +1449,35 @@ fn lifetime_caption(sample: &NeighborsSample, snapshot: &StatusSnapshot) -> Stri
 /// field, joined here by MAC. A neighbour with no lifetime entry (an older
 /// daemon, or a store read that failed) reads `unknown`; it must never read as
 /// though it were first seen on this tick. (realm net-observer, node #43)
-fn neighbour_list(snapshot: &StatusSnapshot, theme: Theme) -> gpui::AnyElement {
+///
+/// The announced tail: after the reading's rows come the devices the record
+/// heard announce themselves on this segment that the reading does not carry
+/// ([`announced_overlay`]), each with `announce` in the `via` column and the
+/// record's own bounds in the since-when cells — it *is* the record row, so
+/// those are never `unknown` for it. (realm net-observer, node #92)
+fn neighbour_list(
+    snapshot: &StatusSnapshot,
+    announced: Option<&Result<Table, String>>,
+    theme: Theme,
+) -> gpui::AnyElement {
     let base = div().flex().flex_col().px_3().py_2();
-    let Some(sample) = snapshot.neighbors.as_ref() else {
-        return empty_state(base, "no neighbour reading yet", theme);
+    let (tail, announce_note) = match announced_for(announced, snapshot) {
+        Ok(tail) => (tail, None),
+        Err(why) => (Vec::new(), Some(announce_error_note(&why, theme))),
     };
-    if sample.neighbors.is_empty() {
+    let Some(sample) = snapshot.neighbors.as_ref() else {
+        return empty_state(
+            base.children(announce_note),
+            "no neighbour reading yet",
+            theme,
+        );
+    };
+    if sample.neighbors.is_empty() && tail.is_empty() {
         let msg = match &sample.reason {
             Some(reason) => format!("no neighbours: {reason}"),
             None => "no neighbours seen \u{00b7} press Rescan to look".to_string(),
         };
-        return empty_state(base, msg, theme);
+        return empty_state(base.children(announce_note), msg, theme);
     }
 
     let key = sample.network_key.as_deref();
@@ -1155,114 +1501,22 @@ fn neighbour_list(snapshot: &StatusSnapshot, theme: Theme) -> gpui::AnyElement {
     rows = rows.child(separator(theme));
 
     for obs in &sample.neighbors {
-        let lifetime = lifetime_for(snapshot, &obs.mac);
         let is_gateway = key.is_some_and(|k| k.eq_ignore_ascii_case(&obs.mac));
-        let node = MapNode::from_obs(obs);
-        let accent = node_accent(&node, is_gateway, theme);
-        let name = obs
-            .hostname
-            .as_deref()
-            .filter(|h| !h.is_empty())
-            .map_or_else(|| node.label.clone(), str::to_string);
-        rows = rows.child(
-            div()
-                .flex()
-                .w_full()
-                .py_0p5()
-                .items_start()
-                .text_size(px(11.0))
-                .child(
-                    div()
-                        .w(px(96.0))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_color(accent)
-                                .child(role_glyph(node.role, is_gateway)),
-                        )
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(role_label(node.role, is_gateway)),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(80.0))
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .child(name),
-                        )
-                        // The grounds for the role, so the glyph is never the
-                        // whole story.
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_size(px(9.0))
-                                .text_color(rgb(theme.muted))
-                                .child(role_basis(node.role, is_gateway)),
-                        ),
-                )
-                .child(
-                    div()
-                        .w(px(120.0))
-                        .flex_shrink_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(obs.ip.clone()),
-                )
-                .child(
-                    div()
-                        .w(px(140.0))
-                        .flex_shrink_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_color(rgb(theme.muted))
-                        .child(obs.mac.clone()),
-                )
-                .child(
-                    div()
-                        .w(px(64.0))
-                        .flex_shrink_0()
-                        .text_size(px(10.0))
-                        .text_color(rgb(theme.muted))
-                        .child(format!("{:?}", obs.source).to_lowercase()),
-                )
-                .child(
-                    div()
-                        .w(px(84.0))
-                        .flex_shrink_0()
-                        .text_size(px(10.0))
-                        .text_color(rgb(theme.muted))
-                        .child(lifetime_cell(lifetime.map(|lt| lt.first_seen_us), now)),
-                )
-                .child(
-                    div()
-                        .w(px(84.0))
-                        .flex_shrink_0()
-                        .text_size(px(10.0))
-                        .text_color(rgb(theme.muted))
-                        .child(lifetime_cell(lifetime.map(|lt| lt.last_seen_us), now)),
-                ),
-        );
+        rows = rows.child(list_row(
+            &ListRow::from_obs(obs, snapshot, is_gateway),
+            now,
+            theme,
+        ));
+    }
+    for a in &tail {
+        rows = rows.child(list_row(&ListRow::from_announced(a), now, theme));
     }
 
+    let announced_clause = if tail.is_empty() {
+        String::new()
+    } else {
+        format!("+{} announced", tail.len())
+    };
     base.child(
         div()
             .pb_1()
@@ -1275,11 +1529,180 @@ fn neighbour_list(snapshot: &StatusSnapshot, theme: Theme) -> gpui::AnyElement {
                     sample.neighbors.len(),
                     if sample.neighbors.len() == 1 { "" } else { "s" }
                 ),
+                &announced_clause,
                 &lifetime_caption(sample, snapshot),
             ])),
     )
     .child(rows)
+    .children(announce_note)
     .into_any_element()
+}
+
+/// What one list row draws, gathered before drawing so the reading's rows and
+/// the announced tail go through the one builder ([`list_row`]) — the columns
+/// are the same, only where each cell comes from differs.
+struct ListRow {
+    node: MapNode,
+    is_gateway: bool,
+    /// The identity cell: the hostname when there is one, else the chip label.
+    name: String,
+    /// The `via` cell: the reading's source token, or `announce`.
+    via: String,
+    /// The record's bounds for the since-when cells, `None` where unknown.
+    first_seen_us: Option<i64>,
+    last_seen_us: Option<i64>,
+}
+
+impl ListRow {
+    /// A row of the reading: the observation, with its lifetime joined by MAC
+    /// from the snapshot's separate list — `None`, hence `unknown`, when the
+    /// daemon sent none for it (realm net-observer, node #43).
+    fn from_obs(obs: &NeighborObs, snapshot: &StatusSnapshot, is_gateway: bool) -> Self {
+        let lifetime = lifetime_for(snapshot, &obs.mac);
+        let node = MapNode::from_obs(obs);
+        let name = obs
+            .hostname
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .map_or_else(|| node.label.clone(), str::to_string);
+        Self {
+            node,
+            is_gateway,
+            name,
+            via: format!("{:?}", obs.source).to_lowercase(),
+            first_seen_us: lifetime.map(|lt| lt.first_seen_us),
+            last_seen_us: lifetime.map(|lt| lt.last_seen_us),
+        }
+    }
+
+    /// A row of the announced tail: never the gateway (the segment key is the
+    /// reading's, and a device the reading carries is not in the tail), with
+    /// the record row's own bounds.
+    fn from_announced(a: &AnnouncedNeighbor) -> Self {
+        let node = MapNode::from_announced(a);
+        let name = a
+            .hostname
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .map_or_else(|| node.label.clone(), str::to_string);
+        Self {
+            node,
+            is_gateway: false,
+            name,
+            via: NeighborSource::Announce.to_string(),
+            first_seen_us: Some(a.first_seen_us),
+            last_seen_us: Some(a.last_seen_us),
+        }
+    }
+}
+
+/// One row of the neighbour list. An announced row's wrapper carries
+/// `map-list-announce:<mac>` — a test handle only, so a headless test can find
+/// the tail by the device it names.
+fn list_row(row: &ListRow, now_us: i64, theme: Theme) -> impl IntoElement {
+    let accent = node_accent(&row.node, row.is_gateway, theme);
+    let announce_selector = row
+        .node
+        .announced
+        .then(|| format!("map-list-announce:{}", row.node.mac));
+    div()
+        .flex()
+        .w_full()
+        .py_0p5()
+        .items_start()
+        .text_size(px(11.0))
+        .when_some(announce_selector, |d, selector| {
+            d.debug_selector(move || selector)
+        })
+        .child(
+            div()
+                .w(px(96.0))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .text_color(accent)
+                        .child(node_glyph(&row.node, row.is_gateway)),
+                )
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(node_role_label(&row.node, row.is_gateway)),
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(80.0))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(row.name.clone()),
+                )
+                // The grounds for the role, so the glyph is never the
+                // whole story.
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(9.0))
+                        .text_color(rgb(theme.muted))
+                        .child(node_role_basis(&row.node, row.is_gateway)),
+                ),
+        )
+        .child(
+            div()
+                .w(px(120.0))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(row.node.ip.clone()),
+        )
+        .child(
+            div()
+                .w(px(140.0))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_color(rgb(theme.muted))
+                .child(row.node.mac.clone()),
+        )
+        .child(
+            div()
+                .w(px(64.0))
+                .flex_shrink_0()
+                .text_size(px(10.0))
+                .text_color(rgb(theme.muted))
+                .child(row.via.clone()),
+        )
+        .child(
+            div()
+                .w(px(84.0))
+                .flex_shrink_0()
+                .text_size(px(10.0))
+                .text_color(rgb(theme.muted))
+                .child(lifetime_cell(row.first_seen_us, now_us)),
+        )
+        .child(
+            div()
+                .w(px(84.0))
+                .flex_shrink_0()
+                .text_size(px(10.0))
+                .text_color(rgb(theme.muted))
+                .child(lifetime_cell(row.last_seen_us, now_us)),
+        )
 }
 
 /// One host's findings as the section draws them.
@@ -1505,8 +1928,9 @@ fn offline_note(reason: &str, theme: Theme) -> impl IntoElement + use<> {
 /// panel uses (the menu-bar refresh timer writes the snapshot every ~3s; see
 /// [`crate::menubar`]). The star and the list are reshaped from
 /// `snapshot.neighbors` on that model (see [`network_map_section`]); the
-/// findings are the one thing this window asks the daemon for itself — once
-/// per open and once per completed rung ([`MapView::spawn_findings_fetch`]),
+/// findings and the record's neighbour table are what this window asks the
+/// daemon for itself — once per open and once per completed rung
+/// ([`MapView::spawn_findings_fetch`], [`MapView::spawn_announced_fetch`]),
 /// never on a timer. It still holds no subscription of its own.
 pub(crate) struct MapView {
     model: Entity<Glance>,
@@ -1529,6 +1953,18 @@ pub(crate) struct MapView {
     /// each rung completes ([`MapView::spawn_findings_fetch`]) — never on a
     /// timer, because the record changes only when a scan runs.
     findings: Option<Result<Table, String>>,
+    /// The daemon's last answer to `DiagnosticQuery::Neighbors`: the record's
+    /// neighbour table on every segment, or the daemon's words for why there
+    /// is none; `None` until the first read returns. The star and the list
+    /// fold the announced devices of the segment they are drawing out of it
+    /// at each paint ([`announced_for`]) — kept as the table, not as the
+    /// fold, because the fold's inputs (the segment key, the snapshot's
+    /// clock) are live. Fetched beside the findings, at the same two moments
+    /// ([`MapView::spawn_announced_fetch`]); between them the overlay ages
+    /// against the live clock until the staleness rule withdraws it, so a
+    /// device that kept announcing is withdrawn too until the next read —
+    /// an absence, never a stale presence. (realm net-observer, node #92)
+    announced: Option<Result<Table, String>>,
     _observe: Subscription,
 }
 
@@ -1566,6 +2002,7 @@ impl MapView {
             mode: MapMode::Graph,
             scan_in_flight: false,
             findings: None,
+            announced: None,
             _observe: observe,
         }
     }
@@ -1593,6 +2030,27 @@ impl MapView {
         .detach();
     }
 
+    /// Ask the daemon for the record's neighbour table on the background
+    /// executor and keep the answer (see [`crate::ui::fetch_neighbors`]) —
+    /// [`MapView::spawn_findings_fetch`] to the letter, for the announce
+    /// overlay, and called at the same two moments. Not part of
+    /// [`MapView::new`] for the same reason: a headless test injects the
+    /// `announced` state and no socket read then races to overwrite it.
+    fn spawn_announced_fetch(&self, cx: &mut Context<Self>) {
+        let socket = self.model.read(cx).socket_path.clone();
+        cx.spawn(async move |view, acx: &mut AsyncApp| {
+            let announced = acx
+                .background_spawn(async move { crate::ui::fetch_neighbors(&socket) })
+                .await;
+            view.update(acx, |v, cx| {
+                v.announced = Some(announced);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Start one rung's round-trip: raise the in-flight flag (the rungs go
     /// inert on the next paint) and run it through the shared control wiring
     /// with [`MapView::scan_finished`] as the completion hook.
@@ -1604,12 +2062,14 @@ impl MapView {
 
     /// The rung's completion hook: the daemon's answer is already on the shared
     /// model (the control line shows it), so lower the flag and re-read the
-    /// findings the run may have produced. Runs whether the command succeeded,
-    /// was refused, or found no daemon — a flag that stayed raised would leave
-    /// the rungs inert for good.
+    /// findings the run may have produced — and the record's neighbour table,
+    /// which the listener may have grown meanwhile. Runs whether the command
+    /// succeeded, was refused, or found no daemon — a flag that stayed raised
+    /// would leave the rungs inert for good.
     fn scan_finished(&mut self, cx: &mut Context<Self>) {
         self.scan_in_flight = false;
         self.spawn_findings_fetch(cx);
+        self.spawn_announced_fetch(cx);
     }
 }
 
@@ -1639,8 +2099,9 @@ impl Render for MapView {
         );
 
         let body = match mode {
-            MapMode::Graph => network_map_section(&snapshot, plot, theme).into_any_element(),
-            MapMode::List => neighbour_list(&snapshot, theme),
+            MapMode::Graph => network_map_section(&snapshot, self.announced.as_ref(), plot, theme)
+                .into_any_element(),
+            MapMode::List => neighbour_list(&snapshot, self.announced.as_ref(), theme),
             MapMode::Findings => findings_section(self.findings.as_ref(), theme),
         };
 
@@ -1848,9 +2309,10 @@ fn open_window(cx: &mut App, model: Entity<Glance>) -> Option<WindowHandle<MapVi
     match cx.open_window(options, move |_window, cx| {
         cx.new(|cx| {
             let view = MapView::new(model, cx);
-            // The first findings read belongs to the open, not to the
-            // constructor (see `MapView::spawn_findings_fetch`).
+            // The first findings and neighbour-table reads belong to the open,
+            // not to the constructor (see `MapView::spawn_findings_fetch`).
             view.spawn_findings_fetch(cx);
+            view.spawn_announced_fetch(cx);
             view
         })
     }) {
@@ -1909,6 +2371,7 @@ mod tests {
             label: "x".into(),
             ip: "192.168.1.2".into(),
             role,
+            announced: false,
         };
         for appearance in [gpui::WindowAppearance::Dark, gpui::WindowAppearance::Light] {
             let theme = Theme::for_appearance(appearance);
@@ -1927,6 +2390,29 @@ mod tests {
             // The gateway flag wins over whatever role the node carries.
             let gw = node_accent(&node(NeighborRole::Host), true, theme);
             assert_eq!(gw, rgb(theme.accent));
+            // An announced-only node is its own ink — none of the role inks,
+            // or a device that said so itself would read as a scanned one.
+            let mut announced = node(NeighborRole::Unknown);
+            announced.announced = true;
+            let announce = node_accent(&announced, false, theme);
+            assert_eq!(announce, rgb(theme.announce));
+            for (other, what) in [
+                (host, "host"),
+                (infra, "infra"),
+                (unknown, "unknown"),
+                (gw, "gateway"),
+            ] {
+                assert_ne!(announce, other, "announced must not read as {what}");
+            }
+            // And its glyph, words and grounds are its own, not the unknown
+            // role's — which would claim the caches listed it.
+            assert_eq!(node_glyph(&announced, false), ANNOUNCE_GLYPH);
+            assert_eq!(node_role_label(&announced, false), "announced");
+            assert_eq!(node_role_basis(&announced, false), ANNOUNCE_BASIS);
+            assert_ne!(
+                node_glyph(&announced, false),
+                role_glyph(NeighborRole::Unknown, false)
+            );
         }
     }
 
@@ -1994,7 +2480,7 @@ mod tests {
                 ),
             ],
         );
-        let (gateway, ring, dropped) = partition(&s, test_plot().capacity);
+        let (gateway, ring, dropped) = partition(&s, &[], test_plot().capacity);
         assert_eq!(gateway.unwrap().mac, "gg:gg:gg:gg:gg:gg");
         assert_eq!(ring.len(), 1);
         assert_eq!(ring[0].mac, "11:11:11:11:11:11");
@@ -2012,7 +2498,7 @@ mod tests {
                 None,
             )],
         );
-        let (gateway, ring, _) = partition(&s, test_plot().capacity);
+        let (gateway, ring, _) = partition(&s, &[], test_plot().capacity);
         assert!(gateway.is_none());
         assert_eq!(ring.len(), 1);
     }
@@ -2032,7 +2518,7 @@ mod tests {
             })
             .collect();
         let plot = test_plot();
-        let (_gw, ring, dropped) = partition(&sample(None, neighbors), plot.capacity);
+        let (_gw, ring, dropped) = partition(&sample(None, neighbors), &[], plot.capacity);
         let cap = plot.capacity.min(MAX_RING);
         assert_eq!(
             ring.len(),
@@ -2224,6 +2710,313 @@ mod tests {
         );
     }
 
+    /// The daemon's `Neighbors` table, as the fold reads it: the nine columns
+    /// of `neighbors_sql` in the daemon's own order (`network_key, mac, ip,
+    /// oui, hostname, source, iface, first_seen_us, last_seen_us`). Shared
+    /// with the headless suite.
+    pub(super) fn neighbors_table(rows: Vec<[&str; 9]>) -> Table {
+        Table {
+            columns: [
+                "network_key",
+                "mac",
+                "ip",
+                "oui",
+                "hostname",
+                "source",
+                "iface",
+                "first_seen_us",
+                "last_seen_us",
+            ]
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+            rows: rows
+                .into_iter()
+                .map(|r| r.iter().map(|c| c.to_string()).collect())
+                .collect(),
+        }
+    }
+
+    /// The segment the announce fixtures are on, and one they are not.
+    const SEG_A: &str = "gg:gg:gg:gg:gg:gg";
+    const SEG_B: &str = "hh:hh:hh:hh:hh:hh";
+
+    /// The fold keeps exactly the `announce` rows of the one segment the star
+    /// is drawing — mixed sources and two segments in, only this segment's
+    /// announced devices out, in the table's order — and a keyless star folds
+    /// nothing, because the record files a keyless segment's devices under a
+    /// key every unidentified segment shares.
+    #[test]
+    fn announced_rows_are_folded_by_segment_and_source() {
+        let table = neighbors_table(vec![
+            // This segment, announced: kept.
+            [
+                SEG_A,
+                "aa:bb:cc:dd:ee:30",
+                "192.168.1.30",
+                "aa:bb:cc",
+                "echo.local",
+                "announce",
+                "en0",
+                "1000",
+                "5000",
+            ],
+            // This segment, from the cache: not the overlay's.
+            [
+                SEG_A,
+                "aa:bb:cc:dd:ee:20",
+                "192.168.1.20",
+                "aa:bb:cc",
+                "",
+                "arp",
+                "en0",
+                "1000",
+                "5000",
+            ],
+            // Another segment, announced: ignored — the star is one segment.
+            [
+                SEG_B,
+                "aa:bb:cc:dd:ee:31",
+                "10.0.0.31",
+                "aa:bb:cc",
+                "foxtrot.local",
+                "announce",
+                "en0",
+                "1000",
+                "5000",
+            ],
+            // This segment, announced, no name and no address yet: kept, with
+            // `None` for the name rather than an empty string.
+            [
+                SEG_A,
+                "aa:bb:cc:dd:ee:32",
+                "",
+                "aa:bb:cc",
+                "",
+                "announce",
+                "en0",
+                "2000",
+                "6000",
+            ],
+            // This segment, from a scan: not the overlay's.
+            [
+                SEG_A,
+                "aa:bb:cc:dd:ee:21",
+                "192.168.1.21",
+                "aa:bb:cc",
+                "",
+                "sweep",
+                "en0",
+                "1000",
+                "5000",
+            ],
+        ]);
+        let folded = announced_neighbors(&table, Some(SEG_A)).expect("a well-formed table");
+        assert_eq!(
+            folded,
+            vec![
+                AnnouncedNeighbor {
+                    mac: "aa:bb:cc:dd:ee:30".to_string(),
+                    ip: "192.168.1.30".to_string(),
+                    hostname: Some("echo.local".to_string()),
+                    first_seen_us: 1000,
+                    last_seen_us: 5000,
+                },
+                AnnouncedNeighbor {
+                    mac: "aa:bb:cc:dd:ee:32".to_string(),
+                    ip: String::new(),
+                    hostname: None,
+                    first_seen_us: 2000,
+                    last_seen_us: 6000,
+                },
+            ]
+        );
+        // The segment key is a MAC, joined like every MAC here: case-blind.
+        assert_eq!(
+            announced_neighbors(&table, Some(&SEG_A.to_ascii_uppercase())).unwrap(),
+            folded
+        );
+        // The other segment's fold is its own device only.
+        let other = announced_neighbors(&table, Some(SEG_B)).unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].mac, "aa:bb:cc:dd:ee:31");
+        // No key, no segment, nothing folded.
+        assert!(announced_neighbors(&table, None).unwrap().is_empty());
+    }
+
+    /// A table the fold cannot read is named, never drawn from whatever sat at
+    /// a position: a missing column by its name, a bound that is not a moment
+    /// by the device it belongs to.
+    #[test]
+    fn an_unreadable_neighbours_table_is_named_not_misread() {
+        let mut table = neighbors_table(vec![]);
+        table.columns.retain(|c| c != "last_seen_us");
+        let why =
+            announced_neighbors(&table, Some(SEG_A)).expect_err("a missing column is an error");
+        assert!(
+            why.contains("`last_seen_us`"),
+            "must name the column: {why}"
+        );
+
+        let bad = neighbors_table(vec![[
+            SEG_A,
+            "aa:bb:cc:dd:ee:30",
+            "192.168.1.30",
+            "aa:bb:cc",
+            "",
+            "announce",
+            "en0",
+            "1000",
+            "yesterday",
+        ]]);
+        let why = announced_neighbors(&bad, Some(SEG_A))
+            .expect_err("a bound that does not parse is an error, not a fresh device");
+        assert!(
+            why.contains("aa:bb:cc:dd:ee:30"),
+            "must name the device: {why}"
+        );
+        assert!(why.contains("last_seen_us"), "must name the cell: {why}");
+        // A row of another source with an unreadable bound is never read at
+        // all — it is not the fold's to judge.
+        let mut other = bad.clone();
+        other.rows[0][5] = "arp".to_string();
+        assert!(announced_neighbors(&other, Some(SEG_A)).unwrap().is_empty());
+    }
+
+    fn announced(mac: &str, last_seen_us: i64) -> AnnouncedNeighbor {
+        AnnouncedNeighbor {
+            mac: mac.to_string(),
+            ip: "192.168.1.9".to_string(),
+            hostname: None,
+            first_seen_us: 1,
+            last_seen_us,
+        }
+    }
+
+    /// The record keeps history, the map shows presence: an announcement
+    /// older than [`ANNOUNCE_STALE_US`] against the snapshot's clock is not
+    /// drawn, one exactly that old still is, and one from after the snapshot
+    /// (a read newer than the snapshot) is present rather than stale.
+    #[test]
+    fn stale_announcements_are_not_drawn() {
+        let now = 10_000_000_000i64;
+        let s = sample(Some(SEG_A), vec![]);
+        let fresh = announced("aa:bb:cc:dd:ee:40", now - 1);
+        let at_the_edge = announced("aa:bb:cc:dd:ee:41", now - ANNOUNCE_STALE_US);
+        let stale = announced("aa:bb:cc:dd:ee:42", now - ANNOUNCE_STALE_US - 1);
+        let ahead = announced("aa:bb:cc:dd:ee:43", now + 5_000_000);
+        let overlay = announced_overlay(
+            &[fresh.clone(), at_the_edge.clone(), stale, ahead.clone()],
+            &s,
+            now,
+        );
+        assert_eq!(overlay, vec![fresh, at_the_edge, ahead]);
+        assert_eq!(ANNOUNCE_STALE_US, 600_000_000, "ten minutes, in µs");
+    }
+
+    /// A device the reading carries keeps its scanned node and gets no
+    /// second one from the record: the overlay is only what the reading does
+    /// NOT have, joined by MAC whatever its case — and the ring seats the
+    /// reading's devices before the announced ones, under the one cap.
+    #[test]
+    fn an_announced_device_in_the_reading_keeps_its_scanned_node() {
+        let s = sample(
+            Some(SEG_A),
+            vec![
+                obs(SEG_A, "192.168.1.1", NeighborSource::Arp, None),
+                obs(
+                    "aa:bb:cc:dd:ee:20",
+                    "192.168.1.20",
+                    NeighborSource::Arp,
+                    None,
+                ),
+            ],
+        );
+        let overlay = announced_overlay(
+            &[
+                announced("AA:BB:CC:DD:EE:20", 1),
+                announced("aa:bb:cc:dd:ee:30", 1),
+            ],
+            &s,
+            1,
+        );
+        assert_eq!(overlay.len(), 1, "the scanned device is not doubled");
+        assert_eq!(overlay[0].mac, "aa:bb:cc:dd:ee:30");
+
+        let (gateway, ring, dropped) = partition(&s, &overlay, test_plot().capacity);
+        assert_eq!(gateway.unwrap().mac, SEG_A);
+        let macs: Vec<&str> = ring.iter().map(|n| n.mac.as_str()).collect();
+        assert_eq!(macs, vec!["aa:bb:cc:dd:ee:20", "aa:bb:cc:dd:ee:30"]);
+        assert!(
+            !ring[0].announced,
+            "the reading's device is drawn as scanned"
+        );
+        assert!(
+            ring[1].announced,
+            "the record's device is drawn as announced"
+        );
+        assert_eq!(dropped, 0);
+
+        // Over the cap, the announced tail is what the ring gives up first.
+        let many: Vec<AnnouncedNeighbor> = (0..MAX_RING + 3)
+            .map(|i| announced(&format!("aa:bb:cc:dd:ff:{i:02x}"), 1))
+            .collect();
+        let (_gw, ring, dropped) = partition(&s, &many, MAX_RING);
+        assert_eq!(ring.len(), MAX_RING);
+        assert!(!ring[0].announced, "the scanned device keeps its seat");
+        assert_eq!(dropped, 1 + many.len() - MAX_RING);
+    }
+
+    /// The whole fold for one snapshot: nothing before the first read and
+    /// nothing without a reading, the daemon's words when the read failed,
+    /// and the overlay — aged against the snapshot's own clock — otherwise.
+    #[test]
+    fn the_overlay_is_folded_for_the_snapshot_it_is_drawn_on() {
+        let snap = |generated_us: i64| StatusSnapshot {
+            generated_us,
+            neighbors: Some(sample(Some(SEG_A), vec![])),
+            ..Default::default()
+        };
+        assert_eq!(announced_for(None, &snap(0)), Ok(vec![]));
+        let table = neighbors_table(vec![[
+            SEG_A,
+            "aa:bb:cc:dd:ee:30",
+            "192.168.1.30",
+            "aa:bb:cc",
+            "echo.local",
+            "announce",
+            "en0",
+            "1000",
+            "5000",
+        ]]);
+        let ok = Ok(table);
+        assert!(
+            announced_for(Some(&ok), &StatusSnapshot::default())
+                .unwrap()
+                .is_empty(),
+            "no reading, no segment, nothing folded"
+        );
+        assert_eq!(announced_for(Some(&ok), &snap(5000)).unwrap().len(), 1);
+        assert!(
+            announced_for(Some(&ok), &snap(5000 + ANNOUNCE_STALE_US + 1))
+                .unwrap()
+                .is_empty(),
+            "the snapshot's clock is what the announcement ages against"
+        );
+        assert_eq!(
+            announced_for(Some(&Err("no socket".to_string())), &snap(5000)),
+            Err("no socket".to_string())
+        );
+        let mut broken = neighbors_table(vec![]);
+        broken.columns.retain(|c| c != "source");
+        assert!(
+            announced_for(Some(&Ok(broken)), &snap(5000))
+                .unwrap_err()
+                .contains("`source`"),
+            "a table the fold cannot read is the same kind of line"
+        );
+    }
+
     /// A separator is only ever written between two fields that exist — the
     /// `Bridge0 ·` defect.
     #[test]
@@ -2333,15 +3126,21 @@ mod tests {
                 ..Default::default()
             };
             // The list has no geometry to run out of: building it must not panic.
-            let _ = neighbour_list(&snap, theme);
-            let _ = neighbour_list(&StatusSnapshot::default(), theme);
+            let _ = neighbour_list(&snap, None, theme);
+            let _ = neighbour_list(&StatusSnapshot::default(), None, theme);
             let _ = neighbour_list(
                 &StatusSnapshot {
                     neighbors: Some(sample(None, vec![])),
                     ..Default::default()
                 },
+                None,
                 theme,
             );
+            // Nor with an overlay read in any of its states.
+            let err = Err("no socket".to_string());
+            let _ = neighbour_list(&snap, Some(&err), theme);
+            let _ = neighbour_list(&StatusSnapshot::default(), Some(&err), theme);
+            let _ = neighbour_list(&snap, Some(&Ok(neighbors_table(vec![]))), theme);
         }
     }
 
@@ -2506,6 +3305,7 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         let _ = network_map_section(
             &snap,
+            None,
             test_plot(),
             Theme::for_appearance(gpui::WindowAppearance::Dark),
         );
@@ -2595,7 +3395,7 @@ mod tests {
 /// and scene construction run for real, rasterization does not.
 #[cfg(test)]
 mod headless_tests {
-    use super::tests::{topology_link, vulns_table};
+    use super::tests::{neighbors_table, topology_link, vulns_table};
     use super::*;
     use crate::ui::Glance;
     use gpui::{Entity, Size, TestAppContext, VisualTestContext};
@@ -2686,7 +3486,7 @@ mod headless_tests {
                 .neighbors
                 .as_ref()
                 .expect("the fixture carries a neighbours sample");
-            let (gateway, ring, _more) = partition(sample, plot.capacity);
+            let (gateway, ring, _more) = partition(sample, &[], plot.capacity);
             let mut expected: Vec<String> = ring.iter().map(|n| n.label.clone()).collect();
             expected.extend(gateway.iter().map(|n| n.label.clone()));
 
@@ -2923,6 +3723,203 @@ mod headless_tests {
         assert!(
             vcx.debug_bounds(selector).is_some(),
             "the findings reading did not show the daemon's words: `{why}`"
+        );
+    }
+
+    /// A fresh window over `snapshot`, opened ALREADY in `mode` and over an
+    /// injected `announced` state — set before the first paint like
+    /// `findings_window` sets the findings, for the same reason, and with the
+    /// socket never driven, so what the window draws is what was injected.
+    fn announced_window(
+        cx: &mut TestAppContext,
+        snapshot: StatusSnapshot,
+        announced: Option<Result<Table, String>>,
+        mode: MapMode,
+    ) -> VisualTestContext {
+        let model = cx.update(|cx| {
+            cx.new(|_| {
+                Glance::new(
+                    snapshot,
+                    None,
+                    "/tmp/net-observer-map-test.sock".to_string(),
+                )
+            })
+        });
+        let window = cx.add_window(|_, cx| {
+            let mut view = MapView::new(model, cx);
+            view.mode = mode;
+            view.announced = announced;
+            view
+        });
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        // Wide enough for the ring to seat the fixture's every node, so an
+        // absence below is the merge rule's doing and never the cap's.
+        vcx.simulate_resize(size(px(900.0), px(700.0)));
+        vcx.run_until_parked();
+        vcx
+    }
+
+    /// The reading the announce tests draw over: the gateway and one scanned
+    /// neighbour, `alpha`.
+    fn scanned_reading() -> StatusSnapshot {
+        let neighbors = vec![obs("gw", 1), obs("alpha", 20)];
+        let gateway_mac = neighbors[0].mac.clone();
+        StatusSnapshot {
+            neighbors: Some(NeighborsSample {
+                ts_us: 1,
+                verdict: types::NeighborsVerdict::Ok,
+                reason: None,
+                network_key: Some(gateway_mac),
+                iface: Some("en0".to_string()),
+                neighbors,
+                services: Vec::new(),
+                heard: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// One `announce` row of the record on the fixture's segment, for the
+    /// device with this MAC and name.
+    fn announce_row(mac: &'static str, hostname: &'static str) -> [&'static str; 9] {
+        [
+            "aa:bb:cc:dd:ee:01",
+            mac,
+            "192.168.1.30",
+            "aa:bb:cc",
+            hostname,
+            "announce",
+            "en0",
+            "1",
+            "1",
+        ]
+    }
+
+    /// The announced-only device every announce test names, and the selectors
+    /// the star and the list draw it under — shared so the absence tests name
+    /// the very selectors the presence test found.
+    const ECHO_MAC: &str = "aa:bb:cc:dd:ee:30";
+    const ECHO_NODE: &str = "map-node-announce:aa:bb:cc:dd:ee:30";
+    const ECHO_ROW: &str = "map-list-announce:aa:bb:cc:dd:ee:30";
+
+    /// A device the record knows only from its announcements is drawn on the
+    /// star as its own node in the announce ink — under the announce
+    /// selector, with its chip — and the legend names that ink.
+    #[gpui::test]
+    fn an_announced_only_device_is_drawn_apart_and_named_in_the_legend(cx: &mut TestAppContext) {
+        let table = neighbors_table(vec![announce_row(ECHO_MAC, "echo.local")]);
+        let mut vcx = announced_window(cx, scanned_reading(), Some(Ok(table)), MapMode::Graph);
+        assert!(
+            vcx.debug_bounds(ECHO_NODE).is_some(),
+            "the announced-only device was not drawn as an announce node"
+        );
+        assert!(
+            vcx.debug_bounds("map-chip:echo.local").is_some(),
+            "the announce node carries no chip"
+        );
+        assert!(
+            vcx.debug_bounds("map-chip:alpha").is_some(),
+            "the scanned neighbour must still be drawn beside it"
+        );
+        assert!(
+            vcx.debug_bounds("map-legend-announced").is_some(),
+            "the legend must name the announce ink"
+        );
+    }
+
+    /// A FRESH window over an empty table draws no announce node — gpui's
+    /// debug-bounds map only grows over a window's life, so only a window
+    /// that never drew one can say there is none — while the legend entry,
+    /// a key, is drawn all the same.
+    #[gpui::test]
+    fn a_fresh_window_with_no_announcements_draws_no_announce_node(cx: &mut TestAppContext) {
+        let mut vcx = announced_window(
+            cx,
+            scanned_reading(),
+            Some(Ok(neighbors_table(vec![]))),
+            MapMode::Graph,
+        );
+        assert!(
+            vcx.debug_bounds(ECHO_NODE).is_none(),
+            "an empty table drew an announce node"
+        );
+        assert!(
+            vcx.debug_bounds("map-chip:alpha").is_some(),
+            "precondition: the star itself is drawn"
+        );
+        assert!(
+            vcx.debug_bounds("map-legend-announced").is_some(),
+            "the legend is a key and names the ink whether or not it is used"
+        );
+    }
+
+    /// A device both the reading and the record carry is drawn once, as its
+    /// scanned node: the reading outranks the record for a device it can
+    /// see, and a second chip would draw a neighbour that is not there.
+    #[gpui::test]
+    fn an_announced_device_also_in_the_reading_draws_its_ordinary_node_only(
+        cx: &mut TestAppContext,
+    ) {
+        // `alpha` is `aa:bb:cc:dd:ee:20` in the reading; the record heard it
+        // announce itself too.
+        let table = neighbors_table(vec![announce_row("aa:bb:cc:dd:ee:20", "alpha")]);
+        let mut vcx = announced_window(cx, scanned_reading(), Some(Ok(table)), MapMode::Graph);
+        assert!(
+            vcx.debug_bounds("map-chip:alpha").is_some(),
+            "the scanned node must be drawn"
+        );
+        assert!(
+            vcx.debug_bounds("map-node-announce:aa:bb:cc:dd:ee:20")
+                .is_none(),
+            "a device the reading carries was drawn a second time as announced"
+        );
+    }
+
+    /// A read the daemon could not answer shows the daemon's own words under
+    /// the star — in both readings — never a blank overlay and never a crash.
+    #[gpui::test]
+    fn a_failed_announced_read_shows_the_daemons_words(cx: &mut TestAppContext) {
+        let why = "daemon cannot answer Neighbors (older daemon): bad request: unknown variant";
+        let selector: &'static str = Box::leak(
+            format!("map-announced-error:announced neighbours unavailable: {why}").into_boxed_str(),
+        );
+        for mode in [MapMode::Graph, MapMode::List] {
+            let mut vcx = announced_window(cx, scanned_reading(), Some(Err(why.to_string())), mode);
+            assert!(
+                vcx.debug_bounds(selector).is_some(),
+                "{mode:?} did not show the daemon's words: `{why}`"
+            );
+            assert!(
+                vcx.debug_bounds(ECHO_NODE).is_none(),
+                "{mode:?} drew an announce node from a failed read"
+            );
+        }
+    }
+
+    /// The list appends an announced-only device after the reading's rows,
+    /// under its own selector, and a fresh list over an empty table appends
+    /// nothing.
+    #[gpui::test]
+    fn the_list_appends_announced_only_devices(cx: &mut TestAppContext) {
+        let table = neighbors_table(vec![announce_row(ECHO_MAC, "echo.local")]);
+        let mut vcx = announced_window(cx, scanned_reading(), Some(Ok(table)), MapMode::List);
+        assert!(
+            vcx.debug_bounds(ECHO_ROW).is_some(),
+            "the list did not append the announced-only device"
+        );
+        let mut empty = announced_window(
+            cx,
+            scanned_reading(),
+            Some(Ok(neighbors_table(vec![]))),
+            MapMode::List,
+        );
+        assert!(
+            empty.debug_bounds(ECHO_ROW).is_none(),
+            "an empty table appended a row"
+        );
+        assert!(
+            empty.debug_bounds("map-empty").is_none(),
+            "precondition: the reading's own rows are drawn"
         );
     }
 

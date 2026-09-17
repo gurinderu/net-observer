@@ -320,6 +320,24 @@ pub fn fetch_findings(socket_path: &str) -> Result<Table, String> {
     )
 }
 
+/// Read every neighbour the daemon's record holds, on every segment
+/// (`DiagnosticQuery::Neighbors { network: None }`), as the table the daemon
+/// answered with. The map folds the `announce`-sourced rows of the segment it
+/// is drawing out of it at paint time (see `map::announced_neighbors`); the
+/// read itself is unfiltered so a fetch made before the segment changed still
+/// carries the new segment's rows (realm net-observer, node #92).
+///
+/// The same blocking [`net_observer_ipc::diagnose`] round-trip as
+/// [`fetch_findings`], with the same rule — **never on the gpui main thread**
+/// (the map window runs it on the background executor) — and the same mapping
+/// of every non-table outcome to the daemon's own words.
+pub fn fetch_neighbors(socket_path: &str) -> Result<Table, String> {
+    classify_diagnosis(
+        "Neighbors",
+        net_observer_ipc::diagnose(socket_path, DiagnosticQuery::Neighbors { network: None }),
+    )
+}
+
 /// Read what this machine talks to right now: the newest tick of the live
 /// flow table, folded by `group_by`
 /// (`DiagnosticQuery::Connections { group_by }`), as the table the daemon
@@ -336,8 +354,8 @@ pub fn fetch_connections(socket_path: &str, group_by: ConnectionsGroupBy) -> Res
     )
 }
 
-/// The pure half of [`fetch_findings`] and [`fetch_connections`]: what each
-/// outcome means for a window. `query` names the diagnosis in the line an
+/// The pure half of [`fetch_findings`], [`fetch_neighbors`] and
+/// [`fetch_connections`]: what each outcome means for a window. `query` names the diagnosis in the line an
 /// older daemon earns. Separated so the mapping is testable without a socket.
 fn classify_diagnosis(
     query: &str,
@@ -641,6 +659,19 @@ mod tests {
         assert!(
             fetch_findings(missing.to_str().unwrap()).is_err(),
             "absent socket must yield a findings Err"
+        );
+    }
+
+    /// The neighbours read degrades the same way: an absent socket is an
+    /// `Err`, never a panic, so the map draws its star without the announce
+    /// overlay and says why, instead of the window dying.
+    #[test]
+    fn fetch_neighbors_offline_when_socket_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sock");
+        assert!(
+            fetch_neighbors(missing.to_str().unwrap()).is_err(),
+            "absent socket must yield a neighbours Err"
         );
     }
 }
