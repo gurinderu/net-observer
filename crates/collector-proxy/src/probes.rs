@@ -112,6 +112,14 @@ impl ProxyInfo {
             .any(|k| self.kind.eq_ignore_ascii_case(k))
     }
 
+    /// Whether this is a `URLTest` group — the one kind that re-tests its
+    /// members on an interval, so only their history going empty is
+    /// evidence of a failed test (realm net-observer, node #62).
+    #[must_use]
+    pub fn is_urltest(&self) -> bool {
+        self.kind.eq_ignore_ascii_case("urltest")
+    }
+
     /// Whether this is a node sing-box never URL-tests: the direct, block
     /// and DNS outbounds have no upstream to test through.
     #[must_use]

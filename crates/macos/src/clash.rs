@@ -78,26 +78,52 @@ impl ClashClient {
     /// history (realm net-observer, nodes #62, #139). `None` when the API
     /// did not answer or the body does not decode.
     pub async fn proxy(&self, name: &str) -> Option<ProxyInfo> {
-        let url = format!("{}/proxies/{}", self.base.trim_end_matches('/'), name);
-        let resp = match self.http.get(&url).send().await {
+        // The name is an outbound tag from sing-box's config — a path
+        // segment, so it is percent-encoded as one rather than pasted in.
+        let url = self.endpoint(&["proxies", name])?;
+        let resp = match self.http.get(url.clone()).send().await {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::debug!(url, error = %e, "clash proxies query failed");
+                tracing::debug!(%url, error = %e, "clash proxies query failed");
                 return None;
             }
         };
         let body = match resp.text().await {
             Ok(b) => b,
             Err(e) => {
-                tracing::debug!(url, error = %e, "clash proxies query failed");
+                tracing::debug!(%url, error = %e, "clash proxies query failed");
                 return None;
             }
         };
         let parsed = parse_proxy(&body, name);
         if parsed.is_none() {
-            tracing::debug!(url, "clash proxies body did not decode");
+            tracing::debug!(%url, "clash proxies body did not decode");
         }
         parsed
+    }
+
+    /// `base` with `segments` appended to its path, each percent-encoded as
+    /// one segment; `None` (logged) when `base` is not a URL at all — a
+    /// misconfiguration, reported once per read rather than as a
+    /// transport failure with a nonsense address.
+    fn endpoint(&self, segments: &[&str]) -> Option<reqwest::Url> {
+        let mut url = match reqwest::Url::parse(&self.base) {
+            Ok(url) => url,
+            Err(e) => {
+                tracing::debug!(base = %self.base, error = %e, "clash api base is not a url");
+                return None;
+            }
+        };
+        match url.path_segments_mut() {
+            Ok(mut path) => {
+                path.pop_if_empty().extend(segments);
+            }
+            Err(()) => {
+                tracing::debug!(base = %self.base, "clash api base cannot carry a path");
+                return None;
+            }
+        }
+        Some(url)
     }
 
     /// Every live flow the proxy carries right now, via `GET /connections`.
@@ -107,29 +133,29 @@ impl ClashClient {
     /// and each the same fact to the caller, "could not look". Never an empty
     /// list for any of them.
     pub async fn connections(&self) -> Option<Vec<LiveConnection>> {
-        let url = format!("{}/connections", self.base.trim_end_matches('/'));
-        let resp = match self.http.get(&url).send().await {
+        let url = self.endpoint(&["connections"])?;
+        let resp = match self.http.get(url.clone()).send().await {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::debug!(url, error = %e, "clash connections query failed");
+                tracing::debug!(%url, error = %e, "clash connections query failed");
                 return None;
             }
         };
         let status = resp.status();
         if !status.is_success() {
-            tracing::debug!(url, %status, "clash connections query refused");
+            tracing::debug!(%url, %status, "clash connections query refused");
             return None;
         }
         let body = match resp.text().await {
             Ok(b) => b,
             Err(e) => {
-                tracing::debug!(url, error = %e, "clash connections query failed");
+                tracing::debug!(%url, error = %e, "clash connections query failed");
                 return None;
             }
         };
         let parsed = parse_connections(&body);
         if parsed.is_none() {
-            tracing::debug!(url, "clash connections body did not decode");
+            tracing::debug!(%url, "clash connections body did not decode");
         }
         parsed
     }
@@ -517,6 +543,30 @@ pub(crate) fn singbox_tun_addr(config_json: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The API path is built from `base` by segments, so an outbound tag
+    /// with a space or a slash is one percent-encoded segment rather than a
+    /// second path; a trailing slash on `base` does not double up; and a
+    /// base that is not a URL at all yields no endpoint.
+    #[test]
+    fn endpoints_encode_each_segment_and_tolerate_a_trailing_slash() {
+        let c = ClashClient::new("http://127.0.0.1:9090");
+        assert_eq!(
+            c.endpoint(&["proxies", "vless-out-8"]).unwrap().as_str(),
+            "http://127.0.0.1:9090/proxies/vless-out-8"
+        );
+        assert_eq!(
+            c.endpoint(&["proxies", "a b/c"]).unwrap().as_str(),
+            "http://127.0.0.1:9090/proxies/a%20b%2Fc"
+        );
+        let c = ClashClient::new("http://127.0.0.1:9090/");
+        assert_eq!(
+            c.endpoint(&["connections"]).unwrap().as_str(),
+            "http://127.0.0.1:9090/connections"
+        );
+        assert_eq!(ClashClient::new("not a url").endpoint(&["proxies"]), None);
+        assert_eq!(ClashClient::new("").endpoint(&["proxies"]), None);
+    }
 
     /// The three `GET /proxies/<name>` bodies observed on the owner's Mac on
     /// 2026-09-17 (realm net-observer, nodes #62, #139), each read as the

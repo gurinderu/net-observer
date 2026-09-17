@@ -70,10 +70,13 @@ ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS est_tun_age_s UINTEGER;
 -- is the tick the collector first read the history empty after having seen
 -- an entry, kept across later empty reads and cleared by an entry (its
 -- memory is per process: a restart, bracketed by the startup observing edge,
--- starts it over). NULL node = no reading on this row; NULL `urltest_ms` with
--- NULL `urltest_absent_since_us` under a named node = never seen tested (a
--- node outside every URLTest group, or not yet tested): not measured. Same
--- migration treatment.
+-- starts it over). Dated ONLY for a member of a URLTest-typed group, the one
+-- kind sing-box re-tests on an interval: a node selected directly in a
+-- Selector is never re-tested, and its entry vanishing on a sing-box restart
+-- or a failed manual test is not evidence, so the column stays NULL for it.
+-- NULL node = no reading on this row; NULL `urltest_ms` with NULL
+-- `urltest_absent_since_us` under a named node = never seen tested, or not a
+-- re-tested node: not measured. Same migration treatment.
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS urltest_ms UINTEGER;
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS urltest_at_us BIGINT;
 ALTER TABLE proxy_sample ADD COLUMN IF NOT EXISTS urltest_node VARCHAR;

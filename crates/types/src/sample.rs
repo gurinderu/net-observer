@@ -151,10 +151,13 @@ pub struct ProxySample {
     /// read, kept across later empty reads (realm net-observer, node #62).
     /// A failed test is observable only as this absence: sing-box deletes
     /// the entry. Collector memory keyed by node: an entry present again
-    /// clears it; a node never seen with an entry stays `None` — a node
-    /// outside every URLTest group is not tested periodically, so its entry
-    /// goes stale but never absent, and this stays `None` for it, honestly
-    /// silent. The memory is process-scoped and resets with the daemon, a
+    /// clears it; a node never seen with an entry stays `None`. Dated ONLY
+    /// for a node some `URLTest`-typed group re-tests on its interval: a
+    /// node selected directly in a Selector is never re-tested, and its
+    /// entry can vanish on a sing-box restart (a URLTest member's comes back
+    /// within seconds, a directly selected node's never) or a failed manual
+    /// test from a GUI — not evidence of a failed test, so this stays `None`
+    /// for it. The memory is process-scoped and resets with the daemon, a
     /// restart being bracketed by the startup observing edge already.
     /// `Some` implies `urltest_ms` is `None`. `serde(default)` as above.
     #[serde(default)]

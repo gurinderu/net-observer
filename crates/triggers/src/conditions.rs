@@ -1324,9 +1324,11 @@ const DIAL_STALL_SLACK: Duration = Duration::from_secs(30);
 /// (`urltest_absent_since_us`), so age, not count, is the measure. Two
 /// missed rounds rather than one, because a node is tested once per
 /// interval and one slow round is not a dead node. `tcp == SKIP` on that
-/// row is no measurement (no fire); a node never seen tested carries no
-/// absence and cannot fire — a node outside every URLTest group is not
-/// re-tested, so its entry goes stale but never absent (honest silence).
+/// row is no measurement (no fire); a node with no dated absence cannot
+/// fire — the collector dates it only for a member of a `URLTest`-typed
+/// group, since a node selected directly in a Selector is never re-tested
+/// and its entry vanishing (a sing-box restart, a manual test) is not
+/// evidence (realm net-observer, node #62).
 pub struct EndpointDialStall {
     /// sing-box's URLTest `interval`, from the config.
     interval: Duration,
@@ -1339,7 +1341,9 @@ impl EndpointDialStall {
     /// `urltest_interval`.
     #[must_use]
     pub fn new(urltest_interval: Duration) -> Self {
-        let threshold = urltest_interval * 2 + DIAL_STALL_SLACK;
+        let threshold = urltest_interval
+            .saturating_mul(2)
+            .saturating_add(DIAL_STALL_SLACK);
         Self {
             interval: urltest_interval,
             threshold_us: i64::try_from(threshold.as_micros()).unwrap_or(i64::MAX),
@@ -4165,8 +4169,8 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         }
     }
 
-    /// No absence — an entry present, or a node never seen tested (outside
-    /// every URLTest group: stale, never absent) — never fires; and a tick
+    /// No absence — an entry present, or a node with none dated (never seen
+    /// tested, or selected directly and not re-tested) — never fires; and a tick
     /// with no reading for the selected node (another node's reading only, a
     /// pre-field daemon) is no measurement.
     #[test]

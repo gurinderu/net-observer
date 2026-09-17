@@ -44,10 +44,19 @@ enum UrltestMemory {
 
 /// Fold one tick's read of `node`'s history into the memory and return
 /// what the sample carries as `urltest_absent_since_us`: `None` while an
-/// entry is present, or for a node never seen with one (not tested
-/// periodically — a node outside every URLTest group — so its entry goes
-/// stale but never absent; honest silence); the tick of the FIRST empty read
-/// after a presence, kept across later empty reads.
+/// entry is present, or for a node never seen with one; the tick of the
+/// FIRST empty read after a presence, kept across later empty reads.
+///
+/// Only for a node some `URLTest`-typed group re-tests on its interval —
+/// the caller's gate. Any other node (one selected directly in a Selector,
+/// as `vless-out-8` in `vless-main` on the Mac) is never re-tested: its
+/// entry goes stale rather than absent, and the two writers that can still
+/// clear it — a sing-box restart (the history is process memory; a URLTest
+/// group's members get theirs back within seconds, a directly selected
+/// node never does) and a failed manual test from a GUI — leave nothing to
+/// restore it, so an absence there is not evidence of a failed test and is
+/// not dated: `endpoint-dial-stall` would otherwise fire on every restart
+/// and never close (realm net-observer, node #62).
 fn note_urltest(
     memory: &mut HashMap<String, UrltestMemory>,
     node: &str,
@@ -79,6 +88,10 @@ struct GroupView {
     leaves: Vec<String>,
     /// What each read answered, by name.
     infos: HashMap<String, ProxyInfo>,
+    /// The leaves some `URLTest`-typed group in the view re-tests on its
+    /// interval — the only ones whose history going empty is evidence of a
+    /// failed test (realm net-observer, node #62).
+    retested: HashSet<String>,
 }
 
 /// Interval collector for per-upstream-server TCP reachability, the TUN 204
@@ -182,6 +195,11 @@ impl<T: TcpProber, F: ProxyFacts, S: StallProbe> ProxyCollector<T, F, S> {
             depth += 1;
         }
         infos.insert(root.name.clone(), root.clone());
+        let retested: HashSet<String> = infos
+            .values()
+            .filter(|i| i.is_urltest())
+            .flat_map(|i| i.all.iter().cloned())
+            .collect();
         // The descent: the group's `now`, and while that names a group, ITS
         // `now` — the node reached is the one traffic goes through.
         let mut selector = None;
@@ -216,6 +234,7 @@ impl<T: TcpProber, F: ProxyFacts, S: StallProbe> ProxyCollector<T, F, S> {
             selector,
             leaves,
             infos,
+            retested,
         })
     }
 }
@@ -293,10 +312,12 @@ impl<T: TcpProber, F: ProxyFacts, S: StallProbe> Collector for ProxyCollector<T,
                 probed.push((endpoint.clone(), o));
             }
         }
-        // sing-box's own URL tests, one reading per leaf, folded through the
-        // absence memory. A leaf the API did not answer for this tick has no
-        // reading and leaves the memory untouched: a failed read is not an
-        // empty history.
+        // sing-box's own URL tests, one reading per leaf. Only a leaf some
+        // URLTest group re-tests goes through the absence memory: for any
+        // other leaf an empty history is not evidence (see `note_urltest`),
+        // so its memory stays untouched and its absence undated. A leaf the
+        // API did not answer for this tick has no reading and leaves the
+        // memory untouched too: a failed read is not an empty history.
         let mut urltests = Vec::new();
         if let Some(view) = view {
             let mut memory = self
@@ -308,7 +329,11 @@ impl<T: TcpProber, F: ProxyFacts, S: StallProbe> Collector for ProxyCollector<T,
                     continue;
                 };
                 let entry = info.urltest;
-                let absent_since_us = note_urltest(&mut memory, &node, entry, ts_us);
+                let absent_since_us = if view.retested.contains(&node) {
+                    note_urltest(&mut memory, &node, entry, ts_us)
+                } else {
+                    None
+                };
                 let endpoint = nodes
                     .iter()
                     .find(|(n, _)| *n == node)
@@ -748,11 +773,12 @@ mod tests {
         );
     }
 
-    /// The absence memory (realm net-observer, node #62): an entry present
-    /// on tick 1, gone on tick 2, sets `absent_since` to tick 2's `ts_us`
-    /// and keeps it through tick 3; the entry back on tick 4 clears it; and
-    /// a node never seen with an entry stays `None` however long its
-    /// history reads empty.
+    /// The absence memory (realm net-observer, node #62), on a member of
+    /// the URLTest group `auto`: an entry present on tick 1, gone on tick 2,
+    /// sets `absent_since` to tick 2's `ts_us` and keeps it through tick 3;
+    /// the entry back on tick 4 clears it; a node never seen with an entry
+    /// stays `None` however long its history reads empty; and a read the
+    /// API did not answer changes nothing.
     #[tokio::test]
     async fn absence_is_dated_from_the_first_empty_read_after_a_presence() {
         let (c, _) = collector_with(mac_facts(), ProbingTier::Active);
@@ -763,38 +789,81 @@ mod tests {
                 .unwrap()
         };
         let s1 = c.collect(10).await;
-        assert_eq!(of(&s1, "out-8").3, Some(186));
-        assert_eq!(of(&s1, "out-8").4, None);
+        assert_eq!(of(&s1, "out-6").3, Some(202));
+        assert_eq!(of(&s1, "out-6").4, None);
         assert_eq!(of(&s1, "out-4").4, None, "never seen tested");
 
-        c.facts.set(node("out-8", "VLESS", None));
+        c.facts.set(node("out-6", "VLESS", None));
         let s2 = c.collect(20).await;
-        assert_eq!(of(&s2, "out-8").3, None);
-        assert_eq!(of(&s2, "out-8").4, Some(20), "absent since this tick");
+        assert_eq!(of(&s2, "out-6").3, None);
+        assert_eq!(of(&s2, "out-6").4, Some(20), "absent since this tick");
         let s3 = c.collect(30).await;
-        assert_eq!(of(&s3, "out-8").4, Some(20), "kept across empty reads");
+        assert_eq!(of(&s3, "out-6").4, Some(20), "kept across empty reads");
         assert_eq!(of(&s3, "out-4").4, None, "still never seen tested");
 
-        c.facts.set(node("out-8", "VLESS", Some(entry(3_000, 190))));
+        c.facts.set(node("out-6", "VLESS", Some(entry(3_000, 190))));
         let s4 = c.collect(40).await;
-        assert_eq!(of(&s4, "out-8").3, Some(190));
-        assert_eq!(of(&s4, "out-8").4, None, "an entry clears the absence");
+        assert_eq!(of(&s4, "out-6").3, Some(190));
+        assert_eq!(of(&s4, "out-6").4, None, "an entry clears the absence");
 
         // A read that did not answer is not an empty history: the memory
         // stays as it was, and the node has no row this tick.
-        c.facts.set(node("out-8", "VLESS", None));
+        c.facts.set(node("out-6", "VLESS", None));
         let s5 = c.collect(50).await;
-        assert_eq!(of(&s5, "out-8").4, Some(50));
-        c.facts.forget("out-8");
+        assert_eq!(of(&s5, "out-6").4, Some(50));
+        c.facts.forget("out-6");
         let s6 = c.collect(60).await;
-        assert!(rows(&s6).iter().all(|r| r.2.as_deref() != Some("out-8")));
-        c.facts.set(node("out-8", "VLESS", None));
+        assert!(rows(&s6).iter().all(|r| r.2.as_deref() != Some("out-6")));
+        c.facts.set(node("out-6", "VLESS", None));
         let s7 = c.collect(70).await;
         assert_eq!(
-            of(&s7, "out-8").4,
+            of(&s7, "out-6").4,
             Some(50),
             "the unread tick changed nothing"
         );
+    }
+
+    /// Only a member of a `URLTest`-typed group is re-tested, so only its
+    /// absence is evidence: on the Mac's shape, `vless-out-6` under the
+    /// URLTest group `vless-auto` present → absent dates the absence, while
+    /// `vless-out-8`, selected directly in the Selector `vless-main`,
+    /// present → absent stays `None` — a sing-box restart or a manual test
+    /// clears its entry with nothing to restore it, and that must not fire
+    /// `endpoint-dial-stall` (realm net-observer, node #62).
+    #[tokio::test]
+    async fn absence_is_dated_only_for_members_of_a_urltest_group() {
+        let (c, _) = collector_with(mac_facts(), ProbingTier::Active);
+        let of = |samples: &[Sample], node: &str| {
+            rows(samples)
+                .into_iter()
+                .find(|r| r.2.as_deref() == Some(node))
+                .unwrap()
+        };
+        let s1 = c.collect(10).await;
+        assert_eq!(
+            of(&s1, "out-6").3,
+            Some(202),
+            "present under the URLTest group"
+        );
+        assert_eq!(of(&s1, "out-8").3, Some(186), "present, selected directly");
+
+        c.facts.set(node("out-6", "VLESS", None));
+        c.facts.set(node("out-8", "VLESS", None));
+        let s2 = c.collect(20).await;
+        assert_eq!(of(&s2, "out-6").3, None);
+        assert_eq!(
+            of(&s2, "out-6").4,
+            Some(20),
+            "a URLTest member's absence is dated"
+        );
+        assert_eq!(of(&s2, "out-8").3, None);
+        assert_eq!(
+            of(&s2, "out-8").4,
+            None,
+            "a directly selected node's absence is not evidence"
+        );
+        let s3 = c.collect(30).await;
+        assert_eq!(of(&s3, "out-8").4, None, "and stays undated");
     }
 
     /// The fold on its own, the four transitions named in the field's doc.
