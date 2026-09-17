@@ -1,8 +1,9 @@
 //! Link-layer facts gathered from macOS command-line tools:
 //! default gateway + physical interface (`route -n get default`), the DHCP
-//! lease (`ipconfig getpacket`), the gateway's ARP entry (`arp -n`), the
-//! joined SSID, the link's identity pair (the AP's BSSID and the interface's
-//! own MAC, see `wifi`) and any recent Wi-Fi driver capture.
+//! router/DNS lease pair (`ipconfig getpacket`), the gateway's ARP entry
+//! (`arp -n`), the joined SSID, the link's identity pair plus the current
+//! DHCP lease's start and length — all three from ONE `ipconfig getsummary`
+//! parse, see [`wifi::summary`] — and any recent Wi-Fi driver capture.
 //!
 //! Every field parses defensively: a missing tool, non-zero exit, or
 //! unrecognised output yields `None`, never a panic — "absence is a signal".
@@ -10,7 +11,7 @@
 use std::time::Duration;
 
 use collector_core::Readiness;
-use collector_link::LinkFacts;
+use collector_link::{LinkFacts, LinkSummary};
 use tokio::process::Command;
 use types::LinkMedium;
 
@@ -121,7 +122,7 @@ impl LinkFacts for SystemFacts {
         let text = std::fs::read_to_string(path).ok()?;
         let probe = crate::clash::fakeip_probe_addr(&text)?;
         // `route -n get` is a local RTM_GET lookup — no packet on the wire, so
-        // this keeps running under quiet mode like every other passive fact.
+        // this keeps running in the passive tier like every other passive fact.
         let out = run("route", &["-n", "get", &probe.to_string()]).await?;
         parse_route_field(&out, "interface")
     }
@@ -133,7 +134,7 @@ impl LinkFacts for SystemFacts {
         // up. That address is assigned to an interface only while sing-box runs,
         // which is exactly how dns-fallback.nix decides sing-box is alive
         // (`ifconfig | grep 'inet 172.19.0.1 '`). A local `ifconfig` read, no
-        // packet on the wire, so it keeps running under quiet mode.
+        // packet on the wire, so it keeps running in the passive tier.
         let path = self.singbox_config.as_ref()?;
         let text = std::fs::read_to_string(path).ok()?;
         let addr = crate::clash::singbox_tun_addr(&text)?;
@@ -145,8 +146,17 @@ impl LinkFacts for SystemFacts {
         wifi::current_ssid(iface).await
     }
 
-    async fn bssid(&self, iface: &str) -> Option<String> {
-        wifi::current_bssid(iface).await
+    async fn summary(&self, iface: &str) -> LinkSummary {
+        let wifi::Summary {
+            bssid,
+            lease_start_us,
+            lease_secs,
+        } = wifi::summary(iface).await;
+        LinkSummary {
+            bssid,
+            lease_start_us,
+            lease_secs,
+        }
     }
 
     async fn if_mac(&self, iface: &str) -> Option<String> {

@@ -200,7 +200,7 @@ pub struct Gated<C> {
 /// How many recent link samples the direct-path gate scans for a measured
 /// `direct`: 8 at the 15 s link cadence is ≈ 2 min. Only that lookup uses it
 /// — `gw-change`'s own predecessor scan keeps [`GW_CHANGE_SCAN`], because a
-/// change straddling a long quiet run is still a change, while a `direct`
+/// change straddling a long withheld run is still a change, while a `direct`
 /// reading that old is not evidence the uplink works now (#96).
 const GATE_DIRECT_SCAN: usize = 8;
 
@@ -244,20 +244,20 @@ impl<C: Condition> Condition for Gated<C> {
 }
 
 /// How far back `gw-change` looks for a comparable (non-`SKIP`) predecessor when
-/// the echo has been withheld for a run of ticks — by the operator's quiet mode
-/// or by the passive probing tier; the other change signatures
-/// (`gw-mac-change`, `roam`) reach back the same way past ticks that could not
-/// read their field. It therefore bounds the rule's reach across a passive
-/// stretch: a change straddling a stretch longer than this many ticks is not
-/// named by `gw-change` (its basis has left the window), while `gw-drop` still
-/// catches a `FAIL` on the first measured tick after it.
+/// the echo has been withheld for a run of ticks by the passive probing tier;
+/// the other change signatures (`gw-mac-change`, `roam`) reach back the same
+/// way past ticks that could not read their field. It therefore bounds the
+/// rule's reach across a passive stretch: a change straddling a stretch longer
+/// than this many ticks is not named by `gw-change` (its basis has left the
+/// window), while `gw-drop` still catches a `FAIL` on the first measured tick
+/// after it.
 const GW_CHANGE_SCAN: usize = 64;
 
 /// Fires when the newest link sample's gateway verdict is `Fail` or `NoGw`.
 ///
-/// `Skip` (quiet mode: the echo was deliberately not sent) is NOT a drop — it is
-/// the absence of a measurement — and the match is exhaustive over the verdict so
-/// a future token cannot join the fault set by accident.
+/// `Skip` (the passive tier: the echo was deliberately not sent) is NOT a
+/// drop — it is the absence of a measurement — and the match is exhaustive
+/// over the verdict so a future token cannot join the fault set by accident.
 /// The rule this obeys: realm `net-observer`, node #25.
 pub struct GwDrop;
 impl Condition for GwDrop {
@@ -287,15 +287,15 @@ impl Condition for GwChange {
     fn eval(&self, w: &RecentWindow) -> Option<Fire> {
         let last = w.last_link()?;
         // A `SKIP` tick carries no measurement, so it can be neither side of a
-        // change: `OK -> SKIP` is the operator flipping quiet on or the tier
-        // to passive, not the gateway moving, and firing on it would
-        // manufacture an incident out of a control-socket click.
+        // change: `OK -> SKIP` is the operator flipping the tier to passive,
+        // not the gateway moving, and firing on it would manufacture an
+        // incident out of a control-socket click.
         if last.gw == GwVerdict::Skip {
             return None;
         }
-        // Reach back past a withheld run (quiet, or the passive tier) for the
-        // newest predecessor that actually measured something. Without this
-        // the change the run straddled (`OK` -> withheld -> `FAIL`) would be
+        // Reach back past a withheld run (the passive tier) for the newest
+        // predecessor that actually measured something. Without this the
+        // change the run straddled (`OK` -> withheld -> `FAIL`) would be
         // suppressed once and then never seen again — silence, exactly what
         // the SKIP token exists to prevent.
         let recent = w.recent_link(GW_CHANGE_SCAN);
@@ -309,8 +309,7 @@ impl Condition for GwChange {
         // the oracle freezes on ANY gateway change — but it is not two
         // consecutive ticks, and the incident must not read as though it were.
         // A change straddling a withheld run is real for the same reason, and
-        // is labelled for the same reason — "withheld", because quiet and the
-        // passive tier both produce it and a SKIP run does not say which.
+        // is labelled "withheld" — the passive tier is what produces it.
         let across = match (provenance, withheld_run) {
             (LinkProvenance::AcrossGap, _) => " (across an observation gap)".to_string(),
             (LinkProvenance::Contiguous, 0) => String::new(),
@@ -387,8 +386,8 @@ impl Condition for GwMacChange {
 /// basis carried across a pause — which must itself be measured. `None` when
 /// nothing measured precedes the newest sample. The one predecessor scan of
 /// the change signatures (`gw-change`, `gw-mac-change`, `roam`): reaching
-/// back past unmeasured ticks is how a change that quiet mode, an empty ARP
-/// cache or an unreadable identity straddled is still seen, and falling back
+/// back past unmeasured ticks is how a change that the passive tier, an empty
+/// ARP cache or an unreadable identity straddled is still seen, and falling back
 /// to the carried basis is how a change DURING a pause is seen at resume.
 fn measured_predecessor<'w>(
     w: &'w RecentWindow,
@@ -858,7 +857,7 @@ while the reference host answers",
 /// only toward this client.
 ///
 /// `lan_probed`/`lan_alive` are `None` on any tick that did not probe (healthy
-/// gateway, quiet mode, no gateway): no measurement, no fire. A probed tick
+/// gateway, the passive tier, no gateway): no measurement, no fire. A probed tick
 /// where nobody answered is the whole segment dead — `gw-drop` territory, not
 /// a selective ban. The gateway match is exhaustive so a future verdict token
 /// cannot join the fault set by accident. (realm net-observer, node #70)
@@ -1168,6 +1167,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1192,6 +1194,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1251,6 +1256,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1440,7 +1448,7 @@ mod tests {
     }
 
     /// A `direct` reading is evidence the uplink works NOW only within the
-    /// last `GATE_DIRECT_SCAN` link samples: an `Ok` that many quiet ticks
+    /// last `GATE_DIRECT_SCAN` link samples: an `Ok` that many withheld ticks
     /// ago is the oldest reading the gate still accepts, one tick older and
     /// the gate refuses. Dies under the `GW_CHANGE_SCAN` reach the gate used
     /// to share with `gw-change` (#96), which accepted a `direct` from 64
@@ -1453,10 +1461,10 @@ mod tests {
             load_below: None,
             settle_us: None,
         };
-        let stream = |quiet: usize| {
+        let stream = |skipped: usize| {
             let mut w = RecentWindow::new(WINDOW_CAP);
             w.push(link(0, TcpVerdict::Ok));
-            for i in 0..quiet {
+            for i in 0..skipped {
                 w.push(link(1 + i as i64, TcpVerdict::Skip));
             }
             w
@@ -1701,35 +1709,37 @@ mod tests {
         assert!(GwChange.eval(&w).is_some()); // Ok -> Fail
     }
 
-    /// Quiet mode suppresses the echo, so the tick reports `SKIP`. That is the
-    /// absence of a measurement, not a dead gateway: it must not fire `gw-drop`,
-    /// and turning quiet on or off must not fire `gw-change` either.
+    /// The passive tier suppresses the echo, so the tick reports `SKIP`. That
+    /// is the absence of a measurement, not a dead gateway: it must not fire
+    /// `gw-drop`, and switching the tier must not fire `gw-change` either.
     #[test]
-    fn quiet_skip_ticks_are_neither_a_drop_nor_a_change() {
+    fn withheld_skip_ticks_are_neither_a_drop_nor_a_change() {
         let mut w = RecentWindow::new(8);
         w.push(link_gw(1, GwVerdict::Ok));
-        // Quiet on: OK -> SKIP is the operator, not the network.
+        // Switched to passive: OK -> SKIP is the operator, not the network.
         w.push(link_gw(2, GwVerdict::Skip));
         assert!(GwDrop.eval(&w).is_none(), "SKIP is not a gateway drop");
         assert!(
             GwChange.eval(&w).is_none(),
-            "turning quiet on must not fire gw-change"
+            "switching to passive must not fire gw-change"
         );
         w.push(link_gw(3, GwVerdict::Skip));
         assert!(GwChange.eval(&w).is_none());
-        // Quiet off with the gateway unchanged: SKIP -> OK is not a change either.
+        // Switched back to active with the gateway unchanged: SKIP -> OK is
+        // not a change either.
         w.push(link_gw(4, GwVerdict::Ok));
         assert!(
             GwChange.eval(&w).is_none(),
-            "turning quiet off must not fire gw-change when nothing moved"
+            "switching back to active must not fire gw-change when nothing moved"
         );
     }
 
-    /// A gateway change that happened WHILE quiet was on is still a change: the
-    /// first measured tick after the quiet run is compared against the last
-    /// measured tick before it, and the detail says the run was straddled.
+    /// A gateway change that happened WHILE the tier was passive is still a
+    /// change: the first measured tick after the withheld run is compared
+    /// against the last measured tick before it, and the detail says the run
+    /// was straddled.
     #[test]
-    fn gw_change_fires_across_a_quiet_run() {
+    fn gw_change_fires_across_a_withheld_run() {
         let mut w = RecentWindow::new(8);
         w.push(link_gw(1, GwVerdict::Ok));
         w.push(link_gw(2, GwVerdict::Skip));
@@ -1737,15 +1747,13 @@ mod tests {
         w.push(link_gw(4, GwVerdict::Fail));
         let fire = GwChange
             .eval(&w)
-            .expect("a change straddling a quiet run must still fire");
+            .expect("a change straddling a withheld run must still fire");
         assert!(
             fire.detail
                 .contains(&format!("{} -> {}", GwVerdict::Ok, GwVerdict::Fail)),
             "detail must name both measured verdicts: {}",
             fire.detail
         );
-        // Quiet and the passive tier both withhold the echo, and a SKIP run
-        // does not say which: the label names the withholding, not quiet.
         assert!(
             fire.detail.ends_with(" (across 2 withheld tick(s))"),
             "the detail must say the change straddled withheld ticks: {}",
@@ -1753,8 +1761,8 @@ mod tests {
         );
     }
 
-    /// With nothing measured before the quiet run there is no basis at all, so
-    /// the first real tick after it is not reported as a change.
+    /// With nothing measured before the withheld run there is no basis at
+    /// all, so the first real tick after it is not reported as a change.
     #[test]
     fn gw_change_silent_when_only_skips_precede() {
         let mut w = RecentWindow::new(8);
@@ -2029,6 +2037,9 @@ mod tests {
             bssid: bssid.map(str::to_string),
             if_mac: if_mac.map(str::to_string),
             medium,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -2885,6 +2896,9 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: probed,
             lan_alive: alive,
@@ -2930,8 +2944,8 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         assert!(PerClientBlock.eval(&w).is_none());
     }
 
-    /// The signature is anchored to a FAILED gateway echo: a healthy or
-    /// quiet/absent gateway must stay silent even if counts are present.
+    /// The signature is anchored to a FAILED gateway echo: a healthy,
+    /// withheld or absent gateway must stay silent even if counts are present.
     #[test]
     fn per_client_block_silent_unless_the_gateway_failed() {
         let mut w = RecentWindow::new(8);
@@ -2963,6 +2977,9 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -3304,7 +3321,7 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         assert!(c.eval(&w).is_none());
     }
 
-    /// Quiet-mode `Skip` ticks are the absence of a measurement (node #25):
+    /// Withheld `Skip` ticks are the absence of a measurement (node #25):
     /// one inside a run does not split the ban, two between `Ok`s do not
     /// start one. Dies under `Skip` read as `Ok` (each `Fail` is then a lone
     /// tick below the run bound: no ban at all) and under `Skip` read as
@@ -3338,8 +3355,8 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
 
     /// One ban round shaped like the field episode: at the roam the default
     /// gateway is momentarily absent (`NoGw`) before the echoes start failing,
-    /// and quiet mode drops one reading inside the run. Same period and ban
-    /// start as [`BAN_ROUND`].
+    /// and the passive tier drops one reading inside the run. Same period and
+    /// ban start as [`BAN_ROUND`].
     const FIELD_ROUND: [GwVerdict; 10] = [
         GwVerdict::Ok,
         GwVerdict::Ok,

@@ -394,8 +394,24 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // Incidents left open by the previous process can never be closed by it
     // again — the closing edge lived in its memory. Stamp them closed at the
-    // observation bound rather than leaving forever-open rows.
-    match store.close_open_incidents(types::now_us()) {
+    // observation bound: the record's own newest sample, not this new
+    // process's start time, which is always later and would make a crashed
+    // run's incidents read as though they had lasted until now. A crash WHILE
+    // PAUSED closes at the last sample before the pause — earlier than the
+    // pause's own `observing_edge` row — which is an accepted asymmetry: the
+    // incident closes at the last thing this record actually observed, not
+    // at a boundary row a paused process wrote about observing nothing
+    // (realm net-observer, node #124).
+    let stale_close_ts = match store.latest_sample_ts_us() {
+        Ok(Some(ts)) => ts,
+        Ok(None) => types::now_us(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read the record's newest sample; \
+                closing stale incidents at now instead");
+            types::now_us()
+        }
+    };
+    match store.close_open_incidents(stale_close_ts) {
         Ok(0) => {}
         Ok(n) => tracing::info!(n, "closed stale open incidents from a previous run"),
         Err(e) => tracing::warn!(error = %e, "failed to close stale open incidents"),
@@ -440,21 +456,14 @@ async fn run_daemon() -> anyhow::Result<()> {
     // the startup log below for why).
     let observing = Arc::new(AtomicBool::new(true));
 
-    // The operator's "quiet" flag: while set, the daemon addresses NO packet at
-    // the gateway (the link collector's ICMP echo is not sent; its tick still
-    // lands, carrying `gw = SKIP`). Shared with the link collector and the
-    // control socket exactly the way `observing` is. Process-scoped and, like
-    // `observing`, deliberately never persisted — a restart resumes probing.
-    let quiet = Arc::new(AtomicBool::new(false));
-
     // The probing tier: which emission classes the link, proxy and dns
     // collectors may put on the wire. Boots into the configured default —
     // `passive`, nothing on the wire, unless the operator's config says
     // otherwise — and is shared with those three collectors and the control
-    // socket exactly the way `quiet` is. Process-scoped and, like `quiet`,
-    // deliberately never persisted: a restart returns to the configured
-    // default, and only `SetProbing` moves it while the daemon runs.
-    // (realm net-observer, node #88)
+    // socket exactly the way `observing` is. Process-scoped and, like
+    // `observing`, deliberately never persisted: a restart returns to the
+    // configured default, and only `SetProbing` moves it while the daemon
+    // runs. (realm net-observer, node #88)
     let probing = Arc::new(ProbingState::new(cfg.probing.default));
 
     // The observing state is process-scoped and deliberately NEVER persisted: a
@@ -476,6 +485,13 @@ async fn run_daemon() -> anyhow::Result<()> {
     // span the observation gap a pause opened, nor the passive stretch a tier
     // switch opened or closed. `0` = no such edge yet.
     let resume_at_us = Arc::new(AtomicI64::new(0));
+    // `ts_us` of the edge that ENDED the observation session the next
+    // `resume_at_us` move re-opens: `SetObserving(false)` stores the pause's
+    // own `ts_us` here, `set_probing` the switch's. The pipeline consumer
+    // reads it once per edge to close whatever the previous session left
+    // open at the instant it actually ended, not at the edge's own (realm
+    // net-observer, node #124).
+    let session_end_us = Arc::new(AtomicI64::new(0));
 
     // The realtime event bus (push, not poll): the pipeline consumer publishes a
     // `StreamFrame::Event` per sample, the trigger `SnapshotHandler` publishes an
@@ -539,7 +555,6 @@ async fn run_daemon() -> anyhow::Result<()> {
             // the proxy facts adapter does; absent, the field records None.
             .with_singbox_config(SINGBOX_CONFIG_PATH),
             cfg.collectors.link.interval,
-            quiet.clone(),
             probing.clone(),
         )));
     }
@@ -757,10 +772,10 @@ async fn run_daemon() -> anyhow::Result<()> {
             &cfg,
             snapshot.clone(),
             observing.clone(),
-            quiet.clone(),
             probing.clone(),
             freezer.clone(),
             resume_at_us.clone(),
+            session_end_us.clone(),
             store.clone(),
             events_tx.clone(),
             oui.clone(),
@@ -794,6 +809,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         snapshot.clone(),
         events_tx,
         resume_at_us,
+        session_end_us,
     ));
 
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
@@ -1247,6 +1263,9 @@ impl Collector for FakeCollector {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1268,6 +1287,9 @@ impl Collector for FakeCollector {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1426,10 +1448,10 @@ fn build_api_server(
     cfg: &Config,
     snapshot: Arc<Mutex<StatusSnapshot>>,
     observing: Arc<AtomicBool>,
-    quiet: Arc<AtomicBool>,
     probing: Arc<ProbingState>,
     freezer: Arc<PcapRingSlot>,
     resume_at_us: Arc<AtomicI64>,
+    session_end_us: Arc<AtomicI64>,
     store: Arc<DuckdbStore>,
     events_tx: tokio::sync::broadcast::Sender<EncodedFrame>,
     oui: Option<Arc<oui_db::OuiDb>>,
@@ -1464,10 +1486,9 @@ fn build_api_server(
         // control path.
         policy: api::ControlPolicy::from_config(cfg.socket_owner_uid, cfg.control_uids.clone()),
         observing: observing.clone(),
-        // Shared, never fresh — for `quiet` and `probing` the same reason as
-        // `observing`, and the ring handle so `FreezePcap` copies the ring that
-        // is actually running rather than refusing next to a live capture.
-        quiet,
+        // Shared, never fresh — for `probing` the same reason as `observing`,
+        // and the ring handle so `FreezePcap` copies the ring that is actually
+        // running rather than refusing next to a live capture.
         probing,
         freezer,
         // Built unconditionally: whether there is anything to scan is decided
@@ -1507,6 +1528,7 @@ fn build_api_server(
             .map(std::path::PathBuf::from),
         blob_dir: std::path::PathBuf::from(&cfg.blob_dir),
         resume_at_us,
+        session_end_us,
         snapshot,
         // The durable sink for `observing_edge` boundary rows: the daemon
         // stays the sole DuckDB owner, so the control path writes through the
@@ -1966,6 +1988,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -2082,9 +2107,9 @@ mod tests {
         let cfg = test_cfg();
         let snapshot = Arc::new(Mutex::new(StatusSnapshot::default()));
         let observing = Arc::new(AtomicBool::new(true));
-        let quiet = Arc::new(AtomicBool::new(false));
         let probing = Arc::new(ProbingState::new(ProbingTier::Passive));
         let resume_at_us = Arc::new(AtomicI64::new(0));
+        let session_end_us = Arc::new(AtomicI64::new(0));
         let store = Arc::new(DuckdbStore::in_memory().unwrap());
         // A broadcast channel needs no runtime, so this whole test is a plain
         // `#[test]`.
@@ -2095,12 +2120,12 @@ mod tests {
             &cfg,
             snapshot.clone(),
             observing.clone(),
-            quiet.clone(),
             probing.clone(),
             // No pcap ring in this test: `FreezePcap` must refuse rather than
             // panic, which is the empty slot's whole job.
             Arc::new(PcapRingSlot::empty()),
             resume_at_us.clone(),
+            session_end_us.clone(),
             store.clone(),
             events_tx.clone(),
             None,
@@ -2194,12 +2219,6 @@ mod tests {
              collector keeps ignoring"
         );
         assert!(
-            Arc::ptr_eq(&srv.quiet, &quiet),
-            "a fresh `quiet` leaves the control socket acking a quiet mode the \
-             link collector never enters, so the gateway keeps being pinged \
-             while the capture is being gathered to prove it is not us"
-        );
-        assert!(
             Arc::ptr_eq(&srv.probing, &probing),
             "a fresh `probing` leaves the control socket acking a tier no \
              collector reads, so \"Probe network\" would light up while every \
@@ -2209,6 +2228,11 @@ mod tests {
             Arc::ptr_eq(&srv.resume_at_us, &resume_at_us),
             "a fresh `resume_at_us` leaves the pipeline's trigger window never \
              cleared, so a count-based condition spans the observation gap"
+        );
+        assert!(
+            Arc::ptr_eq(&srv.session_end_us, &session_end_us),
+            "a fresh `session_end_us` leaves the pipeline closing a pre-pause \
+             incident at the resume's ts_us instead of the pause's own"
         );
         assert!(
             Arc::ptr_eq(&srv.snapshot, &snapshot),

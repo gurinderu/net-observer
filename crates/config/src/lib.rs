@@ -37,8 +37,8 @@ pub struct Config {
 
 /// The probing tier at startup. Applied once, when the daemon boots, and
 /// written as the first `probing_edge` row; the tier is then process-scoped
-/// like `observing` and `quiet` — never persisted, moved only by
-/// `ControlCmd::SetProbing`, and back to this value on the next start.
+/// like `observing` — never persisted, moved only by `ControlCmd::SetProbing`,
+/// and back to this value on the next start.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbingCfg {
     /// `"passive"` (the default when the key is absent — the owner's decision:

@@ -9,11 +9,11 @@ pub mod topology;
 pub mod verdict;
 
 pub use air::{
-    AirObservation, AirSample, Band, ChannelOverlapHypothesis, ChannelSpan, FrequencyExtent,
-    OverlapConfidence, overlap_hypothesis,
+    AirObservation, AirSample, ApGrade, Band, ChannelOverlapHypothesis, ChannelSpan, Confidence,
+    FrequencyExtent, Grade, OverlapConfidence, Signal, overlap_hypothesis,
 };
 pub use incident::{BlobRef, Incident, TriggerFired};
-pub use mac::normalize_mac;
+pub use mac::{mac_is_private, normalize_mac};
 pub use neighbor::{
     HistoryWindow, NeighborLifetime, NeighborObs, NeighborRole, NeighborsSample, RoleConfidence,
 };

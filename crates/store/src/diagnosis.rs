@@ -8,12 +8,14 @@
 //! The rules, verbatim from the docs:
 //!
 //! - `gw=FAIL` ⇒ the local network or Wi-Fi died: infrastructure, not us.
-//! - `gw=OK`, `direct=OK`, `vless=OK`, `tun=000` ⇒ the proxy is wedged; a
-//!   restart cures it.
+//! - `gw=OK`, `direct=OK`, `vless=OK`, tun answered anything but 204 (`000` =
+//!   no status at all, a captive portal's 200, a 5xx) ⇒ the proxy is wedged; a
+//!   restart cures it (realm net-observer, node #122).
 //! - `vless=FAIL` with the rest OK ⇒ that proxy server is dead or blocked from
 //!   this path.
 //! - `tun=000` **with `load1` in the tens** ⇒ host starvation, NOT a wedge: a
-//!   restart does not cure it and tears down live flows.
+//!   restart does not cure it and tears down live flows. Only a silent probe
+//!   reads as starvation — an answered non-204 under load is still the proxy's.
 //! - A `.ru` name answered from the fakeip range is ALWAYS a bug.
 //! - `SKIP` means the probe did not run — neither health nor fault.
 //!
@@ -331,7 +333,10 @@ layer_state AS (
            -- tun=000, but without load there is no telling wedge from starvation.
            WHEN p.tun_code = 0 AND h.load1 IS NULL THEN 'unknown'
            WHEN p.tun_code = 0 AND h.load1 > ? THEN 'host'
-           WHEN p.tun_code = 0 THEN 'proxy'
+           -- Any answer but 204 means the tunnel did not reach its far end
+           -- (a captive portal answers 200) — the shell oracle's `tun != 204`
+           -- vocabulary (realm net-observer, node #122).
+           WHEN p.tun_code <> 204 THEN 'proxy'
            WHEN l.gw <> 'OK' OR l.direct <> 'OK' THEN 'unknown'
            ELSE 'healthy'
          END AS layer
@@ -445,14 +450,19 @@ ORDER BY c.opened_us",
 /// **Wedge vs starvation** — the discriminator the project paid nine hours to
 /// learn, on 2026-07-27.
 ///
-/// Groups contiguous `tun=000` proxy ticks (gap ≤ `gap_us`) into episodes and
-/// names each one:
+/// Groups contiguous dead proxy ticks — `tun_code IS NOT NULL AND tun_code <>
+/// 204`, the oracle's dead-tun vocabulary (realm net-observer, node #122) —
+/// (gap ≤ `gap_us`) into episodes and names each one:
 ///
 /// - `link` — the gateway was down through it: not a proxy fault at all;
 /// - `vless` — the proxy server was unreachable: a restart is not the cure;
-/// - `starvation` — `load1 > load_threshold`: a restart does NOT cure it and
-///   tears down live flows;
-/// - `wedge` — every layer under the tun was healthy and the host was idle: a
+/// - `starvation` — `load1 > load_threshold` AND every tick in the episode
+///   went unanswered (`tun_code = 0` throughout, i.e. the probe timed out): a
+///   restart does NOT cure it and tears down live flows;
+/// - `wedge` — either the host was idle while the tun was dead, or the tun
+///   answered with something other than 204 (a captive portal's 200
+///   included) at any point in the episode even under load: the tunnel
+///   answered, wrongly, and load does not explain a wrong answer — a
 ///   restart cures it;
 /// - `unknown` — no `load1` (or no link sample) covering the episode, so the
 ///   record cannot tell the two apart.
@@ -462,22 +472,24 @@ pub fn wedge_vs_starvation_sql(load_threshold: f64, gap_us: i64) -> PreparedSql 
     let sql = format!(
         "WITH {PROXY_TICK_CTE},
 dead AS (
-  SELECT ts_us, vless FROM proxy_tick WHERE tun_code = 0
+  SELECT ts_us, vless, tun_code FROM proxy_tick
+  WHERE tun_code IS NOT NULL AND tun_code <> 204
 ),
 marked AS (
   SELECT ts_us,
          vless,
+         tun_code,
          CASE WHEN lag(ts_us) OVER (ORDER BY ts_us) IS NULL
                 OR ts_us - lag(ts_us) OVER (ORDER BY ts_us) > ?
               THEN 1 ELSE 0 END AS starts_episode
   FROM dead
 ),
 grouped AS (
-  SELECT ts_us, vless, sum(starts_episode) OVER (ORDER BY ts_us) AS episode
+  SELECT ts_us, vless, tun_code, sum(starts_episode) OVER (ORDER BY ts_us) AS episode
   FROM marked
 ),
 ctx AS (
-  SELECT g.episode, g.ts_us, g.vless, h.load1, l.gw, l.direct
+  SELECT g.episode, g.ts_us, g.vless, g.tun_code, h.load1, l.gw, l.direct
   FROM grouped g
   ASOF LEFT JOIN host_sample h ON g.ts_us >= h.ts_us
   ASOF LEFT JOIN link_sample l ON g.ts_us >= l.ts_us
@@ -494,7 +506,9 @@ SELECT episode,
                          OR coalesce(direct, 'MISSING') <> 'OK'
                        THEN 1 ELSE 0 END) = 1 THEN 'unknown'
          WHEN count(load1) = 0 THEN 'unknown'
-         WHEN max(load1) > ? THEN 'starvation'
+         -- Starvation is a silent probe: any answered (non-204) code under
+         -- load is a wedge instead — the tunnel answered, wrongly.
+         WHEN max(load1) > ? AND max(tun_code) = 0 THEN 'starvation'
          ELSE 'wedge'
        END AS verdict
 FROM ctx
@@ -1041,6 +1055,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1193,6 +1210,49 @@ mod tests {
         assert_ne!(cell(&t, 0, "layer"), "proxy");
     }
 
+    /// A captive portal's 200 is an answer, not a health check pass: the tun
+    /// reached something, but not its far end (realm net-observer, node
+    /// #122). It must read as `proxy`, not `healthy`.
+    #[test]
+    fn verdict_at_blames_the_proxy_on_a_captive_portal_answer() {
+        let s = DuckdbStore::in_memory().unwrap();
+        link(&s, 20 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy(&s, 20 * SEC, TcpVerdict::Ok, Some(200));
+        host(&s, 20 * SEC, 1.2);
+
+        let t = s.verdict_at(20 * SEC).unwrap();
+        assert_eq!(cell(&t, 0, "layer"), "proxy");
+    }
+
+    /// The same captive-portal answer under load is still the proxy's fault,
+    /// not starvation: the tunnel answered, wrongly, and load does not
+    /// explain a wrong answer. Only a silent probe (`tun_code = 0`) reads as
+    /// `host`.
+    #[test]
+    fn verdict_at_blames_the_proxy_not_the_host_for_a_captive_portal_under_load() {
+        let s = DuckdbStore::in_memory().unwrap();
+        link(&s, 20 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy(&s, 20 * SEC, TcpVerdict::Ok, Some(200));
+        host(&s, 20 * SEC, 31.0);
+
+        let t = s.verdict_at(20 * SEC).unwrap();
+        assert_eq!(cell(&t, 0, "layer"), "proxy");
+        assert_ne!(cell(&t, 0, "layer"), "host");
+    }
+
+    /// A tun code that never arrived (not `SKIP`, just absent) is unknown,
+    /// the same as a probe that did not run at all.
+    #[test]
+    fn verdict_at_reports_unknown_when_tun_code_is_null() {
+        let s = DuckdbStore::in_memory().unwrap();
+        link(&s, 20 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy(&s, 20 * SEC, TcpVerdict::Ok, None);
+        host(&s, 20 * SEC, 1.0);
+
+        let t = s.verdict_at(20 * SEC).unwrap();
+        assert_eq!(cell(&t, 0, "layer"), "unknown");
+    }
+
     #[test]
     fn verdict_at_blames_the_vless_server_when_only_it_is_down() {
         let s = DuckdbStore::in_memory().unwrap();
@@ -1333,12 +1393,13 @@ mod tests {
 
     // ---- 3. wedge vs starvation --------------------------------------------
 
-    /// Push `n` ticks of a dead tun over a healthy link, at `load1`.
-    fn tun_dead_episode(s: &DuckdbStore, from_us: i64, n: i64, load1: f64) {
+    /// Push `n` ticks of a dead tun (answering `code`, anything but 204) over
+    /// a healthy link, at `load1`.
+    fn tun_dead_episode(s: &DuckdbStore, from_us: i64, n: i64, code: u16, load1: f64) {
         for i in 0..n {
             let ts = from_us + i * SEC;
             link(s, ts, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
-            proxy(s, ts, TcpVerdict::Ok, Some(0));
+            proxy(s, ts, TcpVerdict::Ok, Some(code));
             host(s, ts, load1);
         }
     }
@@ -1346,7 +1407,7 @@ mod tests {
     #[test]
     fn a_dead_tun_on_an_idle_host_is_a_wedge() {
         let s = DuckdbStore::in_memory().unwrap();
-        tun_dead_episode(&s, 10 * SEC, 4, 1.3);
+        tun_dead_episode(&s, 10 * SEC, 4, 0, 1.3);
         let t = s.wedge_vs_starvation().unwrap();
         assert_eq!(t.rows.len(), 1);
         assert_eq!(cell(&t, 0, "verdict"), "wedge");
@@ -1360,7 +1421,7 @@ mod tests {
     #[test]
     fn the_same_dead_tun_under_load_is_starvation_not_a_wedge() {
         let s = DuckdbStore::in_memory().unwrap();
-        tun_dead_episode(&s, 10 * SEC, 4, 31.0);
+        tun_dead_episode(&s, 10 * SEC, 4, 0, 31.0);
         let t = s.wedge_vs_starvation().unwrap();
         assert_eq!(t.rows.len(), 1);
         assert_eq!(cell(&t, 0, "verdict"), "starvation");
@@ -1368,13 +1429,45 @@ mod tests {
         assert_eq!(cell(&t, 0, "max_load1"), "31");
     }
 
+    /// A captive portal's 200 under load is still a wedge, not starvation:
+    /// the tunnel answered, wrongly, and load does not explain a wrong
+    /// answer — only an episode of silent probes (`tun_code = 0` throughout)
+    /// reads as starvation (realm net-observer, node #122).
+    #[test]
+    fn a_captive_portal_answer_under_load_is_a_wedge_not_starvation() {
+        let s = DuckdbStore::in_memory().unwrap();
+        tun_dead_episode(&s, 10 * SEC, 4, 200, 31.0);
+        let t = s.wedge_vs_starvation().unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "verdict"), "wedge");
+        assert_ne!(cell(&t, 0, "verdict"), "starvation");
+    }
+
+    /// A single answered tick breaks silence for the whole episode: `max(tun_code)`
+    /// is taken over a `USMALLINT` column, so one `200` among three `0`s is
+    /// enough to read the episode as a wedge, not starvation, even under load.
+    #[test]
+    fn one_answered_tick_in_a_silent_episode_makes_it_a_wedge() {
+        let s = DuckdbStore::in_memory().unwrap();
+        for (i, code) in [0u16, 0, 200, 0].into_iter().enumerate() {
+            let ts = 10 * SEC + i as i64 * SEC;
+            link(&s, ts, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+            proxy(&s, ts, TcpVerdict::Ok, Some(code));
+            host(&s, ts, 31.0);
+        }
+        let t = s.wedge_vs_starvation().unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "verdict"), "wedge");
+        assert_ne!(cell(&t, 0, "verdict"), "starvation");
+    }
+
     /// Both episodes in one record, told apart by `load1` alone.
     #[test]
     fn the_two_episodes_are_separated_and_named_individually() {
         let s = DuckdbStore::in_memory().unwrap();
-        tun_dead_episode(&s, 10 * SEC, 3, 1.0);
+        tun_dead_episode(&s, 10 * SEC, 3, 0, 1.0);
         healthy_tick(&s, 60 * SEC);
-        tun_dead_episode(&s, 120 * SEC, 3, 25.0);
+        tun_dead_episode(&s, 120 * SEC, 3, 0, 25.0);
         let t = s.wedge_vs_starvation().unwrap();
         assert_eq!(t.rows.len(), 2);
         assert_eq!(cell(&t, 0, "verdict"), "wedge");
@@ -1434,6 +1527,25 @@ mod tests {
         }
         let t = s.wedge_vs_starvation().unwrap();
         assert!(t.rows.is_empty(), "SKIP became an episode: {:?}", t.rows);
+    }
+
+    /// A tick with no tun code at all (not `SKIP`, just absent) is not an
+    /// episode either — the same NULL-is-unknown rule as `verdict_at`.
+    #[test]
+    fn a_null_tun_code_is_not_an_episode() {
+        let s = DuckdbStore::in_memory().unwrap();
+        for i in 0..4 {
+            let ts = 10 * SEC + i * SEC;
+            link(&s, ts, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+            proxy(&s, ts, TcpVerdict::Ok, None);
+            host(&s, ts, 30.0);
+        }
+        let t = s.wedge_vs_starvation().unwrap();
+        assert!(
+            t.rows.is_empty(),
+            "NULL tun_code became an episode: {:?}",
+            t.rows
+        );
     }
 
     #[test]

@@ -2,7 +2,6 @@
 //! into the [`Collector`] abstraction the daemon drives.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use collector_core::{
@@ -10,7 +9,7 @@ use collector_core::{
 };
 use types::{EmissionClass, GwVerdict, LinkSample, Sample, TcpVerdict};
 
-use crate::facts::LinkFacts;
+use crate::facts::{LinkFacts, LinkSummary};
 use crate::sample::build_link_sample;
 
 /// Static metadata for the `link` collector: macOS-only in v1.
@@ -35,18 +34,10 @@ pub struct LinkCollector<P, T, F> {
     tcp: T,
     facts: F,
     interval: Duration,
-    /// The operator's "quiet" switch, shared with the control socket: while set,
-    /// this collector addresses NO packet at the gateway — the ICMP echo is not
-    /// sent and the tick reports [`GwVerdict::Skip`]. Reading the ARP table and
-    /// the DHCP lease is passive and continues. Process-scoped and never
-    /// persisted: a restart resumes normal probing.
-    quiet: Arc<AtomicBool>,
-    /// The probing tier, shared with the control socket the same way. In the
-    /// passive tier this collector puts NOTHING on the wire: the gateway echo,
-    /// the direct probe and the neighbour pings are all withheld and read
-    /// `SKIP`, while the local facts keep being read. Passive overrides
-    /// `quiet`; quiet still withholds the echo inside the active tier.
-    /// (realm net-observer, node #88)
+    /// The probing tier, shared with the control socket. In the passive tier
+    /// this collector puts NOTHING on the wire: the gateway echo, the direct
+    /// probe and the neighbour pings are all withheld and read `SKIP`, while
+    /// the local facts keep being read. (realm net-observer, node #88)
     probing: Arc<ProbingState>,
 }
 
@@ -57,22 +48,13 @@ where
     F: LinkFacts,
 {
     /// Construct a `link` collector from its probe ports, poll interval and the
-    /// shared `quiet` flag and probing tier (see [`LinkCollector::quiet`] and
-    /// [`LinkCollector::probing`]).
-    pub fn new(
-        ping: P,
-        tcp: T,
-        facts: F,
-        interval: Duration,
-        quiet: Arc<AtomicBool>,
-        probing: Arc<ProbingState>,
-    ) -> Self {
+    /// shared probing tier (see [`LinkCollector::probing`]).
+    pub fn new(ping: P, tcp: T, facts: F, interval: Duration, probing: Arc<ProbingState>) -> Self {
         Self {
             ping,
             tcp,
             facts,
             interval,
-            quiet,
             probing,
         }
     }
@@ -104,14 +86,12 @@ where
         // sample with one adapter's medium and the other's MAC.
         let phys_iface = self.facts.phys_iface().await;
         let iface = phys_iface.clone().unwrap_or_default();
-        // Read both switches ONCE per tick, so the packet that is skipped and
-        // the verdict that reports it can never disagree. The tier decides per
-        // emission class; quiet withholds the gateway echo (and the neighbour
-        // pings that hang off it) inside the active tier. A probe that is not
-        // sent is `None` here, and `build_link_sample` reports it as `SKIP`.
-        let quiet = self.quiet.load(Ordering::Acquire);
+        // Read the tier ONCE per tick, so the packet that is skipped and the
+        // verdict that reports it can never disagree. The tier decides per
+        // emission class. A probe that is not sent is `None` here, and
+        // `build_link_sample` reports it as `SKIP`.
         let tier = self.probing.tier();
-        let echo = tier.emits(EmissionClass::GatewayEcho) && !quiet;
+        let echo = tier.emits(EmissionClass::GatewayEcho);
         let ping = match &gw_addr {
             Some(gw) if echo => Some(self.ping.ping_gw(gw).await),
             // Withheld, or no gateway to address: the echo is never sent.
@@ -120,12 +100,10 @@ where
         // Probe-on-suspicion: only on a tick whose gateway verdict will read
         // FAIL — never on a healthy tick (no suspicion, no extra packets), and
         // never off a withheld echo, which has no verdict to be suspicious of;
-        // neighbour pings during an incident are exactly the packets quiet
-        // and the passive tier exist to withhold. `None` = not probed.
+        // neighbour pings during an incident are exactly the packets the
+        // passive tier exists to withhold. `None` = not probed.
         let lan = match (&gw_addr, ping) {
-            (Some(gw), Some(ping))
-                if !ping.reachable && tier.emits(EmissionClass::LanProbe) && !quiet =>
-            {
+            (Some(gw), Some(ping)) if !ping.reachable && tier.emits(EmissionClass::LanProbe) => {
                 let mut ips = self.facts.arp_neighbor_ips().await;
                 ips.retain(|ip| ip != gw);
                 ips.truncate(LAN_PROBE_MAX);
@@ -155,27 +133,27 @@ where
         // from the hardware-port table, not inferred from a readable Wi-Fi
         // name: the identity rules judge an `if_mac` change by it, and a
         // wired hop must never read as a roam). Local reads, no packet on
-        // the wire, so they keep running under quiet mode and in the passive
-        // tier; recorded every tick because a roam between twin SSIDs shows
+        // the wire, so they keep running in the passive tier too; recorded
+        // every tick because a roam between twin SSIDs shows
         // up here and nowhere else (realm net-observer, node #59). All four
         // are read from the ONE interface this tick resolved; with no
         // interface there is nothing to read them from, and each is the
         // absence of a measurement.
-        let (ssid, bssid, if_mac, medium) = match phys_iface.as_deref() {
+        let (ssid, summary, if_mac, medium) = match phys_iface.as_deref() {
             Some(iface) => (
                 self.facts.ssid(iface).await,
-                self.facts.bssid(iface).await,
+                self.facts.summary(iface).await,
                 self.facts.if_mac(iface).await,
                 self.facts.medium(iface).await,
             ),
-            None => (None, None, None, None),
+            None => (None, LinkSummary::default(), None, None),
         };
         let wifi_present = self.facts.wifi_capture_present().await;
         // Two local reads, not probes: the fakeip pool's route egress and the
         // interface carrying sing-box's own TUN address (the sing-box-alive
-        // fact). Both keep running under quiet mode and in the passive tier
-        // like the other passive facts, and both come from THIS tick so
-        // `fakeip-hijack` compares them without skew.
+        // fact). Both keep running in the passive tier like the other passive
+        // facts, and both come from THIS tick so `fakeip-hijack` compares them
+        // without skew.
         let fakeip_route_if = self.facts.fakeip_route_iface().await;
         let singbox_tun_if = self.facts.singbox_tun_iface().await;
         vec![Sample::Link(build_link_sample(
@@ -189,7 +167,7 @@ where
             fakeip_route_if,
             singbox_tun_if,
             ssid,
-            bssid,
+            summary,
             if_mac,
             medium,
             wifi_present,
@@ -210,6 +188,9 @@ where
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -223,12 +204,14 @@ where
 mod tests {
     use super::*;
     use collector_core::PingOutcome;
+    use std::sync::atomic::Ordering;
     use types::{LinkMedium, ProbingTier};
 
     /// A pinger that records the echoes actually sent — the gateway count and
-    /// the exact neighbor addresses — so "quiet" can be asserted on the packet
-    /// (not only on the verdict) and the neighbor selection on the addresses
-    /// (not only on a count). `gw_alive`/`hosts_alive` script the outcomes.
+    /// the exact neighbor addresses — so withholding can be asserted on the
+    /// packet (not only on the verdict) and the neighbor selection on the
+    /// addresses (not only on a count). `gw_alive`/`hosts_alive` script the
+    /// outcomes.
     struct CountingPing {
         sent: Arc<std::sync::atomic::AtomicUsize>,
         lan_pinged: Arc<std::sync::Mutex<Vec<String>>>,
@@ -276,8 +259,9 @@ mod tests {
             }
         }
     }
-    /// Link facts with a scripted identity triple: `bssid`/`if_mac`/`medium`
-    /// are returned exactly as set, so a test can hand the collector a
+    /// Link facts with a scripted identity triple — `bssid` (now bundled with
+    /// the lease pair into one [`LinkSummary`]), `if_mac` and `medium` — each
+    /// returned exactly as set, so a test can hand the collector a
     /// determinable or an undeterminable identity and read what lands in the
     /// sample. `route_lookups` counts the `phys_iface` resolutions and
     /// `asked_for` records the interface each per-interface read was given,
@@ -285,6 +269,8 @@ mod tests {
     struct FakeFacts {
         ready: bool,
         bssid: Option<String>,
+        lease_start_us: Option<i64>,
+        lease_secs: Option<u32>,
         if_mac: Option<String>,
         medium: Option<LinkMedium>,
         route_lookups: Arc<std::sync::atomic::AtomicUsize>,
@@ -295,6 +281,8 @@ mod tests {
             Self {
                 ready: true,
                 bssid: Some("3c:22:fb:12:34:56".into()),
+                lease_start_us: None,
+                lease_secs: None,
                 if_mac: Some("f0:18:98:0a:0b:0c".into()),
                 medium: Some(LinkMedium::Wifi),
                 route_lookups: Arc::default(),
@@ -343,9 +331,13 @@ mod tests {
             self.asked(iface);
             None
         }
-        async fn bssid(&self, iface: &str) -> Option<String> {
+        async fn summary(&self, iface: &str) -> LinkSummary {
             self.asked(iface);
-            self.bssid.clone()
+            LinkSummary {
+                bssid: self.bssid.clone(),
+                lease_start_us: self.lease_start_us,
+                lease_secs: self.lease_secs,
+            }
         }
         async fn if_mac(&self, iface: &str) -> Option<String> {
             self.asked(iface);
@@ -373,16 +365,12 @@ mod tests {
         Arc::new(ProbingState::new(ProbingTier::Active))
     }
 
-    fn collector_with_ping(
-        ping: CountingPing,
-        quiet: Arc<AtomicBool>,
-    ) -> LinkCollector<CountingPing, FakeTcp, FakeFacts> {
+    fn collector_with_ping(ping: CountingPing) -> LinkCollector<CountingPing, FakeTcp, FakeFacts> {
         LinkCollector::new(
             ping,
             FakeTcp::default(),
             FakeFacts::default(),
             Duration::from_secs(15),
-            quiet,
             active(),
         )
     }
@@ -393,21 +381,12 @@ mod tests {
             FakeTcp::default(),
             facts,
             Duration::from_secs(15),
-            Arc::new(AtomicBool::new(false)),
             active(),
         )
     }
 
-    fn collector_with_quiet(
+    fn collector_with_tier(
         ready: bool,
-        quiet: Arc<AtomicBool>,
-    ) -> LinkCollector<CountingPing, FakeTcp, FakeFacts> {
-        collector_with_switches(ready, quiet, active())
-    }
-
-    fn collector_with_switches(
-        ready: bool,
-        quiet: Arc<AtomicBool>,
         probing: Arc<ProbingState>,
     ) -> LinkCollector<CountingPing, FakeTcp, FakeFacts> {
         LinkCollector::new(
@@ -418,49 +397,17 @@ mod tests {
                 ..FakeFacts::default()
             },
             Duration::from_secs(15),
-            quiet,
             probing,
         )
     }
 
     fn collector(ready: bool) -> LinkCollector<CountingPing, FakeTcp, FakeFacts> {
-        collector_with_quiet(ready, Arc::new(AtomicBool::new(false)))
+        collector_with_tier(ready, active())
     }
 
     #[tokio::test]
     async fn unavailable_preflight_is_not_ready() {
         assert!(!collector(false).preflight().await.is_ready());
-    }
-
-    /// Quiet sends no echo at all and still emits its tick, with the gateway
-    /// verdict `SKIP` — the daemon goes quiet on the wire, never in the record.
-    #[tokio::test]
-    async fn quiet_sends_no_echo_and_still_emits_a_skip_sample() {
-        let quiet = Arc::new(AtomicBool::new(true));
-        let c = collector_with_quiet(true, quiet.clone());
-        let sent = c.ping.sent.clone();
-
-        let samples = c.collect(42).await;
-        assert_eq!(samples.len(), 1, "quiet must not silence the tick");
-        let Sample::Link(l) = &samples[0] else {
-            panic!("expected a link sample")
-        };
-        assert_eq!(l.gw, GwVerdict::Skip);
-        assert_eq!(l.gw_rtt_ms, None);
-        assert_eq!(
-            sent.load(Ordering::Acquire),
-            0,
-            "quiet must address no packet at the gateway"
-        );
-
-        // Flipping the shared flag back takes effect on the next tick.
-        quiet.store(false, Ordering::Release);
-        let samples = c.collect(43).await;
-        let Sample::Link(l) = &samples[0] else {
-            panic!("expected a link sample")
-        };
-        assert_eq!(l.gw, GwVerdict::Ok);
-        assert_eq!(sent.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
@@ -485,7 +432,8 @@ mod tests {
     }
 
     /// The identity pair the facts port reads — the AP's BSSID and the
-    /// interface's own MAC — lands in the sample every tick, untouched.
+    /// interface's own MAC — lands in the sample every tick, untouched, and
+    /// `if_mac_private` is folded from that MAC's own U/L bit.
     #[tokio::test]
     async fn the_link_identity_lands_in_the_sample() {
         let c = collector(true);
@@ -495,6 +443,26 @@ mod tests {
         };
         assert_eq!(l.bssid.as_deref(), Some("3c:22:fb:12:34:56"));
         assert_eq!(l.if_mac.as_deref(), Some("f0:18:98:0a:0b:0c"));
+        // f0:.. is a real OUI: the hardware-burned address, not private.
+        assert_eq!(l.if_mac_private, Some(false));
+    }
+
+    /// The lease pair the ONE `summary` call carries alongside the BSSID
+    /// lands in the sample every tick, untouched (realm net-observer, node
+    /// #93 item 1; node #109 item 1).
+    #[tokio::test]
+    async fn the_lease_pair_lands_in_the_sample() {
+        let c = collector_with_facts(FakeFacts {
+            lease_start_us: Some(1_758_066_844_000_000),
+            lease_secs: Some(86400),
+            ..FakeFacts::default()
+        });
+        let samples = c.collect(42).await;
+        let Sample::Link(l) = &samples[0] else {
+            panic!("expected a link sample")
+        };
+        assert_eq!(l.lease_start_us, Some(1_758_066_844_000_000));
+        assert_eq!(l.lease_secs, Some(86400));
     }
 
     /// An identity the facts port could not determine stays `None` in the
@@ -560,7 +528,7 @@ mod tests {
         assert_eq!(
             *asked_for.lock().unwrap(),
             vec!["en0"; 4],
-            "ssid, bssid, if_mac and medium are all read from that interface"
+            "ssid, summary, if_mac and medium are all read from that interface"
         );
     }
 
@@ -577,7 +545,7 @@ mod tests {
             gw_alive: false,
             ..CountingPing::default()
         };
-        let c = collector_with_ping(ping, Arc::new(AtomicBool::new(false)));
+        let c = collector_with_ping(ping);
         let lan_pinged = c.ping.lan_pinged.clone();
 
         let samples = c.collect(42).await;
@@ -612,32 +580,6 @@ mod tests {
         assert!(lan_pinged.lock().unwrap().is_empty());
     }
 
-    /// Quiet must suppress the neighbor pings too: they are addressed packets,
-    /// and pinging the segment during an incident is exactly what a network
-    /// admin sees. Dies under gating the neighbour probe on anything but a
-    /// SENT echo that failed — a withheld echo is `None`, never "unreachable".
-    #[tokio::test]
-    async fn quiet_suppresses_the_neighbor_probes_too() {
-        let ping = CountingPing {
-            gw_alive: false,
-            ..CountingPing::default()
-        };
-        let c = collector_with_ping(ping, Arc::new(AtomicBool::new(true)));
-        let lan_pinged = c.ping.lan_pinged.clone();
-
-        let samples = c.collect(42).await;
-        let Sample::Link(l) = &samples[0] else {
-            panic!("expected a link sample")
-        };
-        assert_eq!(l.gw, GwVerdict::Skip);
-        assert_eq!(l.lan_probed, None);
-        assert_eq!(l.lan_alive, None);
-        assert!(
-            lan_pinged.lock().unwrap().is_empty(),
-            "quiet must address no packet at the segment"
-        );
-    }
-
     /// The passive tier puts NOTHING on the wire: no echo, no direct connect,
     /// no neighbour ping — even with a gateway that would read FAIL, which is
     /// the one tick the neighbour probe fires on. The tick still lands, every
@@ -654,7 +596,6 @@ mod tests {
             FakeTcp::default(),
             FakeFacts::default(),
             Duration::from_secs(15),
-            Arc::new(AtomicBool::new(false)),
             probing.clone(),
         );
         let echoes = c.ping.sent.clone();
@@ -691,37 +632,5 @@ mod tests {
         assert_eq!(echoes.load(Ordering::Acquire), 1);
         assert_eq!(connects.load(Ordering::Acquire), 1);
         assert_eq!(l.lan_probed, Some(3), "suspicion probes again once active");
-    }
-
-    /// Passive overrides quiet in one direction only: quiet off does not let
-    /// a passive daemon send, and quiet on inside the active tier still
-    /// withholds the echo while the direct probe (not quiet's business) runs.
-    #[tokio::test]
-    async fn passive_overrides_quiet_and_quiet_narrows_active() {
-        // Passive with quiet OFF: still nothing.
-        let c = collector_with_switches(
-            true,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(ProbingState::new(ProbingTier::Passive)),
-        );
-        let samples = c.collect(1).await;
-        let Sample::Link(l) = &samples[0] else {
-            panic!("expected a link sample")
-        };
-        assert_eq!(l.gw, GwVerdict::Skip);
-        assert_eq!(l.direct, TcpVerdict::Skip);
-        assert_eq!(c.ping.sent.load(Ordering::Acquire), 0);
-        assert_eq!(c.tcp.sent.load(Ordering::Acquire), 0);
-
-        // Active with quiet ON: the echo is withheld, the direct probe is sent.
-        let c = collector_with_switches(true, Arc::new(AtomicBool::new(true)), active());
-        let samples = c.collect(2).await;
-        let Sample::Link(l) = &samples[0] else {
-            panic!("expected a link sample")
-        };
-        assert_eq!(l.gw, GwVerdict::Skip);
-        assert_eq!(l.direct, TcpVerdict::Ok);
-        assert_eq!(c.ping.sent.load(Ordering::Acquire), 0);
-        assert_eq!(c.tcp.sent.load(Ordering::Acquire), 1);
     }
 }

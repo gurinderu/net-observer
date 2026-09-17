@@ -110,10 +110,10 @@ filter = "arp or icmp or udp port 67 or udp port 68 or ether broadcast"
 # the wire — the link, proxy and dns probes are withheld and land as SKIP every
 # tick, the held reference streams stay closed, and only the passive collectors
 # (routes, host, wifi, air, neighbours, pcap ring, the link's local reads)
-# measure anything. "active": every probe runs. The tier is process-scoped like
-# quiet: `net-observer-cli probe active|passive` or the bar's "Probe network"
-# row moves it, every switch lands as a `probing_edge` row, and a restart
-# returns to this value.
+# measure anything. "active": every probe runs. The tier is process-scoped:
+# `net-observer-cli probe active|passive` or the bar's "Probe network" row
+# moves it, every switch lands as a `probing_edge` row, and a restart returns
+# to this value.
 [probing]
 default = "passive"
 

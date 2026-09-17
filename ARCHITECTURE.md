@@ -234,9 +234,17 @@ Collectors and their probe ports are **native `async fn`** (Rust ≥ 1.75), not 
   trigger only *if* the next sample is one its condition reads nothing from (a
   `host` tick re-arms `gw-drop`; a `link` tick leaves it latched), which made "does
   a persistent fault re-fire across a pause?" depend on collector arrival order.
-  What a resume does **not** do is reset the firing budget: `last_fire_us` survives
-  it, so each trigger still fires at most once per `backoff_us` and a toggled
-  switch cannot storm the incident log. The `observing_edge` rows bound the gap
+  Before either of those two steps, `TriggerEngine::close_all` closes whatever
+  incident the **previous** session left open, at the `ts_us` of the edge that
+  ended it — the pause's own, or the tier switch's, carried forward in
+  `session_end_us` — never at the first post-edge sample's, which would
+  misattribute the unobserved gap to it; so no `incident` row is ever left
+  open across the bracket. Closing there also releases that trigger's firing
+  budget: `last_fire_us` resets, so a fault still present opens its new-session
+  incident **at once**, not once whatever backoff the closed incident had spent
+  happens to expire. A trigger with **nothing** open at the edge keeps its
+  budget exactly as before, so a toggled switch on a healthy network still
+  cannot storm the incident log. The `observing_edge` rows bound the gap
   between the two records.
 - **Exactly one thing survives that clear: the gateway-CHANGE BASIS.**
   `clear_for_resume` carries the newest `LinkSample` forward, reachable **only**
@@ -406,8 +414,9 @@ graph TD
   **observing on/off toggle switch** on the right, hairline dividers, two
   **sparklines**, label→value rows (gw / direct / tun / selector), an incidents
   line, and a footer of subtle text actions (**Events** — opens the live
-  event-log window — / Refresh / **Freeze pcap** / **Quiet**|**Unquiet** / Quit;
-  the "Restart sing-box" control has been removed from the bar). The panel window
+  event-log window — / Refresh / **Freeze pcap** / **Probe network**|**Stop
+  probing** / Quit; the "Restart sing-box" control has been removed from the
+  bar). The panel window
   is opened `WindowBackgroundAppearance::Blurred`, which puts an
   `NSVisualEffectView` behind it, so the surface token is deliberately
   translucent (`0xRRGGBBAA`) and the base colour lighter than instinct suggests —
@@ -422,8 +431,8 @@ graph TD
   (the coworking gateway does not drop, it *ramps* for ~40 s) and is short enough
   that 120 one-pixel columns fit the 320pt panel without downsampling, so every
   point drawn is a point measured. Both fields are `Option`, and a tick that
-  measured nothing — no sample yet, a paused daemon, quiet mode (`gw = SKIP`), a
-  failed or absent gateway, an unreachable daemon — renders as an **empty
+  measured nothing — no sample yet, a paused daemon, the passive tier (`gw =
+  SKIP`), a failed or absent gateway, an unreachable daemon — renders as an **empty
   column**, never a zero-height bar on the baseline: plotting a missing
   measurement as a value on the floor is the same lie `SKIP` exists to prevent.
   The plot is a row of thin `div`s (gpui 0.2.2 has no chart primitive) with a
@@ -436,8 +445,30 @@ graph TD
   gpui-drawn pill (green track + knob-right when `snapshot.observing`, grey +
   knob-left when paused); clicking it sends `Control(SetObserving(!observing))`
   over the socket (`send_set_observing`) and refreshes, and the header
-  shows a muted "paused" state (grey dot) while collection is off. gpui's
-  build script runs **bindgen over `dispatch.h`** (libclang plus the SDK
+  shows a muted "paused" state (grey dot) while collection is off.
+  **The map window runs the audit ladder by rung and shows its findings.**
+  The network-map window's control row is four rungs — `Scan · Ports ·
+  Banners · CVE` — each a `Control(ScanNeighbors(ScanOptions))` carrying the
+  ladder up to itself (`Scan` = the base sweep + mDNS; `Ports` adds the port
+  scan; `Banners` = ports + banner grab; `CVE` = ports + banners + the match
+  against the daemon's local CVE snapshot), sent through the same
+  background-executor wiring as every other control button, so the daemon's
+  answer — a refusal, or a rung it dropped for a missing dependency, named —
+  lands verbatim in the line under the rungs. The bar only asks: which rungs
+  actually run is the daemon's decision (see [Control path](#control-path)).
+  While one is in flight all four are inert and `scanning…` stands beside
+  them. A **Findings** reading, beside Graph and List, lists every CVE the
+  record hypothesises for an open port — a read-only
+  `Query(Vulns { network: None })` over the socket on the background executor,
+  fetched when the window opens and again after each rung completes, never on
+  a timer — one line per finding grouped by host (`ip:port  cve_id ·
+  confidence · cvss · KEV`, `KEV` only when the daemon flagged it as
+  known-exploited), `no findings` for an empty table, and the daemon's own
+  words when it could not answer (a query it read but could not run, or a
+  daemon built before `Request::Query` existed). Each finding is a hypothesis
+  carrying its confidence, and the caption says so. (realm net-observer, node
+  #90)
+  gpui's build script runs **bindgen over `dispatch.h`** (libclang plus the SDK
   headers), so the crate is a full workspace member but is excluded from
   `default-members` — a bare `cargo build` needs no GUI toolchain. Build the bar
   with `--all` / `-p net-observer-bar` **from inside `nix develop`**. The
@@ -454,7 +485,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 
 | Table | Columns | Notes |
 | --- | --- | --- |
-| `link_sample` | `ts_us, gw, gw_rtt_ms, direct, direct_rtt_ms, dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present, lan_probed, lan_alive, fakeip_route_if, singbox_tun_if, bssid, if_mac, medium` | Local path: gateway ping, direct TCP (bound to phys iface), DHCP/ARP facts, Wi-Fi SSID + CoreCapture presence. `lan_probed`/`lan_alive` are the probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL tick (NULL = not probed). `fakeip_route_if` is the egress interface the route table resolves for a fakeip-pool address; `singbox_tun_if` is the interface carrying sing-box's own TUN address (present only while sing-box runs — the sing-box-alive fact, not "any utun", so a foreign VPN's utun does not read as sing-box being up). Both NULL = could not be determined. `gw_arp_mac` is normalised (`aa:bb:cc:dd:ee:ff`); rows written before the normalisation may carry `arp -n`'s raw form. `bssid` is the BSSID of the access point associated with and `if_mac` the interface's own MAC as currently assigned (Private Wi-Fi Address rotates it per SSID), both lowercase; a BSSID change at the same SSID is a roam the SSID alone cannot show, an `if_mac` change a new DHCP identity toward the network. NULL = not associated / not determinable. `medium` is the medium of the default-route interface (`wifi` or `wired`), measured from the hardware-port table so an `if_mac` change can be judged as a Wi-Fi roam or a dock/undock without a readable SSID or BSSID; NULL = not determinable. |
+| `link_sample` | `ts_us, gw, gw_rtt_ms, direct, direct_rtt_ms, dhcp_router, dhcp_dns, gw_arp_mac, ssid, wifi_capture_present, lan_probed, lan_alive, fakeip_route_if, singbox_tun_if, bssid, if_mac, medium, lease_start_us, lease_secs, if_mac_private` | Local path: gateway ping, direct TCP (bound to phys iface), DHCP/ARP facts, Wi-Fi SSID + CoreCapture presence. `lan_probed`/`lan_alive` are the probe-on-suspicion neighbor-ping counts, measured only on a gateway-FAIL tick (NULL = not probed). `fakeip_route_if` is the egress interface the route table resolves for a fakeip-pool address; `singbox_tun_if` is the interface carrying sing-box's own TUN address (present only while sing-box runs — the sing-box-alive fact, not "any utun", so a foreign VPN's utun does not read as sing-box being up). Both NULL = could not be determined. `gw_arp_mac` is normalised (`aa:bb:cc:dd:ee:ff`); rows written before the normalisation may carry `arp -n`'s raw form. `bssid` is the BSSID of the access point associated with and `if_mac` the interface's own MAC as currently assigned (Private Wi-Fi Address rotates it per SSID), both lowercase; a BSSID change at the same SSID is a roam the SSID alone cannot show, an `if_mac` change a new DHCP identity toward the network. NULL = not associated / not determinable. `medium` is the medium of the default-route interface (`wifi` or `wired`), measured from the hardware-port table so an `if_mac` change can be judged as a Wi-Fi roam or a dock/undock without a readable SSID or BSSID; NULL = not determinable. `lease_start_us` is the current DHCP lease's start (epoch microseconds, from the same `ipconfig getsummary` parse as `bssid`, resolved against the machine's local zone) — a change is a fresh DHCP exchange, an INIT-REBOOT every few minutes a roam; NULL = absent, unparseable, or a DST fold/gap left the local time ambiguous. `lease_secs` is that lease's length in seconds; NULL = absent or unparseable. `if_mac_private` is whether `if_mac`'s U/L bit reads as an administratively-assigned (Private Wi-Fi) address rather than the hardware-burned one; NULL exactly when `if_mac` is. |
 | `proxy_sample` | `ts_us, server_ip, tcp, rtt_ms, tun_code, selector, est_direct_alive, est_direct_age_s, est_tun_alive, est_tun_age_s` | Per-VLESS TCP reachability, tun HTTP 204 (`tun_code`), Clash selector. `tun_code` is the HTTP status the probe got; `0` = probed, no HTTP status (connect refused, timeout, transport error — the shell oracle's curl `000`), the value every reading, live (`starvation`) and offline (`why`, `wedge-or-starvation`), takes as the dead tun; `NULL` = not probed (the passive tier, a preflight skip), neither health nor fault. The `est_*` columns are the established-flow discriminator (held reference streams: direct underlay / through the tunnel), per-tick facts replicated across the tick's rows like `tun_code`; NULL = no measurement. |
 | `dns_sample` | `ts_us, probe, server, verdict, ip, rtt_ms` | One row per resolver probe (name label × resolver path); `verdict` drives the `fakeip` trigger. |
 | `route_event` | `ts_us, kind, iface, detail` | PF_ROUTE event stream (`kind` = `iface` / `addr` / `route`): iface up/down, addr add/loss, default-route change. |
@@ -505,7 +536,7 @@ carries, lives in `types` for the same reason.
 | --- | --- |
 | `verdict_at(ts_us)` | every layer's state at a moment, plus the `layer` the record blames |
 | `incident_context()` | for each incident, the layer state at or just before it opened |
-| `wedge_vs_starvation()` | contiguous `tun=000` episodes, each named `link` / `vless` / `starvation` / `wedge` / `unknown` |
+| `wedge_vs_starvation()` | episodes of ticks whose tun answered anything but 204 (`0` = a silent probe, a captive portal's 200, a 5xx), each named `link` / `vless` / `starvation` / `wedge` / `unknown` |
 | `gw_drops()` | the first link sample of each run of `FAIL`/`NOGW` (`SKIP` ticks removed first, so a quiet run cannot manufacture an edge) |
 | `gateway_ramp(drop_ts_us)` | gateway RTT over the window before a drop, with a least-squares `slope_ms_per_s` over the answered ticks — the ~40 s coworking climb as data |
 | `fakeip_bugs()` | `FAKEIP` on a `.ru` name, which is always a bug |
@@ -516,11 +547,17 @@ The `layer` vocabulary is `link` / `vless` / `proxy` / `host` / `healthy` /
 health or as fault, and two situations make a query decline outright rather than
 answer:
 
-- **A dead tun with no `load1`.** `tun_code = 0` is a wedge if the host was idle
-  and starvation if it was not, and without a host sample the record cannot tell
-  them apart — so the layer is `unknown`, never a guess at `proxy`. The
-  distinction is the one the project paid nine hours to learn on 2026-07-27: a
-  restart cures a wedge and *tears down live flows* under starvation.
+- **A dead-tun episode with no `load1`.** An episode is a run of ticks whose
+  tun answered anything but 204 (`0` — the probe got no status at all; a
+  captive portal's 200; a 5xx). It is `starvation` only when the host was
+  loaded *and* every tick in the episode was silent (`tun_code = 0`
+  throughout); it is `wedge` otherwise — an episode with even one
+  answered-but-wrong tick is a wedge no matter the load, because the tunnel
+  answered and load does not explain a wrong answer. Without a host sample
+  the record cannot tell wedge from starvation at all, so it declines
+  outright: `unknown`, never a guess. The distinction is the one the project
+  paid nine hours to learn on 2026-07-27: a restart cures a wedge and *tears
+  down live flows* under starvation.
 - **A moment inside an observation gap.** An `ASOF JOIN` would honestly hand back
   the newest sample from *before* a pause as though it were a reading taken at
   the moment asked about, with nothing in the row saying otherwise — a gap that
@@ -565,6 +602,26 @@ row and reads `unknown` from its `SKIP`s, never `gap`. `silences_sql` lists
 both brackets under a `kind` column (`pause` | `passive`); `observation_gaps_sql`
 stays pauses-only. (realm net-observer, node #88)
 
+### Air scan
+
+The wifi collector's air scan records the radio neighbourhood as `system_profiler
+SPAirPortDataType` reports it — one `air_sample` row per scan (or a `SKIP` with
+its reason) and one `air_ap` row per access point heard: channel, band, width,
+PHY mode, security label and signal/noise; the report carries no BSSID and
+redacts every SSID (realm net-observer, node #47). `AIR_LATEST_SCAN_SQL`,
+`AIR_LATEST_APS_SQL` and `AIR_SELF_CHANNEL_SQL` read the newest scan for the CLI's
+`air` and the bar's air map.
+
+**The air scan's access points also carry a grade, computed rather than
+stored.** `air_ap` (read by `AIR_LATEST_APS_SQL`, rendered by the CLI's `air`
+command and the bar's air-map window) is judged on two independent axes, both
+pure functions of `AirObservation` with no query of their own: a configuration
+letter A-F (`AirObservation::grade`, penalised over security/band/width/PHY
+generation) and a signal bucket good/fair/poor (`AirObservation::signal`, the
+RSSI-noise gap) — the rubric decided at (realm net-observer, node #89). A rubric
+input the scan did not report costs the AP nothing and only lowers the grade's
+confidence, named in its reasons.
+
 ### Verdict vocabulary
 
 Ported from the oracle and cross-checked against recorded log excerpts:
@@ -577,16 +634,13 @@ Ported from the oracle and cross-checked against recorded log excerpts:
 it is recorded explicitly, never omitted**: absence of a signal is itself
 diagnostic. Two routine producers of `SKIP`, neither an exception to the rule: a
 collector whose per-tick `preflight()` is `Unavailable` (see
-[Collector capability model](#collector-capability-model)), and **quiet mode**
-(`ControlCmd::SetQuiet(true)`), where the link collector withholds the gateway
-echo but still emits one sample per tick carrying `gw = SKIP` — quiet silences
-the wire, never the record, and the triggers read that as *no measurement*, never
-as a healthy gateway and never as a drop. The **passive probing tier**
-(`ControlCmd::SetProbing`, the daemon's default) is the same rule applied to
-every emission class at once: every probe of the link, proxy and dns collectors
-lands as `SKIP`, and the switch itself is bracketed by a `probing_edge` row so
-the record can tell "withheld" from "could not run" (realm net-observer, node
-#88).
+[Collector capability model](#collector-capability-model)), and the **passive
+probing tier** (`ControlCmd::SetProbing`, the daemon's default): every probe of
+the link, proxy and dns collectors is withheld and lands as `SKIP` — the
+withholding silences the wire, never the record, and the triggers read that as
+*no measurement*, never as a healthy gateway and never as a drop. The switch
+itself is bracketed by a `probing_edge` row so the record can tell "withheld"
+from "could not run" (realm net-observer, node #88).
 
 **The one sanctioned exception: an operator pause.** When collection is paused
 (`ControlCmd::SetObserving(false)`) the collectors stop probing entirely rather
@@ -664,9 +718,9 @@ the durable record; the socket is the live, low-latency read path.
     (realm net-observer, node #58)
   - `Request::Control(ControlCmd)` → `Response::Control(ControlResult)` — the
     write/control path (see [Control path](#control-path) below); the only
-    non-read request. Seven commands today — `ControlCmd::KickstartProxy`,
-    `SetObserving(bool)`, `SetQuiet(bool)`, `SetProbing(ProbingTier)`,
-    `FreezePcap`, `ScanNeighbors(ScanOptions)`, `ScanAir` — every one behind
+    non-read request. Six commands today — `ControlCmd::KickstartProxy`,
+    `SetObserving(bool)`, `SetProbing(ProbingTier)`, `FreezePcap`,
+    `ScanNeighbors(ScanOptions)`, `ScanAir` — every one behind
     the same peer-credential check and none behind a config switch.
   - `Request::Subscribe { kinds }` → a **held-open stream** of newline-JSON
     `StreamFrame`s (not a single `Response`, and not bare `Event`s) — the
@@ -709,11 +763,12 @@ the durable record; the socket is the live, low-latency read path.
   `host`), a `generated_us` stamp, an `observing: bool` (whether collection is
   live or paused — `serde(default)` via `observing_default()` so a fresh
   snapshot, and a frame from a pre-pause daemon, read `true`, never misreporting
-  a healthy daemon as paused), a `quiet: bool` (`serde(default)` `false` —
-  collecting but addressing no packet at the gateway, which is a different state
-  from paused), and a bounded, newest-first ring of recent `IncidentSummary`s. `write_frame` / `read_frame` pin the exact framing
-  (`serde_json` + `'\n'`); the crate is runtime-agnostic (no tokio) so the async
-  server and the blocking client share one format definition.
+  a healthy daemon as paused), a `probing: ProbingTier` (`serde(default)`
+  `active` — the tier in force, orthogonal to `observing`), and a bounded,
+  newest-first ring of recent `IncidentSummary`s. `write_frame` / `read_frame`
+  pin the exact framing (`serde_json` + `'\n'`); the crate is runtime-agnostic
+  (no tokio) so the async server and the blocking client share one format
+  definition.
 
 - **Server** (`bin/net-observerd/src/api.rs`, `ApiServer::serve`) — a tokio
   `UnixListener`. Everything the server needs (paths, modes, the acting config,
@@ -921,7 +976,7 @@ follows it — config may switch off what the daemon does by itself (a per-tick
 probe, a passive handler), never a command the operator sends by hand; the
 invocation is the sanction (realm net-observer, node #91). What an arm can
 still refuse, with a reason, is a contradiction of the daemon's own state (a
-scan while paused or quiet) or a missing dependency (no ring, no scanner, no
+scan while paused) or a missing dependency (no ring, no scanner, no
 CVE snapshot).
 
 **The peer-credential gate — who may command the daemon at all.** Before any
@@ -1017,56 +1072,46 @@ already-authorised command:
    `SetObserving` that does **not** change the state is not an edge: no row, no
    frame, because a no-op click must not manufacture a gap in the record.
 
-3. **Self-control — `ControlCmd::SetQuiet(b)`.** While quiet the daemon
-   addresses **no packet at the gateway** — in this daemon that is the link
-   collector's ICMP echo, and only that. Passive facts (ARP table, DHCP lease)
-   keep being read and the link collector keeps emitting one sample per tick with
-   `gw = SKIP`, so quiet silences the wire, never the record — which is why it
-   writes **no** `observing_edge` row: there is no gap to bracket. Like
-   `observing` it is a shared `AtomicBool` mirrored into `snapshot.quiet`, is
-   process-scoped, and is never persisted. Client: the bar footer's
-   **Quiet**/**Unquiet** action.
-
-   **Self-control — `ControlCmd::SetProbing(tier)`.** The probing tier (realm
+3. **Self-control — `ControlCmd::SetProbing(tier)`.** The probing tier (realm
    net-observer, node #88): `passive` puts **nothing on the wire** — every
    emission class of the link, proxy and dns collectors (gateway echo, direct
    probe, neighbour pings, TUN 204, endpoint connects, the held reference
    streams, resolver queries; `types::EmissionClass`) is withheld, each tick
    still lands with its probe verdicts `SKIP`, and the held streams are closed —
-   while `active` runs every class (quiet still withholds the echo inside it).
-   The daemon boots into the tier `[probing] default` names, `passive` when
-   absent, and never changes tier by itself. The three collectors read one
-   shared `collector_core::ProbingState` per tick, mirrored into
-   `snapshot.probing`; process-scoped and never persisted like quiet — but
-   unlike quiet every real switch is **bracketed**: one `types::ProbingEdge`
-   goes to two sinks, a `probing_edge` row via the `Store` and a
-   `StreamFrame::Probing` on the bus, and the startup default is written as a
-   peerless edge too. A no-op switch writes nothing. A real switch, in either
-   direction, closes and re-opens detection exactly as a resume does — it
-   publishes the same `resume_at_us` epoch, so `pipeline::run` clears the
+   while `active` runs every class. The daemon boots into the tier `[probing]
+   default` names, `passive` when absent, and never changes tier by itself. The
+   three collectors read one shared `collector_core::ProbingState` per tick,
+   mirrored into `snapshot.probing`; process-scoped and never persisted like
+   `observing` — but every real switch is **bracketed**: one
+   `types::ProbingEdge` goes to two sinks, a `probing_edge` row via the `Store`
+   and a `StreamFrame::Probing` on the bus, and the startup default is written
+   as a peerless edge too. A no-op switch writes nothing. A real switch, in
+   either direction, closes and re-opens detection exactly as a resume does —
+   it publishes the same `resume_at_us` epoch, so `pipeline::run` clears the
    recent-sample window and re-arms every trigger, and the interval collectors
-   drop a tick that straddled the edge at the source — so the cleared window
-   makes the first post-edge sample judge afresh, exactly as after a resume: a
-   condition that no longer holds closes its open incident at that sample's
-   `ts_us`, one that still holds (a `NoGw` gw-drop, a fakeip hijack — both
-   readable under passive) keeps it open, and the `probing_edge` row at the
-   switch's own `ts_us` is the bracket either way; the first passive `SKIP`s
-   never read as a recovery, and dead ticks from before a stretch stay out of
-   the count after it. Clients: the bar menu's **Probe network**/**Stop probing**
+   drop a tick that straddled the edge at the source. Before either of those
+   two steps, whatever incident was open AT THE SWITCH already closed at the
+   switch's own `ts_us` (`TriggerEngine::close_all`) — never at the first
+   post-switch sample's — and that trigger's firing budget closed with it, so
+   the cleared window makes the first post-edge sample judge **completely**
+   afresh: a fault still present (a `NoGw` gw-drop, a fakeip hijack — both
+   readable under passive) opens a **new** incident of the new session at
+   once, not once whatever backoff the closed incident had spent happens to
+   expire; the `probing_edge` row at the switch's own `ts_us` is the bracket
+   that names the instant either way; the first passive `SKIP`s never read as
+   a recovery, and dead ticks from before a stretch stay out of the count
+   after it. Clients: the bar menu's **Probe network**/**Stop probing**
    row and `net-observer-cli probe passive|active`; `gaps` asks the `Silences`
    diagnosis, which lists passive stretches as `kind = passive` next to the
    pauses (`Gaps` itself stays pauses-only for readers built before the tier;
    when an older daemon answers `Gaps` the CLI says so on stderr, and when it
    reads the file it runs `silences_sql` and prints only its usual source line).
 
-   Passive and quiet are two different promises, which is why only one of them
-   refuses a manual scan. Passive promises **no emission the daemon makes on
-   its own** — nothing on a timer; an operator's `ScanNeighbors` is not the
-   daemon's emission, the command is the sanction (realm net-observer, node
-   #91) and the scan writes its own `neighbor_scan` row, so passive lets it
-   through. Quiet is the **evidence protocol** (realm net-observer, node #26):
-   a capture taken under quiet must contain none of our packets, so quiet
-   keeps refusing the sweep.
+   Passive is deliberately **not** a refusal on a manual scan. Passive
+   promises **no emission the daemon makes on its own** — nothing on a timer;
+   an operator's `ScanNeighbors` is not the daemon's emission, the command is
+   the sanction (realm net-observer, node #91) and the scan writes its own
+   `neighbor_scan` row, so passive lets it through.
 
 4. **Self-control — `ControlCmd::FreezePcap`.** Copy the pcap ring out now, into
    a fresh freeze directory — the same passive artifact the `gw-change` trigger
@@ -1078,7 +1123,7 @@ already-authorised command:
 
 The `ScanNeighbors` and `ScanAir` arms are described under their own
 subsystems; both take the same path below and are refused only by a state they
-contradict (paused; for the sweep also quiet) or a missing dependency.
+contradict (paused) or a missing dependency.
 
 ```
 Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
@@ -1101,10 +1146,11 @@ Request::Control(cmd)  ──►  control_request(cmd, peer_uid, &cx)
                                     │         └─► ControlResult { ok: true, "observing on|off" }
                                     │             (never touches sing-box or the network)
                                     │
-                                    ├─ SetQuiet(b)
-                                    │     └─► quiet.store(b) + snapshot.quiet = b
-                                    │         (NO observing_edge row: the record keeps
-                                    │          receiving one SKIP-gw sample per tick)
+                                    ├─ SetProbing(tier)
+                                    │     └─► probing.set(tier) + snapshot.probing = tier
+                                    │         └─► on a real EDGE only:
+                                    │             store.write_probing_edge(&edge)   (durable)
+                                    │             events_tx.send(StreamFrame::Probing(edge))
                                     │
                                     ├─ FreezePcap
                                     │     └─► freeze_now(cx) → freezer.freeze(dir)

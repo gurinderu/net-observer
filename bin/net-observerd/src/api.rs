@@ -382,12 +382,9 @@ pub struct ApiServer {
     pub policy: ControlPolicy,
     /// The collectors' pause flag; `SetObserving` is its only writer.
     pub observing: Arc<AtomicBool>,
-    /// The link collector's quiet flag; `SetQuiet` is its only writer. Shared
-    /// with the collector — a fresh `Arc` here would ack a quiet nobody honours.
-    pub quiet: Arc<AtomicBool>,
     /// The probing tier the link, proxy and dns collectors read each tick;
     /// `SetProbing` is its only writer. Shared with the collectors for the same
-    /// reason as `quiet`. (realm net-observer, node #88)
+    /// reason as `observing`. (realm net-observer, node #88)
     pub probing: Arc<ProbingState>,
     /// The slot holding the pcap ring, asked at request time rather than held by
     /// value: the ring can start late (no interface at boot) or die, and
@@ -413,12 +410,36 @@ pub struct ApiServer {
     /// by `pipeline::run` to drop its pre-edge trigger window. `0` = no such
     /// edge yet.
     pub resume_at_us: Arc<AtomicI64>,
+    /// `ts_us` of the edge that ENDED the observation session the next
+    /// `resume_at_us` move re-opens. `SetObserving(false)` and `set_probing`
+    /// both write here, and BOTH use `compare_exchange(0, ts_us, ..)`, never a
+    /// plain store: the FIRST unconsumed end wins. A tier switch accepted
+    /// WHILE PAUSED publishes no sample of its own to consume this atomic, so
+    /// an unconditional store would let it push the close point forward — a
+    /// pause at `t=10` then a switch at `t=50`, both before the resume at
+    /// `t=100`, would otherwise close at `50`, still inside the unobserved gap
+    /// the pause opened at `10`. Losing the race is the correct outcome for the
+    /// later writer, which is why both call sites ignore the `Result`.
+    /// `pipeline::run` CONSUMES this exactly once per edge with `swap(0, ..)` —
+    /// reading it and resetting it to `0` atomically, so a value once used
+    /// cannot be read again by a later edge — and closes
+    /// (`TriggerEngine::close_all`) at that value if it was `> 0`, or at the
+    /// edge's own `ts_us` otherwise: `0` means no end was ever recorded for
+    /// this edge. The one residual: a pause whose `compare_exchange` lands
+    /// between the consumer's `resume_at_us` load and its `swap` FOR THE
+    /// PREVIOUS edge loses the race to that still-unconsumed value and is
+    /// silently dropped, so the later resume that ends ITS session falls back
+    /// to its own `ts_us` instead of this pause's — accepted, since closing
+    /// that gap needs an operator toggle inside the consumer's own
+    /// load-to-swap window, sub-millisecond and far tighter than a human
+    /// hand on the control (realm net-observer, node #124).
+    pub session_end_us: Arc<AtomicI64>,
     pub snapshot: Arc<Mutex<StatusSnapshot>>,
     /// Durable sink for pause/resume boundary records.
     pub store: Arc<dyn Store + Send + Sync>,
     /// The one-in-flight gate on `Request::Query` — [`MAX_QUERIES_IN_FLIGHT`]
     /// permits, claimed with `try_acquire` and never awaited. An `Arc` like
-    /// the other shared state here (`observing`, `quiet`, `store`): one gate
+    /// the other shared state here (`observing`, `probing`, `store`): one gate
     /// for the server and every connection task it spawns, whichever of them
     /// is holding the permit.
     pub query_gate: Arc<Semaphore>,
@@ -703,7 +724,6 @@ async fn handle_conn(
                 policy: &srv.policy,
                 acting: &srv.acting,
                 observing: &srv.observing,
-                quiet: &srv.quiet,
                 probing: &srv.probing,
                 freezer: &srv.freezer,
                 scanner: srv.scanner.as_deref(),
@@ -711,6 +731,7 @@ async fn handle_conn(
                 scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
                 blob_dir: &srv.blob_dir,
                 resume_at_us: &srv.resume_at_us,
+                session_end_us: &srv.session_end_us,
                 snapshot: &srv.snapshot,
                 store: srv.store.as_ref(),
                 events_tx: &srv.events_tx,
@@ -925,7 +946,6 @@ pub(crate) struct ControlCtx<'a> {
     pub policy: &'a ControlPolicy,
     pub acting: &'a ActingConfig,
     pub observing: &'a AtomicBool,
-    pub quiet: &'a AtomicBool,
     pub probing: &'a ProbingState,
     pub freezer: &'a PcapRingSlot,
     /// The neighbour scanner, when one could be built for this host.
@@ -937,6 +957,10 @@ pub(crate) struct ControlCtx<'a> {
     pub scan_cve_snapshot: Option<&'a Path>,
     pub blob_dir: &'a Path,
     pub resume_at_us: &'a AtomicI64,
+    /// `ts_us` of the edge that ENDED the observation session the next
+    /// `resume_at_us` move re-opens. See the field of the same name on
+    /// [`ApiServer`] (realm net-observer, node #124).
+    pub session_end_us: &'a AtomicI64,
     pub snapshot: &'a Mutex<StatusSnapshot>,
     pub store: &'a (dyn Store + Send + Sync),
     pub events_tx: &'a broadcast::Sender<EncodedFrame>,
@@ -980,8 +1004,8 @@ pub(crate) fn control_request(
 /// gate on the control path, because config may switch off what the daemon does
 /// by itself, never a command the operator sends by hand — the invocation is the
 /// sanction (realm net-observer, node #91). What an arm can still refuse is a
-/// contradiction of the daemon's own state (a scan while paused or quiet) or a
-/// missing dependency (no ring, no scanner, no snapshot) — each with a reason.
+/// contradiction of the daemon's own state (a scan while paused) or a missing
+/// dependency (no ring, no scanner, no snapshot) — each with a reason.
 fn control_response(
     cmd: ControlCmd,
     authorized: PeerAuthorized,
@@ -1015,6 +1039,29 @@ fn control_response(
                     let ts_us = types::now_us();
                     if b {
                         cx.resume_at_us.store(ts_us, Ordering::Release);
+                    } else {
+                        // The session ends HERE, at the pause: a pause moves no
+                        // `resume_at_us` of its own (it produces no sample for
+                        // `pipeline::run` to react to), so the LATER resume is
+                        // what actually triggers the edge. Without this, that
+                        // resume would close whatever incident the pre-pause
+                        // session left open at the RESUME's `ts_us`, attributing
+                        // the whole unobserved gap to it.
+                        //
+                        // `compare_exchange`, not a store: the FIRST unconsumed
+                        // end wins. A tier switch accepted while still paused
+                        // publishes no sample to consume this atomic either, so
+                        // an unconditional store here would let THAT switch's
+                        // later `ts_us` overwrite the pause's — closing inside
+                        // the gap the pause itself opened. Losing the race is
+                        // correct, so the `Result` is ignored (realm
+                        // net-observer, node #124).
+                        let _ = cx.session_end_us.compare_exchange(
+                            0,
+                            ts_us,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
                     }
                     cx.observing.store(b, Ordering::Release);
                     snap.observing = b;
@@ -1077,25 +1124,6 @@ fn control_response(
                 message: format!("observing {label}{note}"),
             }
         }
-        ControlCmd::SetQuiet(b) => {
-            // The quiet flag has no boundary record by design: unlike a pause it
-            // produces no gap — the link collector keeps emitting one sample per
-            // tick, carrying `gw = SKIP`, so the suppression is already visible in
-            // the record it would otherwise have to bracket.
-            let was = cx.quiet.swap(b, Ordering::AcqRel);
-            cx.snapshot.lock().unwrap_or_else(|e| e.into_inner()).quiet = b;
-            let label = if b { "on" } else { "off" };
-            tracing::info!(
-                quiet = b,
-                changed = was != b,
-                peer_uid = authorized.uid(),
-                "quiet state set via control socket"
-            );
-            ControlResult {
-                ok: true,
-                message: format!("quiet {label}"),
-            }
-        }
         ControlCmd::SetProbing(tier) => set_probing(tier, authorized, cx),
         ControlCmd::FreezePcap => freeze_now(cx),
         ControlCmd::ScanNeighbors(opts) => scan_now(cx, &opts, Some(authorized.uid())),
@@ -1109,9 +1137,9 @@ fn control_response(
 
 /// Switch the probing tier on operator demand (realm net-observer, node #88).
 ///
-/// The `SetQuiet` shape — flip the shared state, mirror it into the snapshot,
-/// answer — plus the two sinks `SetObserving` uses, because a tier switch IS
-/// bracketed: one `ProbingEdge` built once, written as a `probing_edge` row and
+/// Flip the shared state, mirror it into the snapshot, answer — plus the two
+/// sinks `SetObserving` uses, because a tier switch IS bracketed: one
+/// `ProbingEdge` built once, written as a `probing_edge` row and
 /// published as a `StreamFrame::Probing`. The state flip, the clock and the
 /// publish sit under the snapshot lock for the reason `SetObserving` spells
 /// out: two opposite switches must stamp and land in one order, or the rows
@@ -1129,16 +1157,21 @@ fn control_response(
 /// (`RecentWindow::clear_for_resume`, gateway-change basis kept), re-arms every
 /// trigger (`TriggerEngine::rearm_all`) and keeps the bounded pre-edge drain out
 /// of the window; the interval collectors drop a tick that straddled the edge
-/// at the source as well. So the cleared window makes the first post-edge
-/// sample judge afresh, exactly as after a resume: a condition that no longer
-/// holds closes its open incident at that sample's `ts_us`; one that still
-/// holds — a `NoGw` gw-drop, a fakeip hijack, both readable under passive —
-/// keeps it open. The `probing_edge` row at the switch's own `ts_us` is the
-/// bracket that explains either. The probe-fed conditions do not read the
-/// first passive `SKIP`s as a recovery, and after a switch back no dead tick
-/// from before the stretch can join the ticks after it. Without this, the
-/// switch to passive turned every probe-fed condition to `None` at once and
-/// the engine closed open incidents as "recovered" at that instant.
+/// at the source as well. Before either of those two steps, whatever incident
+/// was open AT THE SWITCH already closed at the switch's own `ts_us`
+/// (`TriggerEngine::close_all`, realm net-observer, node #124) — never at the
+/// first post-switch sample's — and that trigger's firing budget closed with
+/// it, so the cleared window makes the first post-edge sample judge
+/// completely afresh: a fault still present (a `NoGw` gw-drop, a fakeip
+/// hijack, both readable under passive) opens a NEW incident of the new
+/// session AT ONCE, not once whatever backoff the closed incident had spent
+/// happens to expire. The `probing_edge` row at the switch's own `ts_us` is
+/// the bracket that names the instant. The probe-fed conditions do not read
+/// the first passive `SKIP`s as a recovery, and after a switch back no dead
+/// tick from before the stretch can join the ticks after it. Without
+/// `close_all`, the switch to passive turned every probe-fed condition to
+/// `None` at once and the engine closed open incidents as "recovered" at the
+/// FIRST POST-SWITCH sample instead of at the switch itself.
 fn set_probing(
     tier: ProbingTier,
     authorized: PeerAuthorized,
@@ -1163,6 +1196,19 @@ fn set_probing(
             // spawner's re-checks. Swapping the order would open the
             // consumer-side hole above instead. Accepted as bounded (one tick,
             // one switch) and left as is.
+            //
+            // `session_end_us` is written BEFORE `resume_at_us`, same
+            // reasoning: the consumer that observes the epoch move must
+            // already see the session's end. `compare_exchange`, not a store:
+            // the FIRST unconsumed end wins, so a switch accepted while the
+            // daemon is PAUSED (no sample flows to consume this atomic before
+            // the later resume) cannot push the close point forward past a
+            // pause that already opened the gap. Losing the race is correct
+            // for this later writer, so the `Result` is ignored (realm
+            // net-observer, node #124).
+            let _ =
+                cx.session_end_us
+                    .compare_exchange(0, ts_us, Ordering::AcqRel, Ordering::Acquire);
             cx.resume_at_us.store(ts_us, Ordering::Release);
             cx.probing.set(tier);
             snap.probing = tier;
@@ -1217,21 +1263,15 @@ fn set_probing(
 /// but does not fail the command: the packets really did go out, and saying
 /// otherwise would be a false statement about what this daemon did.
 fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>) -> ControlResult {
-    // Two refusals BEFORE anything is sent, because a scan is the one command
-    // that contradicts these two states outright.
+    // One refusal BEFORE anything is sent: a scan is the one command that
+    // contradicts a paused daemon outright.
     //
     // Paused: the pause is bracketed silence — `observing_edge` says the daemon
     // deliberately collected nothing between two instants. A scan would drop
     // rows and publish an event with a timestamp inside that bracket, so the gap
     // record and the data would disagree about the same seconds.
     //
-    // Quiet: quiet means this daemon addresses no packet at the gateway; a sweep
-    // addresses the whole subnet. Honouring the click would make quiet a lie the
-    // operator has no way to see — quiet is the EVIDENCE protocol (realm
-    // net-observer, node #26): a capture taken under it must contain none of
-    // our packets.
-    //
-    // The passive probing tier is deliberately NOT a third refusal. Passive
+    // The passive probing tier is deliberately NOT a second refusal. Passive
     // promises no emission the daemon makes on its own; an operator's scan is
     // not the daemon's — the command is the sanction (realm net-observer, node
     // #91) — and the scan writes its own `neighbor_scan` row, so the record
@@ -1240,12 +1280,6 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
         return ControlResult {
             ok: false,
             message: "observation is paused; resume before scanning".to_string(),
-        };
-    }
-    if cx.quiet.load(Ordering::Acquire) {
-        return ControlResult {
-            ok: false,
-            message: "quiet is on; a scan would address the whole subnet".to_string(),
         };
     }
     let Some(scanner) = cx.scanner else {
@@ -1380,9 +1414,7 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
 /// Read the radio environment once on operator demand.
 ///
 /// The daemon asks the OS for its own radio's report and puts nothing on the
-/// air (realm net-observer, node #47). So — unlike [`scan_now`] — there is no
-/// `quiet` refusal here: quiet means this daemon addresses no packet at the
-/// gateway, and a reading that transmits nothing does not contradict it.
+/// air (realm net-observer, node #47).
 ///
 /// A PAUSE still refuses, for the reason it refuses a neighbour scan: the pause
 /// is bracketed silence, and a sample stamped inside that bracket would make the
@@ -1623,7 +1655,6 @@ mod tests {
                 peer_uid: peer_uid_of,
             },
             observing: Arc::new(AtomicBool::new(true)),
-            quiet: Arc::new(AtomicBool::new(false)),
             // Active, so the pre-tier control tests keep their premises; the
             // `set_probing` test flips it itself.
             probing: Arc::new(ProbingState::new(ProbingTier::Active)),
@@ -1633,6 +1664,7 @@ mod tests {
             scan_cve_snapshot: None,
             blob_dir: std::env::temp_dir().join("net-observerd-test-blobs"),
             resume_at_us: Arc::new(AtomicI64::new(0)),
+            session_end_us: Arc::new(AtomicI64::new(0)),
             snapshot: Arc::new(Mutex::new(StatusSnapshot::default())),
             store: Arc::new(store::DuckdbStore::in_memory().unwrap()),
             query_gate: Arc::new(Semaphore::new(MAX_QUERIES_IN_FLIGHT)),
@@ -1649,7 +1681,6 @@ mod tests {
             policy: &srv.policy,
             acting: &srv.acting,
             observing: &srv.observing,
-            quiet: &srv.quiet,
             probing: &srv.probing,
             freezer: &srv.freezer,
             scanner: srv.scanner.as_deref(),
@@ -1657,6 +1688,7 @@ mod tests {
             scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
             blob_dir: &srv.blob_dir,
             resume_at_us: &srv.resume_at_us,
+            session_end_us: &srv.session_end_us,
             snapshot: &srv.snapshot,
             store: srv.store.as_ref(),
             events_tx: &srv.events_tx,
@@ -1692,20 +1724,6 @@ mod tests {
     fn an_air_scan_reaches_the_scanner() {
         let mut srv = test_server("/tmp/unused-air-1.sock", test_acting(), TEST_DAEMON_UID);
         let asked = with_air(&mut srv, AirScanRequest::Started);
-        let cx = test_ctx(&srv);
-        let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
-        assert!(r.ok, "{}", r.message);
-        assert_eq!(asked.load(Ordering::Acquire), 1);
-    }
-
-    /// Quiet suppresses a packet this daemon would put AT the gateway. An air
-    /// read puts nothing anywhere, so quiet does not refuse it — unlike the
-    /// neighbour sweep, which quiet must refuse.
-    #[test]
-    fn quiet_does_not_refuse_an_air_scan() {
-        let mut srv = test_server("/tmp/unused-air-2.sock", test_acting(), TEST_DAEMON_UID);
-        let asked = with_air(&mut srv, AirScanRequest::Started);
-        srv.quiet.store(true, Ordering::Release);
         let cx = test_ctx(&srv);
         let r = control_request(ControlCmd::ScanAir, Some(TEST_DAEMON_UID), &cx);
         assert!(r.ok, "{}", r.message);
@@ -1811,6 +1829,9 @@ mod tests {
                 bssid: None,
                 if_mac: None,
                 medium: None,
+                lease_start_us: None,
+                lease_secs: None,
+                if_mac_private: None,
                 wifi_capture_present: false,
                 lan_probed: None,
                 lan_alive: None,
@@ -2146,7 +2167,6 @@ mod tests {
 
         for cmd in [
             ControlCmd::SetObserving(false),
-            ControlCmd::SetQuiet(true),
             ControlCmd::SetProbing(ProbingTier::Passive),
             ControlCmd::FreezePcap,
             ControlCmd::KickstartProxy,
@@ -2156,7 +2176,6 @@ mod tests {
             // Exhaustive on purpose — a new variant breaks this arm list.
             match cmd {
                 ControlCmd::SetObserving(_)
-                | ControlCmd::SetQuiet(_)
                 | ControlCmd::SetProbing(_)
                 | ControlCmd::FreezePcap
                 | ControlCmd::KickstartProxy
@@ -2204,8 +2223,8 @@ mod tests {
     }
 
     /// `SetProbing` flips the tier the three emitting collectors read, mirrors
-    /// it into the live snapshot, and — unlike quiet — brackets the switch:
-    /// one durable `probing_edge` row and one `Probing` frame describing the
+    /// it into the live snapshot, and brackets the switch: one durable
+    /// `probing_edge` row and one `Probing` frame describing the
     /// same transition (same `ts_us`, same tier, same peer). A repeat to the
     /// tier already in force is not an edge: no row, no frame, still `ok`.
     #[test]
@@ -2226,9 +2245,8 @@ mod tests {
         assert_eq!(res.message, "probing passive");
         assert_eq!(srv.probing.tier(), ProbingTier::Passive);
         assert_eq!(srv.snapshot.lock().unwrap().probing, ProbingTier::Passive);
-        // The tier is orthogonal to the pause and to quiet.
+        // The tier is orthogonal to the pause.
         assert!(srv.observing.load(Ordering::Acquire));
-        assert!(!srv.quiet.load(Ordering::Acquire));
         // The switch closes and re-opens detection the way a resume does: the
         // window-clearing epoch moves to the edge's own instant, which is what
         // `pipeline::run` keys `clear_for_resume` + `rearm_all` off.
@@ -2255,6 +2273,13 @@ mod tests {
         assert_eq!(
             epoch_after_passive, row_ts,
             "the epoch is the edge's own instant: the probing_edge row is the bracket"
+        );
+        // The switch also records itself as the session's own end, stamped
+        // BEFORE the epoch bump (realm net-observer, node #124).
+        assert_eq!(
+            srv.session_end_us.load(Ordering::Acquire),
+            row_ts,
+            "a tier switch must publish the session's end at its own ts_us"
         );
         // Sink 2: exactly one frame, describing the same transition.
         let frame = rx.try_recv().expect("a tier switch must publish one frame");
@@ -2317,6 +2342,16 @@ mod tests {
             srv.store
                 .query_scalar_i64("SELECT ts_us FROM probing_edge WHERE tier = 'active'")
                 .unwrap()
+        );
+        // The FIRST unconsumed end wins: nothing ever consumed (swapped) it
+        // between the two switches — exactly the "switch during a pause"
+        // shape, just with the first edge itself standing in for the pause —
+        // so `session_end_us` still holds the FIRST switch's `ts_us`, not this
+        // second one's, even though `resume_at_us` moved again.
+        assert_eq!(
+            srv.session_end_us.load(Ordering::Acquire),
+            epoch_after_passive,
+            "an unconsumed session_end_us must not be overwritten by a later switch"
         );
         // A tier switch is not a pause: the observing bracket stays untouched.
         assert_eq!(
@@ -2476,36 +2511,11 @@ mod tests {
         );
     }
 
-    /// Quiet says this daemon addresses no packet at the gateway. A sweep
-    /// addresses the whole subnet, so the click is refused rather than silently
-    /// making quiet untrue.
-    #[test]
-    fn a_scan_is_refused_while_quiet_is_on() {
-        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
-        srv.scanner = Some(Arc::new(FakeScanner(Some(fake_report()))));
-        srv.quiet.store(true, Ordering::Release);
-        let cx = test_ctx(&srv);
-        let res = control_request(
-            ControlCmd::ScanNeighbors(ScanOptions::default()),
-            Some(TEST_DAEMON_UID),
-            &cx,
-        );
-        assert!(!res.ok, "quiet must not be broken by a scan");
-        assert!(res.message.contains("quiet"), "{}", res.message);
-        assert_eq!(
-            srv.store
-                .query_scalar_i64("SELECT count(*) FROM neighbor")
-                .unwrap(),
-            0
-        );
-    }
-
-    /// The sibling of the quiet refusal, in the other direction: the passive
-    /// tier promises no emission the daemon makes on its own, and an operator's
-    /// scan is not the daemon's — the command is the sanction (realm
-    /// net-observer, node #91) and the scan writes its own `neighbor_scan`
-    /// row, so passive lets it through and the record shows what was sent
-    /// inside the stretch. (realm net-observer, node #88)
+    /// The passive tier promises no emission the daemon makes on its own, and
+    /// an operator's scan is not the daemon's — the command is the sanction
+    /// (realm net-observer, node #91) and the scan writes its own
+    /// `neighbor_scan` row, so passive lets it through and the record shows
+    /// what was sent inside the stretch. (realm net-observer, node #88)
     #[test]
     fn a_neighbour_scan_runs_under_the_passive_tier() {
         let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
@@ -2699,38 +2709,6 @@ mod tests {
         );
     }
 
-    /// `SetQuiet` flips the flag the link collector reads and mirrors the state
-    /// into the live snapshot so the bar renders it. Unlike a pause it writes NO
-    /// boundary row — quiet produces no gap to bracket.
-    #[test]
-    fn set_quiet_flips_the_flag_and_writes_no_boundary_row() {
-        let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
-        let cx = test_ctx(&srv);
-
-        let on = control_request(ControlCmd::SetQuiet(true), Some(TEST_DAEMON_UID), &cx);
-        assert!(on.ok, "{}", on.message);
-        assert_eq!(on.message, "quiet on");
-        assert!(srv.quiet.load(Ordering::Acquire));
-        assert!(srv.snapshot.lock().unwrap().quiet);
-        // Quiet is orthogonal to the pause: the daemon keeps collecting.
-        assert!(srv.observing.load(Ordering::Acquire));
-
-        let off = control_request(ControlCmd::SetQuiet(false), Some(TEST_DAEMON_UID), &cx);
-        assert!(off.ok);
-        assert_eq!(off.message, "quiet off");
-        assert!(!srv.quiet.load(Ordering::Acquire));
-        assert!(!srv.snapshot.lock().unwrap().quiet);
-
-        assert_eq!(
-            srv.store
-                .as_ref()
-                .query_scalar_i64("SELECT count(*) FROM observing_edge")
-                .unwrap(),
-            0,
-            "quiet keeps emitting samples, so it must not write an observing edge"
-        );
-    }
-
     /// With no ring running, `FreezePcap` is a REFUSAL with a reason — never a
     /// silent success that would leave the operator believing an artifact exists.
     #[test]
@@ -2837,12 +2815,19 @@ mod tests {
     fn new_self_control_commands_still_need_an_authorised_peer() {
         let srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
         let cx = test_ctx(&srv);
-        for cmd in [ControlCmd::SetQuiet(true), ControlCmd::FreezePcap] {
+        for cmd in [
+            ControlCmd::SetProbing(ProbingTier::Passive),
+            ControlCmd::FreezePcap,
+        ] {
             let res = control_request(cmd.clone(), None, &cx);
             assert!(!res.ok, "{cmd:?} must be refused without peer credentials");
             assert!(res.message.contains("control refused"));
         }
-        assert!(!srv.quiet.load(Ordering::Acquire), "the flag must not move");
+        assert_eq!(
+            srv.probing.tier(),
+            ProbingTier::Active,
+            "the tier must not move"
+        );
     }
 
     /// The D1↔D3 anti-drift test: one real edge produces exactly ONE durable
@@ -2869,6 +2854,14 @@ mod tests {
             .store
             .query_scalar_i64("SELECT ts_us FROM observing_edge")
             .unwrap();
+        // The pause also records the session's own end — for the LATER resume
+        // to close the incident this pause interrupted at, not at the
+        // resume's own `ts_us` (realm net-observer, node #124).
+        assert_eq!(
+            srv.session_end_us.load(Ordering::Acquire),
+            row_ts,
+            "a pause must publish the session's end for the pipeline to close against"
+        );
         assert_eq!(
             srv.store
                 .query_scalar_i64("SELECT peer_uid FROM observing_edge")
@@ -2945,12 +2938,22 @@ mod tests {
             0,
             "a pause is not a resume and must not move the resume epoch"
         );
+        let session_end_at_pause = srv.session_end_us.load(Ordering::Acquire);
+        assert!(
+            session_end_at_pause > 0,
+            "a pause must record the session's end for the eventual resume to close against"
+        );
 
         let on = control_request(ControlCmd::SetObserving(true), Some(TEST_DAEMON_UID), &cx);
         assert!(on.ok);
         assert!(
             srv.resume_at_us.load(Ordering::Acquire) > 0,
             "a resume must publish its epoch for the pipeline to observe"
+        );
+        assert_eq!(
+            srv.session_end_us.load(Ordering::Acquire),
+            session_end_at_pause,
+            "a resume does not itself end a session; it must not move session_end_us"
         );
     }
 

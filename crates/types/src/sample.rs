@@ -39,10 +39,32 @@ pub struct LinkSample {
     /// #108). `serde(default)` so a pre-field daemon's samples still decode.
     #[serde(default)]
     pub medium: Option<LinkMedium>,
+    /// Start of the current DHCP lease, epoch microseconds — a fresh exchange
+    /// on a network change, INIT-REBOOT every few minutes on a roam
+    /// (`ipconfig getsummary <iface>`'s `LeaseStartTime`, parsed as LOCAL wall
+    /// time with `chrono::Local` since the field carries no zone). `None` when
+    /// absent, unparseable, or the local time is ambiguous/nonexistent (a DST
+    /// fold or gap: only an unambiguous single local instant is accepted) —
+    /// never a fabricated instant (realm net-observer, node #93 item 1; node
+    /// #109 item 1). `serde(default)` so a pre-field daemon's samples still
+    /// decode.
+    #[serde(default)]
+    pub lease_start_us: Option<i64>,
+    /// Length of the current DHCP lease, seconds (`lease_time` in the same
+    /// `ipconfig getsummary` DHCP packet dump). `None` when absent or
+    /// unparseable. `serde(default)` as above.
+    #[serde(default)]
+    pub lease_secs: Option<u32>,
+    /// Whether [`LinkSample::if_mac`] is administratively assigned (a Private
+    /// Wi-Fi Address) rather than the hardware-burned address, from the U/L
+    /// bit of its first octet ([`crate::mac_is_private`]). `None` exactly when
+    /// `if_mac` is. `serde(default)` as above.
+    #[serde(default)]
+    pub if_mac_private: Option<bool>,
     pub wifi_capture_present: bool,
     /// Probe-on-suspicion: how many LAN neighbors were pinged on this tick.
     /// Measured only when the gateway verdict is `Fail`; `None` = not probed
-    /// (healthy gateway, quiet mode, or no gateway) — never a zero.
+    /// (healthy gateway, the passive tier, or no gateway) — never a zero.
     /// `serde(default)` so a pre-field daemon's samples still decode.
     #[serde(default)]
     pub lan_probed: Option<u16>,
@@ -248,6 +270,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,

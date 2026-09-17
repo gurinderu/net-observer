@@ -460,4 +460,26 @@ mod tests {
             "wpa3_transition"
         );
     }
+
+    /// The config-grade rubric (realm net-observer, node #89) run over the two
+    /// APs in the real recorded report — first-hand data, not a synthesized
+    /// fixture: 2.4 GHz/WPA2-mixed/b-g-n grades `F`, 5 GHz/WPA2/80 MHz/ax
+    /// grades `B`.
+    #[test]
+    fn grades_the_two_aps_in_the_real_report() {
+        let aps = parse_air_report(REAL_REPORT).unwrap();
+        let f = aps[0].grade();
+        assert_eq!(
+            f.grade,
+            types::Grade::F,
+            "2.4 GHz, WPA2-mixed, b/g/n: {f:?}"
+        );
+        let b = aps[1].grade();
+        assert_eq!(
+            b.grade,
+            types::Grade::B,
+            "5 GHz, WPA2, 80 MHz, a/n/ac/ax: {b:?}"
+        );
+        assert_eq!(b.confidence, types::Confidence::High, "{b:?}");
+    }
 }

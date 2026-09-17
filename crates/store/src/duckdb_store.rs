@@ -138,6 +138,35 @@ impl DuckdbStore {
         Ok(n)
     }
 
+    /// The newest `ts_us` across every SAMPLE table — the record's own
+    /// observation bound, distinct from whatever the wall clock reads when a
+    /// fresh process asks. `None` when the record holds no samples at all (a
+    /// freshly created database file).
+    ///
+    /// The pairing for [`Self::close_open_incidents`] at startup: a crashed
+    /// process's open incidents must close at the last instant this record
+    /// actually observed something, not at the new process's own start time —
+    /// `now_us()` is always later than that bound, so it would stamp a
+    /// crashed run's incidents as having lasted until this later moment
+    /// (realm net-observer, node #124).
+    pub fn latest_sample_ts_us(&self) -> Result<Option<i64>, StoreError> {
+        let max: Option<i64> = self.conn.lock().unwrap().query_row(
+            "SELECT MAX(m) FROM (
+                SELECT MAX(ts_us) AS m FROM link_sample
+                UNION ALL SELECT MAX(ts_us) FROM proxy_sample
+                UNION ALL SELECT MAX(ts_us) FROM dns_sample
+                UNION ALL SELECT MAX(ts_us) FROM route_event
+                UNION ALL SELECT MAX(ts_us) FROM host_sample
+                UNION ALL SELECT MAX(ts_us) FROM wifi_sample
+                UNION ALL SELECT MAX(ts_us) FROM air_sample
+                UNION ALL SELECT MAX(ts_us) FROM neighbor_sample
+            )",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(max)
+    }
+
     /// List incidents as `(trigger_id, opened_us, closed_us)`, newest first.
     pub fn list_incidents(&self) -> Result<Vec<(String, i64, Option<i64>)>, StoreError> {
         let conn = self.conn.lock().unwrap();
@@ -314,7 +343,7 @@ impl Store for DuckdbStore {
         let c = self.conn.lock().unwrap();
         match s {
             Sample::Link(l) => c.execute(
-                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO link_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     l.ts_us,
                     l.gw.to_string(),
@@ -332,7 +361,10 @@ impl Store for DuckdbStore {
                     l.singbox_tun_if,
                     l.bssid,
                     l.if_mac,
-                    l.medium.map(|m| m.to_string())
+                    l.medium.map(|m| m.to_string()),
+                    l.lease_start_us,
+                    l.lease_secs,
+                    l.if_mac_private
                 ],
             )?,
             Sample::Proxy(p) => c.execute(
@@ -1118,6 +1150,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1151,6 +1186,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: Some(3),
             lan_alive: Some(1),
@@ -1202,6 +1240,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1239,6 +1280,9 @@ mod tests {
             bssid: Some("3c:22:fb:12:34:56".into()),
             if_mac: Some("f0:18:98:0a:0b:0c".into()),
             medium: Some(LinkMedium::Wifi),
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1298,6 +1342,136 @@ mod tests {
         );
     }
 
+    /// The DHCP lease pair and the MAC-class fold land in their own columns,
+    /// and an unmeasured tick lands as NULL — distinguishable from an
+    /// actual zero-length lease or a hardware address (realm net-observer,
+    /// node #93 item 1; node #109 item 1).
+    #[test]
+    fn link_sample_lease_and_mac_class_round_trip() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let base = LinkSample {
+            ts_us: 1000,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            bssid: None,
+            if_mac: Some("ca:8f:38:b3:12:d3".into()),
+            medium: None,
+            lease_start_us: Some(1_758_066_844_000_000),
+            lease_secs: Some(86400),
+            if_mac_private: Some(true),
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        };
+        s.write_sample(&Sample::Link(base.clone())).unwrap();
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 2000,
+            if_mac: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
+            ..base
+        }))
+        .unwrap();
+        let t = s
+            .query_table(
+                "SELECT ts_us, lease_start_us, lease_secs, if_mac_private \
+                 FROM link_sample ORDER BY ts_us",
+            )
+            .unwrap();
+        assert_eq!(
+            t.rows,
+            vec![
+                vec!["1000", "1758066844000000", "86400", "true"],
+                vec!["2000", "", "", ""],
+            ]
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample \
+                 WHERE ts_us = 2000 AND lease_start_us IS NULL \
+                   AND lease_secs IS NULL AND if_mac_private IS NULL"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    /// A database written by the daemon that shipped `link_sample` with
+    /// `medium` but no lease pair or MAC class keeps its seventeen-column
+    /// table (`CREATE TABLE IF NOT EXISTS` does nothing to an existing one);
+    /// the three new columns are added on open, the old row reads back with
+    /// them NULL, and the new daemon's twenty-value insert lands (realm
+    /// net-observer, node #93 item 1; node #109 item 1).
+    #[test]
+    fn an_old_link_table_without_lease_columns_opens_and_keeps_its_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE link_sample (
+                ts_us BIGINT, gw VARCHAR, gw_rtt_ms DOUBLE, direct VARCHAR, direct_rtt_ms DOUBLE,
+                dhcp_router VARCHAR, dhcp_dns VARCHAR, gw_arp_mac VARCHAR, ssid VARCHAR,
+                wifi_capture_present BOOLEAN, lan_probed USMALLINT, lan_alive USMALLINT,
+                fakeip_route_if VARCHAR, singbox_tun_if VARCHAR, bssid VARCHAR, if_mac VARCHAR,
+                medium VARCHAR);
+             INSERT INTO link_sample VALUES
+                (1000, 'OK', 1.0, 'OK', 1.0, NULL, NULL, NULL, NULL, false, NULL, NULL,
+                 NULL, NULL, NULL, 'f0:18:98:0a:0b:0c', 'wifi');",
+        )
+        .unwrap();
+        let s = DuckdbStore::from_conn(conn).unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample \
+                 WHERE ts_us = 1000 AND if_mac = 'f0:18:98:0a:0b:0c' \
+                   AND lease_start_us IS NULL AND lease_secs IS NULL \
+                   AND if_mac_private IS NULL"
+            )
+            .unwrap(),
+            1,
+            "the old row must survive the added columns"
+        );
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 2000,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            bssid: None,
+            if_mac: Some("ca:8f:38:b3:12:d3".into()),
+            medium: None,
+            lease_start_us: Some(1_758_066_844_000_000),
+            lease_secs: Some(86400),
+            if_mac_private: Some(true),
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM link_sample \
+                 WHERE ts_us = 2000 AND lease_start_us = 1758066844000000 \
+                   AND lease_secs = 86400 AND if_mac_private"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
     /// The established-flow discriminator lands in its own proxy columns;
     /// NULL = no measurement, distinguishable from a stream that died at 0s.
     #[test]
@@ -1346,6 +1520,58 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    /// The bound the startup sweep closes stale incidents at: the newest
+    /// `ts_us` across every sample table, not merely one of them — a link
+    /// sample older than a later host sample must not win (realm net-observer,
+    /// node #124).
+    #[test]
+    fn latest_sample_ts_us_is_the_max_across_every_sample_table() {
+        use types::{GwVerdict, HostSample, LinkSample, Sample, TcpVerdict};
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_sample(&Sample::Link(LinkSample {
+            ts_us: 1000,
+            gw: GwVerdict::Ok,
+            gw_rtt_ms: None,
+            direct: TcpVerdict::Ok,
+            direct_rtt_ms: None,
+            dhcp_router: None,
+            dhcp_dns: None,
+            gw_arp_mac: None,
+            ssid: None,
+            bssid: None,
+            if_mac: None,
+            medium: None,
+            wifi_capture_present: false,
+            lan_probed: None,
+            lan_alive: None,
+            fakeip_route_if: None,
+            singbox_tun_if: None,
+        }))
+        .unwrap();
+        s.write_sample(&Sample::Host(HostSample {
+            ts_us: 5000,
+            load1: 0.0,
+            load5: 0.0,
+            load15: 0.0,
+            disk_used_pct: None,
+            disk_free_mb: None,
+            swap_used_mb: None,
+        }))
+        .unwrap();
+
+        assert_eq!(s.latest_sample_ts_us().unwrap(), Some(5000));
+    }
+
+    /// A freshly created database file holds no samples at all: the sweep must
+    /// read that as `None`, not as a phantom `ts_us` of `0` — the caller falls
+    /// back to `now_us()` only for exactly this case (realm net-observer, node
+    /// #124).
+    #[test]
+    fn latest_sample_ts_us_is_none_with_no_samples() {
+        let s = DuckdbStore::in_memory().unwrap();
+        assert_eq!(s.latest_sample_ts_us().unwrap(), None);
     }
 
     /// The record volume's usage and the swap in use land in their own host
@@ -1613,6 +1839,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
@@ -1885,6 +2114,9 @@ mod tests {
             bssid: None,
             if_mac: None,
             medium: None,
+            lease_start_us: None,
+            lease_secs: None,
+            if_mac_private: None,
             wifi_capture_present: false,
             lan_probed: None,
             lan_alive: None,
