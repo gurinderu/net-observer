@@ -26,8 +26,14 @@ pub struct ExperimentRecord {
     pub id: String,
     pub start_us: i64,
     pub end_us: i64,
-    /// The tier the window restored when it closed.
+    /// The tier in force before the window (restored at its close unless an
+    /// operator moved the tier inside it).
     pub tier_before: ProbingTier,
+    /// Where the start and end freezes copied the ring; `None` when a freeze
+    /// copied nothing. Each copied file also has a `blob_ref` row against
+    /// the window's id.
+    pub freeze_start_dir: Option<String>,
+    pub freeze_end_dir: Option<String>,
     /// The `ExperimentReport`, serialised.
     pub report_json: String,
 }
@@ -741,13 +747,16 @@ impl Store for DuckdbStore {
             // An id is one window's start instant; a second write of the same
             // id is the same window reported again (a retry), so it replaces.
             "INSERT OR REPLACE INTO experiment
-               (id, start_us, end_us, tier_before, report_json)
-             VALUES (?,?,?,?,?)",
+               (id, start_us, end_us, tier_before, freeze_start_dir, freeze_end_dir,
+                report_json)
+             VALUES (?,?,?,?,?,?,?)",
             params![
                 x.id,
                 x.start_us,
                 x.end_us,
                 x.tier_before.as_str(),
+                x.freeze_start_dir,
+                x.freeze_end_dir,
                 x.report_json
             ],
         )?;
@@ -756,7 +765,9 @@ impl Store for DuckdbStore {
     fn experiment(&self, id: &str) -> Result<Option<ExperimentRecord>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, start_us, end_us, tier_before, report_json FROM experiment WHERE id = ?",
+            "SELECT id, start_us, end_us, tier_before, freeze_start_dir, freeze_end_dir,
+                    report_json
+             FROM experiment WHERE id = ?",
         )?;
         let mut rows = stmt.query(params![id])?;
         let Some(r) = rows.next()? else {
@@ -772,7 +783,9 @@ impl Store for DuckdbStore {
             tier_before: tier.parse().map_err(|e: ParseVerdictError| {
                 duckdb::Error::FromSqlConversionFailure(3, duckdb::types::Type::Text, Box::new(e))
             })?,
-            report_json: r.get(4)?,
+            freeze_start_dir: r.get(4)?,
+            freeze_end_dir: r.get(5)?,
+            report_json: r.get(6)?,
         }))
     }
     fn neighbor_lifetimes(
@@ -2510,6 +2523,8 @@ mod tests {
             start_us: 1,
             end_us: 300_000_001,
             tier_before: ProbingTier::Active,
+            freeze_start_dir: Some("/blobs/freeze-experiment-1-start".into()),
+            freeze_end_dir: None,
             report_json: r#"{"id":"experiment-1","notes":[]}"#.into(),
         };
         s.write_experiment(&first).unwrap();
@@ -2517,6 +2532,7 @@ mod tests {
         let again = ExperimentRecord {
             report_json: r#"{"id":"experiment-1","notes":["retried"]}"#.into(),
             tier_before: ProbingTier::Passive,
+            freeze_end_dir: Some("/blobs/freeze-experiment-1-end".into()),
             ..first
         };
         s.write_experiment(&again).unwrap();

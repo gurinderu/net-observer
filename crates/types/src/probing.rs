@@ -178,6 +178,22 @@ impl ProbingReason {
     }
 }
 
+impl FromStr for ProbingReason {
+    type Err = ParseVerdictError;
+
+    /// The column token back into the reason; the reader of a `probing_edge`
+    /// row uses it, so the row and the wire cannot spell a reason differently.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "control" => Ok(Self::Control),
+            "startup" => Ok(Self::Startup),
+            "experiment" => Ok(Self::Experiment),
+            "experiment-end" => Ok(Self::ExperimentEnd),
+            _ => Err(ParseVerdictError(s.to_string())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +290,7 @@ mod tests {
             (ProbingReason::ExperimentEnd, "experiment-end"),
         ] {
             assert_eq!(reason.as_str(), token);
+            assert_eq!(ProbingReason::from_str(token).unwrap(), reason);
             assert_eq!(
                 serde_json::to_string(&reason).unwrap(),
                 format!("\"{token}\"")
@@ -283,5 +300,6 @@ mod tests {
                 reason
             );
         }
+        assert!(ProbingReason::from_str("Experiment").is_err());
     }
 }

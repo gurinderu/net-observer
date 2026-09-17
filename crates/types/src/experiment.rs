@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ProbingTier;
+use crate::{ObservingEdge, ProbingEdge, ProbingReason, ProbingTier};
 
 /// The bounds of one window and the two pcap freezes that bracket it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,9 +21,32 @@ pub struct ExperimentWindow {
     pub start_us: i64,
     /// When it closed: the instant the end freeze was taken, BEFORE the tier
     /// was restored, so the end freeze holds no frame from after the window.
+    /// Wall clock, not the sleep that timed the window: the two differ by
+    /// however long the machine slept inside it (see
+    /// [`ExperimentWindow::slept_s`]).
     pub end_us: i64,
-    /// The tier in force before the window, restored at its end.
+    /// The length the operator asked for. The window's real length is
+    /// `end_us - start_us`; the difference is the machine's sleep.
+    pub requested_minutes: u32,
+    /// The link collector's tick, as configured — the yardstick for a sleep
+    /// inside the window and for the straddling tick (see
+    /// [`OwnFrames::first_echo_us`]).
+    pub link_interval_us: i64,
+    /// The tier in force before the window, read under the same lock that
+    /// switched to passive.
     pub tier_before: ProbingTier,
+    /// The tier in force after the window's closing edge.
+    pub tier_at_end: ProbingTier,
+    /// What the closing edge did about `tier_before`.
+    pub restore: TierRestore,
+    /// Where the START freeze copied the ring (`blob_dir/freeze-experiment-
+    /// <start_us>-start`); `None` when nothing was copied. Each copied file
+    /// also has a `blob_ref` row (`kind = pcap`) against the window's id, and
+    /// the freeze pruner leaves `freeze-experiment-*` alone, so the slice
+    /// the report was read from stays on disk.
+    pub freeze_start_dir: Option<String>,
+    /// The same for the END freeze.
+    pub freeze_end_dir: Option<String>,
     /// Every record the START freeze's ring files held, inside the window or
     /// not; `None` when the ring was not running or its files could not be
     /// read — never a zero.
@@ -32,15 +55,59 @@ pub struct ExperimentWindow {
     pub frames_pcap_end: Option<u64>,
 }
 
+impl ExperimentWindow {
+    /// The window's real length in minutes, to one decimal.
+    #[must_use]
+    pub fn minutes(&self) -> f64 {
+        (self.end_us - self.start_us) as f64 / 60_000_000.0
+    }
+
+    /// Seconds the machine slept inside the window, when the wall clock ran
+    /// past the requested length by more than one link interval — the
+    /// window's end task sleeps on a monotonic clock, which a sleeping
+    /// machine does not advance. `None` when the overrun is within a tick.
+    #[must_use]
+    pub fn slept_s(&self) -> Option<i64> {
+        let overrun_us =
+            (self.end_us - self.start_us) - i64::from(self.requested_minutes) * 60_000_000;
+        (overrun_us > self.link_interval_us).then_some(overrun_us / 1_000_000)
+    }
+}
+
+/// What the window's closing edge did about the tier in force before it.
+///
+/// The window restores `tier_before` only when the tier is still the
+/// passive it set AND no operator edge landed inside the window; otherwise
+/// the operator's choice stands and the closing edge merely marks the end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierRestore {
+    /// `tier_before` was restored.
+    Restored,
+    /// An operator's `SetProbing` landed inside the window, at `at_us`:
+    /// their choice stands, the restore was skipped.
+    OperatorMoved { at_us: i64 },
+    /// The tier was not the window's passive at the end (a switch the record
+    /// did not show as a control edge): left as found, the restore skipped.
+    NotPassive { found: ProbingTier },
+    /// The window could not verify the conditions above — its boundary rows
+    /// could not be read, or no closing edge was written: left as found, the
+    /// restore skipped, `why` naming the gap. A restore it cannot vouch for
+    /// would be a switch the operator did not ask for.
+    Unverified { why: String },
+}
+
 /// What one frozen pcap slice held, and how many of its frames inside the
 /// window this machine itself sent, by protocol.
 ///
 /// Counted by `collector_announce::own_frames::count_own_frames` over the
-/// ring's own filter (`arp or icmp or udp port 67/68 or ether broadcast`), so
-/// the four buckets are the only classes a frame from this machine can land
-/// in there. The daemon's periodic probes that do NOT pass that filter (TCP,
-/// DNS) are outside what this slice can prove either way — the tier's own
-/// `SKIP` rows are the record for those.
+/// ring's own filter (recorded on the report as
+/// [`ExperimentReport::ring_filter`]), so the four buckets are the only
+/// classes a frame from this machine can land in there. The daemon's
+/// periodic probes that do NOT pass that filter (TCP, DNS) are outside what
+/// this slice can prove either way — the tier's own `SKIP` rows are the
+/// record for those — and an ICMP echo from this MAC is not necessarily
+/// the daemon's: the shell oracle and a hand-run `ping` share the address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct OwnFrames {
     /// Every record the slice held, inside the window or not.
@@ -56,10 +123,17 @@ pub struct OwnFrames {
     /// Frames inside `[start_us, end_us]`, from any source.
     pub in_window: u64,
     /// ICMP echo REQUESTS from this machine's MAC inside the window — the
-    /// daemon's own probes (the gateway echo, the LAN probe), expected 0
-    /// under the passive tier. An echo REPLY from this MAC is the OS
-    /// answering someone else's ping and lands in `other`.
+    /// daemon's own probes (the gateway echo, the LAN probe) when the daemon
+    /// sent them, expected 0 under the passive tier. An echo REPLY from this
+    /// MAC is the OS answering someone else's ping and lands in `other`.
     pub icmp_echo: u64,
+    /// The capture timestamp of the first and last of those echoes. A link
+    /// tick that read `active` a moment before the flip still sends its echo
+    /// after `start_us`; the offset says so instead of the count hiding it.
+    #[serde(default)]
+    pub first_echo_us: Option<i64>,
+    #[serde(default)]
+    pub last_echo_us: Option<i64>,
     /// ARP from this machine's MAC — the OS resolving addresses.
     pub arp: u64,
     /// DHCP (UDP 67/68) from this machine's MAC — the OS's lease traffic.
@@ -78,17 +152,13 @@ impl OwnFrames {
     /// Fold a second slice's counts (the ring's other file) into this one.
     pub fn absorb(&mut self, other: &OwnFrames) {
         self.records += other.records;
-        self.earliest_us = match (self.earliest_us, other.earliest_us) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        self.latest_us = match (self.latest_us, other.latest_us) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        };
+        self.earliest_us = min_opt(self.earliest_us, other.earliest_us);
+        self.latest_us = max_opt(self.latest_us, other.latest_us);
         self.truncated |= other.truncated;
         self.in_window += other.in_window;
         self.icmp_echo += other.icmp_echo;
+        self.first_echo_us = min_opt(self.first_echo_us, other.first_echo_us);
+        self.last_echo_us = max_opt(self.last_echo_us, other.last_echo_us);
         self.arp += other.arp;
         self.dhcp += other.dhcp;
         self.other += other.other;
@@ -100,6 +170,31 @@ impl OwnFrames {
     #[must_use]
     pub fn covers_from(&self, start_us: i64) -> bool {
         self.earliest_us.is_some_and(|e| e <= start_us)
+    }
+
+    /// Whether every own echo lies within one link interval of the start —
+    /// the shape of the one tick that straddled the flip, not of a daemon
+    /// still probing.
+    #[must_use]
+    pub fn echoes_are_the_straddling_tick(&self, start_us: i64, link_interval_us: i64) -> bool {
+        self.icmp_echo > 0
+            && self
+                .last_echo_us
+                .is_some_and(|t| t - start_us <= link_interval_us)
+    }
+}
+
+fn min_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn max_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -158,12 +253,48 @@ impl NetworkFacts {
     }
 }
 
+/// The boundary rows the record holds inside the window: every pause or
+/// resume, and every tier switch that was not the window's own bracket. A
+/// zero read against them means something different from a zero read
+/// against an unbroken window.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WindowEdges {
+    /// `observing_edge` rows with `ts_us` inside `[start_us, end_us]`.
+    pub observing: Vec<ObservingEdge>,
+    /// `probing_edge` rows inside the same bounds — the window's own opening
+    /// edge included, since it sits at `start_us`; the readers below skip
+    /// the experiment reasons.
+    pub probing: Vec<ProbingEdge>,
+}
+
+impl WindowEdges {
+    /// The pauses inside the window: the edges that switched collection off.
+    pub fn pauses(&self) -> impl Iterator<Item = &ObservingEdge> {
+        self.observing.iter().filter(|e| !e.observing)
+    }
+
+    /// The tier switches inside the window that were not the window's own
+    /// bracket — an operator's `SetProbing`, or a startup edge from a restart.
+    pub fn operator_probing(&self) -> impl Iterator<Item = &ProbingEdge> {
+        self.probing.iter().filter(|e| {
+            !matches!(
+                e.reason,
+                ProbingReason::Experiment | ProbingReason::ExperimentEnd
+            )
+        })
+    }
+}
+
 /// One finished experiment window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExperimentReport {
     /// `experiment-<start_us>`.
     pub id: String,
     pub window: ExperimentWindow,
+    /// The BPF filter the pcap ring captures with, as configured — the whole
+    /// of what the own-frame count can see.
+    #[serde(default)]
+    pub ring_filter: String,
     /// This machine's interface MAC as read once at the window's end;
     /// `None` when it could not be read, and then `our_frames` is `None`
     /// too — a count against no address would be a count of nothing.
@@ -174,41 +305,53 @@ pub struct ExperimentReport {
     pub our_frames: Option<OwnFrames>,
     /// The record's own counts; `None` when the store could not be read.
     pub network: Option<NetworkFacts>,
+    /// The boundary rows inside the window.
+    #[serde(default)]
+    pub edges: WindowEdges,
     /// What could not be measured, and why — one line each.
     pub notes: Vec<String>,
 }
 
 impl ExperimentReport {
-    /// The window's length in minutes, to one decimal.
+    /// The window's real length in minutes, to one decimal.
     #[must_use]
     pub fn minutes(&self) -> f64 {
-        (self.window.end_us - self.window.start_us) as f64 / 60_000_000.0
+        self.window.minutes()
     }
 
-    /// The one line the operator reads: our probes on the left, the network
-    /// on the right, in plain words. A count that could not be taken is
-    /// named as such, never printed as a zero.
+    /// The one line the operator reads: what the ring showed of ours on the
+    /// left, the network on the right, in plain words. A count that could
+    /// not be taken is named as such, never printed as a zero; the ring's
+    /// filter bounds what "ours" can mean here, so the line never claims
+    /// more than the slice can show.
     #[must_use]
     pub fn verdict(&self) -> String {
+        let w = &self.window;
         let minutes = format!("{:.1}", self.minutes());
         let ours = match &self.our_frames {
             Some(f) => {
-                let mut s = if f.icmp_echo == 0 {
-                    format!("our probes: 0 frames in {minutes} minutes — the daemon was silent")
-                } else {
-                    format!(
-                        "our probes: {} ICMP echoes in {minutes} minutes — the daemon was NOT silent",
-                        f.icmp_echo
-                    )
-                };
+                let mut s = format!(
+                    "our ICMP echo requests in the ring: {} in {minutes} minutes \
+                     (the ring does not carry TCP/DNS; the shell oracle and a hand-run ping share this MAC)",
+                    f.icmp_echo
+                );
+                if let Some(first) = f.first_echo_us {
+                    s.push_str(&format!(
+                        "; first own echo at +{:.1} s",
+                        (first - w.start_us) as f64 / 1_000_000.0
+                    ));
+                    if f.echoes_are_the_straddling_tick(w.start_us, w.link_interval_us) {
+                        s.push_str(" (the straddling tick)");
+                    }
+                }
                 let os = f.arp + f.dhcp + f.other;
                 if os > 0 {
                     s.push_str(&format!(
-                        " (the OS sent {} ARP, {} DHCP, {} other)",
+                        "; the OS sent {} ARP, {} DHCP, {} other",
                         f.arp, f.dhcp, f.other
                     ));
                 }
-                if !f.covers_from(self.window.start_us) {
+                if !f.covers_from(w.start_us) {
                     s.push_str(match f.earliest_us {
                         Some(_) => " [the ring rolled over inside the window; the count covers its tail only]",
                         None => " [the slice held no frame]",
@@ -220,7 +363,7 @@ impl ExperimentReport {
                 s
             }
             None => format!(
-                "our probes: not counted in {minutes} minutes ({})",
+                "our ICMP echo requests in the ring: not counted in {minutes} minutes ({})",
                 if self.own_mac.is_none() {
                     "own MAC unreadable"
                 } else {
@@ -228,6 +371,20 @@ impl ExperimentReport {
                 }
             ),
         };
+        let mut integrity = Vec::new();
+        let pauses = self.edges.pauses().count();
+        if pauses > 0 {
+            integrity.push(format!("{pauses} pauses inside the window"));
+        }
+        if let Some(e) = self.edges.operator_probing().next() {
+            integrity.push(format!(
+                "the tier was moved inside the window at {}",
+                e.ts_us
+            ));
+        }
+        if let Some(s) = w.slept_s() {
+            integrity.push(format!("machine slept for ~{s} s inside the window"));
+        }
         let theirs = match &self.network {
             Some(n) => {
                 let ids = if n.incidents.is_empty() {
@@ -248,7 +405,11 @@ impl ExperimentReport {
             }
             None => String::from("the network: the record could not be read"),
         };
-        format!("{ours}; {theirs}")
+        let mut line = format!("{ours}; {theirs}");
+        if !integrity.is_empty() {
+            line.push_str(&format!(" [{}]", integrity.join("; ")));
+        }
+        line
     }
 
     /// The report as `key | value` rows — the wire shape of the answer to
@@ -262,8 +423,44 @@ impl ExperimentReport {
         put("id", self.id.clone());
         put("start_us", w.start_us.to_string());
         put("end_us", w.end_us.to_string());
+        put("requested_minutes", w.requested_minutes.to_string());
         put("minutes", format!("{:.1}", self.minutes()));
+        put(
+            "machine_slept",
+            w.slept_s()
+                .map_or_else(|| "no".into(), |s| format!("~{s} s inside the window")),
+        );
         put("tier_before", w.tier_before.as_str().to_string());
+        put(
+            "tier_at_end",
+            match &w.restore {
+                TierRestore::Restored => format!(
+                    "{} (restored from the window's passive)",
+                    w.tier_at_end.as_str()
+                ),
+                TierRestore::OperatorMoved { at_us } => format!(
+                    "{} (changed by the operator at {at_us}; restore skipped)",
+                    w.tier_at_end.as_str()
+                ),
+                TierRestore::NotPassive { found } => format!(
+                    "{} (found {} at the end, not the window's passive; restore skipped)",
+                    w.tier_at_end.as_str(),
+                    found.as_str()
+                ),
+                TierRestore::Unverified { why } => {
+                    format!("{} (restore skipped: {why})", w.tier_at_end.as_str())
+                }
+            },
+        );
+        put("ring_filter", self.ring_filter.clone());
+        put(
+            "freeze_start_dir",
+            w.freeze_start_dir.clone().unwrap_or_else(|| "none".into()),
+        );
+        put(
+            "freeze_end_dir",
+            w.freeze_end_dir.clone().unwrap_or_else(|| "none".into()),
+        );
         put(
             "frames_pcap_start",
             count_or(w.frames_pcap_start, "not read"),
@@ -295,6 +492,20 @@ impl ExperimentReport {
                 );
                 put("frames_in_window", f.in_window.to_string());
                 put("our_icmp_echo", f.icmp_echo.to_string());
+                put(
+                    "first_own_echo",
+                    match f.first_echo_us {
+                        None => "none".into(),
+                        Some(first) => {
+                            let mut s =
+                                format!("+{:.1} s", (first - w.start_us) as f64 / 1_000_000.0);
+                            if f.echoes_are_the_straddling_tick(w.start_us, w.link_interval_us) {
+                                s.push_str(" (the straddling tick)");
+                            }
+                            s
+                        }
+                    },
+                );
                 put("our_arp", f.arp.to_string());
                 put("our_dhcp", f.dhcp.to_string());
                 put("our_other", f.other.to_string());
@@ -312,6 +523,7 @@ impl ExperimentReport {
                     "pcap_truncated",
                     "frames_in_window",
                     "our_icmp_echo",
+                    "first_own_echo",
                     "our_arp",
                     "our_dhcp",
                     "our_other",
@@ -321,6 +533,26 @@ impl ExperimentReport {
                 }
             }
         }
+        put(
+            "pauses_inside_window",
+            edges_text(
+                self.edges.pauses().count(),
+                self.edges
+                    .pauses()
+                    .map(|e| e.ts_us.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        put(
+            "probing_edges_inside_window",
+            edges_text(
+                self.edges.operator_probing().count(),
+                self.edges
+                    .operator_probing()
+                    .map(|e| format!("{} {} ({})", e.ts_us, e.tier.as_str(), e.reason.as_str()))
+                    .collect::<Vec<_>>(),
+            ),
+        );
         match &self.network {
             Some(n) => {
                 put("route_events", n.route_events.to_string());
@@ -354,6 +586,10 @@ impl ExperimentReport {
                         s
                     },
                 );
+                put(
+                    "gw_change_incidents",
+                    n.incidents_by("gw-change").to_string(),
+                );
                 put("roam_incidents", n.incidents_by("roam").to_string());
                 put(
                     "wifi_churn_incidents",
@@ -377,6 +613,7 @@ impl ExperimentReport {
                     "incidents",
                     "incident_ids",
                     "gw_verdicts",
+                    "gw_change_incidents",
                     "roam_incidents",
                     "wifi_churn_incidents",
                     "announce_flushes",
@@ -406,6 +643,14 @@ fn count_or(v: Option<u64>, absent: &str) -> String {
     v.map_or_else(|| absent.to_string(), |n| n.to_string())
 }
 
+fn edges_text(n: usize, stamps: Vec<String>) -> String {
+    if n == 0 {
+        "0".into()
+    } else {
+        format!("{n} ({})", stamps.join(", "))
+    }
+}
+
 fn flows_text(f: Option<&FlowTotals>) -> String {
     match f {
         None => "no tick".into(),
@@ -420,6 +665,11 @@ fn flows_text(f: Option<&FlowTotals>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ObservingCause;
+
+    const START: i64 = 100;
+    const FIVE_MIN: i64 = 5 * 60_000_000;
+    const LINK: i64 = 15_000_000;
 
     fn frames(icmp_echo: u64) -> OwnFrames {
         OwnFrames {
@@ -429,6 +679,8 @@ mod tests {
             truncated: false,
             in_window: 30,
             icmp_echo,
+            first_echo_us: (icmp_echo > 0).then_some(START + 3_200_000),
+            last_echo_us: (icmp_echo > 0).then_some(START + 3_200_000),
             arp: 2,
             dhcp: 1,
             other: 0,
@@ -439,15 +691,25 @@ mod tests {
         ExperimentReport {
             id: "experiment-100".into(),
             window: ExperimentWindow {
-                start_us: 100,
-                end_us: 100 + 5 * 60_000_000,
+                start_us: START,
+                end_us: START + FIVE_MIN,
+                requested_minutes: 5,
+                link_interval_us: LINK,
                 tier_before: ProbingTier::Active,
+                tier_at_end: ProbingTier::Active,
+                restore: TierRestore::Restored,
+                freeze_start_dir: Some(
+                    "/var/lib/observer/blobs/freeze-experiment-100-start".into(),
+                ),
+                freeze_end_dir: Some("/var/lib/observer/blobs/freeze-experiment-100-end".into()),
                 frames_pcap_start: Some(10),
                 frames_pcap_end: Some(40),
             },
+            ring_filter: "arp or icmp or udp port 67 or udp port 68 or ether broadcast".into(),
             own_mac: our.map(|_| "f0:18:98:0a:0b:0c".to_string()),
             our_frames: our,
             network,
+            edges: WindowEdges::default(),
             notes: Vec::new(),
         }
     }
@@ -461,31 +723,66 @@ mod tests {
         }
     }
 
-    /// The line the operator reads: silence on the left when no echo of ours
-    /// was in the slice, and the network's counts on the right.
+    fn cell(rows: &[[String; 2]], k: &str) -> String {
+        rows.iter()
+            .find(|[key, _]| key == k)
+            .map(|[_, v]| v.clone())
+            .unwrap_or_else(|| panic!("no row {k}"))
+    }
+
+    /// The line the operator reads says what the ring can show — echo
+    /// requests from this MAC, with the filter's limits named — never
+    /// "silent"; the network's counts sit on the right.
     #[test]
-    fn a_silent_window_reads_as_silent() {
+    fn a_window_without_echoes_names_what_the_ring_can_show() {
         let r = report(Some(frames(0)), Some(quiet_network()));
         assert_eq!(
             r.verdict(),
-            "our probes: 0 frames in 5.0 minutes — the daemon was silent \
-             (the OS sent 2 ARP, 1 DHCP, 0 other); \
+            "our ICMP echo requests in the ring: 0 in 5.0 minutes \
+             (the ring does not carry TCP/DNS; the shell oracle and a hand-run ping share this MAC); \
+             the OS sent 2 ARP, 1 DHCP, 0 other; \
              the network showed: 2 route events, 1 incidents (gw-drop-1 [gw-drop]), 0 roams"
         );
+        assert!(!r.verdict().contains("silent"));
+        assert_eq!(
+            cell(&r.rows(), "ring_filter"),
+            "arp or icmp or udp port 67 or udp port 68 or ether broadcast"
+        );
+        assert_eq!(cell(&r.rows(), "first_own_echo"), "none");
     }
 
-    /// One echo of ours is the whole point of the count: the line says NOT
-    /// silent, with the number.
+    /// An echo of ours is counted with its offset from the start, and when
+    /// every echo lies within one link interval of the start the line says
+    /// it is the tick that straddled the flip — named, never excluded.
     #[test]
-    fn an_echo_of_ours_is_named_not_silent() {
+    fn an_early_echo_is_named_as_the_straddling_tick() {
         let r = report(Some(frames(3)), Some(quiet_network()));
+        let v = r.verdict();
         assert!(
-            r.verdict().starts_with(
-                "our probes: 3 ICMP echoes in 5.0 minutes — the daemon was NOT silent"
-            ),
+            v.starts_with("our ICMP echo requests in the ring: 3 in 5.0 minutes"),
+            "{v}"
+        );
+        assert!(
+            v.contains("; first own echo at +3.2 s (the straddling tick)"),
+            "{v}"
+        );
+        assert_eq!(
+            cell(&r.rows(), "first_own_echo"),
+            "+3.2 s (the straddling tick)"
+        );
+
+        // A later echo is not the straddling tick: the daemon (or someone on
+        // this MAC) was still sending.
+        let mut f = frames(3);
+        f.last_echo_us = Some(START + 4 * LINK);
+        let r = report(Some(f), Some(quiet_network()));
+        assert!(
+            r.verdict().contains("; first own echo at +3.2 s;"),
             "{}",
             r.verdict()
         );
+        assert!(!r.verdict().contains("straddling"), "{}", r.verdict());
+        assert_eq!(cell(&r.rows(), "first_own_echo"), "+3.2 s");
     }
 
     /// A count that could not be taken is a word, never a zero — in the
@@ -494,23 +791,29 @@ mod tests {
     fn an_unreadable_mac_is_not_counted_never_zero() {
         let r = report(None, Some(quiet_network()));
         assert!(
-            r.verdict()
-                .starts_with("our probes: not counted in 5.0 minutes (own MAC unreadable)"),
+            r.verdict().starts_with(
+                "our ICMP echo requests in the ring: not counted in 5.0 minutes (own MAC unreadable)"
+            ),
             "{}",
             r.verdict()
         );
         let rows = r.rows();
-        let cell = |k: &str| {
-            rows.iter()
-                .find(|[key, _]| key == k)
-                .map(|[_, v]| v.clone())
-                .unwrap_or_else(|| panic!("no row {k}"))
-        };
-        assert_eq!(cell("own_mac"), "unreadable");
-        assert_eq!(cell("our_icmp_echo"), "not counted: own MAC unreadable");
-        assert_eq!(cell("our_total"), "not counted: own MAC unreadable");
-        assert_eq!(cell("gw_verdicts"), "SKIP=20 (all withheld: passive)");
-        assert_eq!(cell("verdict"), r.verdict());
+        assert_eq!(cell(&rows, "own_mac"), "unreadable");
+        assert_eq!(
+            cell(&rows, "our_icmp_echo"),
+            "not counted: own MAC unreadable"
+        );
+        assert_eq!(
+            cell(&rows, "first_own_echo"),
+            "not counted: own MAC unreadable"
+        );
+        assert_eq!(cell(&rows, "our_total"), "not counted: own MAC unreadable");
+        assert_eq!(
+            cell(&rows, "gw_verdicts"),
+            "SKIP=20 (all withheld: passive)"
+        );
+        assert_eq!(cell(&rows, "gw_change_incidents"), "0");
+        assert_eq!(cell(&rows, "verdict"), r.verdict());
     }
 
     /// A ring that rolled over inside the window cannot vouch for its first
@@ -526,18 +829,131 @@ mod tests {
             "{}",
             r.verdict()
         );
+        assert_eq!(cell(&r.rows(), "pcap_covers_window"), "no");
+    }
+
+    /// The closing edge's outcome is a sentence on the `tier_at_end` row:
+    /// restored, or left as the operator set it at a named instant.
+    #[test]
+    fn the_restore_outcome_is_named() {
+        let mut r = report(Some(frames(0)), Some(quiet_network()));
+        assert_eq!(
+            cell(&r.rows(), "tier_at_end"),
+            "active (restored from the window's passive)"
+        );
+        r.window.restore = TierRestore::OperatorMoved { at_us: 777 };
+        r.window.tier_at_end = ProbingTier::Active;
+        assert_eq!(
+            cell(&r.rows(), "tier_at_end"),
+            "active (changed by the operator at 777; restore skipped)"
+        );
+        r.window.restore = TierRestore::NotPassive {
+            found: ProbingTier::Active,
+        };
+        assert_eq!(
+            cell(&r.rows(), "tier_at_end"),
+            "active (found active at the end, not the window's passive; restore skipped)"
+        );
+        r.window.restore = TierRestore::Unverified {
+            why: "the window's boundary rows could not be read".into(),
+        };
+        r.window.tier_at_end = ProbingTier::Passive;
+        assert_eq!(
+            cell(&r.rows(), "tier_at_end"),
+            "passive (restore skipped: the window's boundary rows could not be read)"
+        );
+    }
+
+    /// The boundary rows inside the window are listed with their instants,
+    /// the window's own bracket left out, and the verdict carries them so
+    /// the zeros on its left read against them.
+    #[test]
+    fn edges_inside_the_window_are_named_with_their_instants() {
+        let mut r = report(Some(frames(0)), Some(quiet_network()));
+        r.edges = WindowEdges {
+            observing: vec![
+                ObservingEdge {
+                    ts_us: 150,
+                    observing: false,
+                    peer_uid: Some(501),
+                    cause: ObservingCause::Control,
+                },
+                ObservingEdge {
+                    ts_us: 160,
+                    observing: true,
+                    peer_uid: Some(501),
+                    cause: ObservingCause::Control,
+                },
+            ],
+            probing: vec![
+                ProbingEdge {
+                    ts_us: START,
+                    tier: ProbingTier::Passive,
+                    peer_uid: Some(501),
+                    reason: ProbingReason::Experiment,
+                },
+                ProbingEdge {
+                    ts_us: 170,
+                    tier: ProbingTier::Active,
+                    peer_uid: Some(501),
+                    reason: ProbingReason::Control,
+                },
+            ],
+        };
         let rows = r.rows();
-        assert!(rows.contains(&["pcap_covers_window".to_string(), "no".to_string()]));
+        assert_eq!(cell(&rows, "pauses_inside_window"), "1 (150)");
+        assert_eq!(
+            cell(&rows, "probing_edges_inside_window"),
+            "1 (170 active (control))"
+        );
+        let v = r.verdict();
+        assert!(
+            v.ends_with(
+                "[1 pauses inside the window; the tier was moved inside the window at 170]"
+            ),
+            "{v}"
+        );
+        r.edges = WindowEdges::default();
+        assert_eq!(cell(&r.rows(), "pauses_inside_window"), "0");
+        assert!(
+            !r.verdict().contains("inside the window"),
+            "{}",
+            r.verdict()
+        );
+    }
+
+    /// The window is measured on the wall clock: an end more than one link
+    /// interval past the requested length is a sleep, said in seconds.
+    #[test]
+    fn a_wall_clock_overrun_beyond_one_tick_is_a_sleep() {
+        let mut r = report(Some(frames(0)), Some(quiet_network()));
+        assert_eq!(r.window.slept_s(), None);
+        assert_eq!(cell(&r.rows(), "machine_slept"), "no");
+        r.window.end_us = START + FIVE_MIN + LINK; // exactly one tick: not a sleep
+        assert_eq!(r.window.slept_s(), None);
+        r.window.end_us = START + FIVE_MIN + LINK + 1_000_000 + 600_000_000;
+        assert_eq!(r.window.slept_s(), Some(616));
+        assert_eq!(cell(&r.rows(), "machine_slept"), "~616 s inside the window");
+        assert!(
+            r.verdict()
+                .ends_with("[machine slept for ~616 s inside the window]"),
+            "{}",
+            r.verdict()
+        );
+        assert_eq!(cell(&r.rows(), "minutes"), "15.3");
     }
 
     /// Two ring files fold into one count, keeping the earliest and latest
-    /// stamp of either and the truncation of either.
+    /// stamp of either, the first and last echo of either, and the
+    /// truncation of either.
     #[test]
     fn absorb_folds_two_slices() {
         let mut a = frames(1);
         let mut b = frames(2);
         b.earliest_us = Some(10);
         b.latest_us = Some(900);
+        b.first_echo_us = Some(START + 1_000_000);
+        b.last_echo_us = Some(START + 9_000_000);
         b.truncated = true;
         a.absorb(&b);
         assert_eq!(a.records, 80);
@@ -546,10 +962,13 @@ mod tests {
         assert_eq!(a.own_total(), 3 + 4 + 2);
         assert_eq!(a.earliest_us, Some(10));
         assert_eq!(a.latest_us, Some(900));
+        assert_eq!(a.first_echo_us, Some(START + 1_000_000));
+        assert_eq!(a.last_echo_us, Some(START + 9_000_000));
         assert!(a.truncated);
         let mut empty = OwnFrames::default();
         empty.absorb(&frames(0));
         assert_eq!(empty.earliest_us, Some(50));
+        assert_eq!(empty.first_echo_us, None);
     }
 
     /// The stored JSON and the rendered rows come from one value; the JSON
@@ -570,16 +989,19 @@ mod tests {
     fn network_rows_name_what_is_absent() {
         let r = report(Some(frames(0)), None);
         let rows = r.rows();
-        assert!(rows.contains(&[
-            "route_events".to_string(),
-            "not read: the record could not be read".to_string()
-        ]));
+        assert_eq!(
+            cell(&rows, "route_events"),
+            "not read: the record could not be read"
+        );
         assert!(
             r.verdict()
-                .ends_with("the network: the record could not be read")
+                .ends_with("the network: the record could not be read"),
+            "{}",
+            r.verdict()
         );
 
         let n = NetworkFacts {
+            incidents: vec![("gw-change-2".into(), "gw-change".into())],
             flows_at_start: Some(FlowTotals {
                 ts_us: 90,
                 verdict: "SKIP".into(),
@@ -599,12 +1021,17 @@ mod tests {
             ..NetworkFacts::default()
         };
         let rows = report(Some(frames(0)), Some(n)).rows();
-        assert!(rows.contains(&["flows_at_start".to_string(), "SKIP at 90".to_string()]));
-        assert!(rows.contains(&[
-            "flows_at_end".to_string(),
-            "12 flows (up 100 B, down 2000 B) at 300".to_string()
-        ]));
-        assert!(rows.contains(&["rssi_dbm".to_string(), "min -70, max -55".to_string()]));
-        assert!(rows.contains(&["gw_verdicts".to_string(), "no link sample".to_string()]));
+        assert_eq!(cell(&rows, "flows_at_start"), "SKIP at 90");
+        assert_eq!(
+            cell(&rows, "flows_at_end"),
+            "12 flows (up 100 B, down 2000 B) at 300"
+        );
+        assert_eq!(cell(&rows, "rssi_dbm"), "min -70, max -55");
+        assert_eq!(cell(&rows, "gw_verdicts"), "no link sample");
+        assert_eq!(cell(&rows, "gw_change_incidents"), "1");
+        assert_eq!(
+            cell(&rows, "freeze_end_dir"),
+            "/var/lib/observer/blobs/freeze-experiment-100-end"
+        );
     }
 }

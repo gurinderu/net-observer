@@ -15,7 +15,10 @@ pub use air::{
     FrequencyExtent, Grade, OverlapConfidence, Signal, overlap_hypothesis,
 };
 pub use connection::{ConnectionRow, ConnectionsGroupBy, ConnectionsSample, LiveConnection};
-pub use experiment::{ExperimentReport, ExperimentWindow, FlowTotals, NetworkFacts, OwnFrames};
+pub use experiment::{
+    ExperimentReport, ExperimentWindow, FlowTotals, NetworkFacts, OwnFrames, TierRestore,
+    WindowEdges,
+};
 pub use incident::{BlobRef, Incident, TriggerFired};
 pub use mac::{mac_is_private, normalize_mac};
 pub use neighbor::{
@@ -25,7 +28,8 @@ pub use neighbor::{
 pub use observing::{ObservingCause, ObservingEdge};
 pub use probing::{EmissionClass, ProbingEdge, ProbingReason, ProbingTier};
 pub use sample::{
-    DnsSample, HostSample, LinkSample, ProxySample, RouteEvent, Sample, WifiSample, now_us,
+    DnsSample, HostSample, LinkSample, ProxySample, RouteEvent, Sample, WifiSample, local_instant,
+    now_us,
 };
 pub use topology::{
     LearnedVia, TopologyLifetime, TopologyLink, link_from_cdp, link_from_frame, link_from_lldp,

@@ -17,6 +17,15 @@ const RING_BASENAME: &str = "ring.pcap";
 /// How many freeze directories to retain (newest-first); older ones are pruned.
 const KEEP_FREEZES: usize = 12;
 
+/// The prefix of an experiment window's two freezes
+/// (`freeze-experiment-<start_us>-start` / `-end`, realm net-observer, node
+/// #61). Exempt from pruning: the window's report was read from the end
+/// slice and names both directories, and the pruner otherwise keeps the
+/// newest [`KEEP_FREEZES`] directories whether or not a record refers to
+/// them — twelve incident freezes after a window would silently take the
+/// slice its report is about.
+const EXPERIMENT_FREEZE_PREFIX: &str = "freeze-experiment-";
+
 /// A live `tcpdump` ring capture. Killing the process happens on `Drop`.
 #[derive(Debug)]
 pub struct PcapRing {
@@ -134,6 +143,8 @@ fn copy_ring_files(ring_dir: &Path, dest_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Keep the `keep` newest sub-directories under `parent`, removing older ones.
+/// An experiment window's freezes ([`EXPERIMENT_FREEZE_PREFIX`]) are neither
+/// counted nor removed: the report that names them is the reason they exist.
 fn prune_freezes(parent: &Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
@@ -141,6 +152,11 @@ fn prune_freezes(parent: &Path, keep: usize) {
     let mut dirs: Vec<(SystemTime, PathBuf)> = entries
         .flatten()
         .filter(|e| e.path().is_dir())
+        .filter(|e| {
+            !e.file_name()
+                .to_string_lossy()
+                .starts_with(EXPERIMENT_FREEZE_PREFIX)
+        })
         .filter_map(|e| {
             let modified = e.metadata().ok()?.modified().ok()?;
             Some((modified, e.path()))
@@ -194,5 +210,38 @@ mod tests {
             .filter(|e| e.path().is_dir())
             .count();
         assert_eq!(remaining, 2);
+    }
+
+    /// An experiment window's freezes are left alone however old, and do
+    /// not use up the incident freezes' budget either (realm net-observer,
+    /// node #61).
+    #[test]
+    fn prune_leaves_experiment_freezes_alone_and_uncounted() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["freeze-experiment-1-start", "freeze-experiment-1-end"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        for i in 0..5 {
+            std::fs::create_dir(root.path().join(format!("freeze-{i}"))).unwrap();
+        }
+        prune_freezes(root.path(), 2);
+        let mut remaining: Vec<String> = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining.len(), 4, "{remaining:?}");
+        assert!(remaining.contains(&"freeze-experiment-1-start".to_string()));
+        assert!(remaining.contains(&"freeze-experiment-1-end".to_string()));
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|n| !n.starts_with("freeze-experiment-"))
+                .count(),
+            2,
+            "the incident freezes keep their own budget: {remaining:?}"
+        );
     }
 }

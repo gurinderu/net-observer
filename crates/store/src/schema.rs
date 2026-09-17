@@ -249,12 +249,15 @@ CREATE TABLE IF NOT EXISTS probing_edge (
 -- they in fact were. Same migration treatment as `observing_edge.cause`.
 ALTER TABLE probing_edge ADD COLUMN IF NOT EXISTS reason VARCHAR;
 -- One row per finished experiment window (realm net-observer, node #61):
--- its bounds, the tier it restored, and the whole report as JSON — the
--- same `ExperimentReport` the daemon answers `Query(Experiment { id })`
+-- its bounds, the tier in force before it, where its two pcap freezes
+-- landed (NULL when a freeze copied nothing), and the whole report as JSON
+-- — the same `ExperimentReport` the daemon answers `Query(Experiment { id })`
 -- with, kept here so a report outlives the daemon process that computed
--- it. A window the daemon was restarted under leaves no row: its opening
--- `probing_edge` (reason 'experiment') without a closing one is the trace.
+-- it. Each copied ring file also has a `blob_ref` row (`kind = 'pcap'`,
+-- `incident_id` = the window's id), like an incident's freeze. A window the
+-- daemon was restarted under leaves no row: its opening `probing_edge`
+-- (reason 'experiment') without a closing one is the trace.
 CREATE TABLE IF NOT EXISTS experiment (
   id VARCHAR PRIMARY KEY, start_us BIGINT, end_us BIGINT, tier_before VARCHAR,
-  report_json VARCHAR);
+  freeze_start_dir VARCHAR, freeze_end_dir VARCHAR, report_json VARCHAR);
 "#;

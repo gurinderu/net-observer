@@ -63,7 +63,21 @@ pub fn count_own_frames<R: Read>(
         }
         out.in_window += 1;
         match classify(&record.data, own_mac) {
-            Some(Bucket::IcmpEcho) => out.icmp_echo += 1,
+            Some(Bucket::IcmpEcho) => {
+                out.icmp_echo += 1;
+                // The first and last echo of ours: a tick that read `active`
+                // a moment before the flip still sends its echo after the
+                // window opened, and the report names that offset rather
+                // than the count hiding it (realm net-observer, node #61).
+                out.first_echo_us = Some(
+                    out.first_echo_us
+                        .map_or(record.ts_us, |t| t.min(record.ts_us)),
+                );
+                out.last_echo_us = Some(
+                    out.last_echo_us
+                        .map_or(record.ts_us, |t| t.max(record.ts_us)),
+                );
+            }
             Some(Bucket::Arp) => out.arp += 1,
             Some(Bucket::Dhcp) => out.dhcp += 1,
             Some(Bucket::Other) => out.other += 1,
@@ -186,6 +200,8 @@ mod tests {
         assert_eq!(f.own_total(), 1);
         assert_eq!(f.earliest_us, Some(15_000_000));
         assert_eq!(f.latest_us, Some(15_000_000));
+        assert_eq!(f.first_echo_us, Some(15_000_000));
+        assert_eq!(f.last_echo_us, Some(15_000_000));
         assert!(!f.truncated);
         assert!(
             !f.covers_from(START),
@@ -207,13 +223,30 @@ mod tests {
         assert!(f.covers_from(START));
     }
 
-    /// The window's bounds are inclusive on both ends.
+    /// The window's bounds are inclusive on both ends, and the first and
+    /// last echo of ours are the earliest and latest of them — the offset
+    /// the report names for a tick that straddled the flip.
     #[test]
-    fn the_window_bounds_are_inclusive() {
+    fn the_window_bounds_are_inclusive_and_the_echoes_are_stamped() {
         let ours = echo_request(OWN);
-        let f = count(&[(10, 0, &ours), (20, 0, &ours)]);
-        assert_eq!(f.in_window, 2);
+        let theirs = echo_request(PEER);
+        let f = count(&[(10, 0, &ours), (12, 500_000, &theirs), (20, 0, &ours)]);
+        assert_eq!(f.in_window, 3);
         assert_eq!(f.icmp_echo, 2);
+        assert_eq!(f.first_echo_us, Some(10_000_000));
+        assert_eq!(f.last_echo_us, Some(20_000_000));
+        // An echo of ours outside the window stamps nothing.
+        let f = count(&[(25, 0, &ours)]);
+        assert_eq!(f.first_echo_us, None);
+        assert_eq!(f.last_echo_us, None);
+        // The straddling shape: every echo within one 15 s tick of the start.
+        let f = count(&[(10, 0, &ours), (24, 0, &ours)]);
+        assert!(f.echoes_are_the_straddling_tick(START, 15_000_000));
+        let f = count(&[(10, 0, &ours), (20, 0, &ours), (25, 0, &ours)]);
+        assert!(f.echoes_are_the_straddling_tick(START, 15_000_000));
+        let f = count(&[(10, 0, &ours), (20, 0, &ours)]);
+        assert!(!f.echoes_are_the_straddling_tick(START, 5_000_000));
+        assert!(!count(&[(15, 0, &theirs)]).echoes_are_the_straddling_tick(START, 15_000_000));
     }
 
     /// Another machine's echo inside the window is a frame in the window,

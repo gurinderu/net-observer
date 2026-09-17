@@ -12,10 +12,110 @@
 use std::time::Duration;
 
 use duckdb::types::Value;
-use types::{FlowTotals, NetworkFacts};
+use types::{
+    FlowTotals, NetworkFacts, ObservingCause, ObservingEdge, ProbingEdge, ProbingReason,
+    WindowEdges,
+};
 
 use crate::diagnosis::PreparedSql;
 use crate::{QueryTable, Store, StoreError};
+
+/// The boundary rows inside `[start_us, end_us]`, both ends inclusive: every
+/// `observing_edge` (a pause or resume) and every `probing_edge` (the
+/// window's own opening edge at `start_us` among them — the reader filters
+/// by reason). The window's end task reads these BEFORE its closing edge, to
+/// decide whether the tier is still its own to restore, and the report names
+/// each so a zero read against a paused stretch is not read as an unbroken
+/// window (realm net-observer, node #61).
+pub fn window_edges(
+    store: &dyn Store,
+    start_us: i64,
+    end_us: i64,
+    budget: Duration,
+) -> Result<WindowEdges, StoreError> {
+    let between = || vec![Value::BigInt(start_us), Value::BigInt(end_us)];
+    let observing = store.query_prepared_within(
+        &PreparedSql::bound(
+            "SELECT ts_us, observing, peer_uid, cause FROM observing_edge
+             WHERE ts_us BETWEEN ? AND ? ORDER BY ts_us",
+            between(),
+        ),
+        budget,
+    )?;
+    let probing = store.query_prepared_within(
+        &PreparedSql::bound(
+            "SELECT ts_us, tier, peer_uid, reason FROM probing_edge
+             WHERE ts_us BETWEEN ? AND ? ORDER BY ts_us",
+            between(),
+        ),
+        budget,
+    )?;
+    Ok(WindowEdges {
+        observing: observing
+            .rows
+            .iter()
+            .map(|r| {
+                Ok(ObservingEdge {
+                    ts_us: parse_i64(cell(r, 0), 0)?,
+                    observing: cell(r, 1) == "true",
+                    peer_uid: parse_opt_u32(cell(r, 2), 2)?,
+                    // A NULL cause is a row from before the column: an
+                    // operator's toggle, as the gap derivation reads it.
+                    cause: parse_token_or(cell(r, 3), ObservingCause::Control, 3)?,
+                })
+            })
+            .collect::<Result<_, StoreError>>()?,
+        probing: probing
+            .rows
+            .iter()
+            .map(|r| {
+                Ok(ProbingEdge {
+                    ts_us: parse_i64(cell(r, 0), 0)?,
+                    tier: parse_token(cell(r, 1), 1)?,
+                    peer_uid: parse_opt_u32(cell(r, 2), 2)?,
+                    // A NULL reason is a row from before the column: control.
+                    reason: parse_token_or(cell(r, 3), ProbingReason::Control, 3)?,
+                })
+            })
+            .collect::<Result<_, StoreError>>()?,
+    })
+}
+
+/// A token column as its enum, the driver's own conversion failure when the
+/// text is not a token this build knows.
+fn parse_token<T>(text: &str, col: usize) -> Result<T, StoreError>
+where
+    T: std::str::FromStr<Err = types::ParseVerdictError>,
+{
+    text.parse::<T>().map_err(|e| {
+        StoreError::Duckdb(duckdb::Error::FromSqlConversionFailure(
+            col,
+            duckdb::types::Type::Text,
+            Box::new(e),
+        ))
+    })
+}
+
+/// [`parse_token`] with an empty cell (SQL `NULL`) reading as `absent`.
+fn parse_token_or<T>(text: &str, absent: T, col: usize) -> Result<T, StoreError>
+where
+    T: std::str::FromStr<Err = types::ParseVerdictError>,
+{
+    if text.is_empty() {
+        Ok(absent)
+    } else {
+        parse_token(text, col)
+    }
+}
+
+fn parse_opt_u32(text: &str, col: usize) -> Result<Option<u32>, StoreError> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<u32>()
+        .map(Some)
+        .map_err(|e| conversion(col, e))
+}
 
 /// The newest flow-table tick at or before a moment, its rows summed. A
 /// `SKIP` tick (the API did not answer) is one row with NULL counts, so the
@@ -336,6 +436,79 @@ mod tests {
         let f = window_facts(&s, START, END, BUDGET).unwrap();
         assert_eq!(f.gw_verdicts, vec![("SKIP".to_string(), 3)]);
         assert!(f.gw_all_skip());
+    }
+
+    /// The boundary rows inside the window come back as the edges they
+    /// were written as — the window's own opening edge included, an
+    /// operator's switch and a pause with their instants — and rows from
+    /// outside the bounds stay outside.
+    #[test]
+    fn window_edges_read_back_the_rows_inside_the_bounds() {
+        use types::{ObservingCause, ObservingEdge, ProbingEdge, ProbingReason, ProbingTier};
+        let s = DuckdbStore::in_memory().unwrap();
+        let probing = |ts_us, tier, reason| ProbingEdge {
+            ts_us,
+            tier,
+            peer_uid: Some(501),
+            reason,
+        };
+        let observing = |ts_us, observing| ObservingEdge {
+            ts_us,
+            observing,
+            peer_uid: Some(501),
+            cause: ObservingCause::Control,
+        };
+        s.write_probing_edge(&probing(
+            START - 1,
+            ProbingTier::Active,
+            ProbingReason::Control,
+        ))
+        .unwrap();
+        s.write_probing_edge(&probing(
+            START,
+            ProbingTier::Passive,
+            ProbingReason::Experiment,
+        ))
+        .unwrap();
+        s.write_probing_edge(&probing(
+            2_000_000,
+            ProbingTier::Active,
+            ProbingReason::Control,
+        ))
+        .unwrap();
+        s.write_probing_edge(&probing(
+            END + 1,
+            ProbingTier::Passive,
+            ProbingReason::Control,
+        ))
+        .unwrap();
+        s.write_observing_edge(&observing(START - 1, false))
+            .unwrap();
+        s.write_observing_edge(&observing(3_000_000, false))
+            .unwrap();
+        s.write_observing_edge(&observing(END, true)).unwrap();
+
+        let e = window_edges(&s, START, END, BUDGET).unwrap();
+        assert_eq!(
+            e.probing,
+            vec![
+                probing(START, ProbingTier::Passive, ProbingReason::Experiment),
+                probing(2_000_000, ProbingTier::Active, ProbingReason::Control),
+            ]
+        );
+        assert_eq!(
+            e.observing,
+            vec![observing(3_000_000, false), observing(END, true)]
+        );
+        assert_eq!(e.pauses().count(), 1);
+        assert_eq!(
+            e.operator_probing().map(|p| p.ts_us).collect::<Vec<_>>(),
+            vec![2_000_000]
+        );
+        assert_eq!(
+            window_edges(&s, END + 10, END + 20, BUDGET).unwrap(),
+            WindowEdges::default()
+        );
     }
 
     /// The flow readings are the newest tick at or before each bound — a
