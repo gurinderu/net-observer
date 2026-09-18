@@ -772,9 +772,10 @@ CLI's offline `query` opens whatever file it is handed); rows written by that
 daemon read back with a `NULL` cause, which the gap derivation treats as
 `control` — which is what they in fact were.
 
-**Retention.** Nothing in the record is pruned unless config says so: the
-policy (how long to keep) is the owner's decision, and the shipped default is
-keep-forever — `[record] retention_days = 0` (realm net-observer, node #130).
+**Retention.** The policy (how long to keep) is the owner's decision; the
+shipped default prunes `connection_sample` after 7 days — `[record]
+retention_days = 7`. `retention_days = 0` keeps forever and runs no prune at
+all (realm net-observer, node #130).
 The mechanism is `Store::prune_older_than(table, cutoff_us)`: `DELETE FROM
 <table> WHERE ts_us < cutoff` and, in the same transaction, one `record_prune`
 row naming the table, the cutoff and the count — the bracket that says the
