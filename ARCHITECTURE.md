@@ -1366,7 +1366,7 @@ through the pure predicate `api::control_authorized`. It admits:
   headless / SSH-only host where `/dev/console` is root-owned and the
   console-user rule authorises nobody.
 
-Everything else — an unrelated local uid on the mode-`0666` socket — is refused,
+Everything else — an unrelated `staff` uid on the mode-`0660` socket — is refused,
 as is a peer whose credentials could not be read: an authority decision **fails
 closed**. `Status`, `Incidents` and `Subscribe` are deliberately **not** gated:
 the permissive default `socket_mode` exists precisely for unprivileged readers,
@@ -1375,8 +1375,9 @@ only when no cheaper clause has already said yes (`control_authorized(.., None)`
 is exactly "authorised with no console session"), so an authorised-by-config peer
 costs no `stat("/dev/console")` at all.
 
-Refusals are **rate-limited, never silent.** The socket is world-connectable by
-default, so an unauthorised local process could otherwise grow a **root** daemon's
+Refusals are **rate-limited, never silent.** The socket is connectable by every
+process of the console user's group by default, so an unauthorised local process
+could otherwise grow a **root** daemon's
 log at its own loop rate. Control refusals and accept-time connection-cap refusals
 each go through their own `api::RateLimitedLog`: at most one `warn!` per minute
 (`REFUSAL_LOG_INTERVAL`), and every line reports how many events it stands for, so
@@ -1659,10 +1660,12 @@ depth*, not the authorisation mechanism — the peer-credential gate above is, a
 it applies whatever the file permissions are. Still, an operator who uses the
 control path should narrow who can even connect: set `socket_mode = 0o600` and
 `socket_owner_uid = <logged-in uid>` so only that owner reaches the endpoint at
-all. With the default `socket_mode = 0o666` the socket is world-connectable (fine
-for read-only status; a stranger's `Control` is refused by the peer-credential
-gate, but tightening the mode removes the attempt as well as the effect), and
-`socket_owner_uid` is
+all. With the default `socket_mode = 0o660` and `socket_gid = 20` the socket is
+connectable by root and every process of the console user's group, `staff`
+(fine for read-only status — that group is who the record is for, realm
+net-observer, node #110; a stranger's `Control` is refused by the
+peer-credential gate, but tightening the mode removes the attempt as well as
+the effect), and `socket_owner_uid` is
 `None` (the socket keeps the daemon's root ownership — and then authorises no one
 through that clause). On a host with no console session, `control_uids` is the
 way to authorise an administrator, since the console-user rule admits nobody
@@ -1766,13 +1769,26 @@ read-only — is blocked while the daemon runs.
   "net-observer offline" dot, retried each tick.
 
 The menu-bar UI stays a separate unprivileged binary — never the daemon itself.
-The daemon relaxes the socket file's mode (config `socket_mode`, default `0666`)
+The daemon opens the socket file's mode to the group (config `socket_mode`,
+default `0o660`) and `chown`s it to `socket_gid` (default `20`, macOS `staff`)
 so the logged-in user's UI can connect to the root-owned socket. The socket is
 owned by root by default; when `socket_owner_uid` is set the daemon `chown`s it to
-that uid instead. What keeps the world-connectable read socket from also
+that uid instead. What keeps the group-connectable read socket from also
 accepting privileged commands is the **peer-credential gate** on every
 `Request::Control` — root, the daemon's own uid, `socket_owner_uid`, the
 logged-in console user, or a uid in `control_uids` — not the file mode; a
 restrictive `socket_mode = 0o600` paired with `socket_owner_uid` is defence in
 depth on top of it, worth setting wherever the control path is used (see
 [Control path](#control-path)).
+
+**Who can read the record.** Addresses stay raw in the record and on the
+socket — forensics needs them — and what narrows is who can read them: root
+and the console user's group (realm net-observer, node #110). The daemon runs
+under `umask 027`, so every file it creates is born group-readable and
+world-nothing. The socket is `0660 root:staff` (`socket_mode`, `socket_gid`);
+the record and its write-ahead log are `0640 root:staff` (`record_mode`,
+`record_gid`), and the record's directory carries the same group plus the
+setgid bit so the WAL DuckDB re-creates after every checkpoint inherits it —
+all set once at startup, each step a warning and never fatal if it fails. The
+blob directory and the pcap ring stay root's. The daemon's log file is
+launchd's, written by the job definition in `nix-config`, not by this daemon.
