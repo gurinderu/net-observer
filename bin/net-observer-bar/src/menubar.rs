@@ -19,7 +19,10 @@
 //! flips an `AtomicBool`. A gpui foreground task polls that flag and *toggles* the
 //! panel — a Tailscale-style dropdown anchored under the icon (a borderless
 //! `WindowKind::PopUp`, no titlebar): a click opens it, a click while it is open
-//! closes it, and it also dismisses itself when it loses key focus (click-away).
+//! closes it, and it also dismisses itself when it loses key focus (click-away):
+//! a panel that is key closes on the next loss of key focus it observes unless
+//! its own menu holds the focus, and whether it was key is read off the window
+//! when the dismissal is wired, never assumed (realm net-observer, node #74).
 //! Keeping all gpui/window work on gpui's own executor avoids reentering it from
 //! an AppKit callback. A second foreground task re-queries the daemon over the
 //! local socket every ~3s and updates both the shared model (so an open panel
@@ -430,11 +433,24 @@ fn open_panel(cx: &mut App, model: &Entity<Glance>, button: &NSStatusBarButton) 
 /// Dismiss-on-click-away via gpui's window-activation observation: close the
 /// popup once it has been active and then resigns key.
 ///
-/// The `was_active` latch skips the opening activation (and any spurious
-/// deactivate before the panel is ever shown). `Glance::menu_focus_guard` is
-/// raised while the actions menu owns the focus — opening that menu takes key
-/// focus from this panel, and without the latch the panel would vanish the moment
-/// its own menu appeared, taking the menu's parent out from under it.
+/// The rule: a panel that is key — at wiring time or at any moment after —
+/// closes on the next loss of key focus it observes, unless its own menu holds
+/// the focus (realm net-observer, node #74).
+///
+/// The `was_active` latch is seeded from the window's actual state, not from
+/// `false`: gpui's platform layer makes the popup key inside `Window::new`,
+/// before the root view — and so this observer — exists, and
+/// `observe_window_activation` replays nothing, so a latch starting cold met the
+/// first deactivation with `was_active == false` and left the panel standing.
+/// The latch still exists for the one deactivation that reaches a window nobody
+/// has seen key: gpui's mac backend resigns a window that Cocoa hands a
+/// `windowDidBecomeKey:` it is not key for, and that manufactured resign must
+/// not dismiss a panel that has not been shown.
+///
+/// `Glance::menu_focus_guard` is raised while the actions menu owns the focus —
+/// opening that menu takes key focus from this panel, and without the guard the
+/// panel would vanish the moment its own menu appeared, taking the menu's parent
+/// out from under it.
 ///
 /// `detach` keeps the subscription alive for the window's lifetime — it is
 /// dropped with the window — so we needn't store it, and `PanelView` (ui.rs)
@@ -451,7 +467,7 @@ fn wire_click_away_dismiss(
     let menu_guard = model.read(cx).menu_focus_guard.clone();
     let dismissed_at = model.read(cx).panel_dismissed_at.clone();
     let model = model.clone();
-    let mut was_active = false;
+    let mut was_active = window.is_window_active();
     cx.observe_window_activation(window, move |_view, window, cx| {
         if window.is_window_active() {
             was_active = true;
@@ -587,6 +603,20 @@ mod headless_tests {
         WindowHandle<PanelView>,
         Arc<Mutex<Option<Instant>>>,
     ) {
+        panel_window(cx, true)
+    }
+
+    /// Open a panel window, with or without the click-away wiring. `false` leaves
+    /// the wiring to the test, so it can be raised on a window that is already
+    /// active — the state the real `open_panel` wires it in.
+    fn panel_window(
+        cx: &mut TestAppContext,
+        wire_dismiss: bool,
+    ) -> (
+        Entity<Glance>,
+        WindowHandle<PanelView>,
+        Arc<Mutex<Option<Instant>>>,
+    ) {
         let model = cx.update(|cx| {
             cx.new(|_| {
                 Glance::new(
@@ -601,7 +631,9 @@ mod headless_tests {
         let for_wiring = model.clone();
         let window = cx.add_window(move |window, cx| {
             let view = PanelView::new(for_view, cx);
-            wire_click_away_dismiss(window, cx, &for_wiring);
+            if wire_dismiss {
+                wire_click_away_dismiss(window, cx, &for_wiring);
+            }
             view
         });
         cx.update(|cx| {
@@ -688,6 +720,53 @@ mod headless_tests {
         assert!(
             !is_open(cx, window),
             "a click away with no menu open must dismiss the panel"
+        );
+        assert!(
+            dismissed.lock().expect("dismissal stamp").is_some(),
+            "the dismissal must be stamped, so the next status-item click reopens \
+             rather than being swallowed as the dismissing gesture"
+        );
+        assert!(
+            cx.update(|cx| model.read(cx).panel_window.is_none()),
+            "the shared handle must go with the window it names"
+        );
+    }
+
+    /// The dismissal wired on a window that is *already* active still closes it
+    /// on the first deactivation it observes (realm net-observer, node #74).
+    ///
+    /// This is the order the real `open_panel` produces: the platform makes the
+    /// popup key inside `Window::new`, before the root view and its observer
+    /// exist, so the observer never sees the activation — the first event it
+    /// sees is the loss of focus. A latch that starts at `false` meets that
+    /// event cold and leaves the panel standing, which is what the owner saw.
+    /// The test above cannot catch it: there the activation comes after the
+    /// wiring, so the observer sees it and the latch is warm.
+    #[gpui::test]
+    fn a_panel_active_before_its_wiring_still_dismisses_on_its_first_deactivation(
+        cx: &mut TestAppContext,
+    ) {
+        let (model, window, dismissed) = panel_window(cx, false);
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, _| window.activate_window());
+        vcx.run_until_parked();
+        assert!(
+            vcx.update(|window, _| window.is_window_active()),
+            "precondition: the window is active before the dismissal is wired"
+        );
+
+        window
+            .update(cx, |_, window, cx| {
+                wire_click_away_dismiss(window, cx, &model)
+            })
+            .expect("the panel window is live");
+        vcx.deactivate_window();
+        vcx.run_until_parked();
+
+        assert!(
+            !is_open(cx, window),
+            "a deactivation the observer sees first — with no activation before \
+             it — must still dismiss the panel"
         );
         assert!(
             dismissed.lock().expect("dismissal stamp").is_some(),

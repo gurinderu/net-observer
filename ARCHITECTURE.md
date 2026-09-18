@@ -609,7 +609,12 @@ graph TD
   via `objc2` / `objc2-app-kit`) whose icon-only health dot shows the latest
   link/proxy health and whose click toggles an anchored **gpui** popup (a
   Tailscale-style dropdown — `WindowKind::PopUp`, anchored under the icon,
-  dismissed on click-away) rendering the full `StatusSnapshot`
+  dismissed on click-away: a panel that is key closes on the next loss of key
+  focus it observes unless its own actions menu holds the focus, and whether it
+  is key is read off the window when the dismissal is wired rather than assumed,
+  because gpui keys the popup before the root view exists and replays no
+  activation to an observer wired after it — realm net-observer, node #74)
+  rendering the full `StatusSnapshot`
   (latest link/proxy tick + recent incidents), re-queried on a ~3s timer; a down
   daemon / absent socket degrades to a graceful "net-observer offline" state. The
   popup is a **Tailscale-style** panel: it reads the window's
