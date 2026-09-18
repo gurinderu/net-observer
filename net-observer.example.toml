@@ -29,12 +29,19 @@ socket_path = "/var/lib/observer/observer.sock"
 # — nobody else. Was 0o666 (world-connectable) before the ruling.
 socket_mode = 0o660
 
-# The group the socket is chowned to after bind.
+# The group the socket is chowned to after bind. TOML has no null, so this line
+# can only move the gid: 0 (wheel) is the root-only setting.
 socket_gid = 20
 
-# The group and mode of the record (`db_path`) and its write-ahead log: root
-# writes, the group reads. The record's directory takes the same group and the
-# setgid bit, so the WAL DuckDB re-creates after every checkpoint inherits it.
+# The group and mode of the record (`db_path`), its write-ahead log and every
+# pcap freeze under `blob_dir`: root writes, the group reads. The record's
+# directory and the blob tree take the same group and the setgid bit, so a WAL
+# DuckDB re-creates and a ring file tcpdump rotates in are born in that group
+# (macOS gives a new file its directory's group regardless; the bit makes Linux
+# do the same). The mode is applied to the files present at startup and to
+# each freeze as it is made; a WAL re-created later is born under the daemon's
+# umask 027 (0640), so a stricter value here does not reach it. Freezes made
+# before this build keep their bits.
 record_gid = 20
 record_mode = 0o640
 
@@ -43,7 +50,7 @@ record_mode = 0o640
 # uid is also authorised to send control requests (Control(..)) — it is the
 # operator's explicit statement about who owns the control endpoint. To harden
 # the control path, set this to the logged-in user's uid AND set
-# socket_mode = 0o600 so only that owner can even connect — a world-connectable
+# socket_mode = 0o600 so only that owner can even connect — a group-connectable
 # read socket should not also invite action attempts.
 # socket_owner_uid = 501
 

@@ -33,20 +33,29 @@ pub struct Config {
     /// The group the daemon `chown`s the socket to. Default `Some(20)`, macOS
     /// `staff` — the group every console user is in, so `socket_mode`'s group
     /// bits are what admit the bar and the CLI. `None` leaves the group as
-    /// `bind` created it; TOML has no null, so a file can only move the gid
-    /// (realm net-observer, node #110).
+    /// `bind` created it; TOML has no null, so a file can only move the gid —
+    /// `0` (`wheel`) is the reachable root-only knob (realm net-observer,
+    /// node #110).
     #[serde(default = "default_staff_gid")]
     pub socket_gid: Option<u32>,
-    /// The group the record (`db_path`) and its write-ahead log are `chown`ed
-    /// to, and the group the record's directory takes together with the
-    /// setgid bit, so the WAL DuckDB re-creates after every checkpoint
-    /// inherits it. Default `Some(20)`, macOS `staff`; `None` leaves every
-    /// group as created (realm net-observer, node #110).
+    /// The group the record (`db_path`), its write-ahead log and every freeze
+    /// copy under `blob_dir` are `chown`ed to, and the group the record's
+    /// directory and the blob tree take together with the setgid bit: on
+    /// macOS a new file takes its directory's group regardless of the bit,
+    /// and the bit makes Linux do the same — so a WAL DuckDB re-creates and a
+    /// ring file `tcpdump` rotates in are born in this group. Default
+    /// `Some(20)`, macOS `staff`. `None` leaves every group as created; TOML
+    /// has no null, so a file can only move the gid — `0` (`wheel`) is the
+    /// reachable root-only knob (realm net-observer, node #110).
     #[serde(default = "default_staff_gid")]
     pub record_gid: Option<u32>,
-    /// Permission bits (octal) applied to the record and its write-ahead log.
-    /// Default `0o640`: root writes, `record_gid` reads, the world sees
-    /// nothing (realm net-observer, node #110).
+    /// Permission bits (octal) applied to the record, its write-ahead log and
+    /// every freeze copy. Default `0o640`: root writes, `record_gid` reads,
+    /// the world sees nothing. Enforced on the files present at startup and
+    /// on each freeze as it is made; a WAL DuckDB re-creates after a later
+    /// checkpoint is born under the daemon's fixed `umask 027` instead
+    /// (`0666 & !027` = `0640`), so a stricter value here does not reach it
+    /// (realm net-observer, node #110).
     #[serde(default = "default_record_mode")]
     pub record_mode: u32,
     /// Extra uids allowed to send a `Request::Control`, on top of root, the

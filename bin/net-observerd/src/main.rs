@@ -38,8 +38,9 @@ use config::Config;
 use macos::LldpCapture;
 use macos::{
     AnnounceCapture, BoundTcpProber, ConnectionSystemFacts, CoreWlanFacts, DnsResolver,
-    HeldReferenceStreams, HostLoad, IcmpPinger, PcapRing, PfRouteSource, ProxySystemFacts,
-    SystemFacts, SystemNeighbors, SystemProfilerAir, SystemSegment, TcpdumpLldpCapture,
+    FreezeAccess, HeldReferenceStreams, HostLoad, IcmpPinger, PcapRing, PfRouteSource,
+    ProxySystemFacts, SystemFacts, SystemNeighbors, SystemProfilerAir, SystemSegment,
+    TcpdumpLldpCapture,
 };
 use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
@@ -397,71 +398,130 @@ fn wal_path(db_path: &Path) -> PathBuf {
 /// node #110). Runs once, right after the store is opened, so the file exists.
 ///
 /// Three steps, each on its own and each best-effort: the record's directory
-/// takes group `gid` and the setgid bit, so the files DuckDB creates there
-/// later — the WAL after every checkpoint — inherit that group; the record
-/// file takes group `gid` and `mode`; so does `<db_path>.wal` when it exists
-/// now. `gid = None` leaves every group as it is and still sets the modes. A
-/// failure is logged at warn and the next step runs: a record that stays
-/// 0644 is a warning, not an outage — the daemon's job is the record. The
-/// blob directory and the pcap ring are not touched here: they stay root's.
+/// takes group `gid` and the setgid bit ([`grant_dir_access`] — on macOS a
+/// new file takes its directory's group regardless, the bit makes Linux do
+/// the same); the record file takes group `gid` and `mode`; so does
+/// `<db_path>.wal` when it exists now. `mode` reaches the files present at
+/// this moment: a WAL DuckDB re-creates after a later checkpoint is born
+/// under the process umask instead (`0666 & !0o027` = `0640`), so a stricter
+/// `record_mode` does not follow it. `gid = None` leaves every group as it is
+/// and still sets the modes. A failure is logged at warn and the next step
+/// runs — a record that stays 0644 is a warning, not an outage — and the
+/// closing line says whether every step landed.
 fn restrict_record_access(db_path: &Path, gid: Option<u32>, mode: u32) {
+    let mut ok = true;
     if let Some(dir) = db_path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        match std::fs::metadata(dir) {
-            Ok(meta) => {
-                if let Err(e) = std::os::unix::fs::chown(dir, None, gid) {
-                    tracing::warn!(
-                        error = %e,
-                        path = %dir.display(),
-                        ?gid,
-                        "record directory: chown failed"
-                    );
-                }
-                let dir_mode = with_setgid(meta.permissions().mode());
-                if let Err(e) =
-                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(dir_mode))
-                {
-                    tracing::warn!(
-                        error = %e,
-                        path = %dir.display(),
-                        mode = format!("{dir_mode:o}"),
-                        "record directory: setgid failed"
-                    );
-                }
-            }
-            Err(e) => tracing::warn!(
-                error = %e,
-                path = %dir.display(),
-                "record directory: stat failed"
-            ),
-        }
+        ok &= grant_dir_access(dir, gid);
     }
-    restrict_record_file(db_path, gid, mode);
+    ok &= grant_file_access(db_path, gid, mode);
     let wal = wal_path(db_path);
     if wal.exists() {
-        restrict_record_file(&wal, gid, mode);
+        ok &= grant_file_access(&wal, gid, mode);
     }
-    tracing::info!(
-        path = %db_path.display(),
-        ?gid,
-        mode = format!("{mode:o}"),
-        "record readable by root and group"
-    );
+    if ok {
+        tracing::info!(
+            path = %db_path.display(),
+            ?gid,
+            mode = format!("{mode:o}"),
+            "record readable by root and group"
+        );
+    } else {
+        tracing::warn!(
+            path = %db_path.display(),
+            ?gid,
+            mode = format!("{mode:o}"),
+            "record access: not every step landed (see the warnings above); \
+             who can read the record is not what the config says"
+        );
+    }
 }
 
-/// One file of the record: group `gid`, then `mode`. Chown first — a chown
-/// can clear mode bits, a chmod never moves a group.
-fn restrict_record_file(path: &Path, gid: Option<u32>, mode: u32) {
+/// The blob tree follows the record: `blob_dir` and, when it exists already,
+/// `blob_dir/ring` take group `gid` and the setgid bit, so a freeze directory
+/// and the ring files `tcpdump` writes later are born in that group (realm
+/// net-observer, node #110). The freeze copies themselves — what the operator
+/// opens after an incident — get the record's group and mode outright when
+/// they are made (`macos::FreezeAccess`); the ring files are only ever read
+/// by that copy, which runs as root. Files and freezes made before this build
+/// keep the bits they were made with. Best-effort, like the record.
+fn restrict_blob_access(blob_dir: &Path, gid: Option<u32>) {
+    let mut ok = grant_dir_access(blob_dir, gid);
+    let ring_dir = blob_dir.join("ring");
+    if ring_dir.is_dir() {
+        ok &= grant_dir_access(&ring_dir, gid);
+    }
+    if ok {
+        tracing::info!(
+            path = %blob_dir.display(),
+            ?gid,
+            "blob directory readable by root and group"
+        );
+    } else {
+        tracing::warn!(
+            path = %blob_dir.display(),
+            ?gid,
+            "blob access: not every step landed (see the warnings above)"
+        );
+    }
+}
+
+/// What every freeze copy takes: the record's group and mode (realm
+/// net-observer, node #110).
+fn freeze_access(cfg: &Config) -> FreezeAccess {
+    FreezeAccess {
+        gid: cfg.record_gid,
+        mode: cfg.record_mode,
+    }
+}
+
+/// One directory: group `gid`, then its own bits plus setgid
+/// ([`with_setgid`]). Chown first — a chown can clear mode bits, a chmod
+/// never moves a group. Each failure is a warning; returns whether every
+/// step landed.
+fn grant_dir_access(dir: &Path, gid: Option<u32>) -> bool {
+    let meta = match std::fs::metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %dir.display(), "directory: stat failed");
+            return false;
+        }
+    };
+    let mut ok = true;
+    if let Err(e) = std::os::unix::fs::chown(dir, None, gid) {
+        tracing::warn!(error = %e, path = %dir.display(), ?gid, "directory: chown failed");
+        ok = false;
+    }
+    let dir_mode = with_setgid(meta.permissions().mode());
+    if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(dir_mode)) {
+        tracing::warn!(
+            error = %e,
+            path = %dir.display(),
+            mode = format!("{dir_mode:o}"),
+            "directory: setgid failed"
+        );
+        ok = false;
+    }
+    ok
+}
+
+/// One file: group `gid`, then `mode`, in that order for the same reason as
+/// the directory. Each failure is a warning; returns whether both landed.
+fn grant_file_access(path: &Path, gid: Option<u32>, mode: u32) -> bool {
+    let mut ok = true;
     if let Err(e) = std::os::unix::fs::chown(path, None, gid) {
-        tracing::warn!(error = %e, path = %path.display(), ?gid, "record: chown failed");
+        tracing::warn!(error = %e, path = %path.display(), ?gid, "file: chown failed");
+        ok = false;
     }
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
         tracing::warn!(
             error = %e,
             path = %path.display(),
             mode = format!("{mode:o}"),
-            "record: chmod failed"
+            "file: chmod failed"
         );
+        ok = false;
     }
+    ok
 }
 
 /// One retention sweep of the record: for each table of a plan
@@ -636,8 +696,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(&cfg.blob_dir);
 
     let store = Arc::new(DuckdbStore::open(&cfg.db_path).context("opening store")?);
-    // The file exists now; open it to root and one group, never to the world.
+    // The file exists now; open it to root and one group, never to the world —
+    // and the blob tree with it, so a freeze the operator opens later is too.
     restrict_record_access(Path::new(&cfg.db_path), cfg.record_gid, cfg.record_mode);
+    restrict_blob_access(Path::new(&cfg.blob_dir), cfg.record_gid);
 
     // The schema migrates forward only: a file a NEWER build has opened keeps
     // its wider tables under this build, and every positional write to them is
@@ -1101,6 +1163,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         let ring_dir = Path::new(&cfg.blob_dir).join("ring");
         let ring_mb = cfg.collectors.pcap_ring.ring_mb;
         let filter = cfg.collectors.pcap_ring.filter.clone();
+        let freeze = freeze_access(&cfg);
         let resolve_iface = resolve_iface.clone();
         tokio::spawn(async move {
             supervise_pcap_ring(
@@ -1109,7 +1172,7 @@ async fn run_daemon() -> anyhow::Result<()> {
                 pcap_reason,
                 resolve_iface,
                 move |iface| {
-                    PcapRing::start(iface, ring_dir.clone(), ring_mb, &filter)
+                    PcapRing::start(iface, ring_dir.clone(), ring_mb, &filter, freeze)
                         .map(|r| Arc::new(r) as Arc<dyn PcapFreezer>)
                 },
             )
@@ -1762,6 +1825,7 @@ fn maybe_start_pcap_ring(
         ring_dir,
         cfg.collectors.pcap_ring.ring_mb,
         &cfg.collectors.pcap_ring.filter,
+        freeze_access(cfg),
     ) {
         Ok(ring) => (
             Arc::new(PcapRingSlot::with_ring(
@@ -2065,7 +2129,8 @@ fn build_api_server(
         // same handle the pipeline does.
         store: store as Arc<dyn store::Store + Send + Sync>,
         // One diagnosis at a time: a `Query` holds the store mutex the pipeline
-        // writes through, and the socket is world-connectable.
+        // writes through, and the socket is group-connectable (0660 root:staff
+        // by default).
         query_gate: Arc::new(tokio::sync::Semaphore::new(api::MAX_QUERIES_IN_FLIGHT)),
         events_tx,
         // Empty at boot on purpose: a window is process-scoped like the tier
@@ -3828,6 +3893,49 @@ mod tests {
             Path::new("/nonexistent/net-observerd/observer.duckdb"),
             None,
             0o640,
+        );
+    }
+
+    /// The blob tree: the directory and an existing `ring/` take setgid on
+    /// top of their bits, a missing `ring/` is skipped, a missing blob dir is
+    /// a warning and not a panic. Files inside are not touched here.
+    #[test]
+    fn restrict_blob_access_sets_setgid_on_the_tree_and_leaves_files_alone() {
+        let blobs = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(blobs.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+
+        restrict_blob_access(blobs.path(), None);
+        assert_eq!(mode(blobs.path()), 0o2755);
+
+        let ring = blobs.path().join("ring");
+        std::fs::create_dir(&ring).unwrap();
+        std::fs::set_permissions(&ring, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let old = ring.join("ring.pcap0");
+        std::fs::write(&old, b"").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o600)).unwrap();
+        restrict_blob_access(blobs.path(), None);
+        assert_eq!(mode(&ring), 0o2750);
+        assert_eq!(mode(&old), 0o600, "existing ring files keep their bits");
+
+        restrict_blob_access(Path::new("/nonexistent/net-observerd/blobs"), None);
+    }
+
+    /// Every freeze takes the record's own group and mode, read from the
+    /// config — a literal here would let `record_mode` stop at the record.
+    #[test]
+    fn freeze_access_is_the_records() {
+        let cfg = Config {
+            record_gid: Some(4243),
+            record_mode: 0o600,
+            ..Config::default()
+        };
+        assert_eq!(
+            freeze_access(&cfg),
+            FreezeAccess {
+                gid: Some(4243),
+                mode: 0o600
+            }
         );
     }
 }

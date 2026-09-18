@@ -43,6 +43,6 @@ pub use host::HostLoad;
 pub use lldp_capture::{LldpCapture, TcpdumpLldpCapture};
 pub use neighbors::SystemNeighbors;
 pub use net::{BoundTcpProber, IcmpPinger};
-pub use pcap::PcapRing;
+pub use pcap::{FreezeAccess, PcapRing};
 pub use route::PfRouteSource;
 pub use stall::HeldReferenceStreams;

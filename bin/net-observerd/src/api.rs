@@ -65,15 +65,17 @@ const ROOT_UID: u32 = 0;
 pub(crate) const MAX_SUBSCRIBERS: usize = 256;
 
 /// Largest request frame the daemon will buffer before giving up on finding a
-/// newline. The socket is world-connectable by default, so no client may grow
-/// server memory by never terminating its request; an over-long frame is
+/// newline. The socket is group-connectable by default (0660 root:staff — every
+/// process of the console user), so no client may grow server memory by never
+/// terminating its request; an over-long frame is
 /// truncated, fails to parse, and is answered `Response::Error`.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
 /// How many named diagnoses (`Request::Query`) may run at once: ONE. A diagnosis
 /// holds the store's connection mutex for as long as its `ASOF JOIN` takes, and
-/// the pipeline's next sample write waits behind it; on a world-connectable
-/// socket that is a stall any local process could inflict by looping queries.
+/// the pipeline's next sample write waits behind it; on a group-connectable
+/// socket that is a stall any of the console user's processes could inflict by
+/// looping queries.
 /// `MAX_CONNECTIONS` bounds how many such connections exist, not what they cost,
 /// so the gate is here: a second concurrent query is refused at once with a
 /// decodable `Response::Error` (`try_acquire`, never a queue that would let the
@@ -134,8 +136,9 @@ pub struct Burst {
 
 /// A log throttle for a line an unprivileged local process can trigger.
 ///
-/// The socket is world-connectable by default, so an unauthorised process can loop
-/// connect+`Control` and, at one `warn!` per attempt, grow a ROOT daemon's log at
+/// The socket is group-connectable by default (0660 root:staff), so an
+/// unauthorised process of the console user can loop connect+`Control` and, at
+/// one `warn!` per attempt, grow a ROOT daemon's log at
 /// its own pace. At most one line per `interval`, and each line reports how many
 /// events were suppressed since the last one — deferred, never lost, so the flood
 /// stays visible and countable without being transcribed. Monotonic ([`Instant`])
@@ -237,7 +240,8 @@ pub struct ControlPolicy {
     /// ONE process, where `getpeereid(2)` and `geteuid(2)` return the same value:
     /// a hardcoded `Some(geteuid())` at the lookup site is indistinguishable from
     /// the real lookup there, while in production — where `daemon_uid` IS
-    /// `geteuid()` — it would authorise EVERY local peer on the mode-0666 socket.
+    /// `geteuid()` — it would authorise EVERY peer on the group-connectable
+    /// (0660 root:staff by default) socket.
     /// Injecting a uid that is neither this process's, nor root's, nor the
     /// console user's is the only thing that makes that substitution observable.
     peer_uid: fn(&UnixStream) -> Option<u32>,
@@ -272,8 +276,8 @@ impl ControlPolicy {
 ///   is the out-of-the-box case for the menu-bar toggle against a root daemon;
 /// - any uid explicitly listed in `control_uids`.
 ///
-/// Everything else — an unrelated local uid on the mode-0666 socket — is
-/// refused. An unidentifiable peer is refused by [`authorize_control`]: an
+/// Everything else — an unrelated `staff` uid on the group-connectable socket —
+/// is refused. An unidentifiable peer is refused by [`authorize_control`]: an
 /// authority decision fails closed.
 fn control_authorized(policy: &ControlPolicy, peer_uid: u32, console_uid: Option<u32>) -> bool {
     peer_uid == ROOT_UID
@@ -507,8 +511,9 @@ pub struct ApiServer {
     pub query_gate: Arc<Semaphore>,
     /// The realtime bus, carrying frames already serialised once.
     pub events_tx: broadcast::Sender<EncodedFrame>,
-    /// Bounded log for control refusals — attacker-triggerable on a mode-0666
-    /// socket, so the line is rate-limited and aggregated, never per attempt.
+    /// Bounded log for control refusals — attacker-triggerable on a
+    /// group-connectable (0660 root:staff by default) socket, so the line is
+    /// rate-limited and aggregated, never per attempt.
     pub control_refusals: RateLimitedLog,
     /// Same treatment for subscriber-cap refusals. `MAX_CONNECTIONS` is
     /// deliberately larger than `MAX_SUBSCRIBERS`, so a peer holding the
@@ -850,7 +855,7 @@ async fn handle_conn(
 async fn query_store(srv: &ApiServer, q: DiagnosticQuery) -> Response {
     match srv.query_gate.try_acquire() {
         Err(_busy) => {
-            // Client-triggerable on a mode-0666 socket: never above `debug!`.
+            // Client-triggerable on a group-connectable socket: never above `debug!`.
             tracing::debug!("query refused: another diagnosis is running");
             Response::Error(QUERY_BUSY.to_string())
         }
@@ -1034,7 +1039,7 @@ async fn stream_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // that went away while the stream is quiet, and its content is never
     // inspected — so nothing a client sends can grow the daemon's memory.
     // `read_line` APPENDS, so any growable buffer here (however scoped) is an
-    // unbounded-memory hole on a world-connectable socket. `AsyncReadExt::read`
+    // unbounded-memory hole on a group-connectable socket. `AsyncReadExt::read`
     // is cancel-safe, so a lost race with `recv` reads nothing.
     let mut probe = [0u8; 1];
     loop {
@@ -1172,9 +1177,10 @@ pub(crate) fn control_request(
     match authorize_control(cx.policy, peer_uid) {
         Ok(authorized) => control_response(cmd, authorized, cx),
         Err(refusal) => {
-            // Rate-limited: the socket is world-connectable by default, so an
-            // unauthorised local process must not be able to grow a ROOT daemon's
-            // log at its own loop rate. Never silent — suppressed refusals are
+            // Rate-limited: the socket is group-connectable by default (0660
+            // root:staff), so an unauthorised process of the console user must
+            // not be able to grow a ROOT daemon's log at its own loop rate.
+            // Never silent — suppressed refusals are
             // counted and reported by the next line.
             if let Some(burst) = cx.refusals.record(Instant::now()) {
                 tracing::warn!(
@@ -2819,7 +2825,7 @@ mod tests {
         assert!(control_authorized(&base, 501, None));
         // The logged-in console user — the out-of-the-box menu-bar case.
         assert!(control_authorized(&base, 600, Some(600)));
-        // An unrelated local uid on the mode-0666 socket is refused.
+        // An unrelated staff uid on the group-connectable socket is refused.
         assert!(!control_authorized(&base, 502, None));
         assert!(!control_authorized(&base, 502, Some(600)));
 
@@ -4748,7 +4754,8 @@ mod tests {
     /// client in one process `getpeereid(2)` and `geteuid(2)` agree, so a
     /// hardcoded `Some(geteuid())` at the lookup site reads exactly like the real
     /// lookup — while in production, where `daemon_uid` IS `geteuid()`, it would
-    /// authorise EVERY local peer on the mode-0666 socket. Driven through
+    /// authorise EVERY peer on the group-connectable (0660 root:staff by
+    /// default) socket. Driven through
     /// [`handle_conn`], because that is where the lookup lives; calling
     /// [`control_request`] directly would prove nothing about it.
     ///
@@ -4872,7 +4879,7 @@ mod tests {
     /// of the suite, because every test policy substitutes a stub for both:
     /// `console: || None` silently disables the console-user clause — the
     /// out-of-the-box menu-bar toggle against a root daemon — and a constant
-    /// `peer_uid` authorises every local peer on the mode-0666 socket.
+    /// `peer_uid` authorises every peer on the group-connectable socket.
     ///
     /// [`std::ptr::fn_addr_eq`], never a bare `==`: rustc's
     /// `unpredictable_function_pointer_comparisons` is warn-by-default and this

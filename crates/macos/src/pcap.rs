@@ -6,6 +6,7 @@
 //! destination directory so the volatile buffer is preserved *before* any slow
 //! forensic work runs. Old freeze directories are pruned to bound disk use.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -31,6 +32,19 @@ const EXPERIMENT_FREEZE_PREFIX: &str = "freeze-experiment-";
 /// neither kind spends the other's budget.
 const KEEP_EXPERIMENT_FREEZES: usize = 12;
 
+/// Who may read a freeze: the group and mode every copied file takes — the
+/// record's own (`record_gid` / `record_mode`), because "root and staff" is
+/// the reader set for everything the daemon writes, and a frozen pcap is what
+/// the operator opens after an incident (realm net-observer, node #110).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreezeAccess {
+    /// The group the freeze directory and each copied file are `chown`ed to;
+    /// `None` leaves the group the directory they were created in gave them.
+    pub gid: Option<u32>,
+    /// The permission bits each copied file takes.
+    pub mode: u32,
+}
+
 /// A live `tcpdump` ring capture. Killing the process happens on `Drop`.
 #[derive(Debug)]
 pub struct PcapRing {
@@ -39,11 +53,14 @@ pub struct PcapRing {
     /// socket and the supervisor can both reach it.
     child: Mutex<Child>,
     ring_dir: PathBuf,
+    /// Applied to every freeze this ring produces.
+    freeze_access: FreezeAccess,
 }
 
 impl PcapRing {
     /// Start `tcpdump` capturing on `iface` into a rotating ring under
     /// `ring_dir` (`-C ring_mb -W 2`), applying `filter` as the BPF expression.
+    /// Every freeze the ring later produces takes `freeze_access`.
     ///
     /// # Errors
     /// Returns an error if the ring directory cannot be created or `tcpdump`
@@ -53,6 +70,7 @@ impl PcapRing {
         ring_dir: impl Into<PathBuf>,
         ring_mb: u32,
         filter: &str,
+        freeze_access: FreezeAccess,
     ) -> std::io::Result<Self> {
         let ring_dir = ring_dir.into();
         std::fs::create_dir_all(&ring_dir)?;
@@ -77,6 +95,7 @@ impl PcapRing {
         Ok(Self {
             child: Mutex::new(child),
             ring_dir,
+            freeze_access,
         })
     }
 
@@ -86,7 +105,7 @@ impl PcapRing {
     /// ring yields an empty vec, never a panic). Prunes old freeze siblings.
     #[must_use]
     pub fn freeze(&self, dest_dir: &Path) -> Vec<PathBuf> {
-        let copied = copy_ring_files(&self.ring_dir, dest_dir);
+        let copied = copy_ring_files(&self.ring_dir, dest_dir, self.freeze_access);
         if let Some(parent) = dest_dir.parent() {
             prune_freezes(parent, KEEP_FREEZES);
         }
@@ -121,11 +140,23 @@ impl Drop for PcapRing {
 
 /// Copy every `ring.pcap*` file from `ring_dir` into `dest_dir`, returning the
 /// destination paths that were written.
-fn copy_ring_files(ring_dir: &Path, dest_dir: &Path) -> Vec<PathBuf> {
+///
+/// `std::fs::copy` carries the ring file's own bits — `tcpdump`'s, under the
+/// daemon's umask — and the new file takes the freeze directory's group, so
+/// each copy is given `access` outright: the freeze directory is `chown`ed to
+/// `access.gid`, every copied file to the same group and `access.mode`. The
+/// operator opens THESE files after an incident, so they follow the record
+/// (realm net-observer, node #110). A failure there is a warning and the
+/// copy still counts: the evidence is on disk, root can read it. Freezes
+/// made before this build keep the bits they were made with.
+fn copy_ring_files(ring_dir: &Path, dest_dir: &Path, access: FreezeAccess) -> Vec<PathBuf> {
     let mut copied = Vec::new();
     if let Err(e) = std::fs::create_dir_all(dest_dir) {
         tracing::warn!(?dest_dir, error = %e, "could not create freeze dir");
         return copied;
+    }
+    if let Err(e) = std::os::unix::fs::chown(dest_dir, None, access.gid) {
+        tracing::warn!(?dest_dir, gid = ?access.gid, error = %e, "freeze dir: chown failed");
     }
     let Ok(entries) = std::fs::read_dir(ring_dir) else {
         return copied;
@@ -140,11 +171,31 @@ fn copy_ring_files(ring_dir: &Path, dest_dir: &Path) -> Vec<PathBuf> {
         }
         let dest = dest_dir.join(name);
         match std::fs::copy(&path, &dest) {
-            Ok(_) => copied.push(dest),
+            Ok(_) => {
+                grant_access(&dest, access);
+                copied.push(dest);
+            }
             Err(e) => tracing::warn!(?path, error = %e, "failed to copy ring file"),
         }
     }
     copied
+}
+
+/// One copied file: group `access.gid`, then `access.mode`. Chown first — a
+/// chown can clear mode bits, a chmod never moves a group. Each failure is a
+/// warning; the file stays where the copy put it.
+fn grant_access(path: &Path, access: FreezeAccess) {
+    if let Err(e) = std::os::unix::fs::chown(path, None, access.gid) {
+        tracing::warn!(?path, gid = ?access.gid, error = %e, "freeze file: chown failed");
+    }
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(access.mode)) {
+        tracing::warn!(
+            ?path,
+            mode = format!("{:o}", access.mode),
+            error = %e,
+            "freeze file: chmod failed"
+        );
+    }
 }
 
 /// Keep the `keep` newest sub-directories under `parent`, removing older ones.
@@ -196,25 +247,50 @@ fn prune_freezes_with(parent: &Path, keep: usize, keep_experiments: usize) {
 mod tests {
     use super::*;
 
+    /// The group is left as created (`None`): a test process is not root
+    /// and owns no other group.
+    const TEST_ACCESS: FreezeAccess = FreezeAccess {
+        gid: None,
+        mode: 0o640,
+    };
+
+    /// Only the ring files are copied, and each copy takes the freeze's
+    /// mode rather than the ring file's own — the operator opens the copy
+    /// (realm net-observer, node #110).
     #[test]
-    fn copies_only_ring_files() {
+    fn copies_only_ring_files_and_grants_the_freeze_mode() {
         let ring = tempfile::tempdir().unwrap();
         std::fs::write(ring.path().join("ring.pcap0"), b"aaa").unwrap();
         std::fs::write(ring.path().join("ring.pcap1"), b"bbb").unwrap();
         std::fs::write(ring.path().join("unrelated.txt"), b"ccc").unwrap();
+        // The source bits are deliberately not the freeze's: `fs::copy` would
+        // carry them, and the test must see the copy lose them.
+        std::fs::set_permissions(
+            ring.path().join("ring.pcap0"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
 
         let dest = tempfile::tempdir().unwrap();
-        let copied = copy_ring_files(ring.path(), dest.path().join("freeze-1").as_path());
+        let copied = copy_ring_files(
+            ring.path(),
+            dest.path().join("freeze-1").as_path(),
+            TEST_ACCESS,
+        );
 
         assert_eq!(copied.len(), 2);
         assert!(copied.iter().all(|p| p.exists()));
         assert!(!dest.path().join("freeze-1").join("unrelated.txt").exists());
+        for p in &copied {
+            let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o640, "{}", p.display());
+        }
     }
 
     #[test]
     fn copy_from_missing_ring_is_empty() {
         let dest = tempfile::tempdir().unwrap();
-        let copied = copy_ring_files(Path::new("/nonexistent/ring"), dest.path());
+        let copied = copy_ring_files(Path::new("/nonexistent/ring"), dest.path(), TEST_ACCESS);
         assert!(copied.is_empty());
     }
 

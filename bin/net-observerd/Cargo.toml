@@ -24,7 +24,8 @@ vuln-db.workspace = true
 oui-db.workspace = true
 net-observer-ipc.workspace = true
 tokio = { workspace = true, features = ["net", "io-util"] }
-# Only for `geteuid` in the control-path authorisation policy (`api::ControlPolicy`).
+# Only for `geteuid` in the control-path authorisation policy (`api::ControlPolicy`)
+# and `umask` at the start of `main` (realm net-observer, node #110).
 # Peer credentials themselves come from `tokio::net::UnixStream::peer_cred()`.
 libc.workspace = true
 tracing.workspace = true
