@@ -410,7 +410,7 @@ const INSERT_NEIGHBOR: &str = "INSERT INTO neighbor VALUES (?,?,?,?,?,?,?,?,?)
        source = excluded.source,
        last_seen_us = excluded.last_seen_us";
 const INSERT_CONNECTION_SAMPLE: &str =
-    "INSERT INTO connection_sample VALUES (?,?,?,?,?,?,?,?,?,?,?)";
+    "INSERT INTO connection_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_SINGBOX_LOG_SAMPLE: &str = "INSERT INTO singbox_log_sample VALUES (?,?,?,?,?)";
 const INSERT_NEIGHBOR_SCAN: &str = "INSERT INTO neighbor_scan VALUES (?,?,?,?,?,?,?,?)";
 const INSERT_INCIDENT: &str = "INSERT INTO incident VALUES (?,?,?,?,?)";
@@ -650,8 +650,18 @@ impl Store for DuckdbStore {
                     tx.execute(
                         INSERT_CONNECTION_SAMPLE,
                         params![
-                            cs.ts_us, verdict, r.host, r.dst_ip, r.dst_port, r.process, r.network,
-                            r.chain, r.count, r.upload, r.download
+                            cs.ts_us,
+                            verdict,
+                            r.host,
+                            r.dst_ip,
+                            r.dst_port,
+                            r.process,
+                            r.network,
+                            r.chain,
+                            r.count,
+                            r.upload,
+                            r.download,
+                            r.scope.as_str()
                         ],
                     )?;
                 }
@@ -2377,6 +2387,7 @@ mod tests {
             count,
             upload: 10 * u64::from(count),
             download: 5000,
+            scope: types::ConnectionScope::External,
         }
     }
 
@@ -2411,7 +2422,7 @@ mod tests {
                 "SELECT count(*) FROM connection_sample WHERE ts_us=8000 AND verdict='OK' \
                  AND host='claude.ai' AND dst_ip IS NULL AND dst_port=443 AND process IS NULL \
                  AND network='tcp' AND chain='vless-out-6' AND count=3 AND upload=30 \
-                 AND download=5000"
+                 AND download=5000 AND scope='external'"
             )
             .unwrap(),
             1
@@ -2465,6 +2476,56 @@ mod tests {
         let ts = t.columns.iter().position(|c| c == "ts_us").unwrap();
         assert_eq!(t.rows.len(), 3);
         assert!(t.rows.iter().all(|r| r[ts] == "8300"), "{:?}", t.rows);
+    }
+
+    /// A record written before the scope existed keeps its eleven-column
+    /// rows, gains the column on open, and this build writes twelve-column
+    /// rows into it — with the old rows reading back as `external` through
+    /// the diagnosis, never hidden (realm net-observer, node #75).
+    #[test]
+    fn an_old_connection_table_without_scope_opens_and_keeps_its_rows() {
+        use types::{ConnectionsGroupBy, ConnectionsSample, ConnectionsVerdict};
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE connection_sample (
+               ts_us BIGINT, verdict VARCHAR, host VARCHAR, dst_ip VARCHAR,
+               dst_port USMALLINT, process VARCHAR, network VARCHAR, chain VARCHAR,
+               count UINTEGER, upload UBIGINT, download UBIGINT);
+             INSERT INTO connection_sample VALUES
+               (1000, 'OK', NULL, '172.19.0.1', 53, NULL, 'udp', 'dns-out', 9, 1, 1);",
+        )
+        .unwrap();
+        let s = DuckdbStore::from_conn(conn).unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM connection_sample \
+                 WHERE ts_us = 1000 AND count = 9 AND scope IS NULL"
+            )
+            .unwrap(),
+            1,
+            "the old row must survive the added column"
+        );
+        let t = s.connections(ConnectionsGroupBy::Ip).unwrap();
+        let scope = t.columns.iter().position(|c| c == "scope").unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(t.rows[0][scope], "external", "{:?}", t.rows);
+
+        let mut row = connection_row(None, Some("172.19.0.1"), None, 4);
+        row.scope = types::ConnectionScope::Internal;
+        s.write_sample(&Sample::Connections(ConnectionsSample {
+            ts_us: 2000,
+            verdict: ConnectionsVerdict::Ok,
+            rows: vec![row],
+        }))
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM connection_sample \
+                 WHERE ts_us = 2000 AND count = 4 AND scope = 'internal'"
+            )
+            .unwrap(),
+            1
+        );
     }
 
     /// The distinction the SKIP rule exists for, at the storage layer: a tick

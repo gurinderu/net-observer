@@ -7,7 +7,7 @@ use std::time::Duration;
 use collector_core::{Collector, CollectorMeta, Os, Readiness, Source};
 use types::Sample;
 
-use crate::facts::ConnectionFacts;
+use crate::facts::{ConnectionFacts, OwnListeners};
 use crate::sample::build_connections_sample;
 
 /// Static metadata for the `connections` collector. The flow list comes from
@@ -55,24 +55,32 @@ impl<F: ConnectionFacts> Collector for ConnectionsCollector<F> {
     }
 
     async fn collect(&self, ts_us: i64) -> Vec<Sample> {
-        // Await the API, then compose the sample with the sync `build_*`. An
-        // unanswered API is folded into a SKIP sample by the fold itself.
+        // Await the API and the config's listeners, then compose the sample
+        // with the sync `build_*`. An unanswered API is folded into a SKIP
+        // sample by the fold itself.
         let connections = self.facts.connections().await;
+        let listeners = self.facts.own_listeners().await;
         vec![Sample::Connections(build_connections_sample(
             ts_us,
             connections,
+            &listeners,
         ))]
     }
 
     fn skip(&self, ts_us: i64) -> Vec<Sample> {
-        vec![Sample::Connections(build_connections_sample(ts_us, None))]
+        // A SKIP has no rows to classify, so no listeners are read.
+        vec![Sample::Connections(build_connections_sample(
+            ts_us,
+            None,
+            &OwnListeners::default(),
+        ))]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{ConnectionsVerdict, LiveConnection};
+    use types::{ConnectionScope, ConnectionsVerdict, LiveConnection};
 
     struct FakeApi {
         answer: Option<Vec<LiveConnection>>,
@@ -80,6 +88,12 @@ mod tests {
     impl ConnectionFacts for FakeApi {
         async fn connections(&self) -> Option<Vec<LiveConnection>> {
             self.answer.clone()
+        }
+        async fn own_listeners(&self) -> OwnListeners {
+            OwnListeners {
+                tun_addr: Some("172.19.0.1".into()),
+                dns_pin: Some("192.0.2.53".into()),
+            }
         }
         async fn preflight(&self) -> Readiness {
             Readiness::Ready
@@ -115,6 +129,29 @@ mod tests {
         assert_eq!(s.verdict, ConnectionsVerdict::Ok);
         assert_eq!(s.rows.len(), 1);
         assert_eq!(s.rows[0].count, 2);
+    }
+
+    /// The tick's rows are classified against the listeners the port read:
+    /// a flow to the TUN address lands `internal`, one to the world
+    /// `external`.
+    #[tokio::test]
+    async fn the_ticks_rows_are_scoped_against_the_ports_listeners() {
+        let mut dns = flow("");
+        dns.host = None;
+        dns.dst_ip = Some("172.19.0.1".into());
+        dns.dst_port = Some(53);
+        let mut world = flow("claude.ai");
+        world.dst_ip = Some("149.154.167.41".into());
+        let c = collector(Some(vec![dns, world]));
+        let samples = c.collect(42).await;
+        let [Sample::Connections(s)] = samples.as_slice() else {
+            panic!("expected one connections sample, got {samples:?}");
+        };
+        let scopes: Vec<ConnectionScope> = s.rows.iter().map(|r| r.scope).collect();
+        assert_eq!(
+            scopes,
+            vec![ConnectionScope::Internal, ConnectionScope::External]
+        );
     }
 
     /// SKIP, never silence: an API that did not answer still leaves a sample

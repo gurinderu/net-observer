@@ -15,7 +15,10 @@ pub use air::{
     AirObservation, AirSample, ApGrade, Band, ChannelOverlapHypothesis, ChannelSpan, Confidence,
     FrequencyExtent, Grade, OverlapConfidence, Signal, overlap_hypothesis,
 };
-pub use connection::{ConnectionRow, ConnectionsGroupBy, ConnectionsSample, LiveConnection};
+pub use connection::{
+    ConnectionRow, ConnectionScope, ConnectionsGroupBy, ConnectionsSample, LiveConnection,
+    ParseScopeError, classify_scope,
+};
 pub use experiment::{
     ExperimentReport, ExperimentWindow, FlowTotals, NetworkFacts, OwnFrames, TierRestore,
     WindowEdges,

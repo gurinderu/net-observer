@@ -252,6 +252,15 @@ CREATE TABLE IF NOT EXISTS connection_sample (
   ts_us BIGINT, verdict VARCHAR, host VARCHAR, dst_ip VARCHAR, dst_port USMALLINT,
   process VARCHAR, network VARCHAR, chain VARCHAR, count UINTEGER, upload UBIGINT,
   download UBIGINT);
+-- Where `dst_ip` lies ('internal' | 'lan' | 'external'), judged once by the
+-- collector against sing-box's own listeners from its rendered config, so the
+-- readers can show the world by default and fold the plumbing — 1023 of 1080
+-- flows in one measured tick were DNS queries to the TUN address (realm
+-- net-observer, node #75). NULL on the empty-tick marker row, and on rows
+-- written before the column existed; a reader treats that NULL as 'external'
+-- (shown, never hidden). Added after the table first shipped — same migration
+-- treatment as `observing_edge.cause` below.
+ALTER TABLE connection_sample ADD COLUMN IF NOT EXISTS scope VARCHAR;
 -- sing-box's own ERROR/WARN lines, read passively from its log and classed
 -- (realm net-observer, nodes #140, #141): one row per (class, node) per tick
 -- of the `singbox-log` collector, `count` lines of that class seen in the
