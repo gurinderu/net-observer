@@ -10,8 +10,9 @@ use types::ProbingTier;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub db_path: String,
-    /// How long the record at `db_path` keeps its sample rows. Absent: keep
-    /// forever (realm net-observer, node #130).
+    /// How long the record at `db_path` keeps its sample rows. Absent: the
+    /// shipped default of 7 days; `retention_days = 0` keeps forever (realm
+    /// net-observer, node #130).
     #[serde(default)]
     pub record: RecordCfg,
     pub blob_dir: String,
@@ -41,8 +42,8 @@ pub struct Config {
 }
 
 /// Retention of the record's sample tables: the mechanism only — the POLICY
-/// (how long to keep) is the owner's, and the default changes nothing (realm
-/// net-observer, node #130).
+/// (how long to keep) is the owner's; the shipped default is 7 days, and `0`
+/// keeps forever (realm net-observer, node #130).
 ///
 /// The daemon prunes at startup and then once every 24 h of awake time: every
 /// row of each named table whose `ts_us` is older than `retention_days` is
@@ -52,9 +53,9 @@ pub struct Config {
 /// store never interpolates a name as given, so config can reach nothing else.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordCfg {
-    /// Days of samples to keep; `0` (the default) keeps forever and runs no
-    /// prune at all.
-    #[serde(default)]
+    /// Days of samples to keep; default `7`. `0` keeps forever and runs no
+    /// prune at all (realm net-observer, node #130).
+    #[serde(default = "default_retention_days")]
     pub retention_days: u32,
     /// The tables the prune touches. Default: `connection_sample` alone — one
     /// row per flow key per tick, an order of magnitude more than any other
@@ -66,10 +67,14 @@ pub struct RecordCfg {
 impl Default for RecordCfg {
     fn default() -> Self {
         RecordCfg {
-            retention_days: 0,
+            retention_days: default_retention_days(),
             retention_tables: default_retention_tables(),
         }
     }
+}
+
+fn default_retention_days() -> u32 {
+    7
 }
 
 fn default_retention_tables() -> Vec<String> {
@@ -849,16 +854,16 @@ mod tests {
             "an unknown tier is an error, never a silent fall-back"
         );
     }
-    /// Keep forever when nothing is configured — the default changes nothing
-    /// — with `connection_sample` the one table a widening starts from; a
-    /// `[record]` section sets the days and may widen or replace the list with
-    /// other prunable names (the daemon checks them against
+    /// 7 days of `connection_sample` when nothing is configured — the one
+    /// table a widening starts from; a `[record]` section sets the days
+    /// (`0` keeps forever) and may widen or replace the list with other
+    /// prunable names (the daemon checks them against
     /// `store::PRUNABLE_TABLES` at startup; this crate only carries them —
     /// realm net-observer, node #130).
     #[test]
-    fn record_retention_defaults_to_keep_forever_and_reads_from_toml() {
+    fn record_retention_defaults_to_seven_days_and_reads_from_toml() {
         let c = Config::load(None).unwrap();
-        assert_eq!(c.record.retention_days, 0);
+        assert_eq!(c.record.retention_days, 7);
         assert_eq!(c.record.retention_tables, ["connection_sample"]);
 
         let dir = tempfile::tempdir().unwrap();
@@ -883,10 +888,11 @@ mod tests {
             ["connection_sample", "wifi_sample"]
         );
 
-        // A config from before the section keeps loading, on keep-forever.
+        // A config from before the section keeps loading, on the shipped
+        // default — 7 days, not keep-forever.
         std::fs::write(&p, "[collectors.link]\ninterval = \"5s\"\n").unwrap();
         let c = Config::load(Some(p.to_str().unwrap())).unwrap();
-        assert_eq!(c.record.retention_days, 0);
+        assert_eq!(c.record.retention_days, 7);
     }
     /// The shipped example loads and mirrors the defaults, with every root
     /// key still at the root: a `[section]` header placed above one would
@@ -901,7 +907,7 @@ mod tests {
         assert_eq!(c.db_path, "/var/lib/observer/observer.duckdb");
         assert_eq!(c.blob_dir, "/var/lib/observer/blobs");
         assert_eq!(c.socket_path, "/var/lib/observer/observer.sock");
-        assert_eq!(c.record.retention_days, 0);
+        assert_eq!(c.record.retention_days, 7);
         assert_eq!(c.record.retention_tables, ["connection_sample"]);
     }
     #[test]
