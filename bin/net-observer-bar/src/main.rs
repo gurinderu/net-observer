@@ -24,7 +24,10 @@
 //!
 //! - [`status`] — the load-bearing, unit-tested pure render layer:
 //!   `render_status` + `status_dot`/`status_glyph` + `health`, all over an
-//!   [`net_observer_ipc::StatusSnapshot`], tested against synthetic snapshots.
+//!   [`net_observer_ipc::StatusSnapshot`], and `presentation`, the whole
+//!   status-item state table (offline / bad answer / paused / stale / live)
+//!   over the fetch outcome and the bar's clock — tested against synthetic
+//!   snapshots.
 //! - [`ui`] — the gpui panel view + shared model, and [`ui::read_fresh`], the
 //!   blocking socket fetch that maps daemon-down to an "offline" `Err`.
 //! - [`menubar`] — the dockless (`.accessory`) `NSStatusItem` shell (AppKit

@@ -614,7 +614,20 @@ graph TD
   read off the window when the dismissal is wired — realm net-observer, node #74)
   rendering the full `StatusSnapshot`
   (latest link/proxy tick + recent incidents), re-queried on a ~3s timer; a down
-  daemon / absent socket degrades to a graceful "net-observer offline" state. The
+  daemon / absent socket degrades to a graceful "net-observer offline" state.
+  **The dot has four states** (realm net-observer, node #88): **green** when
+  the network is up (gw `OK` and tun `204`), **red** when it is down (gw or tun
+  bad), **hollow** (`◌`, a dotted circle) when the daemon is reachable but has
+  no verdict — the passive tier's `SKIP`, or no tick yet — with the tooltip's
+  first line saying why (`no verdict — probing passive (gw SKIP, tun not
+  probed)`), and **grey** (`⚫`) only when the daemon is unreachable *or stale*:
+  the bar reads every 3 s, and a snapshot whose `generated_us` is more than
+  `STALE_AFTER` = 30 s (two default collector intervals) behind the bar's clock
+  is presented as offline with `last tick <n> s ago`, because a socket that
+  still answers from a pipeline that stopped ticking would otherwise keep a green
+  dot lit. A paused daemon (`⏸`) outranks staleness — it stops ticking by design
+  — and a daemon that has never ticked is hollow, not grey. The whole table is
+  one pure function (`status::presentation`), tested without a GUI. The
   popup is a **Tailscale-style** panel: it reads the window's
   `WindowAppearance` and picks a LIGHT or DARK token set (never hardcoded dark),
   laid out as a clean list — a header row with the app name and an

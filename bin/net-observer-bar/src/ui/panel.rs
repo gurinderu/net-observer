@@ -186,7 +186,11 @@ fn header_row(
 /// stronger claim about what is being recorded wins the label — paused over
 /// the tier — and the tier is always named, because "passive" is the
 /// daemon's default and an operator reading the panel must see whether the
-/// wire is silent. Pure over its inputs, so the wording is a testable fact.
+/// wire is silent. When there is no verdict to show ([`Health::NoData`]) the
+/// label says so in front of the tier — `no verdict — probing passive` — so
+/// the hollow header dot is explained where it sits, the way the menu-bar
+/// tooltip explains the hollow menu-bar dot (realm net-observer, node #88).
+/// Pure over its inputs, so the wording is a testable fact.
 fn header_sub_label(online: bool, snapshot: &StatusSnapshot) -> Option<&'static str> {
     if !online {
         return None;
@@ -194,9 +198,12 @@ fn header_sub_label(online: bool, snapshot: &StatusSnapshot) -> Option<&'static 
     if !snapshot.observing {
         return Some("paused");
     }
-    Some(match snapshot.probing {
-        ProbingTier::Passive => "passive",
-        ProbingTier::Active => "probing",
+    let no_verdict = health(snapshot) == Health::NoData;
+    Some(match (no_verdict, snapshot.probing) {
+        (true, ProbingTier::Passive) => "no verdict — probing passive",
+        (true, ProbingTier::Active) => "no verdict — probing",
+        (false, ProbingTier::Passive) => "passive",
+        (false, ProbingTier::Active) => "probing",
     })
 }
 
@@ -245,18 +252,20 @@ impl Render for WarnTooltip {
 /// The header health dot glyph + color. When paused, a grey dot regardless of the
 /// underlying health (collection is off, so there is nothing live to judge);
 /// otherwise it follows the shared [`health`] classifier so the panel dot and the
-/// menu-bar dot can never disagree.
+/// menu-bar dot can never disagree — including the shape: no verdict is a hollow
+/// dotted circle (U+25CC, the menu-bar's own), so a reachable daemon with nothing
+/// to say is not drawn with the filled grey dot offline and paused get
+/// (realm net-observer, node #88).
 fn header_dot(snapshot: &StatusSnapshot, online: bool, theme: Theme) -> (&'static str, Rgba) {
     if !online || !snapshot.observing {
         // Offline or paused: nothing live to judge — a muted dot.
         return ("\u{25CF}", rgb(theme.muted));
     }
-    let color = match health(snapshot) {
-        Health::NoData => rgb(theme.muted),
-        Health::Ok => rgb(theme.ok),
-        Health::Bad => rgb(theme.bad),
-    };
-    ("\u{25CF}", color)
+    match health(snapshot) {
+        Health::NoData => ("\u{25CC}", rgb(theme.muted)),
+        Health::Ok => ("\u{25CF}", rgb(theme.ok)),
+        Health::Bad => ("\u{25CF}", rgb(theme.bad)),
+    }
 }
 
 /// A Tailscale-style toggle switch bound to `observing`: a pill track
@@ -778,15 +787,58 @@ fn freshness_line(snapshot: &StatusSnapshot, now_us: i64) -> String {
 mod tests {
     use super::*;
 
-    /// The three states the header can name, kept apart: offline says
-    /// nothing, paused outranks the tier, and the tier is named in both
-    /// directions.
+    /// The states the header can name, kept apart: offline says nothing,
+    /// paused outranks the tier, the tier is named in both directions, and a
+    /// snapshot with no verdict says so in front of the tier — an empty
+    /// snapshot is exactly that (realm net-observer, node #88).
     #[test]
     fn header_sub_label_keeps_paused_and_passive_apart() {
         let snap = |observing: bool, probing: ProbingTier| StatusSnapshot {
             observing,
             probing,
             ..StatusSnapshot::default()
+        };
+        // A verdict to show: gw OK + tun 204.
+        let with_verdict = |observing: bool, probing: ProbingTier| StatusSnapshot {
+            link: Some(types::LinkSample {
+                ts_us: 1,
+                gw: types::GwVerdict::Ok,
+                gw_rtt_ms: None,
+                direct: types::TcpVerdict::Ok,
+                direct_rtt_ms: None,
+                dhcp_router: None,
+                dhcp_dns: None,
+                gw_arp_mac: None,
+                ssid: None,
+                bssid: None,
+                if_mac: None,
+                medium: None,
+                lease_start_us: None,
+                lease_secs: None,
+                if_mac_private: None,
+                wifi_capture_present: false,
+                lan_probed: None,
+                lan_alive: None,
+                fakeip_route_if: None,
+                singbox_tun_if: None,
+            }),
+            proxy: Some(types::ProxySample {
+                ts_us: 1,
+                server_ip: "1.2.3.4".into(),
+                tcp: types::TcpVerdict::Ok,
+                rtt_ms: None,
+                tun_code: Some(204),
+                selector: None,
+                est_direct_alive: None,
+                est_direct_age_s: None,
+                est_tun_alive: None,
+                est_tun_age_s: None,
+                urltest_ms: None,
+                urltest_at_us: None,
+                urltest_node: None,
+                urltest_absent_since_us: None,
+            }),
+            ..snap(observing, probing)
         };
         assert_eq!(
             header_sub_label(false, &snap(true, ProbingTier::Passive)),
@@ -797,12 +849,21 @@ mod tests {
             Some("paused")
         );
         assert_eq!(
-            header_sub_label(true, &snap(true, ProbingTier::Passive)),
+            header_sub_label(true, &with_verdict(true, ProbingTier::Passive)),
             Some("passive")
         );
         assert_eq!(
-            header_sub_label(true, &snap(true, ProbingTier::Active)),
+            header_sub_label(true, &with_verdict(true, ProbingTier::Active)),
             Some("probing")
+        );
+        // No verdict at all: the sentence names the gap, then the tier.
+        assert_eq!(
+            header_sub_label(true, &snap(true, ProbingTier::Passive)),
+            Some("no verdict — probing passive")
+        );
+        assert_eq!(
+            header_sub_label(true, &snap(true, ProbingTier::Active)),
+            Some("no verdict — probing")
         );
     }
 
