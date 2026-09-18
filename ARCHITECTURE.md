@@ -614,7 +614,32 @@ graph TD
   read off the window when the dismissal is wired — realm net-observer, node #74)
   rendering the full `StatusSnapshot`
   (latest link/proxy tick + recent incidents), re-queried on a ~3s timer; a down
-  daemon / absent socket degrades to a graceful "net-observer offline" state. The
+  daemon / absent socket degrades to a graceful "net-observer offline" state.
+  **The health dot has four states** (realm net-observer, node #88): **green**
+  when the network is up (gw `OK` and tun `204`), **red** when it is down (gw
+  or tun bad), **hollow** (`◌`, a dotted circle) when the daemon is reachable
+  but has no verdict — the passive tier's `SKIP`, or no tick yet — with the
+  tooltip's first line saying why (`no verdict — probing passive (gw SKIP, tun
+  not probed)`), and **grey** (`⚫`) only when the daemon is unreachable *or
+  stale*; `⏸` (paused) and `⚠` (reachable, but its answer was unusable) sit
+  above it. Staleness is the age of the health inputs themselves, not of the
+  snapshot: the bar reads every 3 s, and when the newer of the link and proxy
+  ticks is more than `STALE_AFTER` = 30 s (two default collector intervals)
+  behind the bar's clock the dot is presented as offline with `last tick <n> s
+  ago`, because a socket that still answers from link/proxy collectors that
+  stopped ticking would otherwise keep a green dot lit — and `generated_us`
+  would not catch it, since every sample kind bumps it. The bar's own sighting
+  of a resume (`observing` flipping back on in a read it applied) counts as a
+  tick, so a daemon just told to collect is not grey for the interval its
+  collectors need to produce the first sample; a paused daemon outranks
+  staleness — it stops ticking by design — and a snapshot with neither a link
+  nor a proxy tick is hollow, not grey. The state is decided once
+  (`status::state`, pure, tested without a GUI) and read three times: the
+  menu-bar glyph and tooltip (`status::presentation`), the panel header's dot
+  and one-or-two-word label (the *reasons* stay in the tooltip, so the label
+  can never push the toggle out of the 320 px header), and the sparkline ring,
+  which records a gap for every state but live — a stale daemon's last reply
+  time is not replotted every 3 s as a flat line. The
   popup is a **Tailscale-style** panel: it reads the window's
   `WindowAppearance` and picks a LIGHT or DARK token set (never hardcoded dark),
   laid out as a clean list — a header row with the app name and an
@@ -639,7 +664,7 @@ graph TD
   that 120 one-pixel columns fit the 320pt panel without downsampling, so every
   point drawn is a point measured. Both fields are `Option`, and a tick that
   measured nothing — no sample yet, a paused daemon, the passive tier (`gw =
-  SKIP`), a failed or absent gateway, an unreachable daemon — renders as an **empty
+  SKIP`), a failed or absent gateway, an unreachable, stale or badly-answering daemon — renders as an **empty
   column**, never a zero-height bar on the baseline: plotting a missing
   measurement as a value on the floor is the same lie `SKIP` exists to prevent.
   The plot is a row of thin `div`s (gpui 0.2.2 has no chart primitive) with a

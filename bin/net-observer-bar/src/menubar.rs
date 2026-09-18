@@ -27,7 +27,10 @@
 //! an AppKit callback. A second foreground task re-queries the daemon over the
 //! local socket every ~3s and updates both the shared model (so an open panel
 //! re-renders) and the status-item dot + tooltip. When the daemon is down the
-//! query fails and the shell renders a grey "offline" dot instead of crashing.
+//! query fails and the shell renders a grey "offline" dot instead of crashing;
+//! a daemon that answers but has stopped ticking gets the same grey dot once
+//! the newer of its link and proxy ticks — or the bar's last sighting of a
+//! resume, whichever is later — is older than [`crate::status::STALE_AFTER`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,8 +50,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::NSString;
 
-use crate::status::{render_status, status_dot};
-use crate::ui::{Glance, GlanceError, PanelView, read_fresh};
+use crate::status::presentation;
+use crate::ui::{Glance, PanelView, now_us, read_fresh};
 use config::Config;
 use net_observer_ipc::StatusSnapshot;
 
@@ -206,13 +209,9 @@ pub fn run(config: Option<String>, start: Option<crate::StartWindow>) {
                     let fresh = read_fresh(&socket_path);
                     let updated = acx.update(|app| {
                         model.update(app, |g, cx| {
-                            match fresh {
-                                Ok(s) => {
-                                    g.snapshot = s;
-                                    g.error = None;
-                                }
-                                Err(e) => g.error = Some(e),
-                            }
+                            // The one apply path: it also stamps a resume this
+                            // read is the first to show (`resume_seen_us`).
+                            g.apply_read(fresh, now_us());
                             // One tick = one sparkline column. Recorded here and
                             // only here, so the panel's history keeps the REFRESH
                             // cadence (see `Glance::record_tick`).
@@ -281,44 +280,24 @@ pub fn run(config: Option<String>, start: Option<crate::StartWindow>) {
 }
 
 /// Set the status-item button's title (icon-only health dot) and tooltip (the
-/// full multi-line [`render_status`] text, shown on hover).
+/// multi-line text shown on hover).
 ///
-/// The menu-bar title is just the [`status_dot`] — a single colored dot, no text
-/// (Tailscale-style). The verbose detail still lives in the hover tooltip.
-///
-/// Four shells wrap the pure [`status_dot`]/[`render_status`] renderers (which
-/// describe a live snapshot only, so they stay untouched):
-/// - **offline** ([`GlanceError::Unreachable`] — daemon down / socket absent): a
-///   grey `⚫` dot and a tooltip explaining why, rather than stale health shown as
-///   live.
-/// - **bad answer** ([`GlanceError::Protocol`]): the daemon *is* reachable — it
-///   answered, we just could not use the answer (an error frame, or a decode
-///   failure against an older daemon). A `⚠` glyph and a tooltip that says so,
-///   never "offline", which would be a false claim about the world.
-/// - **paused** (collection turned off via the panel switch): a `⏸` glyph and a
-///   "paused" tooltip prefix — the daemon is alive but not collecting, so the
-///   live health dot would be misleading.
-/// - **observing**: the live [`status_dot`] + [`render_status`].
+/// The menu-bar title is a single glyph, no text (Tailscale-style); the verbose
+/// detail lives in the hover tooltip. Which glyph and which tooltip is decided
+/// by the pure [`presentation`] — offline, bad answer, paused, stale, or the
+/// live health dot — against the bar's clock and its last resume sighting, so
+/// the state table is tested without a GUI; this shell only copies the
+/// decision onto the button. The panel header renders the same decision
+/// (`crate::status::state`), so the two never disagree.
 fn apply_glyph(button: &NSStatusBarButton, glance: &Glance) {
-    let title: &str = match &glance.error {
-        Some(GlanceError::Unreachable(_)) => "\u{26AB}", // ⚫ offline (daemon down)
-        Some(GlanceError::Protocol(_)) => "\u{26A0}",    // ⚠ up, but the answer is unusable
-        None if !glance.snapshot.observing => "\u{23F8}", // ⏸ paused (collection off)
-        None => status_dot(&glance.snapshot),
-    };
-    button.setTitle(&NSString::from_str(title));
-
-    let tooltip = match &glance.error {
-        Some(GlanceError::Unreachable(e)) => format!("net-observer offline\n{e}"),
-        Some(GlanceError::Protocol(e)) => {
-            format!("net-observer: daemon reachable, but its answer failed\n{e}")
-        }
-        None if !glance.snapshot.observing => {
-            format!("paused\n{}", render_status(&glance.snapshot))
-        }
-        None => render_status(&glance.snapshot),
-    };
-    button.setToolTip(Some(&NSString::from_str(&tooltip)));
+    let shown = presentation(
+        glance.error.as_ref(),
+        &glance.snapshot,
+        glance.resume_seen_us,
+        now_us(),
+    );
+    button.setTitle(&NSString::from_str(shown.glyph));
+    button.setToolTip(Some(&NSString::from_str(&shown.tooltip())));
 }
 
 /// Toggle the anchored panel: open it if closed, close it if open.

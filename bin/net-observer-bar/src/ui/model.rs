@@ -5,6 +5,8 @@ use std::collections::VecDeque;
 use net_observer_ipc::{ControlResult, StatusSnapshot};
 
 use super::control::{GlanceError, read_fresh};
+use super::parts::now_us;
+use crate::status::{self, State};
 
 /// How many refresh ticks the panel's own sparkline history keeps.
 ///
@@ -28,8 +30,9 @@ pub const HISTORY_LEN: usize = 120;
 ///
 /// Both fields are `Option` on purpose. A tick where the measurement did not
 /// happen — no sample yet, a paused daemon, the passive tier (`gw = SKIP`), a
-/// gateway that failed or is absent, or an unreachable daemon — is a **gap**, and a gap is
-/// not a zero. Plotting a missing measurement as a value on the floor is the same
+/// gateway that failed or is absent, an unreachable, stale or badly-answering
+/// daemon — is a **gap**, and a gap is not a zero. Plotting a missing
+/// measurement as a value on the floor is the same
 /// lie the `SKIP` verdict exists to prevent (see `AGENTS.md`, "SKIP, never
 /// silence"): it would draw a flat healthy-looking 0ms line for a gateway that was
 /// never asked.
@@ -43,12 +46,17 @@ pub struct HistoryPoint {
 
 /// Reduce a snapshot to the one plottable point for this tick.
 ///
-/// Pure over its inputs, so the gap rules above are directly testable. `online` is
-/// [`Glance::online`]: an unreachable daemon measured nothing, whatever the stale
-/// snapshot still says.
-pub fn history_point(snapshot: &StatusSnapshot, online: bool) -> HistoryPoint {
-    if !online || !snapshot.observing {
-        // Offline or paused: collection is not running. Nothing was measured.
+/// Pure over its inputs, so the gap rules above are directly testable. `state`
+/// is the status item's [`State`] for this tick ([`Glance::state`]): only a
+/// [`State::Live`] snapshot is measured. An unreachable daemon measured
+/// nothing, whatever the retained snapshot still says; a paused one collects
+/// nothing; a stale one has stopped measuring, and replotting its last sample
+/// every tick would draw the flat healthy line the gap exists to prevent; and
+/// a read whose answer could not be used brought no new sample either
+/// (realm net-observer, node #88).
+pub fn history_point(snapshot: &StatusSnapshot, state: &State) -> HistoryPoint {
+    if !matches!(state, State::Live(_)) {
+        // Nothing was measured this tick.
         return HistoryPoint::default();
     }
     let gw_rtt_ms = snapshot.link.as_ref().and_then(|l| match l.gw {
@@ -69,6 +77,14 @@ pub struct Glance {
     /// The most recent fetch error, if the last refresh failed — classified into
     /// "nothing answered" vs "the daemon answered badly" (see [`GlanceError`]).
     pub error: Option<GlanceError>,
+    /// The bar's own instant (epoch microseconds) of last seeing `observing`
+    /// flip from off to on in a read it applied; `None` if it never has. The
+    /// staleness rule counts it as a tick (`status::state`): a daemon just told
+    /// to collect still serves the samples from before the pause, and must not
+    /// go grey for the interval its collectors need to produce the first new
+    /// one (realm net-observer, node #88). Stamped by [`Glance::apply_read`],
+    /// which every path that re-reads the daemon goes through.
+    pub resume_seen_us: Option<i64>,
     /// Config socket path, so the panel's manual "Refresh" can re-query and the
     /// event-log window can open its subscription.
     pub socket_path: String,
@@ -123,6 +139,7 @@ impl Glance {
         Self {
             snapshot,
             error,
+            resume_seen_us: None,
             socket_path,
             control_msg: None,
             events_window: None,
@@ -149,20 +166,51 @@ impl Glance {
         if self.history.len() == HISTORY_LEN {
             self.history.pop_front();
         }
+        let state = self.state(now_us());
         self.history
-            .push_back(history_point(&self.snapshot, self.online()));
+            .push_back(history_point(&self.snapshot, &state));
     }
 
-    /// Re-query the daemon into this model. Used by the manual refresh button; the
-    /// timer path in [`crate::menubar`] mutates the same fields directly.
-    pub fn refresh(&mut self) {
-        match read_fresh(&self.socket_path) {
+    /// The status item's [`State`] for this model at `now_us` — the one
+    /// decision the menu-bar dot, the panel header and the sparkline ring are
+    /// all drawn from (see `status::state`).
+    pub fn state(&self, now_us: i64) -> State {
+        status::state(
+            self.error.as_ref(),
+            &self.snapshot,
+            self.resume_seen_us,
+            now_us,
+        )
+    }
+
+    /// Apply the outcome of a read of the daemon — the one way every path that
+    /// re-reads it (the refresh timer in [`crate::menubar`], the manual
+    /// Refresh, every control round-trip's read-back) lands its result: a
+    /// snapshot replaces the last one and clears the error; a failure keeps
+    /// the last snapshot and records the error. Pure state application, so it
+    /// is directly testable; `now_us` is the bar's clock at the read.
+    ///
+    /// This is also where the bar notices a resume: a snapshot that shows
+    /// collection on where the last one showed it off stamps
+    /// [`Glance::resume_seen_us`] with `now_us`. One place, because the
+    /// observing toggle applies its read-back through here too, and a resume
+    /// the timer never saw flip would otherwise be a resume nobody saw.
+    pub fn apply_read(&mut self, fresh: Result<StatusSnapshot, GlanceError>, now_us: i64) {
+        match fresh {
             Ok(s) => {
+                if !self.snapshot.observing && s.observing {
+                    self.resume_seen_us = Some(now_us);
+                }
                 self.snapshot = s;
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// Re-query the daemon into this model. Used by the manual refresh button.
+    pub fn refresh(&mut self) {
+        self.apply_read(read_fresh(&self.socket_path), now_us());
     }
 
     /// Whether the daemon is reachable. Only [`GlanceError::Unreachable`] means
@@ -177,9 +225,9 @@ impl Glance {
     /// the gpui main thread and is directly testable.
     ///
     /// `control` becomes the transient `control_msg` line; `fresh` is applied
-    /// exactly the way [`Glance::refresh`] applies its own read, so the switch
+    /// through [`Glance::apply_read`] like every other read, so the switch
     /// reflects the daemon's real state (or goes offline) rather than a
-    /// silently-flipped local bool.
+    /// silently-flipped local bool — and a resume it carries is seen.
     pub fn apply_toggle_result(
         &mut self,
         control: Result<ControlResult, String>,
@@ -192,13 +240,7 @@ impl Glance {
             }
             Err(e) => format!("failed: {e}"),
         });
-        match fresh {
-            Ok(s) => {
-                self.snapshot = s;
-                self.error = None;
-            }
-            Err(e) => self.error = Some(e),
-        }
+        self.apply_read(fresh, now_us());
     }
 }
 
@@ -276,9 +318,10 @@ mod tests {
     /// as `None`, never as a value on the floor.
     #[test]
     fn unmeasured_ticks_stay_gaps() {
+        let live_ok = State::Live(crate::status::Health::Ok);
         // No sample at all.
         let empty = StatusSnapshot::default();
-        assert_eq!(history_point(&empty, true), HistoryPoint::default());
+        assert_eq!(history_point(&empty, &live_ok), HistoryPoint::default());
 
         // Gateway verdicts that carry no measured reply time. SKIP is the
         // passive tier: the echo was deliberately never sent.
@@ -293,7 +336,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                history_point(&s, true).gw_rtt_ms,
+                history_point(&s, &live_ok).gw_rtt_ms,
                 None,
                 "{gw} must be a gap, not a plotted value"
             );
@@ -304,10 +347,13 @@ mod tests {
             link: Some(link(types::GwVerdict::Ok, None)),
             ..Default::default()
         };
-        assert_eq!(history_point(&s, true).gw_rtt_ms, None);
+        assert_eq!(history_point(&s, &live_ok).gw_rtt_ms, None);
 
-        // A paused daemon collects nothing, however healthy the retained snapshot
-        // looks; and an unreachable daemon measured nothing at all.
+        // Only a live tick is measured: a paused daemon collects nothing,
+        // however healthy the retained snapshot looks; an unreachable one
+        // measured nothing at all; a stale one has stopped measuring, so its
+        // last sample is not replotted as a flat line under an "offline"
+        // header; and an unusable answer brought no sample.
         let live = StatusSnapshot {
             link: Some(link(types::GwVerdict::Ok, Some(12.0))),
             host: Some(types::HostSample {
@@ -322,17 +368,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            history_point(&live, true),
+            history_point(&live, &live_ok),
             HistoryPoint {
                 gw_rtt_ms: Some(12.0),
                 load1: Some(3.0)
             },
             "a live, observing daemon plots both series"
         );
-        let mut paused = live.clone();
-        paused.observing = false;
-        assert_eq!(history_point(&paused, true), HistoryPoint::default());
-        assert_eq!(history_point(&live, false), HistoryPoint::default());
+        for unmeasured in [
+            State::Paused,
+            State::Offline("no socket".into()),
+            State::Stale { age_s: 40 },
+            State::BadAnswer("bad frame".into()),
+        ] {
+            assert_eq!(
+                history_point(&live, &unmeasured),
+                HistoryPoint::default(),
+                "{unmeasured:?} measured nothing this tick"
+            );
+        }
     }
 
     /// The bar's own reachability, not the stale snapshot, decides: a `Glance`
@@ -344,6 +398,27 @@ mod tests {
         g.error = Some(GlanceError::Unreachable("no socket".into()));
         g.record_tick();
         assert_eq!(g.history.back().copied(), Some(HistoryPoint::default()));
+    }
+
+    /// A daemon that answers but whose link tick has gone stale records a gap
+    /// too — its last reply time is not replotted every 3 s as a flat line
+    /// under an "offline" header — while the same tick, fresh, is plotted
+    /// (realm net-observer, node #88). The fixture's link is stamped one
+    /// second after the epoch, which is stale against any real clock.
+    #[test]
+    fn stale_glance_records_a_gap() {
+        let mut g = glance();
+        g.snapshot.link = Some(link(types::GwVerdict::Ok, Some(99.0)));
+        assert!(matches!(g.state(now_us()), State::Stale { .. }));
+        g.record_tick();
+        assert_eq!(g.history.back().copied(), Some(HistoryPoint::default()));
+
+        g.snapshot.link = Some(types::LinkSample {
+            ts_us: now_us(),
+            ..link(types::GwVerdict::Ok, Some(99.0))
+        });
+        g.record_tick();
+        assert_eq!(g.history.back().and_then(|p| p.gw_rtt_ms), Some(99.0));
     }
 
     /// A protocol failure must NOT read as offline: the daemon answered, so the
@@ -429,6 +504,41 @@ mod tests {
         assert_eq!(glance.control_msg.as_deref(), Some("ok: observing off"));
         assert!(!glance.snapshot.observing, "switch follows the daemon");
         assert!(glance.error.is_none(), "a good read clears offline");
+    }
+
+    /// The bar stamps the instant it sees collection come back on — and only
+    /// that edge: a read that shows it still on, still off, or going off
+    /// leaves the stamp alone, and a failed read touches nothing but the
+    /// error (realm net-observer, node #88).
+    #[test]
+    fn apply_read_stamps_the_resume_edge_only() {
+        let observing = |on: bool| StatusSnapshot {
+            observing: on,
+            ..StatusSnapshot::default()
+        };
+        let mut glance = Glance::new(observing(true), None, "/nonexistent.sock".to_string());
+        assert_eq!(glance.resume_seen_us, None);
+
+        // On -> on: no edge.
+        glance.apply_read(Ok(observing(true)), 10);
+        assert_eq!(glance.resume_seen_us, None);
+        // On -> off: the pause edge is not a resume.
+        glance.apply_read(Ok(observing(false)), 20);
+        assert_eq!(glance.resume_seen_us, None);
+        // Off -> off: still paused.
+        glance.apply_read(Ok(observing(false)), 30);
+        assert_eq!(glance.resume_seen_us, None);
+        // A failed read while paused changes nothing but the error.
+        glance.apply_read(Err(GlanceError::Unreachable("down".to_string())), 35);
+        assert_eq!(glance.resume_seen_us, None);
+        assert!(!glance.snapshot.observing, "the last snapshot is kept");
+        // Off -> on: the resume, stamped with the bar's clock at the read.
+        glance.apply_read(Ok(observing(true)), 40);
+        assert_eq!(glance.resume_seen_us, Some(40));
+        assert!(glance.error.is_none(), "a good read clears the error");
+        // On -> on afterwards: the stamp is not renewed.
+        glance.apply_read(Ok(observing(true)), 50);
+        assert_eq!(glance.resume_seen_us, Some(40));
     }
 
     /// A refusal (`ok: false`) reads as a failure line even though the round-trip
