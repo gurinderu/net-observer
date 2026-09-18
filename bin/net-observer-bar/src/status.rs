@@ -29,14 +29,6 @@ use crate::ui::GlanceError;
 /// clock the daemon stamps its samples with, since both run on this Mac.
 pub const STALE_AFTER: Duration = Duration::from_secs(30);
 
-/// Render a [`StatusSnapshot`] as a compact, human-readable multi-line glance:
-/// the [`headline`] (the app name, or the "no verdict" sentence that explains a
-/// hollow dot), then the link, proxy and incident lines ([`render_body`]).
-/// Pure over its input so it can be unit-tested without a socket or a GUI.
-pub fn render_status(snap: &StatusSnapshot) -> String {
-    format!("{}\n{}", headline(snap), render_body(snap))
-}
-
 /// Why a snapshot carries no verdict — the words both the tooltip's headline
 /// and the panel header's label put after `no verdict —`, so the two never
 /// explain the same hollow dot differently. Meaningful for a
@@ -60,11 +52,12 @@ pub fn no_verdict_reason(snap: &StatusSnapshot) -> &'static str {
     }
 }
 
-/// The first line of [`render_status`]. `net-observer` while there is a verdict
-/// to show; when there is none ([`Health::NoData`]) it says so and why
-/// ([`no_verdict_reason`]), plus what the `SKIP` tick carried — e.g.
-/// `no verdict — probing passive (gw SKIP, tun not probed)` — so the hollow
-/// dot ([`status_dot`]) is explained by the very tooltip it hangs under.
+/// The first line of the live tooltip ([`Presentation::tooltip_head`]):
+/// `net-observer` while there is a verdict to show; when there is none
+/// ([`Health::NoData`]) it says so and why ([`no_verdict_reason`]), plus what
+/// the `SKIP` tick carried — e.g. `no verdict — probing passive (gw SKIP, tun
+/// not probed)` — so the hollow dot ([`status_dot`]) is explained by the very
+/// tooltip it hangs under.
 fn headline(snap: &StatusSnapshot) -> String {
     if health(snap) != Health::NoData {
         return "net-observer".to_string();
@@ -627,8 +620,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let out = render_status(&snap);
-        assert!(out.starts_with("net-observer\n"), "{out}");
+        assert_eq!(headline(&snap), "net-observer");
+        let out = render_body(&snap);
         assert!(out.contains("gw=OK direct=OK"));
         assert!(out.contains("tun=204 selector=auto urltest=-"));
         assert!(out.contains("wedge opened=80 closed=open"));
@@ -648,20 +641,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(no_verdict_reason(&passive), "probing passive");
-        assert!(
-            render_status(&passive)
-                .starts_with("no verdict — probing passive (gw SKIP, tun not probed)\n"),
-            "{}",
-            render_status(&passive)
+        assert_eq!(
+            headline(&passive),
+            "no verdict — probing passive (gw SKIP, tun not probed)"
         );
 
         let passive_tun_measured = StatusSnapshot {
             proxy: Some(proxy(Some(204), Some("auto"))),
             ..passive.clone()
         };
-        assert!(
-            render_status(&passive_tun_measured)
-                .starts_with("no verdict — probing passive (gw SKIP, tun 204)\n")
+        assert_eq!(
+            headline(&passive_tun_measured),
+            "no verdict — probing passive (gw SKIP, tun 204)"
         );
 
         let active_skip = StatusSnapshot {
@@ -669,18 +660,18 @@ mod tests {
             ..passive
         };
         assert_eq!(no_verdict_reason(&active_skip), "gateway probe did not run");
-        assert!(
-            render_status(&active_skip)
-                .starts_with("no verdict — gateway probe did not run (gw SKIP, tun not probed)\n")
+        assert_eq!(
+            headline(&active_skip),
+            "no verdict — gateway probe did not run (gw SKIP, tun not probed)"
         );
 
         assert_eq!(
             no_verdict_reason(&StatusSnapshot::default()),
             "no link or proxy tick yet"
         );
-        assert!(
-            render_status(&StatusSnapshot::default())
-                .starts_with("no verdict — no link or proxy tick yet\n")
+        assert_eq!(
+            headline(&StatusSnapshot::default()),
+            "no verdict — no link or proxy tick yet"
         );
 
         let ok = StatusSnapshot {
@@ -688,7 +679,7 @@ mod tests {
             proxy: Some(proxy(Some(204), None)),
             ..Default::default()
         };
-        assert!(render_status(&ok).starts_with("net-observer\n"));
+        assert_eq!(headline(&ok), "net-observer");
     }
 
     /// An incident-closed frame moves exactly the entry it names to closed,
@@ -731,7 +722,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(render_status(&snap).contains("urltest=auto:202ms@5s"));
+        assert!(render_body(&snap).contains("urltest=auto:202ms@5s"));
 
         // A node whose entry sing-box deleted shows the age of the absence.
         let snap = StatusSnapshot {
@@ -743,12 +734,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(render_status(&snap).contains("urltest=auto:absent@10s"));
+        assert!(render_body(&snap).contains("urltest=auto:absent@10s"));
     }
 
     #[test]
     fn render_empty_status_shows_placeholders() {
-        let out = render_status(&StatusSnapshot::default());
+        let out = render_body(&StatusSnapshot::default());
         assert!(out.contains("link   (no data)"));
         assert!(out.contains("proxy  (no data)"));
         assert!(out.contains("incidents (none)"));
@@ -761,7 +752,7 @@ mod tests {
             ..Default::default()
         };
         // tun=000 is the wedge signature; a zero code must render, not vanish.
-        assert!(render_status(&snap).contains("tun=0 selector=-"));
+        assert!(render_body(&snap).contains("tun=0 selector=-"));
     }
 
     /// The footer's date and the staleness rule read the same instant: the
@@ -851,7 +842,7 @@ mod tests {
         let ok = fresh(Some(link(GwVerdict::Ok)), Some(proxy(Some(204), None)));
         let p = presentation(None, &ok, None, NOW_US);
         assert_eq!(p.glyph, "🟢");
-        assert_eq!(p.tooltip(), render_status(&ok));
+        assert_eq!(p.tooltip(), format!("net-observer\n{}", render_body(&ok)));
 
         // Fresh Bad -> red.
         let bad = fresh(Some(link(GwVerdict::Fail)), Some(proxy(Some(204), None)));
