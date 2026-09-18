@@ -433,19 +433,11 @@ fn open_panel(cx: &mut App, model: &Entity<Glance>, button: &NSStatusBarButton) 
 /// Dismiss-on-click-away via gpui's window-activation observation: close the
 /// popup once it has been active and then resigns key.
 ///
-/// The rule: a panel that is key — at wiring time or at any moment after —
-/// closes on the next loss of key focus it observes, unless its own menu holds
-/// the focus (realm net-observer, node #74).
-///
-/// The `was_active` latch is seeded from the window's actual state, not from
-/// `false`: gpui's platform layer makes the popup key inside `Window::new`,
-/// before the root view — and so this observer — exists, and
-/// `observe_window_activation` replays nothing, so a latch starting cold met the
-/// first deactivation with `was_active == false` and left the panel standing.
-/// The latch still exists for the one deactivation that reaches a window nobody
-/// has seen key: gpui's mac backend resigns a window that Cocoa hands a
-/// `windowDidBecomeKey:` it is not key for, and that manufactured resign must
-/// not dismiss a panel that has not been shown.
+/// The `was_active` latch is seeded from the window's key state at wiring time —
+/// the panel is already key before this observer exists, and gpui replays no
+/// activation to a new observer — and the panel closes on the next loss of key
+/// focus it observes, unless its own menu holds the focus (realm net-observer,
+/// node #74).
 ///
 /// `Glance::menu_focus_guard` is raised while the actions menu owns the focus —
 /// opening that menu takes key focus from this panel, and without the guard the
