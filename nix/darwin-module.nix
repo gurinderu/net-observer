@@ -69,6 +69,19 @@ in
         destroy the very record being migrated away from.
       '';
     };
+
+    recordGroup = mkOption {
+      type = types.str;
+      default = "staff";
+      description = ''
+        The group that may read what the daemon writes — the record, its
+        freezes, the log file — and traverse `/var/lib/observer` (realm
+        net-observer, node #110). Must be the group whose gid `record_gid`
+        names in the rendered config: the daemon chowns by gid, this module
+        by name, and they have to agree. `staff` is the group every macOS
+        console user is in.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
@@ -95,12 +108,25 @@ in
       };
     };
 
-    # Root-owned and root-writable; the readers are unprivileged and reach the
-    # daemon through its socket, never through these files. The socket's own mode
-    # and owner are the daemon's config, not this module's.
+    # Root-owned and root-writable, `recordGroup` with the setgid bit and nothing
+    # for the world (2750 — what the daemon's own `create_dir_all` gives under its
+    # umask 027): the readers are unprivileged and reach the daemon through its
+    # socket AND, for the CLI's offline `query`, through the group-readable files
+    # under this directory (realm net-observer, node #110). The daemon sets the
+    # same group and bit on every start; this keeps a `darwin-rebuild switch`
+    # from undoing it — a plain `chmod 755` clears setgid. The socket's own mode
+    # and group are the daemon's config, not this module's.
+    #
+    # The log file is launchd's, opened before the program runs, so its bits are
+    # this module's to set: created if absent, root:recordGroup 0640, so the
+    # console user reads the daemon's own account of an incident. Idempotent.
     system.activationScripts.preActivation.text = ''
       mkdir -p /var/lib/observer
-      chmod 755 /var/lib/observer
+      chgrp ${cfg.recordGroup} /var/lib/observer
+      chmod 2750 /var/lib/observer
+      touch ${toString cfg.logFile}
+      chgrp ${cfg.recordGroup} ${toString cfg.logFile}
+      chmod 0640 ${toString cfg.logFile}
     '';
   };
 }

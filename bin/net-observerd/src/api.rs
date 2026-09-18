@@ -19,10 +19,11 @@
 //! [`Request::Subscribe`], which is answered by a stream of
 //! [`StreamFrame`]s instead of a single [`Response`].
 //!
-//! Reads are open to anyone who can connect (the default `socket_mode` is
-//! deliberately permissive so the unprivileged menu-bar app can poll a root
-//! daemon); *control* is not. Every `Request::Control` first passes the
-//! peer-credential gate in [`control_request`] — see [`ControlPolicy`].
+//! Reads are open to anyone who can connect (the default `socket_mode` admits
+//! the console user's group, `staff`, so the unprivileged menu-bar app can
+//! poll a root daemon — realm net-observer, node #110); *control* is not.
+//! Every `Request::Control` first passes the peer-credential gate in
+//! [`control_request`] — see [`ControlPolicy`].
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -56,22 +57,25 @@ const ROOT_UID: u32 = 0;
 
 /// Hard cap on concurrently held-open `Subscribe` streams. A generous backstop,
 /// not a tuning knob: each subscriber costs a task, an fd and a broadcast
-/// receiver, and the socket is world-connectable by default (`socket_mode`
-/// 0o666), so an unprivileged process must not be able to exhaust the daemon by
-/// opening subscriptions in a loop. Beyond it the daemon refuses with a
-/// decodable `StreamFrame::Error` rather than a bare close.
+/// receiver, and the socket is connectable by every process of the console
+/// user's group by default (`socket_mode` 0o660, `staff`), so an unprivileged
+/// process must not be able to exhaust the daemon by opening subscriptions in
+/// a loop. Beyond it the daemon refuses with a decodable `StreamFrame::Error`
+/// rather than a bare close.
 pub(crate) const MAX_SUBSCRIBERS: usize = 256;
 
 /// Largest request frame the daemon will buffer before giving up on finding a
-/// newline. The socket is world-connectable by default, so no client may grow
-/// server memory by never terminating its request; an over-long frame is
+/// newline. The socket is group-connectable by default (0660 root:staff — every
+/// process of the console user), so no client may grow server memory by never
+/// terminating its request; an over-long frame is
 /// truncated, fails to parse, and is answered `Response::Error`.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
 /// How many named diagnoses (`Request::Query`) may run at once: ONE. A diagnosis
 /// holds the store's connection mutex for as long as its `ASOF JOIN` takes, and
-/// the pipeline's next sample write waits behind it; on a world-connectable
-/// socket that is a stall any local process could inflict by looping queries.
+/// the pipeline's next sample write waits behind it; on a group-connectable
+/// socket that is a stall any of the console user's processes could inflict by
+/// looping queries.
 /// `MAX_CONNECTIONS` bounds how many such connections exist, not what they cost,
 /// so the gate is here: a second concurrent query is refused at once with a
 /// decodable `Response::Error` (`try_acquire`, never a queue that would let the
@@ -99,7 +103,8 @@ pub const QUERY_DEADLINE: Duration = Duration::from_secs(30);
 /// accept time. [`MAX_SUBSCRIBERS`] bounds *subscriptions*; a connection that
 /// never sends a request never reaches that path at all, so without this cap a
 /// local process can pin unbounded tasks, fds and 8 KiB read buffers on a socket
-/// that is world-connectable by default (`socket_mode` 0o666).
+/// that every process of the console user's group can connect to by default
+/// (`socket_mode` 0o660, `staff`).
 pub(crate) const MAX_CONNECTIONS: usize = 512;
 
 // The subscriber cap must stay the limit a well-behaved client meets FIRST: it
@@ -131,8 +136,9 @@ pub struct Burst {
 
 /// A log throttle for a line an unprivileged local process can trigger.
 ///
-/// The socket is world-connectable by default, so an unauthorised process can loop
-/// connect+`Control` and, at one `warn!` per attempt, grow a ROOT daemon's log at
+/// The socket is group-connectable by default (0660 root:staff), so an
+/// unauthorised process of the console user can loop connect+`Control` and, at
+/// one `warn!` per attempt, grow a ROOT daemon's log at
 /// its own pace. At most one line per `interval`, and each line reports how many
 /// events were suppressed since the last one — deferred, never lost, so the flood
 /// stays visible and countable without being transcribed. Monotonic ([`Instant`])
@@ -201,7 +207,7 @@ fn peer_uid_of(stream: &UnixStream) -> Option<u32> {
 /// Who may send a `Request::Control`. Built once at start-up from the config.
 ///
 /// Peer credentials are checked on `Request::Control` **only** — `Status`,
-/// `Incidents` and `Subscribe` stay open, because the permissive default
+/// `Incidents` and `Subscribe` stay open, because the group-open default
 /// `socket_mode` exists precisely for unprivileged readers and a read carries no
 /// authority.
 #[derive(Debug, Clone)]
@@ -234,7 +240,8 @@ pub struct ControlPolicy {
     /// ONE process, where `getpeereid(2)` and `geteuid(2)` return the same value:
     /// a hardcoded `Some(geteuid())` at the lookup site is indistinguishable from
     /// the real lookup there, while in production — where `daemon_uid` IS
-    /// `geteuid()` — it would authorise EVERY local peer on the mode-0666 socket.
+    /// `geteuid()` — it would authorise EVERY peer on the group-connectable
+    /// (0660 root:staff by default) socket.
     /// Injecting a uid that is neither this process's, nor root's, nor the
     /// console user's is the only thing that makes that substitution observable.
     peer_uid: fn(&UnixStream) -> Option<u32>,
@@ -269,8 +276,8 @@ impl ControlPolicy {
 ///   is the out-of-the-box case for the menu-bar toggle against a root daemon;
 /// - any uid explicitly listed in `control_uids`.
 ///
-/// Everything else — an unrelated local uid on the mode-0666 socket — is
-/// refused. An unidentifiable peer is refused by [`authorize_control`]: an
+/// Everything else — an unrelated `staff` uid on the group-connectable socket —
+/// is refused. An unidentifiable peer is refused by [`authorize_control`]: an
 /// authority decision fails closed.
 fn control_authorized(policy: &ControlPolicy, peer_uid: u32, console_uid: Option<u32>) -> bool {
     peer_uid == ROOT_UID
@@ -421,6 +428,10 @@ pub struct ApiServer {
     pub socket_path: String,
     pub socket_mode: u32,
     pub socket_owner_uid: Option<u32>,
+    /// The group the socket is `chown`ed to after bind — `staff` by default,
+    /// the group `socket_mode`'s group bits open the socket to (realm
+    /// net-observer, node #110). `None` leaves the group as bind created it.
+    pub socket_gid: Option<u32>,
     /// Concurrent held-open `Subscribe` cap. Production passes
     /// [`MAX_SUBSCRIBERS`]; tests pass a small value so the refusal path is one
     /// extra connection rather than 257.
@@ -500,8 +511,9 @@ pub struct ApiServer {
     pub query_gate: Arc<Semaphore>,
     /// The realtime bus, carrying frames already serialised once.
     pub events_tx: broadcast::Sender<EncodedFrame>,
-    /// Bounded log for control refusals — attacker-triggerable on a mode-0666
-    /// socket, so the line is rate-limited and aggregated, never per attempt.
+    /// Bounded log for control refusals — attacker-triggerable on a
+    /// group-connectable (0660 root:staff by default) socket, so the line is
+    /// rate-limited and aggregated, never per attempt.
     pub control_refusals: RateLimitedLog,
     /// Same treatment for subscriber-cap refusals. `MAX_CONNECTIONS` is
     /// deliberately larger than `MAX_SUBSCRIBERS`, so a peer holding the
@@ -541,9 +553,10 @@ impl ApiServer {
     }
 
     /// Bind the Unix-domain socket at `socket_path`, `chmod` it to `socket_mode`
-    /// so an unprivileged client (the bar; the daemon runs as root) can connect,
-    /// optionally `chown` it to `socket_owner_uid`, and serve [`Request`]s from
-    /// the shared snapshot until the task is aborted.
+    /// and `chown` it to `socket_owner_uid` / `socket_gid` so an unprivileged
+    /// client (the bar; the daemon runs as root) can connect through the group
+    /// bits (realm net-observer, node #110), and serve [`Request`]s from the
+    /// shared snapshot until the task is aborted.
     ///
     /// The peer-credential [`ControlPolicy`] gates the whole of the control
     /// path; `acting` only names the service `KickstartProxy` targets. Only this
@@ -566,23 +579,39 @@ impl ApiServer {
         // A leftover socket file from a previous run makes bind() fail; clear it.
         let _ = std::fs::remove_file(&self.socket_path);
         let listener = UnixListener::bind(&self.socket_path)?;
-        // The root daemon must relax the mode so the logged-in user's UI can connect.
+        // The root daemon opens the mode to the group so the logged-in user's UI
+        // can connect; bind left it under the process umask.
         std::fs::set_permissions(
             &self.socket_path,
             std::fs::Permissions::from_mode(self.socket_mode),
         )?;
-        // Socket hardening for the control path: when an owner uid is configured,
-        // chown the socket to it (operators pair this with mode 0600 so only the
-        // owner can even connect to the control endpoint). Best-effort: a
-        // chown failure is logged but never takes the daemon down. Note this is
-        // belt-and-braces only — authorisation itself is the peer-credential
-        // check in `control_request`, not the socket mode.
-        if let Some(uid) = self.socket_owner_uid {
-            match std::os::unix::fs::chown(&self.socket_path, Some(uid), None) {
-                Ok(()) => tracing::info!(uid, path = %self.socket_path, "status socket chowned"),
-                Err(e) => {
-                    tracing::warn!(error = %e, uid, path = %self.socket_path, "failed to chown status socket")
-                }
+        // One chown for both halves: the group the mode's group bits admit
+        // (`staff` by default — who may READ, realm net-observer, node #110)
+        // and, when an owner uid is configured, the control-path hardening
+        // (operators pair it with mode 0600 so only the owner can even connect
+        // to the control endpoint). Best-effort: a chown failure is logged but
+        // never takes the daemon down. Note this is belt-and-braces only —
+        // authorisation itself is the peer-credential check in
+        // `control_request`, not the socket mode or its group.
+        if self.socket_owner_uid.is_some() || self.socket_gid.is_some() {
+            match std::os::unix::fs::chown(
+                &self.socket_path,
+                self.socket_owner_uid,
+                self.socket_gid,
+            ) {
+                Ok(()) => tracing::info!(
+                    uid = ?self.socket_owner_uid,
+                    gid = ?self.socket_gid,
+                    path = %self.socket_path,
+                    "status socket chowned"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    uid = ?self.socket_owner_uid,
+                    gid = ?self.socket_gid,
+                    path = %self.socket_path,
+                    "failed to chown status socket"
+                ),
             }
         }
         tracing::info!(
@@ -826,7 +855,7 @@ async fn handle_conn(
 async fn query_store(srv: &ApiServer, q: DiagnosticQuery) -> Response {
     match srv.query_gate.try_acquire() {
         Err(_busy) => {
-            // Client-triggerable on a mode-0666 socket: never above `debug!`.
+            // Client-triggerable on a group-connectable socket: never above `debug!`.
             tracing::debug!("query refused: another diagnosis is running");
             Response::Error(QUERY_BUSY.to_string())
         }
@@ -1010,7 +1039,7 @@ async fn stream_events<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // that went away while the stream is quiet, and its content is never
     // inspected — so nothing a client sends can grow the daemon's memory.
     // `read_line` APPENDS, so any growable buffer here (however scoped) is an
-    // unbounded-memory hole on a world-connectable socket. `AsyncReadExt::read`
+    // unbounded-memory hole on a group-connectable socket. `AsyncReadExt::read`
     // is cancel-safe, so a lost race with `recv` reads nothing.
     let mut probe = [0u8; 1];
     loop {
@@ -1148,9 +1177,10 @@ pub(crate) fn control_request(
     match authorize_control(cx.policy, peer_uid) {
         Ok(authorized) => control_response(cmd, authorized, cx),
         Err(refusal) => {
-            // Rate-limited: the socket is world-connectable by default, so an
-            // unauthorised local process must not be able to grow a ROOT daemon's
-            // log at its own loop rate. Never silent — suppressed refusals are
+            // Rate-limited: the socket is group-connectable by default (0660
+            // root:staff), so an unauthorised process of the console user must
+            // not be able to grow a ROOT daemon's log at its own loop rate.
+            // Never silent — suppressed refusals are
             // counted and reported by the next line.
             if let Some(burst) = cx.refusals.record(Instant::now()) {
                 tracing::warn!(
@@ -2309,8 +2339,11 @@ mod tests {
         let (events_tx, _rx) = broadcast::channel(16);
         ApiServer {
             socket_path: socket_path.to_string(),
-            socket_mode: 0o666,
+            // The shipped default; the client is this same process, so the
+            // owner bits admit it. No chown: `None` twice skips the syscall.
+            socket_mode: 0o660,
             socket_owner_uid: None,
+            socket_gid: None,
             max_subscribers: MAX_SUBSCRIBERS,
             max_connections: MAX_CONNECTIONS,
             request_timeout: REQUEST_READ_TIMEOUT,
@@ -2792,7 +2825,7 @@ mod tests {
         assert!(control_authorized(&base, 501, None));
         // The logged-in console user — the out-of-the-box menu-bar case.
         assert!(control_authorized(&base, 600, Some(600)));
-        // An unrelated local uid on the mode-0666 socket is refused.
+        // An unrelated staff uid on the group-connectable socket is refused.
         assert!(!control_authorized(&base, 502, None));
         assert!(!control_authorized(&base, 502, Some(600)));
 
@@ -4721,7 +4754,8 @@ mod tests {
     /// client in one process `getpeereid(2)` and `geteuid(2)` agree, so a
     /// hardcoded `Some(geteuid())` at the lookup site reads exactly like the real
     /// lookup — while in production, where `daemon_uid` IS `geteuid()`, it would
-    /// authorise EVERY local peer on the mode-0666 socket. Driven through
+    /// authorise EVERY peer on the group-connectable (0660 root:staff by
+    /// default) socket. Driven through
     /// [`handle_conn`], because that is where the lookup lives; calling
     /// [`control_request`] directly would prove nothing about it.
     ///
@@ -4845,7 +4879,7 @@ mod tests {
     /// of the suite, because every test policy substitutes a stub for both:
     /// `console: || None` silently disables the console-user clause — the
     /// out-of-the-box menu-bar toggle against a root daemon — and a constant
-    /// `peer_uid` authorises every local peer on the mode-0666 socket.
+    /// `peer_uid` authorises every peer on the group-connectable socket.
     ///
     /// [`std::ptr::fn_addr_eq`], never a bare `==`: rustc's
     /// `unpredictable_function_pointer_comparisons` is warn-by-default and this

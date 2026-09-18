@@ -1022,8 +1022,9 @@ the durable record; the socket is the live, low-latency read path.
     `tokio::task::spawn_blocking`, never on the runtime — and at most **one at
     a time** (`api::MAX_QUERIES_IN_FLIGHT`, a one-permit `Semaphore` claimed
     with `try_acquire`): a diagnosis holds the store mutex the pipeline writes
-    through, and on a world-connectable socket a queue of them would be a stall
-    any local process could inflict, so a second concurrent `Query` is refused
+    through, and on a group-connectable socket (`0660 root:staff` by default) a
+    queue of them would be a stall any of the console user's processes could
+    inflict, so a second concurrent `Query` is refused
     at once with `Response::Error("a diagnosis is already running; retry")`
     (`api::QUERY_BUSY`) rather than queued. Not a per-peer rate limit — a
     deliberate non-goal. The one run is itself **bounded**: the daemon interrupts
@@ -1117,11 +1118,12 @@ the durable record; the socket is the live, low-latency read path.
   the `ControlPolicy`, the `observing` flag and `resume_at_us`, the snapshot, the
   store and the event bus) is bundled into one `ApiServer` the accept loop clones
   a single `Arc` of per connection. On start it removes any stale socket file,
-  binds `cfg.socket_path`, `chmod`s it to `cfg.socket_mode` so the unprivileged
-  bar can connect to the root-owned socket, and — when `cfg.socket_owner_uid` is
-  set — `chown`s it to that uid (control-path hardening; see
+  binds `cfg.socket_path`, `chmod`s it to `cfg.socket_mode` and `chown`s it to
+  `cfg.socket_gid` (`staff` by default) so the unprivileged bar can connect to
+  the root-owned socket through the group bits — and to `cfg.socket_owner_uid`
+  when that is set (control-path hardening; see
   [Control path](#control-path)). One task per connection: read one `Request`,
-  bounded in the three dimensions a world-connectable socket can be attacked in —
+  bounded in the three dimensions a group-connectable socket can be attacked in —
   **bytes** (`MAX_REQUEST_BYTES` = 64 KiB, so a client cannot grow daemon memory by
   never terminating its frame), **time** (`REQUEST_READ_TIMEOUT` = 10 s over the
   *whole* initial read, so a byte-per-second drip cannot extend it and a silent
@@ -1370,7 +1372,7 @@ through the pure predicate `api::control_authorized`. It admits:
   headless / SSH-only host where `/dev/console` is root-owned and the
   console-user rule authorises nobody.
 
-Everything else — an unrelated local uid on the mode-`0666` socket — is refused,
+Everything else — an unrelated `staff` uid on the mode-`0660` socket — is refused,
 as is a peer whose credentials could not be read: an authority decision **fails
 closed**. `Status`, `Incidents` and `Subscribe` are deliberately **not** gated:
 the permissive default `socket_mode` exists precisely for unprivileged readers,
@@ -1379,8 +1381,9 @@ only when no cheaper clause has already said yes (`control_authorized(.., None)`
 is exactly "authorised with no console session"), so an authorised-by-config peer
 costs no `stat("/dev/console")` at all.
 
-Refusals are **rate-limited, never silent.** The socket is world-connectable by
-default, so an unauthorised local process could otherwise grow a **root** daemon's
+Refusals are **rate-limited, never silent.** The socket is connectable by every
+process of the console user's group by default, so an unauthorised local process
+could otherwise grow a **root** daemon's
 log at its own loop rate. Control refusals and accept-time connection-cap refusals
 each go through their own `api::RateLimitedLog`: at most one `warn!` per minute
 (`REFUSAL_LOG_INTERVAL`), and every line reports how many events it stands for, so
@@ -1663,10 +1666,12 @@ depth*, not the authorisation mechanism — the peer-credential gate above is, a
 it applies whatever the file permissions are. Still, an operator who uses the
 control path should narrow who can even connect: set `socket_mode = 0o600` and
 `socket_owner_uid = <logged-in uid>` so only that owner reaches the endpoint at
-all. With the default `socket_mode = 0o666` the socket is world-connectable (fine
-for read-only status; a stranger's `Control` is refused by the peer-credential
-gate, but tightening the mode removes the attempt as well as the effect), and
-`socket_owner_uid` is
+all. With the default `socket_mode = 0o660` and `socket_gid = 20` the socket is
+connectable by root and every process of the console user's group, `staff`
+(fine for read-only status — that group is who the record is for, realm
+net-observer, node #110; a stranger's `Control` is refused by the
+peer-credential gate, but tightening the mode removes the attempt as well as
+the effect), and `socket_owner_uid` is
 `None` (the socket keeps the daemon's root ownership — and then authorises no one
 through that clause). On a host with no console session, `control_uids` is the
 way to authorise an administrator, since the console-user rule admits nobody
@@ -1741,7 +1746,10 @@ The flake ships all three binaries and owns the launchd job that runs the daemon
   named after the binary, **not** `net-observer.log`, because the shell
   LaunchDaemon this project replaces owns that file and two launchd jobs sharing a
   `StandardOutPath` would interleave into, and corrupt, the behavioural oracle.
-  The activation script creates `/var/lib/observer` (root-owned, `755`).
+  The activation script creates `/var/lib/observer` as `2750 root:staff` and
+  keeps the log file `0640 root:staff` — `staff` being `recordGroup`, which
+  must name the group whose gid the rendered config's `record_gid` is (realm
+  net-observer, node #110).
 - **The carrier for "the packages build" is CI, not this host.** The three
   packages are built by the `nix-build` workflow on macos-latest, one job per
   package, each saving its own nix store cache when green (realm net-observer,
@@ -1770,13 +1778,43 @@ read-only — is blocked while the daemon runs.
   "net-observer offline" dot, retried each tick.
 
 The menu-bar UI stays a separate unprivileged binary — never the daemon itself.
-The daemon relaxes the socket file's mode (config `socket_mode`, default `0666`)
+The daemon opens the socket file's mode to the group (config `socket_mode`,
+default `0o660`) and `chown`s it to `socket_gid` (default `20`, macOS `staff`)
 so the logged-in user's UI can connect to the root-owned socket. The socket is
 owned by root by default; when `socket_owner_uid` is set the daemon `chown`s it to
-that uid instead. What keeps the world-connectable read socket from also
+that uid instead. What keeps the group-connectable read socket from also
 accepting privileged commands is the **peer-credential gate** on every
 `Request::Control` — root, the daemon's own uid, `socket_owner_uid`, the
 logged-in console user, or a uid in `control_uids` — not the file mode; a
 restrictive `socket_mode = 0o600` paired with `socket_owner_uid` is defence in
 depth on top of it, worth setting wherever the control path is used (see
 [Control path](#control-path)).
+
+**Who can read the record.** Addresses stay raw in the record and on the
+socket — forensics needs them — and what narrows is who can read them: root
+and the console user's group, for everything the daemon writes (realm
+net-observer, node #110). The daemon runs under `umask 027`, so every file it
+creates is born group-readable and world-nothing. The socket is `0660
+root:staff` (`socket_mode`, `socket_gid`). The record and its write-ahead log
+are `0640 root:staff` (`record_mode`, `record_gid`), and the record's
+directory carries the same group plus the setgid bit — on macOS a new file
+takes its directory's group regardless of the bit, and the bit makes Linux do
+the same — so a WAL DuckDB re-creates after a later checkpoint is born in that
+group; its *mode* then comes from the umask (`0666 & ~027` = `0640`), not from
+`record_mode`, which is enforced on the files present at startup. The blob
+tree follows the record from this build on: `blob_dir` and `blob_dir/ring`
+take the same group and bit, and every pcap freeze — what the operator opens
+after an incident — is given `record_gid` and `record_mode` outright as it is
+copied (`macos::FreezeAccess`). The ring files already in `blob_dir/ring` get
+the same group and mode at startup: `tcpdump` reopens an existing
+`ring.pcap*` by truncation and never re-modes it, so one an earlier build left
+`0644` would otherwise stay world-readable for good, and the daemon owns and
+restarts that `tcpdump`. Freezes made before this build keep their bits. All
+of it is set at startup or at the freeze, each step a warning and never fatal
+if it fails. The daemon's log file is launchd's, opened before the program
+runs: `nix/darwin-module.nix` names it (`logFile`, the job's `StandardOutPath`
+/ `StandardErrorPath`) and its activation script creates it if absent and
+keeps it `0640 root:<recordGroup>` — the same script that keeps
+`/var/lib/observer` at `2750 root:<recordGroup>` across a `darwin-rebuild
+switch`, `recordGroup` (default `staff`) having to name the group whose gid
+`record_gid` is.
