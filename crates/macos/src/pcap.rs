@@ -12,8 +12,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-/// Base name of the ring capture files inside the ring directory.
-const RING_BASENAME: &str = "ring.pcap";
+/// Base name of the ring capture files inside the ring directory. Public so
+/// the daemon can find the files an earlier build left there (realm
+/// net-observer, node #110).
+pub const RING_BASENAME: &str = "ring.pcap";
 
 /// How many freeze directories to retain (newest-first); older ones are pruned.
 const KEEP_FREEZES: usize = 12;

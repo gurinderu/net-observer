@@ -438,31 +438,63 @@ fn restrict_record_access(db_path: &Path, gid: Option<u32>, mode: u32) {
 
 /// The blob tree follows the record: `blob_dir` and, when it exists already,
 /// `blob_dir/ring` take group `gid` and the setgid bit, so a freeze directory
-/// and the ring files `tcpdump` writes later are born in that group (realm
-/// net-observer, node #110). The freeze copies themselves — what the operator
+/// and a ring file `tcpdump` creates later are born in that group (realm
+/// net-observer, node #110). The ring files already there take `gid` and
+/// `mode` as well: `tcpdump` reopens an existing `ring.pcap*` by truncation
+/// and never re-modes it, so one an earlier build left world-readable would
+/// stay so for good — and the daemon owns and restarts that `tcpdump`, so
+/// the file is its to set. The freeze copies themselves — what the operator
 /// opens after an incident — get the record's group and mode outright when
-/// they are made (`macos::FreezeAccess`); the ring files are only ever read
-/// by that copy, which runs as root. Files and freezes made before this build
+/// they are made (`macos::FreezeAccess`); freezes made before this build
 /// keep the bits they were made with. Best-effort, like the record.
-fn restrict_blob_access(blob_dir: &Path, gid: Option<u32>) {
+fn restrict_blob_access(blob_dir: &Path, gid: Option<u32>, mode: u32) {
     let mut ok = grant_dir_access(blob_dir, gid);
     let ring_dir = blob_dir.join("ring");
     if ring_dir.is_dir() {
         ok &= grant_dir_access(&ring_dir, gid);
+        ok &= grant_ring_files_access(&ring_dir, gid, mode);
     }
     if ok {
         tracing::info!(
             path = %blob_dir.display(),
             ?gid,
+            mode = format!("{mode:o}"),
             "blob directory readable by root and group"
         );
     } else {
         tracing::warn!(
             path = %blob_dir.display(),
             ?gid,
+            mode = format!("{mode:o}"),
             "blob access: not every step landed (see the warnings above)"
         );
     }
+}
+
+/// Every `ring.pcap*` file in `ring_dir` (`macos::RING_BASENAME`): group
+/// `gid`, then `mode`. Other files there are not the ring's and are left
+/// alone. Returns whether every one landed; a directory that cannot be read
+/// is one failure.
+fn grant_ring_files_access(ring_dir: &Path, gid: Option<u32>, mode: u32) -> bool {
+    let entries = match std::fs::read_dir(ring_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %ring_dir.display(), "ring directory: read failed");
+            return false;
+        }
+    };
+    let mut ok = true;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_ring_file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(macos::RING_BASENAME));
+        if is_ring_file && path.is_file() {
+            ok &= grant_file_access(&path, gid, mode);
+        }
+    }
+    ok
 }
 
 /// What every freeze copy takes: the record's group and mode (realm
@@ -699,7 +731,7 @@ async fn run_daemon() -> anyhow::Result<()> {
     // The file exists now; open it to root and one group, never to the world —
     // and the blob tree with it, so a freeze the operator opens later is too.
     restrict_record_access(Path::new(&cfg.db_path), cfg.record_gid, cfg.record_mode);
-    restrict_blob_access(Path::new(&cfg.blob_dir), cfg.record_gid);
+    restrict_blob_access(Path::new(&cfg.blob_dir), cfg.record_gid, cfg.record_mode);
 
     // The schema migrates forward only: a file a NEWER build has opened keeps
     // its wider tables under this build, and every positional write to them is
@@ -3898,14 +3930,17 @@ mod tests {
 
     /// The blob tree: the directory and an existing `ring/` take setgid on
     /// top of their bits, a missing `ring/` is skipped, a missing blob dir is
-    /// a warning and not a panic. Files inside are not touched here.
+    /// a warning and not a panic. A ring file an earlier build left there
+    /// takes the record's mode — `tcpdump` reopens it by truncation and would
+    /// otherwise leave it world-readable for good — while a file that is not
+    /// the ring's keeps its bits.
     #[test]
-    fn restrict_blob_access_sets_setgid_on_the_tree_and_leaves_files_alone() {
+    fn restrict_blob_access_sets_setgid_on_the_tree_and_remodes_the_ring_files() {
         let blobs = tempfile::tempdir().unwrap();
         std::fs::set_permissions(blobs.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
 
-        restrict_blob_access(blobs.path(), None);
+        restrict_blob_access(blobs.path(), None, 0o640);
         assert_eq!(mode(blobs.path()), 0o2755);
 
         let ring = blobs.path().join("ring");
@@ -3913,12 +3948,24 @@ mod tests {
         std::fs::set_permissions(&ring, std::fs::Permissions::from_mode(0o750)).unwrap();
         let old = ring.join("ring.pcap0");
         std::fs::write(&old, b"").unwrap();
-        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o600)).unwrap();
-        restrict_blob_access(blobs.path(), None);
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let other = ring.join("notes.txt");
+        std::fs::write(&other, b"").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        restrict_blob_access(blobs.path(), None, 0o640);
         assert_eq!(mode(&ring), 0o2750);
-        assert_eq!(mode(&old), 0o600, "existing ring files keep their bits");
+        assert_eq!(
+            mode(&old),
+            0o640,
+            "a ring file from an earlier build takes the record's mode"
+        );
+        assert_eq!(
+            mode(&other),
+            0o644,
+            "a file that is not the ring's is left alone"
+        );
 
-        restrict_blob_access(Path::new("/nonexistent/net-observerd/blobs"), None);
+        restrict_blob_access(Path::new("/nonexistent/net-observerd/blobs"), None, 0o640);
     }
 
     /// Every freeze takes the record's own group and mode, read from the

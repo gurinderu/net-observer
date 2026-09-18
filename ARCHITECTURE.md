@@ -1743,7 +1743,10 @@ The flake ships all three binaries and owns the launchd job that runs the daemon
   named after the binary, **not** `net-observer.log`, because the shell
   LaunchDaemon this project replaces owns that file and two launchd jobs sharing a
   `StandardOutPath` would interleave into, and corrupt, the behavioural oracle.
-  The activation script creates `/var/lib/observer` (root-owned, `755`).
+  The activation script creates `/var/lib/observer` as `2750 root:staff` and
+  keeps the log file `0640 root:staff` — `staff` being `recordGroup`, which
+  must name the group whose gid the rendered config's `record_gid` is (realm
+  net-observer, node #110).
 - **The carrier for "the packages build" is CI, not this host.** The three
   packages are built by the `nix-build` workflow on macos-latest, one job per
   package, each saving its own nix store cache when green (realm net-observer,
@@ -1799,11 +1802,16 @@ group; its *mode* then comes from the umask (`0666 & ~027` = `0640`), not from
 tree follows the record from this build on: `blob_dir` and `blob_dir/ring`
 take the same group and bit, and every pcap freeze — what the operator opens
 after an incident — is given `record_gid` and `record_mode` outright as it is
-copied (`macos::FreezeAccess`); the ring files are read only by that copy,
-which runs as root, and freezes made before this build keep their bits. All of
-it is set at startup or at the freeze, each step a warning and never fatal if
-it fails. The daemon's log file is launchd's, opened before the program runs:
-`nix/darwin-module.nix` names it (`logFile`, the job's `StandardOutPath` /
-`StandardErrorPath`) and its activation script creates it if absent and keeps
-it `0640 root:staff` — the same script that keeps `/var/lib/observer` at
-`2755 root:staff` across a `darwin-rebuild switch`.
+copied (`macos::FreezeAccess`). The ring files already in `blob_dir/ring` get
+the same group and mode at startup: `tcpdump` reopens an existing
+`ring.pcap*` by truncation and never re-modes it, so one an earlier build left
+`0644` would otherwise stay world-readable for good, and the daemon owns and
+restarts that `tcpdump`. Freezes made before this build keep their bits. All
+of it is set at startup or at the freeze, each step a warning and never fatal
+if it fails. The daemon's log file is launchd's, opened before the program
+runs: `nix/darwin-module.nix` names it (`logFile`, the job's `StandardOutPath`
+/ `StandardErrorPath`) and its activation script creates it if absent and
+keeps it `0640 root:<recordGroup>` — the same script that keeps
+`/var/lib/observer` at `2750 root:<recordGroup>` across a `darwin-rebuild
+switch`, `recordGroup` (default `staff`) having to name the group whose gid
+`record_gid` is.

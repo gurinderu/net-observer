@@ -51,8 +51,9 @@ pub struct Config {
     pub record_gid: Option<u32>,
     /// Permission bits (octal) applied to the record, its write-ahead log and
     /// every freeze copy. Default `0o640`: root writes, `record_gid` reads,
-    /// the world sees nothing. Enforced on the files present at startup and
-    /// on each freeze as it is made; a WAL DuckDB re-creates after a later
+    /// the world sees nothing. Enforced on the files present at startup — the
+    /// record, its WAL, the ring files `tcpdump` will reopen by truncation —
+    /// and on each freeze as it is made; a WAL DuckDB re-creates after a later
     /// checkpoint is born under the daemon's fixed `umask 027` instead
     /// (`0666 & !027` = `0640`), so a stricter value here does not reach it
     /// (realm net-observer, node #110).
