@@ -17,9 +17,26 @@ blob_dir = "/var/lib/observer/blobs"
 # other client) connects here instead of opening the DB directly.
 socket_path = "/var/lib/observer/observer.sock"
 
-# Permission bits (octal) applied to the socket file so the unprivileged bar can
-# connect while the daemon runs as root.
-socket_mode = 0o666
+# Who can read what the daemon writes (realm net-observer, node #110): the
+# owner's ruling is that addresses stay RAW in the record and on the socket —
+# forensics needs them — and what narrows is access, to root and the console
+# user's group. The daemon runs as root under umask 027, so every file it
+# creates is group-readable and world-nothing; the four keys below name the
+# group and the modes. 20 is macOS `staff`, the group every console user is in.
+
+# Permission bits (octal) applied to the socket file: root and the group
+# `socket_gid` names may connect — the bar and the CLI run as the console user
+# — nobody else. Was 0o666 (world-connectable) before the ruling.
+socket_mode = 0o660
+
+# The group the socket is chowned to after bind.
+socket_gid = 20
+
+# The group and mode of the record (`db_path`) and its write-ahead log: root
+# writes, the group reads. The record's directory takes the same group and the
+# setgid bit, so the WAL DuckDB re-creates after every checkpoint inherits it.
+record_gid = 20
+record_mode = 0o640
 
 # Optional: chown the socket to this uid (control-path hardening). Unset by
 # default, so the socket keeps the daemon's ownership. It has a SECOND role: this

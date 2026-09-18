@@ -17,14 +17,37 @@ pub struct Config {
     pub blob_dir: String,
     /// Unix-domain socket the daemon binds and the bar connects to for live status.
     pub socket_path: String,
-    /// Permission bits applied to the socket file (octal), so the unprivileged bar
-    /// can connect while the daemon runs as root.
+    /// Permission bits applied to the socket file (octal). Default `0o660`:
+    /// the daemon runs as root, and the group `socket_gid` names — the console
+    /// user's `staff` — is who may connect, so the bar and the CLI read raw
+    /// addresses and nobody else does. Was `0o666`, world-connectable, before
+    /// the owner ruled that access narrows and the data stays raw (realm
+    /// net-observer, node #110).
     pub socket_mode: u32,
     /// When `Some(uid)`, the daemon `chown`s the socket to this uid (control-path
     /// hardening: pair with a restrictive `socket_mode` such as `0o600` so only
     /// the owner can even connect to the control endpoint). Default `None` — the
     /// socket keeps the daemon's ownership.
     pub socket_owner_uid: Option<u32>,
+    /// The group the daemon `chown`s the socket to. Default `Some(20)`, macOS
+    /// `staff` — the group every console user is in, so `socket_mode`'s group
+    /// bits are what admit the bar and the CLI. `None` leaves the group as
+    /// `bind` created it; TOML has no null, so a file can only move the gid
+    /// (realm net-observer, node #110).
+    #[serde(default = "default_staff_gid")]
+    pub socket_gid: Option<u32>,
+    /// The group the record (`db_path`) and its write-ahead log are `chown`ed
+    /// to, and the group the record's directory takes together with the
+    /// setgid bit, so the WAL DuckDB re-creates after every checkpoint
+    /// inherits it. Default `Some(20)`, macOS `staff`; `None` leaves every
+    /// group as created (realm net-observer, node #110).
+    #[serde(default = "default_staff_gid")]
+    pub record_gid: Option<u32>,
+    /// Permission bits (octal) applied to the record and its write-ahead log.
+    /// Default `0o640`: root writes, `record_gid` reads, the world sees
+    /// nothing (realm net-observer, node #110).
+    #[serde(default = "default_record_mode")]
+    pub record_mode: u32,
     /// Extra uids allowed to send a `Request::Control`, on top of root, the
     /// daemon's own uid, `socket_owner_uid`, and the logged-in console user.
     /// Empty by default. The escape hatch for a host with no graphical console
@@ -74,6 +97,17 @@ impl Default for RecordCfg {
 
 fn default_retention_tables() -> Vec<String> {
     vec!["connection_sample".to_string()]
+}
+
+/// macOS `staff` (gid 20): the group every console user is in — the one
+/// group the socket and the record are opened to (realm net-observer, node
+/// #110).
+fn default_staff_gid() -> Option<u32> {
+    Some(20)
+}
+
+fn default_record_mode() -> u32 {
+    0o640
 }
 
 /// The probing tier at startup. Applied once, when the daemon boots, and
@@ -371,8 +405,11 @@ impl Default for Config {
             record: RecordCfg::default(),
             blob_dir: "/var/lib/observer/blobs".into(),
             socket_path: "/var/lib/observer/observer.sock".into(),
-            socket_mode: 0o666,
+            socket_mode: 0o660,
             socket_owner_uid: None,
+            socket_gid: default_staff_gid(),
+            record_gid: default_staff_gid(),
+            record_mode: default_record_mode(),
             control_uids: Vec::new(),
             collectors: Collectors {
                 link: LinkCfg {
@@ -487,11 +524,48 @@ mod tests {
         assert!(c.collectors.link.enabled);
         assert_eq!(c.collectors.link.interval.as_secs(), 15);
     }
+    /// Root and `staff` connect, nobody else: the owner's ruling is that the
+    /// addresses on the wire stay raw and ACCESS is what narrows (realm
+    /// net-observer, node #110). `0o666` was the default before it.
     #[test]
     fn socket_defaults_apply() {
         let c = Config::load(None).unwrap();
         assert_eq!(c.socket_path, "/var/lib/observer/observer.sock");
-        assert_eq!(c.socket_mode, 0o666);
+        assert_eq!(c.socket_mode, 0o660);
+        assert_eq!(c.socket_gid, Some(20));
+    }
+    /// The record and its WAL: root writes, `staff` reads, the world sees
+    /// nothing (realm net-observer, node #110).
+    #[test]
+    fn record_access_defaults_apply() {
+        let c = Config::load(None).unwrap();
+        assert_eq!(c.record_gid, Some(20));
+        assert_eq!(c.record_mode, 0o640);
+    }
+    /// All four access keys are root keys read from TOML — octal literals for
+    /// the modes, a plain gid for the groups — and a file from before they
+    /// existed keeps loading on the defaults.
+    #[test]
+    fn access_keys_come_from_toml_and_default_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.toml");
+        std::fs::write(
+            &p,
+            "socket_mode = 0o600\nsocket_gid = 0\nrecord_gid = 80\nrecord_mode = 0o600\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert_eq!(c.socket_mode, 0o600);
+        assert_eq!(c.socket_gid, Some(0));
+        assert_eq!(c.record_gid, Some(80));
+        assert_eq!(c.record_mode, 0o600);
+
+        std::fs::write(&p, "[collectors.link]\ninterval = \"5s\"\n").unwrap();
+        let c = Config::load(Some(p.to_str().unwrap())).unwrap();
+        assert_eq!(c.socket_mode, 0o660);
+        assert_eq!(c.socket_gid, Some(20));
+        assert_eq!(c.record_gid, Some(20));
+        assert_eq!(c.record_mode, 0o640);
     }
     #[test]
     fn dns_route_host_defaults_apply() {
@@ -901,6 +975,10 @@ mod tests {
         assert_eq!(c.db_path, "/var/lib/observer/observer.duckdb");
         assert_eq!(c.blob_dir, "/var/lib/observer/blobs");
         assert_eq!(c.socket_path, "/var/lib/observer/observer.sock");
+        assert_eq!(c.socket_mode, 0o660);
+        assert_eq!(c.socket_gid, Some(20));
+        assert_eq!(c.record_gid, Some(20));
+        assert_eq!(c.record_mode, 0o640);
         assert_eq!(c.record.retention_days, 0);
         assert_eq!(c.record.retention_tables, ["connection_sample"]);
     }

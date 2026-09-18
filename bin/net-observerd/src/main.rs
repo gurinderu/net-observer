@@ -10,7 +10,8 @@ mod api;
 mod api_query;
 mod pipeline;
 
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -159,6 +160,16 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Before anything is created: every file this root process makes from here
+    // on — the record, its WAL, a frozen ring copy, a log dump — is born
+    // group-readable and world-nothing, whatever mask launchd handed us. The
+    // owner's ruling is that addresses stay raw and ACCESS is what narrows
+    // (realm net-observer, node #110). The previous mask `umask` returns is
+    // not needed.
+    // SAFETY: `umask` sets the process's file-mode creation mask and returns
+    // the old one; it takes no pointers and cannot fail (POSIX: "always
+    // successful").
+    unsafe { libc::umask(0o027) };
     // Build the runtime explicitly (instead of `#[tokio::main]`) so shutdown can
     // be *bounded*. The route collector's PF_ROUTE `read(2)` runs on a dedicated
     // OS thread that cannot be aborted; the bounded consumer drain plus process
@@ -364,6 +375,95 @@ fn retention_plan(record: &config::RecordCfg) -> anyhow::Result<Option<config::R
     }))
 }
 
+/// The mode a record directory takes: its own permission bits plus setgid, so
+/// a file created inside it later inherits the directory's group rather than
+/// its creator's (realm net-observer, node #110). The file-type bits
+/// `st_mode` carries are dropped — `chmod(2)` takes permission bits only.
+fn with_setgid(st_mode: u32) -> u32 {
+    (st_mode & 0o7777) | 0o2000
+}
+
+/// The write-ahead log DuckDB keeps beside the record: `<db_path>.wal`, the
+/// full file name plus the suffix (not a replaced extension).
+fn wal_path(db_path: &Path) -> PathBuf {
+    let mut wal = db_path.as_os_str().to_owned();
+    wal.push(".wal");
+    PathBuf::from(wal)
+}
+
+/// Narrow who can read the record to root and one group — the console user's
+/// `staff` by default — instead of hashing what is in it: the owner's ruling
+/// is that addresses stay raw and ACCESS is what changes (realm net-observer,
+/// node #110). Runs once, right after the store is opened, so the file exists.
+///
+/// Three steps, each on its own and each best-effort: the record's directory
+/// takes group `gid` and the setgid bit, so the files DuckDB creates there
+/// later — the WAL after every checkpoint — inherit that group; the record
+/// file takes group `gid` and `mode`; so does `<db_path>.wal` when it exists
+/// now. `gid = None` leaves every group as it is and still sets the modes. A
+/// failure is logged at warn and the next step runs: a record that stays
+/// 0644 is a warning, not an outage — the daemon's job is the record. The
+/// blob directory and the pcap ring are not touched here: they stay root's.
+fn restrict_record_access(db_path: &Path, gid: Option<u32>, mode: u32) {
+    if let Some(dir) = db_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        match std::fs::metadata(dir) {
+            Ok(meta) => {
+                if let Err(e) = std::os::unix::fs::chown(dir, None, gid) {
+                    tracing::warn!(
+                        error = %e,
+                        path = %dir.display(),
+                        ?gid,
+                        "record directory: chown failed"
+                    );
+                }
+                let dir_mode = with_setgid(meta.permissions().mode());
+                if let Err(e) =
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(dir_mode))
+                {
+                    tracing::warn!(
+                        error = %e,
+                        path = %dir.display(),
+                        mode = format!("{dir_mode:o}"),
+                        "record directory: setgid failed"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                path = %dir.display(),
+                "record directory: stat failed"
+            ),
+        }
+    }
+    restrict_record_file(db_path, gid, mode);
+    let wal = wal_path(db_path);
+    if wal.exists() {
+        restrict_record_file(&wal, gid, mode);
+    }
+    tracing::info!(
+        path = %db_path.display(),
+        ?gid,
+        mode = format!("{mode:o}"),
+        "record readable by root and group"
+    );
+}
+
+/// One file of the record: group `gid`, then `mode`. Chown first — a chown
+/// can clear mode bits, a chmod never moves a group.
+fn restrict_record_file(path: &Path, gid: Option<u32>, mode: u32) {
+    if let Err(e) = std::os::unix::fs::chown(path, None, gid) {
+        tracing::warn!(error = %e, path = %path.display(), ?gid, "record: chown failed");
+    }
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            mode = format!("{mode:o}"),
+            "record: chmod failed"
+        );
+    }
+}
+
 /// One retention sweep of the record: for each table of a plan
 /// [`retention_plan`] returned, delete every row older than
 /// `record.retention_days` through the store's own allow-list (realm
@@ -536,6 +636,8 @@ async fn run_daemon() -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(&cfg.blob_dir);
 
     let store = Arc::new(DuckdbStore::open(&cfg.db_path).context("opening store")?);
+    // The file exists now; open it to root and one group, never to the world.
+    restrict_record_access(Path::new(&cfg.db_path), cfg.record_gid, cfg.record_mode);
 
     // The schema migrates forward only: a file a NEWER build has opened keeps
     // its wider tables under this build, and every positional write to them is
@@ -1888,6 +1990,7 @@ fn build_api_server(
     let socket_path = cfg.socket_path.clone();
     let socket_mode = cfg.socket_mode;
     let socket_owner_uid = cfg.socket_owner_uid;
+    let socket_gid = cfg.socket_gid;
     // Parameters of the manual actions, not a gate: config never stands between
     // an authorised operator's command and its execution (realm net-observer,
     // node #91).
@@ -1898,11 +2001,12 @@ fn build_api_server(
         socket_path,
         socket_mode,
         socket_owner_uid,
+        socket_gid,
         max_subscribers: api::MAX_SUBSCRIBERS,
-        // Bounds for a socket that is world-connectable by default: a local
-        // process must not be able to pin unbounded tasks/fds by connecting
-        // and never speaking, nor grow a root daemon's log by looping refused
-        // control requests.
+        // Bounds for a socket every process of the console user's group can
+        // connect to by default: a local process must not be able to pin
+        // unbounded tasks/fds by connecting and never speaking, nor grow a
+        // root daemon's log by looping refused control requests.
         max_connections: api::MAX_CONNECTIONS,
         request_timeout: api::REQUEST_READ_TIMEOUT,
         control_refusals: api::RateLimitedLog::new(api::REFUSAL_LOG_INTERVAL),
@@ -2640,9 +2744,11 @@ mod tests {
     fn test_cfg() -> Config {
         Config {
             socket_path: "/tmp/net-observerd-wiring-test.sock".into(),
-            // Deliberately NOT the shipped 0o666: a hardcoded default dies here.
+            // Deliberately NOT the shipped 0o660 / staff: a hardcoded default
+            // dies here.
             socket_mode: 0o600,
             socket_owner_uid: Some(4242),
+            socket_gid: Some(4243),
             control_uids: vec![7, 9],
             blob_dir: "/tmp/net-observerd-wiring-test-blobs".into(),
             acting: config::ActingCfg {
@@ -2807,8 +2913,9 @@ mod tests {
     /// Everything [`build_api_server`] is handed reaches the server it builds,
     /// and the handles it is handed stay SHARED rather than copied.
     ///
-    /// Dies under any of: a hardcoded socket field (`socket_mode: 0o666`,
-    /// `socket_owner_uid: None`, `enabled: false`); dropping `cfg.control_uids`
+    /// Dies under any of: a hardcoded socket field (`socket_mode: 0o660`,
+    /// `socket_owner_uid: None`, `socket_gid: Some(20)`, `enabled: false`);
+    /// dropping `cfg.control_uids`
     /// from the control policy; substituting a literal for `api::MAX_SUBSCRIBERS`
     /// / `api::MAX_CONNECTIONS` / `api::REQUEST_READ_TIMEOUT`;
     /// `RateLimitedLog::new(Duration::ZERO)` on either refusal limiter; a fresh
@@ -2866,6 +2973,10 @@ mod tests {
         assert_eq!(
             srv.socket_owner_uid, cfg.socket_owner_uid,
             "the socket must be chowned to the configured owner"
+        );
+        assert_eq!(
+            srv.socket_gid, cfg.socket_gid,
+            "the socket must be chowned to the configured group"
         );
         assert_eq!(
             srv.acting.singbox_service, cfg.acting.singbox_service,
@@ -3659,5 +3770,64 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(plan.retention_tables, ["wifi_sample"]);
+    }
+
+    // ── record access (realm net-observer, node #110) ───────────────────────
+
+    /// The directory keeps its own bits and gains setgid; the file-type bits
+    /// `st_mode` carries (`S_IFDIR`) are dropped, and a bit already set stays
+    /// set — `chmod(2)` takes permission bits only.
+    #[test]
+    fn with_setgid_keeps_the_bits_and_drops_the_file_type() {
+        assert_eq!(with_setgid(0o755), 0o2755);
+        assert_eq!(with_setgid(0o040755), 0o2755);
+        assert_eq!(with_setgid(0o042750), 0o2750);
+        assert_eq!(with_setgid(0o040_000), 0o2000);
+    }
+
+    /// DuckDB's WAL is the record's full name plus `.wal`, so the record's
+    /// own extension is kept, not replaced.
+    #[test]
+    fn wal_path_appends_to_the_full_record_name() {
+        assert_eq!(
+            wal_path(Path::new("/var/lib/observer/observer.duckdb")),
+            PathBuf::from("/var/lib/observer/observer.duckdb.wal")
+        );
+        assert_eq!(
+            wal_path(Path::new("observer")),
+            PathBuf::from("observer.wal")
+        );
+    }
+
+    /// The access pass on a real temporary record: the file and a WAL beside
+    /// it take the mode, the directory takes setgid on top of its own bits, a
+    /// missing WAL is skipped, and nothing is fatal. The group is left as it
+    /// is (`None`): a test process is not root and owns no other group.
+    #[test]
+    fn restrict_record_access_sets_the_modes_and_the_setgid_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("observer.duckdb");
+        std::fs::write(&db, b"").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        restrict_record_access(&db, None, 0o640);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&db), 0o640);
+        assert_eq!(mode(dir.path()), 0o2755);
+
+        let wal = wal_path(&db);
+        std::fs::write(&wal, b"").unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        restrict_record_access(&db, None, 0o600);
+        assert_eq!(mode(&db), 0o600);
+        assert_eq!(mode(&wal), 0o600);
+
+        // A record whose directory cannot be read is a warning, not a panic.
+        restrict_record_access(
+            Path::new("/nonexistent/net-observerd/observer.duckdb"),
+            None,
+            0o640,
+        );
     }
 }
