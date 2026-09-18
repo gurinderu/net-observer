@@ -89,6 +89,15 @@ duckdb = { git = "https://github.com/gurinderu/duckdb-rs", rev = "76b8eba", defa
 # neighbour scan — nothing queries mDNS on a timer.
 mdns-sd = "0.21"
 clap = { version = "4", features = ["derive"] }
+# Renders every `net-observer-cli` table (`incidents`, `query`, the
+# diagnoses) so they all look the same: `UTF8_FULL_CONDENSED` preset,
+# `ContentArrangement::Dynamic` wraps long cells (signatures, host names)
+# inside the terminal width instead of letting them overflow. Default
+# features are just `tty` (pulls `crossterm`, itself with default features
+# off), which comfy-table needs to read the real terminal width itself when
+# stdout is one; the CLI's own `std::io::IsTerminal` check decides only
+# whether to override that with a fixed width for piped output.
+comfy-table = "7"
 surge-ping = "0.8"
 socket2 = "0.5"
 # Async HTTP client for the macOS adapters (Clash `now`, TUN 204 probe, DoH). The

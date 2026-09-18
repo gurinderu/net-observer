@@ -118,8 +118,11 @@ pub(crate) fn fmt_instant(ts_us: i64) -> String {
 
 /// A microsecond instant as `<raw> (<local ISO>)` — the raw number stays
 /// (it is what you paste back into `--at` or a SQL predicate) and the local
-/// rendering is what a human reads. `pub(crate)` because the live `status` and
-/// `incidents` subcommands print their instants in exactly this shape.
+/// rendering is what a human reads. `pub(crate)` because the live `status`
+/// subcommand prints its instants in exactly this shape. `incidents` prints
+/// its own, plainer local rendering instead (`OPENED` as bare
+/// `YYYY-MM-DD HH:MM:SS`, directly pasteable into `why --at`) — a table row
+/// has no room for the raw number too.
 pub(crate) fn stamp_us(ts_us: i64) -> String {
     format!("{ts_us} ({})", fmt_instant(ts_us))
 }

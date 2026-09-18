@@ -33,11 +33,14 @@ pub struct Trigger {
     backoff_us: i64,
     armed: bool,
     last_fire_us: i64,
-    /// The incident the last firing opened, held until the condition's
-    /// Some→None edge closes it. Lives here because this is the only place
-    /// that edge is observable. A firing suppressed by the backoff does NOT
-    /// replace it: a continuing assertion belongs to the same episode.
-    open_incident: Option<String>,
+    /// The incident the last firing opened, and the `ts_us` it was minted
+    /// at, held until the condition's Some→None edge closes it. Lives here
+    /// because this is the only place that edge is observable; the opened
+    /// instant is kept alongside it (not re-parsed from the id) so a close
+    /// can be clamped to never precede it. A firing suppressed by the
+    /// backoff does NOT replace it: a continuing assertion belongs to the
+    /// same episode.
+    open_incident: Option<(String, i64)>,
 }
 
 impl Trigger {
@@ -98,7 +101,7 @@ impl TriggerEngine {
                         for h in &trig.handlers {
                             h.on_fire(&incident_id, now_us, &fire.detail);
                         }
-                        trig.open_incident = Some(incident_id);
+                        trig.open_incident = Some((incident_id, now_us));
                         trig.armed = false;
                         trig.last_fire_us = now_us;
                     }
@@ -111,9 +114,15 @@ impl TriggerEngine {
                     // signal that will ever exist. Leaving the row open
                     // instead is strictly worse: the first trial week
                     // accumulated 60+ forever-open incidents.
-                    if let Some(id) = trig.open_incident.take() {
+                    if let Some((id, opened_us)) = trig.open_incident.take() {
+                        // A close is never stamped before its open: two
+                        // samples of the same tick can carry timestamps from
+                        // different collectors and arrive out of order, so
+                        // the closing sample's own `now_us` is clamped up to
+                        // the instant that opened this incident.
+                        let closed_us = now_us.max(opened_us);
                         for h in &trig.handlers {
-                            h.on_clear(&id, now_us);
+                            h.on_clear(&id, closed_us);
                         }
                     }
                     trig.armed = true;
@@ -182,9 +191,12 @@ impl TriggerEngine {
     /// net-observer, node #124).
     pub fn close_all(&mut self, ts_us: i64) {
         for trig in &mut self.triggers {
-            if let Some(id) = trig.open_incident.take() {
+            if let Some((id, opened_us)) = trig.open_incident.take() {
+                // Same clamp as `on_sample`: the edge's own `ts_us` must
+                // never close an incident before the instant that opened it.
+                let closed_us = ts_us.max(opened_us);
                 for h in &trig.handlers {
-                    h.on_clear(&id, ts_us);
+                    h.on_clear(&id, closed_us);
                 }
                 trig.armed = true;
                 trig.last_fire_us = i64::MIN;
@@ -451,6 +463,53 @@ mod tests {
             h.cleared.lock().unwrap().clone(),
             vec![(opened[0].clone(), 10)],
             "exactly one clear: A, closed at the edge — never zero, never B"
+        );
+    }
+
+    /// Observed on the Mac: `singbox-no-route-1789730687378964` opened at
+    /// `…964` and closed at `…955` — 9us BEFORE it opened. Two samples of one
+    /// tick carry timestamps from different collectors and can arrive out of
+    /// order, so the clearing sample's own `ts_us` (passed to `on_sample` as
+    /// `now_us`) can precede the firing sample's. `on_clear` must never see a
+    /// `closed_us` earlier than the incident's own `opened_us`.
+    #[test]
+    fn a_close_is_never_stamped_before_its_open() {
+        let h = Arc::new(EdgeHandler::new());
+        let handlers: Vec<Arc<dyn crate::handlers::Handler>> = vec![h.clone()];
+        let trig = Trigger::new(Box::new(GwDrop), handlers, 1_000);
+        let mut eng = TriggerEngine::new(vec![trig]);
+        let mut w = RecentWindow::new(8);
+        w.push(link(1_000, GwVerdict::Fail));
+        eng.on_sample(&w, 1_000); // fires; opened_us = 1_000
+        // The clearing sample's own ts_us is 9us BEFORE the opening one.
+        w.push(link(991, GwVerdict::Ok));
+        eng.on_sample(&w, 991);
+        let opened = h.opened.lock().unwrap().clone();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(
+            h.cleared.lock().unwrap().clone(),
+            vec![(opened[0].clone(), 1_000)],
+            "closed_us must clamp up to opened_us, never precede it"
+        );
+    }
+
+    /// The same clamp, exercised through `close_all` (the pause/tier-switch
+    /// edge) rather than the `None` arm of `on_sample`.
+    #[test]
+    fn close_all_never_stamps_a_close_before_its_open() {
+        let h = Arc::new(EdgeHandler::new());
+        let handlers: Vec<Arc<dyn crate::handlers::Handler>> = vec![h.clone()];
+        let trig = Trigger::new(Box::new(GwDrop), handlers, 1_000);
+        let mut eng = TriggerEngine::new(vec![trig]);
+        let mut w = RecentWindow::new(8);
+        w.push(link(1_000, GwVerdict::Fail));
+        eng.on_sample(&w, 1_000); // fires; opened_us = 1_000
+        let opened = h.opened.lock().unwrap().clone();
+        eng.close_all(991); // the edge's own ts is earlier than the opening instant
+        assert_eq!(
+            h.cleared.lock().unwrap().clone(),
+            vec![(opened[0].clone(), 1_000)],
+            "close_all must clamp closed_us up to opened_us too"
         );
     }
 
