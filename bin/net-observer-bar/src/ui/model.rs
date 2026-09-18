@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use net_observer_ipc::{ControlResult, StatusSnapshot};
 
 use super::control::{GlanceError, read_fresh};
+use super::parts::now_us;
 
 /// How many refresh ticks the panel's own sparkline history keeps.
 ///
@@ -69,6 +70,14 @@ pub struct Glance {
     /// The most recent fetch error, if the last refresh failed — classified into
     /// "nothing answered" vs "the daemon answered badly" (see [`GlanceError`]).
     pub error: Option<GlanceError>,
+    /// The bar's own instant (epoch microseconds) of last seeing `observing`
+    /// flip from off to on in a read it applied; `None` if it never has. The
+    /// staleness rule counts it as a tick (`status::state`): a daemon just told
+    /// to collect still serves the samples from before the pause, and must not
+    /// go grey for the interval its collectors need to produce the first new
+    /// one (realm net-observer, node #88). Stamped by [`Glance::apply_read`],
+    /// which every path that re-reads the daemon goes through.
+    pub resume_seen_us: Option<i64>,
     /// Config socket path, so the panel's manual "Refresh" can re-query and the
     /// event-log window can open its subscription.
     pub socket_path: String,
@@ -123,6 +132,7 @@ impl Glance {
         Self {
             snapshot,
             error,
+            resume_seen_us: None,
             socket_path,
             control_msg: None,
             events_window: None,
@@ -153,16 +163,34 @@ impl Glance {
             .push_back(history_point(&self.snapshot, self.online()));
     }
 
-    /// Re-query the daemon into this model. Used by the manual refresh button; the
-    /// timer path in [`crate::menubar`] mutates the same fields directly.
-    pub fn refresh(&mut self) {
-        match read_fresh(&self.socket_path) {
+    /// Apply the outcome of a read of the daemon — the one way every path that
+    /// re-reads it (the refresh timer in [`crate::menubar`], the manual
+    /// Refresh, every control round-trip's read-back) lands its result: a
+    /// snapshot replaces the last one and clears the error; a failure keeps
+    /// the last snapshot and records the error. Pure state application, so it
+    /// is directly testable; `now_us` is the bar's clock at the read.
+    ///
+    /// This is also where the bar notices a resume: a snapshot that shows
+    /// collection on where the last one showed it off stamps
+    /// [`Glance::resume_seen_us`] with `now_us`. One place, because the
+    /// observing toggle applies its read-back through here too, and a resume
+    /// the timer never saw flip would otherwise be a resume nobody saw.
+    pub fn apply_read(&mut self, fresh: Result<StatusSnapshot, GlanceError>, now_us: i64) {
+        match fresh {
             Ok(s) => {
+                if !self.snapshot.observing && s.observing {
+                    self.resume_seen_us = Some(now_us);
+                }
                 self.snapshot = s;
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// Re-query the daemon into this model. Used by the manual refresh button.
+    pub fn refresh(&mut self) {
+        self.apply_read(read_fresh(&self.socket_path), now_us());
     }
 
     /// Whether the daemon is reachable. Only [`GlanceError::Unreachable`] means
@@ -177,9 +205,9 @@ impl Glance {
     /// the gpui main thread and is directly testable.
     ///
     /// `control` becomes the transient `control_msg` line; `fresh` is applied
-    /// exactly the way [`Glance::refresh`] applies its own read, so the switch
+    /// through [`Glance::apply_read`] like every other read, so the switch
     /// reflects the daemon's real state (or goes offline) rather than a
-    /// silently-flipped local bool.
+    /// silently-flipped local bool — and a resume it carries is seen.
     pub fn apply_toggle_result(
         &mut self,
         control: Result<ControlResult, String>,
@@ -192,13 +220,7 @@ impl Glance {
             }
             Err(e) => format!("failed: {e}"),
         });
-        match fresh {
-            Ok(s) => {
-                self.snapshot = s;
-                self.error = None;
-            }
-            Err(e) => self.error = Some(e),
-        }
+        self.apply_read(fresh, now_us());
     }
 }
 
@@ -429,6 +451,41 @@ mod tests {
         assert_eq!(glance.control_msg.as_deref(), Some("ok: observing off"));
         assert!(!glance.snapshot.observing, "switch follows the daemon");
         assert!(glance.error.is_none(), "a good read clears offline");
+    }
+
+    /// The bar stamps the instant it sees collection come back on — and only
+    /// that edge: a read that shows it still on, still off, or going off
+    /// leaves the stamp alone, and a failed read touches nothing but the
+    /// error (realm net-observer, node #88).
+    #[test]
+    fn apply_read_stamps_the_resume_edge_only() {
+        let observing = |on: bool| StatusSnapshot {
+            observing: on,
+            ..StatusSnapshot::default()
+        };
+        let mut glance = Glance::new(observing(true), None, "/nonexistent.sock".to_string());
+        assert_eq!(glance.resume_seen_us, None);
+
+        // On -> on: no edge.
+        glance.apply_read(Ok(observing(true)), 10);
+        assert_eq!(glance.resume_seen_us, None);
+        // On -> off: the pause edge is not a resume.
+        glance.apply_read(Ok(observing(false)), 20);
+        assert_eq!(glance.resume_seen_us, None);
+        // Off -> off: still paused.
+        glance.apply_read(Ok(observing(false)), 30);
+        assert_eq!(glance.resume_seen_us, None);
+        // A failed read while paused changes nothing but the error.
+        glance.apply_read(Err(GlanceError::Unreachable("down".to_string())), 35);
+        assert_eq!(glance.resume_seen_us, None);
+        assert!(!glance.snapshot.observing, "the last snapshot is kept");
+        // Off -> on: the resume, stamped with the bar's clock at the read.
+        glance.apply_read(Ok(observing(true)), 40);
+        assert_eq!(glance.resume_seen_us, Some(40));
+        assert!(glance.error.is_none(), "a good read clears the error");
+        // On -> on afterwards: the stamp is not renewed.
+        glance.apply_read(Ok(observing(true)), 50);
+        assert_eq!(glance.resume_seen_us, Some(40));
     }
 
     /// A refusal (`ok: false`) reads as a failure line even though the round-trip

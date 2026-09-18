@@ -2,7 +2,7 @@
 //! (fetched live from `net-observerd` over the local socket) into the menu-bar health
 //! dot (and the retained compact glyph), the health classification, the
 //! multi-line tooltip/panel text, and — over the fetch outcome as well — the
-//! whole status-item [`Presentation`].
+//! status item's [`State`] and its [`Presentation`].
 //!
 //! This is the load-bearing, unit-tested part of the menu-bar app. It is pure
 //! over its input — no DB, no socket, no GUI — so every renderer is tested here
@@ -17,10 +17,10 @@ use types::{GwVerdict, ProbingTier};
 
 use crate::ui::GlanceError;
 
-/// How old a snapshot's last tick may be before the bar stops presenting it as
-/// live: past this, the daemon answered the socket but nothing has advanced its
-/// `generated_us`, so the dot goes grey exactly as for a daemon that does not
-/// answer at all (realm net-observer, node #88).
+/// How old the health inputs may be before the bar stops presenting them as
+/// live: past this, the daemon answered the socket but neither the link nor
+/// the proxy collector has ticked, so the dot goes grey exactly as for a
+/// daemon that does not answer at all (realm net-observer, node #88).
 ///
 /// Two default collector intervals (15 s each, see the `config` crate): one
 /// missed tick is a probe that ran long, two is a pipeline that stopped. The
@@ -37,35 +37,47 @@ pub fn render_status(snap: &StatusSnapshot) -> String {
     format!("{}\n{}", headline(snap), render_body(snap))
 }
 
-/// The first line of [`render_status`]. `net-observer` while there is a verdict
-/// to show; when there is none ([`Health::NoData`]) it says so and why, so the
-/// hollow dot ([`status_dot`]) is explained by the very tooltip it hangs under:
+/// Why a snapshot carries no verdict — the words both the tooltip's headline
+/// and the panel header's label put after `no verdict —`, so the two never
+/// explain the same hollow dot differently. Meaningful for a
+/// [`Health::NoData`] snapshot; for any other it names what *would* be the
+/// reason, which no caller shows.
 ///
-/// - `no verdict — probing passive (gw SKIP, tun not probed)` — the passive
-///   tier withheld the gateway echo (and the tun probe with it); a measured
-///   tun reads `tun 204` instead,
-/// - `no verdict — gateway probe did not run (gw SKIP, …)` — a `SKIP` under
-///   the active tier: the link tick's preflight found nothing to probe, which
-///   is a different fact from a tier that never asks,
-/// - `no verdict — no link or proxy tick yet` — nothing has arrived at all.
+/// - `no link or proxy tick yet` — nothing has arrived at all,
+/// - `probing passive` — the passive tier withheld the gateway echo,
+/// - `gateway probe did not run` — a `SKIP` under the active tier: the link
+///   tick's preflight found nothing to probe, which is a different fact from a
+///   tier that never asks.
+pub fn no_verdict_reason(snap: &StatusSnapshot) -> &'static str {
+    // `NoData` has exactly two sources (see `health`): no link *and* no proxy
+    // tick, or a `SKIP` gateway with an unmeasured or healthy tun.
+    if snap.link.is_none() {
+        return "no link or proxy tick yet";
+    }
+    match snap.probing {
+        ProbingTier::Passive => "probing passive",
+        ProbingTier::Active => "gateway probe did not run",
+    }
+}
+
+/// The first line of [`render_status`]. `net-observer` while there is a verdict
+/// to show; when there is none ([`Health::NoData`]) it says so and why
+/// ([`no_verdict_reason`]), plus what the `SKIP` tick carried — e.g.
+/// `no verdict — probing passive (gw SKIP, tun not probed)` — so the hollow
+/// dot ([`status_dot`]) is explained by the very tooltip it hangs under.
 fn headline(snap: &StatusSnapshot) -> String {
     if health(snap) != Health::NoData {
         return "net-observer".to_string();
     }
-    // `NoData` has exactly two sources (see `health`): no link *and* no proxy
-    // tick, or a `SKIP` gateway with an unmeasured or healthy tun.
+    let reason = no_verdict_reason(snap);
     match &snap.link {
-        None => "no verdict — no link or proxy tick yet".to_string(),
+        None => format!("no verdict — {reason}"),
         Some(_) => {
-            let why = match snap.probing {
-                ProbingTier::Passive => "probing passive",
-                ProbingTier::Active => "gateway probe did not run",
-            };
             let tun = match snap.proxy.as_ref().and_then(|p| p.tun_code) {
                 None => "tun not probed".to_string(),
                 Some(code) => format!("tun {code}"),
             };
-            format!("no verdict — {why} (gw SKIP, {tun})")
+            format!("no verdict — {reason} (gw SKIP, {tun})")
         }
     }
 }
@@ -146,10 +158,10 @@ pub fn close_incident(
 /// The three-state health of a [`StatusSnapshot`], derived from the gateway
 /// verdict and the tun probe code. The single source of truth for both the
 /// menu-bar dot ([`status_dot`]) and the panel's header dot
-/// (`ui::health_dot`), so the two can never drift apart.
+/// (`ui::header_dot`), so the two can never drift apart.
 ///
 /// Reachability is not a health: whether the daemon answered at all lives in
-/// [`GlanceError`], and [`presentation`] is where the two meet.
+/// [`GlanceError`], and [`state`] is where the two meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
     /// No verdict: no link and no proxy tick yet, or the gateway probe was
@@ -254,6 +266,97 @@ pub fn status_glyph(snap: &StatusSnapshot) -> String {
     format!("{dot} gw:{gw} tun:{tun}")
 }
 
+/// The status item's state, decided once by [`state`] and rendered twice —
+/// as the menu-bar glyph and tooltip ([`presentation`]) and as the panel
+/// header's dot and label (`ui::panel`) — so the two can never disagree
+/// (realm net-observer, node #88).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum State {
+    /// Nothing answered ([`GlanceError::Unreachable`]): the transport error.
+    Offline(String),
+    /// The daemon answered, but the answer was unusable
+    /// ([`GlanceError::Protocol`]): the daemon's or the decoder's message.
+    BadAnswer(String),
+    /// Collection switched off via the panel switch.
+    Paused,
+    /// The daemon answers, but the health inputs are more than
+    /// [`STALE_AFTER`] old: their age in whole seconds.
+    Stale { age_s: i64 },
+    /// A current snapshot, judged by [`health`].
+    Live(Health),
+}
+
+/// Decide the status item's [`State`] from the last fetch outcome, the
+/// snapshot it left behind, the bar's own memory of the last resume
+/// (`resume_seen_us`, see `Glance::resume_seen_us`) and the bar's clock
+/// (`now_us`, epoch microseconds). Pure over its inputs, so the whole table
+/// is testable without a GUI (realm net-observer, node #88):
+///
+/// - **offline** ([`GlanceError::Unreachable`] — daemon down / socket
+///   absent), rather than stale health shown as live.
+/// - **bad answer** ([`GlanceError::Protocol`]): the daemon *is* reachable —
+///   it answered, we just could not use the answer (an error frame, or a
+///   decode failure against an older daemon). Never "offline", which would be
+///   a false claim about the world.
+/// - **paused**: the daemon is alive but not collecting, so the live health
+///   dot would be misleading. Outranks staleness: a paused daemon stops
+///   ticking by design, and the pause is bracketed in the record.
+/// - **stale**: the daemon answered, but the health inputs themselves — the
+///   link and proxy ticks the dot is judged from — are more than
+///   [`STALE_AFTER`] behind `now_us`. The snapshot's own `generated_us` is
+///   not the measure: every sample kind bumps it, so dns or host ticks would
+///   keep it fresh while the link and proxy collectors had stalled, which is
+///   exactly the failure this state exists to show. The bar's last resume
+///   sighting counts as a tick, or a daemon just told to collect would go
+///   grey for the interval its collectors need to produce the first sample.
+///   A snapshot with neither a link nor a proxy tick is not stale — there is
+///   no tick to date — and falls through to the hollow "no verdict" dot.
+/// - **live**: judged by [`health`].
+pub fn state(
+    error: Option<&GlanceError>,
+    snap: &StatusSnapshot,
+    resume_seen_us: Option<i64>,
+    now_us: i64,
+) -> State {
+    match error {
+        Some(GlanceError::Unreachable(e)) => return State::Offline(e.clone()),
+        Some(GlanceError::Protocol(e)) => return State::BadAnswer(e.clone()),
+        None => {}
+    }
+    if !snap.observing {
+        return State::Paused;
+    }
+    match stale_age_s(snap, resume_seen_us, now_us) {
+        Some(age_s) => State::Stale { age_s },
+        None => State::Live(health(snap)),
+    }
+}
+
+/// The instant of the newest health input: the later of the link and proxy
+/// ticks, `None` when neither has arrived. The same measure the panel's
+/// footer dates the snapshot by (`updated Ns ago`) and [`state`] judges
+/// staleness by, so the two never date the same snapshot differently.
+pub fn newest_health_tick_us(snap: &StatusSnapshot) -> Option<i64> {
+    [
+        snap.link.as_ref().map(|l| l.ts_us),
+        snap.proxy.as_ref().map(|p| p.ts_us),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+/// The age of the health inputs in whole seconds, when it is past
+/// [`STALE_AFTER`]; `None` while they are fresh, `None` when there are none
+/// yet, and `None` within [`STALE_AFTER`] of the bar last seeing collection
+/// resume (`resume_seen_us`), which counts as a tick.
+fn stale_age_s(snap: &StatusSnapshot, resume_seen_us: Option<i64>, now_us: i64) -> Option<i64> {
+    let newest = newest_health_tick_us(snap)?;
+    let anchor = resume_seen_us.map_or(newest, |resumed| newest.max(resumed));
+    let age_us = now_us.saturating_sub(anchor);
+    (age_us > STALE_AFTER.as_micros() as i64).then_some(age_us / 1_000_000)
+}
+
 /// What the status item shows: the title glyph and the hover tooltip, decided
 /// by [`presentation`]. The shell in `menubar` only copies both onto the
 /// `NSStatusBarButton`.
@@ -284,83 +387,50 @@ impl Presentation {
 /// The grey dot: the daemon is not there, or has stopped ticking.
 const OFFLINE_GLYPH: &str = "\u{26AB}"; // ⚫
 
-/// Decide the status item's glyph and tooltip from the last fetch outcome, the
-/// snapshot it left behind, and the bar's clock (`now_us`, epoch microseconds).
-/// Pure over its inputs, so the whole state table is testable without a GUI
+/// Render the [`state`] as the status item's glyph and tooltip
 /// (realm net-observer, node #88):
 ///
-/// - **offline** ([`GlanceError::Unreachable`] — daemon down / socket absent):
-///   `⚫` and `net-observer offline` plus the transport error, rather than stale
-///   health shown as live.
-/// - **bad answer** ([`GlanceError::Protocol`]): the daemon *is* reachable — it
-///   answered, we just could not use the answer (an error frame, or a decode
-///   failure against an older daemon). `⚠` and a tooltip that says so, never
-///   "offline", which would be a false claim about the world.
-/// - **paused** (collection turned off via the panel switch): `⏸` and a
-///   "paused" head over the snapshot — the daemon is alive but not collecting,
-///   so the live health dot would be misleading. Outranks staleness: a paused
-///   daemon stops ticking by design, and the pause is bracketed in the record.
-/// - **stale** (the daemon answered, but its `generated_us` is more than
-///   [`STALE_AFTER`] behind `now_us`): `⚫` and `net-observer offline` /
-///   `last tick <n> s ago` — the socket is up, the pipeline behind it is not,
-///   and a green dot from a dead pipeline is the silent wrong data the bar
-///   exists to prevent. A daemon that has not ticked at all yet
-///   (`generated_us == 0`) is not stale — there is no tick to date — and falls
-///   through to the hollow "no verdict" dot.
+/// - **offline**: `⚫`, `net-observer offline` plus the transport error.
+/// - **bad answer**: `⚠` and a tooltip that says the daemon is reachable.
+/// - **paused**: `⏸` and a `paused` head over the snapshot's lines — no
+///   "no verdict" headline, the pause is the reason there is none.
+/// - **stale**: `⚫` and `net-observer offline` / `last tick <n> s ago`, the
+///   stale health kept out of the tooltip.
 /// - **live**: the [`status_dot`] under the snapshot's own [`headline`], so a
 ///   hollow dot is explained by the first line of its tooltip.
 pub fn presentation(
     error: Option<&GlanceError>,
     snap: &StatusSnapshot,
+    resume_seen_us: Option<i64>,
     now_us: i64,
 ) -> Presentation {
-    match error {
-        Some(GlanceError::Unreachable(e)) => {
-            return Presentation {
-                glyph: OFFLINE_GLYPH,
-                tooltip_head: format!("net-observer offline\n{e}"),
-                tooltip_body: None,
-            };
-        }
-        Some(GlanceError::Protocol(e)) => {
-            return Presentation {
-                glyph: "\u{26A0}", // ⚠ up, but the answer is unusable
-                tooltip_head: format!("net-observer: daemon reachable, but its answer failed\n{e}"),
-                tooltip_body: None,
-            };
-        }
-        None => {}
-    }
-    if !snap.observing {
-        return Presentation {
+    match state(error, snap, resume_seen_us, now_us) {
+        State::Offline(e) => Presentation {
+            glyph: OFFLINE_GLYPH,
+            tooltip_head: format!("net-observer offline\n{e}"),
+            tooltip_body: None,
+        },
+        State::BadAnswer(e) => Presentation {
+            glyph: "\u{26A0}", // ⚠ up, but the answer is unusable
+            tooltip_head: format!("net-observer: daemon reachable, but its answer failed\n{e}"),
+            tooltip_body: None,
+        },
+        State::Paused => Presentation {
             glyph: "\u{23F8}", // ⏸ paused (collection off)
             tooltip_head: "paused".to_string(),
-            tooltip_body: Some(render_status(snap)),
-        };
-    }
-    if let Some(age_s) = stale_age_s(snap, now_us) {
-        return Presentation {
+            tooltip_body: Some(render_body(snap)),
+        },
+        State::Stale { age_s } => Presentation {
             glyph: OFFLINE_GLYPH,
             tooltip_head: format!("net-observer offline\nlast tick {age_s} s ago"),
             tooltip_body: None,
-        };
+        },
+        State::Live(_) => Presentation {
+            glyph: status_dot(snap),
+            tooltip_head: headline(snap),
+            tooltip_body: Some(render_body(snap)),
+        },
     }
-    Presentation {
-        glyph: status_dot(snap),
-        tooltip_head: headline(snap),
-        tooltip_body: Some(render_body(snap)),
-    }
-}
-
-/// The age of the snapshot's last tick in whole seconds, when it is past
-/// [`STALE_AFTER`]; `None` while it is fresh, and `None` for a snapshot that
-/// has never ticked (`generated_us == 0`, the daemon's own starting value).
-fn stale_age_s(snap: &StatusSnapshot, now_us: i64) -> Option<i64> {
-    if snap.generated_us <= 0 {
-        return None;
-    }
-    let age_us = now_us.saturating_sub(snap.generated_us);
-    (age_us > STALE_AFTER.as_micros() as i64).then_some(age_us / 1_000_000)
 }
 
 #[cfg(test)]
@@ -567,7 +637,8 @@ mod tests {
     /// The first line explains a hollow dot: the passive tier names itself and
     /// what it withheld; a `SKIP` under the active tier is a different fact
     /// and says so; nothing at all says nothing at all. With a verdict the
-    /// line is the app name, as before.
+    /// line is the app name, as before. The reason is the one word list the
+    /// header label uses too ([`no_verdict_reason`]).
     #[test]
     fn render_headline_explains_the_missing_verdict() {
         let passive = StatusSnapshot {
@@ -576,6 +647,7 @@ mod tests {
             probing: ProbingTier::Passive,
             ..Default::default()
         };
+        assert_eq!(no_verdict_reason(&passive), "probing passive");
         assert!(
             render_status(&passive)
                 .starts_with("no verdict — probing passive (gw SKIP, tun not probed)\n"),
@@ -596,11 +668,16 @@ mod tests {
             probing: ProbingTier::Active,
             ..passive
         };
+        assert_eq!(no_verdict_reason(&active_skip), "gateway probe did not run");
         assert!(
             render_status(&active_skip)
                 .starts_with("no verdict — gateway probe did not run (gw SKIP, tun not probed)\n")
         );
 
+        assert_eq!(
+            no_verdict_reason(&StatusSnapshot::default()),
+            "no link or proxy tick yet"
+        );
         assert!(
             render_status(&StatusSnapshot::default())
                 .starts_with("no verdict — no link or proxy tick yet\n")
@@ -687,18 +764,48 @@ mod tests {
         assert!(render_status(&snap).contains("tun=0 selector=-"));
     }
 
-    /// The bar's clock in the presentation tests: 100 s after the epoch.
+    /// The footer's date and the staleness rule read the same instant: the
+    /// later of the two health ticks, or nothing when neither has arrived.
+    #[test]
+    fn newest_health_tick_is_the_later_of_link_and_proxy() {
+        assert_eq!(newest_health_tick_us(&StatusSnapshot::default()), None);
+        let snap = StatusSnapshot {
+            link: Some(LinkSample {
+                ts_us: 1_000_000,
+                ..link(GwVerdict::Ok)
+            }),
+            proxy: Some(ProxySample {
+                ts_us: 4_000_000,
+                ..proxy(Some(204), None)
+            }),
+            ..Default::default()
+        };
+        assert_eq!(newest_health_tick_us(&snap), Some(4_000_000));
+        let link_only = StatusSnapshot {
+            proxy: None,
+            ..snap
+        };
+        assert_eq!(newest_health_tick_us(&link_only), Some(1_000_000));
+    }
+
+    /// The bar's clock in the state tests: 100 s after the epoch.
     const NOW_US: i64 = 100_000_000;
 
-    /// A snapshot that ticked 5 s before [`NOW_US`] — well inside
-    /// [`STALE_AFTER`].
-    fn fresh(link: Option<LinkSample>, proxy: Option<ProxySample>) -> StatusSnapshot {
+    /// A snapshot whose link and proxy ticks are `age_s` seconds before
+    /// [`NOW_US`]; `generated_us` is left at its default on purpose — the
+    /// rule must not read it.
+    fn ticked(age_s: i64, link: Option<LinkSample>, proxy: Option<ProxySample>) -> StatusSnapshot {
+        let ts_us = NOW_US - age_s * 1_000_000;
         StatusSnapshot {
-            generated_us: NOW_US - 5_000_000,
-            link,
-            proxy,
+            link: link.map(|l| LinkSample { ts_us, ..l }),
+            proxy: proxy.map(|p| ProxySample { ts_us, ..p }),
             ..Default::default()
         }
+    }
+
+    /// A snapshot that ticked 5 s ago — well inside [`STALE_AFTER`].
+    fn fresh(link: Option<LinkSample>, proxy: Option<ProxySample>) -> StatusSnapshot {
+        ticked(5, link, proxy)
     }
 
     /// The whole state table of the status item, one row per state
@@ -707,7 +814,7 @@ mod tests {
     fn presentation_maps_each_state_to_its_glyph_and_tooltip() {
         // Unreachable -> the grey dot, "offline" and the transport error.
         let unreachable = GlanceError::Unreachable("No such file or directory".into());
-        let p = presentation(Some(&unreachable), &StatusSnapshot::default(), NOW_US);
+        let p = presentation(Some(&unreachable), &StatusSnapshot::default(), None, NOW_US);
         assert_eq!(p.glyph, "\u{26AB}");
         assert_eq!(
             p.tooltip_head,
@@ -717,7 +824,7 @@ mod tests {
 
         // Protocol -> the warning sign: reachable, never "offline".
         let protocol = GlanceError::Protocol("unexpected response".into());
-        let p = presentation(Some(&protocol), &StatusSnapshot::default(), NOW_US);
+        let p = presentation(Some(&protocol), &StatusSnapshot::default(), None, NOW_US);
         assert_eq!(p.glyph, "\u{26A0}");
         assert_eq!(
             p.tooltip_head,
@@ -725,28 +832,30 @@ mod tests {
         );
         assert!(!p.tooltip().contains("offline"));
 
-        // Paused -> the pause sign over the snapshot.
+        // Paused -> the pause sign over the snapshot's lines, and no "no
+        // verdict" headline under it: the pause is the reason.
         let paused = StatusSnapshot {
             observing: false,
-            ..fresh(Some(link(GwVerdict::Ok)), Some(proxy(Some(204), None)))
+            ..fresh(Some(link(GwVerdict::Skip)), None)
         };
-        let p = presentation(None, &paused, NOW_US);
+        let p = presentation(None, &paused, None, NOW_US);
         assert_eq!(p.glyph, "\u{23F8}");
         assert_eq!(p.tooltip_head, "paused");
         assert_eq!(
             p.tooltip_body.as_deref(),
-            Some(render_status(&paused).as_str())
+            Some(render_body(&paused).as_str())
         );
+        assert!(!p.tooltip().contains("no verdict"), "{}", p.tooltip());
 
         // Fresh Ok -> green, under the app name and the snapshot.
         let ok = fresh(Some(link(GwVerdict::Ok)), Some(proxy(Some(204), None)));
-        let p = presentation(None, &ok, NOW_US);
+        let p = presentation(None, &ok, None, NOW_US);
         assert_eq!(p.glyph, "🟢");
         assert_eq!(p.tooltip(), render_status(&ok));
 
         // Fresh Bad -> red.
         let bad = fresh(Some(link(GwVerdict::Fail)), Some(proxy(Some(204), None)));
-        let p = presentation(None, &bad, NOW_US);
+        let p = presentation(None, &bad, None, NOW_US);
         assert_eq!(p.glyph, "🔴");
         assert_eq!(p.tooltip_head, "net-observer");
 
@@ -755,7 +864,7 @@ mod tests {
             probing: ProbingTier::Passive,
             ..fresh(Some(link(GwVerdict::Skip)), Some(proxy(None, Some("auto"))))
         };
-        let p = presentation(None, &skip_only, NOW_US);
+        let p = presentation(None, &skip_only, None, NOW_US);
         assert_eq!(p.glyph, "\u{25CC}");
         assert_eq!(
             p.tooltip_head,
@@ -764,50 +873,105 @@ mod tests {
         assert!(p.tooltip_body.is_some());
     }
 
-    /// A daemon that answers but whose last tick is 40 s old is presented as
-    /// offline — the grey dot and a "last tick" line, the stale health kept out
-    /// of the tooltip — whatever that stale health was
-    /// (realm net-observer, node #88).
+    /// The staleness rule reads the health inputs' own instants, never the
+    /// snapshot's `generated_us` (realm net-observer, node #88): link and
+    /// proxy both 40 s old is offline whatever else ticked; one of them fresh
+    /// proves the pipeline runs, and health still judges both.
     #[test]
-    fn presentation_treats_a_stale_snapshot_as_offline() {
-        let stale_ok = StatusSnapshot {
-            generated_us: NOW_US - 40_000_000,
-            link: Some(link(GwVerdict::Ok)),
-            proxy: Some(proxy(Some(204), None)),
-            ..Default::default()
+    fn state_is_stale_only_when_both_health_ticks_are_old() {
+        let both_old = StatusSnapshot {
+            // A dns/host tick "just now" must not rescue it.
+            generated_us: NOW_US - 1_000_000,
+            ..ticked(40, Some(link(GwVerdict::Ok)), Some(proxy(Some(204), None)))
         };
-        let p = presentation(None, &stale_ok, NOW_US);
+        assert_eq!(
+            state(None, &both_old, None, NOW_US),
+            State::Stale { age_s: 40 }
+        );
+        let p = presentation(None, &both_old, None, NOW_US);
         assert_eq!(p.glyph, "\u{26AB}");
         assert_eq!(p.tooltip_head, "net-observer offline\nlast tick 40 s ago");
-        assert_eq!(p.tooltip_body, None);
         assert_eq!(p.tooltip(), "net-observer offline\nlast tick 40 s ago");
 
+        // Link 40 s old, proxy fresh: not stale, and the old link's FAIL still
+        // counts against the health.
+        let proxy_fresh = StatusSnapshot {
+            proxy: Some(ProxySample {
+                ts_us: NOW_US - 5_000_000,
+                ..proxy(Some(204), None)
+            }),
+            ..ticked(40, Some(link(GwVerdict::Fail)), None)
+        };
+        assert_eq!(
+            state(None, &proxy_fresh, None, NOW_US),
+            State::Live(Health::Bad)
+        );
+        assert_eq!(presentation(None, &proxy_fresh, None, NOW_US).glyph, "🔴");
+
         // Exactly at the bound is still fresh; one microsecond past it is not.
-        let at_bound = StatusSnapshot {
-            generated_us: NOW_US - STALE_AFTER.as_micros() as i64,
-            ..stale_ok.clone()
-        };
-        assert_eq!(presentation(None, &at_bound, NOW_US).glyph, "🟢");
+        let at_bound = ticked(30, Some(link(GwVerdict::Ok)), Some(proxy(Some(204), None)));
+        assert_eq!(
+            state(None, &at_bound, None, NOW_US),
+            State::Live(Health::Ok)
+        );
         let past_bound = StatusSnapshot {
-            generated_us: at_bound.generated_us - 1,
-            ..stale_ok.clone()
+            link: at_bound.link.clone().map(|l| LinkSample {
+                ts_us: l.ts_us - 1,
+                ..l
+            }),
+            proxy: at_bound.proxy.clone().map(|p| ProxySample {
+                ts_us: p.ts_us - 1,
+                ..p
+            }),
+            ..at_bound
         };
-        assert_eq!(presentation(None, &past_bound, NOW_US).glyph, "\u{26AB}");
+        assert_eq!(
+            state(None, &past_bound, None, NOW_US),
+            State::Stale { age_s: 30 }
+        );
 
         // A pause outranks staleness: a paused daemon stops ticking by design.
         let stale_paused = StatusSnapshot {
             observing: false,
-            ..stale_ok
+            ..both_old
         };
-        assert_eq!(presentation(None, &stale_paused, NOW_US).glyph, "\u{23F8}");
+        assert_eq!(state(None, &stale_paused, None, NOW_US), State::Paused);
     }
 
-    /// A daemon that has never ticked (`generated_us` still 0, its starting
-    /// value) has no tick to date: it is a hollow "no verdict", not a grey
-    /// "offline" dated to the epoch.
+    /// The bar's own sighting of a resume counts as a tick: a daemon just told
+    /// to collect is not "offline" for the interval its collectors need to
+    /// produce the first sample, however old the samples it still serves are.
     #[test]
-    fn presentation_does_not_date_a_daemon_that_never_ticked() {
-        let p = presentation(None, &StatusSnapshot::default(), NOW_US);
+    fn state_counts_a_recent_resume_as_a_tick() {
+        let long_paused = ticked(600, Some(link(GwVerdict::Ok)), Some(proxy(Some(204), None)));
+        let resumed_5s_ago = Some(NOW_US - 5_000_000);
+        assert_eq!(
+            state(None, &long_paused, resumed_5s_ago, NOW_US),
+            State::Live(Health::Ok)
+        );
+        // A resume seen long ago does not keep rescuing old samples.
+        let resumed_40s_ago = Some(NOW_US - 40_000_000);
+        assert_eq!(
+            state(None, &long_paused, resumed_40s_ago, NOW_US),
+            State::Stale { age_s: 40 }
+        );
+        // Nor does it date a snapshot fresher than itself.
+        let fresh_ok = fresh(Some(link(GwVerdict::Ok)), Some(proxy(Some(204), None)));
+        assert_eq!(
+            state(None, &fresh_ok, resumed_40s_ago, NOW_US),
+            State::Live(Health::Ok)
+        );
+    }
+
+    /// A daemon that has produced neither a link nor a proxy tick has no
+    /// tick to date: it is a hollow "no verdict", not a grey "offline".
+    #[test]
+    fn state_does_not_date_a_daemon_that_never_ticked() {
+        assert_eq!(
+            state(None, &StatusSnapshot::default(), None, NOW_US),
+            State::Live(Health::NoData)
+        );
+        let p = presentation(None, &StatusSnapshot::default(), None, NOW_US);
         assert_eq!(p.glyph, "\u{25CC}");
         assert_eq!(p.tooltip_head, "no verdict — no link or proxy tick yet");
     }

@@ -45,14 +45,21 @@ impl std::fmt::Display for GlanceError {
 }
 
 /// Classify a transport failure from [`net_observer_ipc::query`]. Only the kinds that
-/// mean "nobody was there" are [`GlanceError::Unreachable`]; everything else
+/// mean "nobody answered" are [`GlanceError::Unreachable`]; everything else
 /// (`InvalidData` from a frame we cannot decode, a broken pipe mid-exchange, …)
 /// happened *with* a daemon on the other end.
+///
+/// `WouldBlock` is in the first group because it is what the query's read budget
+/// expiring looks like on macOS: `SO_RCVTIMEO` running out surfaces as `EAGAIN`,
+/// which the standard library maps to `WouldBlock`, not `TimedOut`. A daemon
+/// that accepts the connection and never answers is "no answer" — the grey dot
+/// by the owner's rule — not a bad answer (realm net-observer, node #88).
 fn classify_io(e: std::io::Error) -> GlanceError {
     match e.kind() {
         std::io::ErrorKind::NotFound
         | std::io::ErrorKind::ConnectionRefused
-        | std::io::ErrorKind::TimedOut => GlanceError::Unreachable(e.to_string()),
+        | std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::WouldBlock => GlanceError::Unreachable(e.to_string()),
         _ => GlanceError::Protocol(e.to_string()),
     }
 }
@@ -457,7 +464,8 @@ mod tests {
         );
     }
 
-    /// Only the kinds that mean "nobody was there" are unreachable; a decode
+    /// Only the kinds that mean "nobody answered" are unreachable — including
+    /// `WouldBlock`, the shape a macOS read budget expiring takes; a decode
     /// failure (a new bar against an older daemon) happened *with* a live daemon on
     /// the other end.
     #[test]
@@ -467,6 +475,7 @@ mod tests {
             ErrorKind::NotFound,
             ErrorKind::ConnectionRefused,
             ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
         ] {
             assert!(
                 matches!(

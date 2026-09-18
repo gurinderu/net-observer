@@ -10,7 +10,7 @@ use gpui::{
 use net_observer_ipc::{IncidentSummary, StatusSnapshot};
 use types::ProbingTier;
 
-use crate::status::{Health, health};
+use crate::status::{Health, State, newest_health_tick_us, no_verdict_reason};
 
 use super::control::{GlanceError, toggle_round_trip};
 use super::model::{Glance, HistoryPoint};
@@ -60,6 +60,14 @@ impl Render for PanelView {
             Some(GlanceError::Protocol(m)) => (None, Some(m.clone())),
             None => (None, None),
         };
+        // The same decision the menu-bar dot is drawn from, so the header and
+        // the status item can never disagree (realm net-observer, node #88).
+        let state = crate::status::state(
+            glance.error.as_ref(),
+            &snapshot,
+            glance.resume_seen_us,
+            now_us,
+        );
 
         div()
             .flex()
@@ -77,7 +85,14 @@ impl Render for PanelView {
             .text_size(px(13.0))
             .rounded_lg()
             .overflow_hidden()
-            .child(header_row(&snapshot, online, offline_msg, theme, cx))
+            .child(header_row(
+                &snapshot,
+                &state,
+                online,
+                offline_msg,
+                theme,
+                cx,
+            ))
             .child(separator(theme))
             .child(status_body(&snapshot, &history, now_us, theme))
             .child(separator(theme))
@@ -122,21 +137,24 @@ fn status_body(
 }
 
 /// The header row: a health dot + the app name on the left, the observing toggle
-/// switch on the right. When paused, a muted "paused" label sits after the name
-/// and the dot is grey.
+/// switch on the right. The dot and the muted label after the name render
+/// `state` — the same [`State`] the menu-bar dot is drawn from — so a paused,
+/// stale or badly-answering daemon reads the same in both places.
 ///
 /// `online` is [`Glance::online`] — false only when the daemon is unreachable, in
-/// which case `offline` carries the reason for the warning glyph's tooltip. A
-/// protocol failure is not offline (see [`GlanceError`]): the header stays live and
-/// the footer states it.
+/// which case `offline` carries the reason for the warning glyph's tooltip and
+/// the toggle is disabled. A protocol failure or a stale snapshot is not offline
+/// (the daemon answered, see [`GlanceError`]): the toggle stays live, and the
+/// footer states a protocol failure's message.
 fn header_row(
     snapshot: &StatusSnapshot,
+    state: &State,
     online: bool,
     offline: Option<String>,
     theme: Theme,
     cx: &mut Context<PanelView>,
 ) -> impl IntoElement {
-    let (dot, dot_color) = header_dot(snapshot, online, theme);
+    let (dot, dot_color) = header_dot(state, theme);
 
     let mut left = div()
         .flex()
@@ -151,7 +169,7 @@ fn header_row(
         );
     // A muted state label after the name, only while the daemon is up. Offline
     // is conveyed by a warning glyph next to the (disabled) toggle — no text.
-    if let Some(label) = header_sub_label(online, snapshot) {
+    if let Some(label) = header_sub_label(state, snapshot) {
         left = left.child(
             div()
                 .text_size(px(11.0))
@@ -178,7 +196,8 @@ fn header_row(
         ))
 }
 
-/// The header's muted state label, or `None` while offline.
+/// The header's muted state label for a [`State`], or `None` while offline
+/// (the warning glyph next to the toggle carries that).
 ///
 /// Paused and passive are DIFFERENT states and must never be rendered as
 /// one: a paused daemon collects nothing; a passive daemon collects and
@@ -187,23 +206,22 @@ fn header_row(
 /// the tier — and the tier is always named, because "passive" is the
 /// daemon's default and an operator reading the panel must see whether the
 /// wire is silent. When there is no verdict to show ([`Health::NoData`]) the
-/// label says so in front of the tier — `no verdict — probing passive` — so
-/// the hollow header dot is explained where it sits, the way the menu-bar
-/// tooltip explains the hollow menu-bar dot (realm net-observer, node #88).
-/// Pure over its inputs, so the wording is a testable fact.
-fn header_sub_label(online: bool, snapshot: &StatusSnapshot) -> Option<&'static str> {
-    if !online {
-        return None;
-    }
-    if !snapshot.observing {
-        return Some("paused");
-    }
-    let no_verdict = health(snapshot) == Health::NoData;
-    Some(match (no_verdict, snapshot.probing) {
-        (true, ProbingTier::Passive) => "no verdict — probing passive",
-        (true, ProbingTier::Active) => "no verdict — probing",
-        (false, ProbingTier::Passive) => "passive",
-        (false, ProbingTier::Active) => "probing",
+/// label says so and why, in the words the menu-bar tooltip uses
+/// ([`no_verdict_reason`]) — `no verdict — probing passive` — so the hollow
+/// header dot is explained where it sits; a stale daemon reads `offline —
+/// last tick <n> s ago`, as the menu-bar tooltip does (realm net-observer,
+/// node #88). Pure over its inputs, so the wording is a testable fact.
+fn header_sub_label(state: &State, snapshot: &StatusSnapshot) -> Option<String> {
+    Some(match state {
+        State::Offline(_) => return None,
+        State::BadAnswer(_) => "answer failed".to_string(),
+        State::Paused => "paused".to_string(),
+        State::Stale { age_s } => format!("offline — last tick {age_s} s ago"),
+        State::Live(Health::NoData) => format!("no verdict — {}", no_verdict_reason(snapshot)),
+        State::Live(Health::Ok | Health::Bad) => match snapshot.probing {
+            ProbingTier::Passive => "passive".to_string(),
+            ProbingTier::Active => "probing".to_string(),
+        },
     })
 }
 
@@ -249,22 +267,21 @@ impl Render for WarnTooltip {
     }
 }
 
-/// The header health dot glyph + color. When paused, a grey dot regardless of the
-/// underlying health (collection is off, so there is nothing live to judge);
-/// otherwise it follows the shared [`health`] classifier so the panel dot and the
-/// menu-bar dot can never disagree — including the shape: no verdict is a hollow
-/// dotted circle (U+25CC, the menu-bar's own), so a reachable daemon with nothing
-/// to say is not drawn with the filled grey dot offline and paused get
-/// (realm net-observer, node #88).
-fn header_dot(snapshot: &StatusSnapshot, online: bool, theme: Theme) -> (&'static str, Rgba) {
-    if !online || !snapshot.observing {
-        // Offline or paused: nothing live to judge — a muted dot.
-        return ("\u{25CF}", rgb(theme.muted));
-    }
-    match health(snapshot) {
-        Health::NoData => ("\u{25CC}", rgb(theme.muted)),
-        Health::Ok => ("\u{25CF}", rgb(theme.ok)),
-        Health::Bad => ("\u{25CF}", rgb(theme.bad)),
+/// The header health dot glyph + color for a [`State`] — the same state the
+/// menu-bar dot is drawn from, so the panel dot and the menu-bar dot can never
+/// disagree. Offline, a bad answer, paused and stale are a muted filled dot:
+/// nothing live to judge. A live verdict is the filled dot in its health
+/// colour, and no verdict is a hollow dotted circle (U+25CC, the menu-bar's
+/// own), so a reachable daemon with nothing to say is not drawn with the grey
+/// dot the other states get (realm net-observer, node #88).
+fn header_dot(state: &State, theme: Theme) -> (&'static str, Rgba) {
+    match state {
+        State::Offline(_) | State::BadAnswer(_) | State::Paused | State::Stale { .. } => {
+            ("\u{25CF}", rgb(theme.muted))
+        }
+        State::Live(Health::NoData) => ("\u{25CC}", rgb(theme.muted)),
+        State::Live(Health::Ok) => ("\u{25CF}", rgb(theme.ok)),
+        State::Live(Health::Bad) => ("\u{25CF}", rgb(theme.bad)),
     }
 }
 
@@ -769,15 +786,11 @@ fn gw_verdict_color(v: types::GwVerdict, theme: Theme) -> Rgba {
     }
 }
 
+/// The footer's date: the newest health tick, aged — the same instant the
+/// staleness rule judges (`status::state`), so the footer never dates a
+/// snapshot the header calls stale as fresh.
 fn freshness_line(snapshot: &StatusSnapshot, now_us: i64) -> String {
-    let newest = [
-        snapshot.link.as_ref().map(|l| l.ts_us),
-        snapshot.proxy.as_ref().map(|p| p.ts_us),
-    ]
-    .into_iter()
-    .flatten()
-    .max();
-    match newest {
+    match newest_health_tick_us(snapshot) {
         Some(ts) => format!("updated {}", age_str(ts, now_us)),
         None => "no data".to_string(),
     }
@@ -787,24 +800,27 @@ fn freshness_line(snapshot: &StatusSnapshot, now_us: i64) -> String {
 mod tests {
     use super::*;
 
-    /// The states the header can name, kept apart: offline says nothing,
-    /// paused outranks the tier, the tier is named in both directions, and a
-    /// snapshot with no verdict says so in front of the tier — an empty
-    /// snapshot is exactly that (realm net-observer, node #88).
+    /// The header renders the shared [`State`] the menu-bar dot is drawn
+    /// from, and the words keep the states apart: offline says nothing (the
+    /// warning glyph carries it), a bad answer and a stale daemon say so, paused
+    /// outranks the tier, the tier is named in both directions, and a snapshot
+    /// with no verdict says why in the tooltip's own words
+    /// (realm net-observer, node #88).
     #[test]
-    fn header_sub_label_keeps_paused_and_passive_apart() {
-        let snap = |observing: bool, probing: ProbingTier| StatusSnapshot {
-            observing,
+    fn header_sub_label_renders_each_state() {
+        let snap = |probing: ProbingTier| StatusSnapshot {
             probing,
             ..StatusSnapshot::default()
         };
-        // A verdict to show: gw OK + tun 204.
-        let with_verdict = |observing: bool, probing: ProbingTier| StatusSnapshot {
+        let passive = snap(ProbingTier::Passive);
+        let active = snap(ProbingTier::Active);
+        // A `SKIP` link tick under the active tier: no verdict, a different why.
+        let active_skip = StatusSnapshot {
             link: Some(types::LinkSample {
                 ts_us: 1,
-                gw: types::GwVerdict::Ok,
+                gw: types::GwVerdict::Skip,
                 gw_rtt_ms: None,
-                direct: types::TcpVerdict::Ok,
+                direct: types::TcpVerdict::Skip,
                 direct_rtt_ms: None,
                 dhcp_router: None,
                 dhcp_dns: None,
@@ -822,48 +838,81 @@ mod tests {
                 fakeip_route_if: None,
                 singbox_tun_if: None,
             }),
-            proxy: Some(types::ProxySample {
-                ts_us: 1,
-                server_ip: "1.2.3.4".into(),
-                tcp: types::TcpVerdict::Ok,
-                rtt_ms: None,
-                tun_code: Some(204),
-                selector: None,
-                est_direct_alive: None,
-                est_direct_age_s: None,
-                est_tun_alive: None,
-                est_tun_age_s: None,
-                urltest_ms: None,
-                urltest_at_us: None,
-                urltest_node: None,
-                urltest_absent_since_us: None,
-            }),
-            ..snap(observing, probing)
+            ..snap(ProbingTier::Active)
         };
+
         assert_eq!(
-            header_sub_label(false, &snap(true, ProbingTier::Passive)),
+            header_sub_label(&State::Offline("gone".into()), &passive),
             None
         );
         assert_eq!(
-            header_sub_label(true, &snap(false, ProbingTier::Active)),
+            header_sub_label(&State::BadAnswer("bad frame".into()), &passive).as_deref(),
+            Some("answer failed")
+        );
+        assert_eq!(
+            header_sub_label(&State::Paused, &active).as_deref(),
             Some("paused")
         );
         assert_eq!(
-            header_sub_label(true, &with_verdict(true, ProbingTier::Passive)),
+            header_sub_label(&State::Stale { age_s: 40 }, &active).as_deref(),
+            Some("offline — last tick 40 s ago")
+        );
+        assert_eq!(
+            header_sub_label(&State::Live(Health::Ok), &passive).as_deref(),
             Some("passive")
         );
         assert_eq!(
-            header_sub_label(true, &with_verdict(true, ProbingTier::Active)),
+            header_sub_label(&State::Live(Health::Bad), &active).as_deref(),
             Some("probing")
         );
-        // No verdict at all: the sentence names the gap, then the tier.
+        // No verdict: the reason, in the words the menu-bar tooltip uses.
         assert_eq!(
-            header_sub_label(true, &snap(true, ProbingTier::Passive)),
-            Some("no verdict — probing passive")
+            header_sub_label(&State::Live(Health::NoData), &StatusSnapshot::default()).as_deref(),
+            Some("no verdict — no link or proxy tick yet")
         );
         assert_eq!(
-            header_sub_label(true, &snap(true, ProbingTier::Active)),
-            Some("no verdict — probing")
+            header_sub_label(&State::Live(Health::NoData), &active_skip).as_deref(),
+            Some("no verdict — gateway probe did not run")
+        );
+        let passive_skip = StatusSnapshot {
+            probing: ProbingTier::Passive,
+            ..active_skip
+        };
+        assert_eq!(
+            header_sub_label(&State::Live(Health::NoData), &passive_skip).as_deref(),
+            Some("no verdict — probing passive")
+        );
+    }
+
+    /// The header dot is muted for every state that has nothing live to judge,
+    /// hollow for a live snapshot with no verdict, and coloured only by a live
+    /// verdict (realm net-observer, node #88).
+    #[test]
+    fn header_dot_is_hollow_only_for_a_live_no_verdict() {
+        let theme = Theme::light();
+        for muted in [
+            State::Offline("gone".into()),
+            State::BadAnswer("bad frame".into()),
+            State::Paused,
+            State::Stale { age_s: 40 },
+        ] {
+            assert_eq!(
+                header_dot(&muted, theme),
+                ("\u{25CF}", rgb(theme.muted)),
+                "{muted:?}"
+            );
+        }
+        assert_eq!(
+            header_dot(&State::Live(Health::NoData), theme),
+            ("\u{25CC}", rgb(theme.muted))
+        );
+        assert_eq!(
+            header_dot(&State::Live(Health::Ok), theme),
+            ("\u{25CF}", rgb(theme.ok))
+        );
+        assert_eq!(
+            header_dot(&State::Live(Health::Bad), theme),
+            ("\u{25CF}", rgb(theme.bad))
         );
     }
 

@@ -2,7 +2,8 @@
 //!
 //! An `NSStatusItem` in the system menu bar shows an icon-only health dot derived
 //! from the latest link/proxy tick (green when healthy, red when gw/tun are bad,
-//! white before any data). Clicking it toggles an anchored **gpui** popup (a
+//! hollow while there is no verdict, grey only when the daemon is unreachable or
+//! its ticks have gone stale). Clicking it toggles an anchored **gpui** popup (a
 //! Tailscale-style dropdown, dismissed on click-away) rendering the full
 //! [`StatusSnapshot`](net_observer_ipc::StatusSnapshot): the latest link tick
 //! (gw/direct), the latest proxy tick (tun/selector), and the most recent

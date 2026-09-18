@@ -615,19 +615,28 @@ graph TD
   rendering the full `StatusSnapshot`
   (latest link/proxy tick + recent incidents), re-queried on a ~3s timer; a down
   daemon / absent socket degrades to a graceful "net-observer offline" state.
-  **The dot has four states** (realm net-observer, node #88): **green** when
-  the network is up (gw `OK` and tun `204`), **red** when it is down (gw or tun
-  bad), **hollow** (`◌`, a dotted circle) when the daemon is reachable but has
-  no verdict — the passive tier's `SKIP`, or no tick yet — with the tooltip's
-  first line saying why (`no verdict — probing passive (gw SKIP, tun not
-  probed)`), and **grey** (`⚫`) only when the daemon is unreachable *or stale*:
-  the bar reads every 3 s, and a snapshot whose `generated_us` is more than
-  `STALE_AFTER` = 30 s (two default collector intervals) behind the bar's clock
-  is presented as offline with `last tick <n> s ago`, because a socket that
-  still answers from a pipeline that stopped ticking would otherwise keep a green
-  dot lit. A paused daemon (`⏸`) outranks staleness — it stops ticking by design
-  — and a daemon that has never ticked is hollow, not grey. The whole table is
-  one pure function (`status::presentation`), tested without a GUI. The
+  **The health dot has four states** (realm net-observer, node #88): **green**
+  when the network is up (gw `OK` and tun `204`), **red** when it is down (gw
+  or tun bad), **hollow** (`◌`, a dotted circle) when the daemon is reachable
+  but has no verdict — the passive tier's `SKIP`, or no tick yet — with the
+  tooltip's first line saying why (`no verdict — probing passive (gw SKIP, tun
+  not probed)`), and **grey** (`⚫`) only when the daemon is unreachable *or
+  stale*; `⏸` (paused) and `⚠` (reachable, but its answer was unusable) sit
+  above it. Staleness is the age of the health inputs themselves, not of the
+  snapshot: the bar reads every 3 s, and when the newer of the link and proxy
+  ticks is more than `STALE_AFTER` = 30 s (two default collector intervals)
+  behind the bar's clock the dot is presented as offline with `last tick <n> s
+  ago`, because a socket that still answers from link/proxy collectors that
+  stopped ticking would otherwise keep a green dot lit — and `generated_us`
+  would not catch it, since every sample kind bumps it. The bar's own sighting
+  of a resume (`observing` flipping back on in a read it applied) counts as a
+  tick, so a daemon just told to collect is not grey for the interval its
+  collectors need to produce the first sample; a paused daemon outranks
+  staleness — it stops ticking by design — and a snapshot with neither a link
+  nor a proxy tick is hollow, not grey. The state is decided once
+  (`status::state`, pure, tested without a GUI) and rendered twice: the
+  menu-bar glyph and tooltip (`status::presentation`) and the panel header's
+  dot and label, so the two can never disagree. The
   popup is a **Tailscale-style** panel: it reads the window's
   `WindowAppearance` and picks a LIGHT or DARK token set (never hardcoded dark),
   laid out as a clean list — a header row with the app name and an

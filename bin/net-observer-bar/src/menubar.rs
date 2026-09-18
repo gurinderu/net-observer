@@ -208,13 +208,9 @@ pub fn run(config: Option<String>, start: Option<crate::StartWindow>) {
                     let fresh = read_fresh(&socket_path);
                     let updated = acx.update(|app| {
                         model.update(app, |g, cx| {
-                            match fresh {
-                                Ok(s) => {
-                                    g.snapshot = s;
-                                    g.error = None;
-                                }
-                                Err(e) => g.error = Some(e),
-                            }
+                            // The one apply path: it also stamps a resume this
+                            // read is the first to show (`resume_seen_us`).
+                            g.apply_read(fresh, now_us());
                             // One tick = one sparkline column. Recorded here and
                             // only here, so the panel's history keeps the REFRESH
                             // cadence (see `Glance::record_tick`).
@@ -288,10 +284,17 @@ pub fn run(config: Option<String>, start: Option<crate::StartWindow>) {
 /// The menu-bar title is a single glyph, no text (Tailscale-style); the verbose
 /// detail lives in the hover tooltip. Which glyph and which tooltip is decided
 /// by the pure [`presentation`] — offline, bad answer, paused, stale, or the
-/// live health dot — against the bar's clock, so the state table is tested
-/// without a GUI; this shell only copies the decision onto the button.
+/// live health dot — against the bar's clock and its last resume sighting, so
+/// the state table is tested without a GUI; this shell only copies the
+/// decision onto the button. The panel header renders the same decision
+/// (`crate::status::state`), so the two never disagree.
 fn apply_glyph(button: &NSStatusBarButton, glance: &Glance) {
-    let shown = presentation(glance.error.as_ref(), &glance.snapshot, now_us());
+    let shown = presentation(
+        glance.error.as_ref(),
+        &glance.snapshot,
+        glance.resume_seen_us,
+        now_us(),
+    );
     button.setTitle(&NSString::from_str(shown.glyph));
     button.setToolTip(Some(&NSString::from_str(&shown.tooltip())));
 }
