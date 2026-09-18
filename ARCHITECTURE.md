@@ -1019,8 +1019,9 @@ the durable record; the socket is the live, low-latency read path.
     `tokio::task::spawn_blocking`, never on the runtime — and at most **one at
     a time** (`api::MAX_QUERIES_IN_FLIGHT`, a one-permit `Semaphore` claimed
     with `try_acquire`): a diagnosis holds the store mutex the pipeline writes
-    through, and on a world-connectable socket a queue of them would be a stall
-    any local process could inflict, so a second concurrent `Query` is refused
+    through, and on a group-connectable socket (`0660 root:staff` by default) a
+    queue of them would be a stall any of the console user's processes could
+    inflict, so a second concurrent `Query` is refused
     at once with `Response::Error("a diagnosis is already running; retry")`
     (`api::QUERY_BUSY`) rather than queued. Not a per-peer rate limit — a
     deliberate non-goal. The one run is itself **bounded**: the daemon interrupts
@@ -1114,11 +1115,12 @@ the durable record; the socket is the live, low-latency read path.
   the `ControlPolicy`, the `observing` flag and `resume_at_us`, the snapshot, the
   store and the event bus) is bundled into one `ApiServer` the accept loop clones
   a single `Arc` of per connection. On start it removes any stale socket file,
-  binds `cfg.socket_path`, `chmod`s it to `cfg.socket_mode` so the unprivileged
-  bar can connect to the root-owned socket, and — when `cfg.socket_owner_uid` is
-  set — `chown`s it to that uid (control-path hardening; see
+  binds `cfg.socket_path`, `chmod`s it to `cfg.socket_mode` and `chown`s it to
+  `cfg.socket_gid` (`staff` by default) so the unprivileged bar can connect to
+  the root-owned socket through the group bits — and to `cfg.socket_owner_uid`
+  when that is set (control-path hardening; see
   [Control path](#control-path)). One task per connection: read one `Request`,
-  bounded in the three dimensions a world-connectable socket can be attacked in —
+  bounded in the three dimensions a group-connectable socket can be attacked in —
   **bytes** (`MAX_REQUEST_BYTES` = 64 KiB, so a client cannot grow daemon memory by
   never terminating its frame), **time** (`REQUEST_READ_TIMEOUT` = 10 s over the
   *whole* initial read, so a byte-per-second drip cannot extend it and a silent
@@ -1784,12 +1786,24 @@ depth on top of it, worth setting wherever the control path is used (see
 
 **Who can read the record.** Addresses stay raw in the record and on the
 socket — forensics needs them — and what narrows is who can read them: root
-and the console user's group (realm net-observer, node #110). The daemon runs
-under `umask 027`, so every file it creates is born group-readable and
-world-nothing. The socket is `0660 root:staff` (`socket_mode`, `socket_gid`);
-the record and its write-ahead log are `0640 root:staff` (`record_mode`,
-`record_gid`), and the record's directory carries the same group plus the
-setgid bit so the WAL DuckDB re-creates after every checkpoint inherits it —
-all set once at startup, each step a warning and never fatal if it fails. The
-blob directory and the pcap ring stay root's. The daemon's log file is
-launchd's, written by the job definition in `nix-config`, not by this daemon.
+and the console user's group, for everything the daemon writes (realm
+net-observer, node #110). The daemon runs under `umask 027`, so every file it
+creates is born group-readable and world-nothing. The socket is `0660
+root:staff` (`socket_mode`, `socket_gid`). The record and its write-ahead log
+are `0640 root:staff` (`record_mode`, `record_gid`), and the record's
+directory carries the same group plus the setgid bit — on macOS a new file
+takes its directory's group regardless of the bit, and the bit makes Linux do
+the same — so a WAL DuckDB re-creates after a later checkpoint is born in that
+group; its *mode* then comes from the umask (`0666 & ~027` = `0640`), not from
+`record_mode`, which is enforced on the files present at startup. The blob
+tree follows the record from this build on: `blob_dir` and `blob_dir/ring`
+take the same group and bit, and every pcap freeze — what the operator opens
+after an incident — is given `record_gid` and `record_mode` outright as it is
+copied (`macos::FreezeAccess`); the ring files are read only by that copy,
+which runs as root, and freezes made before this build keep their bits. All of
+it is set at startup or at the freeze, each step a warning and never fatal if
+it fails. The daemon's log file is launchd's, opened before the program runs:
+`nix/darwin-module.nix` names it (`logFile`, the job's `StandardOutPath` /
+`StandardErrorPath`) and its activation script creates it if absent and keeps
+it `0640 root:staff` — the same script that keeps `/var/lib/observer` at
+`2755 root:staff` across a `darwin-rebuild switch`.
