@@ -29,7 +29,8 @@
 //! re-renders) and the status-item dot + tooltip. When the daemon is down the
 //! query fails and the shell renders a grey "offline" dot instead of crashing;
 //! a daemon that answers but has stopped ticking gets the same grey dot once
-//! its snapshot is older than [`crate::status::STALE_AFTER`].
+//! the newer of its link and proxy ticks — or the bar's last sighting of a
+//! resume, whichever is later — is older than [`crate::status::STALE_AFTER`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

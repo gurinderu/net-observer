@@ -10,7 +10,7 @@ use gpui::{
 use net_observer_ipc::{IncidentSummary, StatusSnapshot};
 use types::ProbingTier;
 
-use crate::status::{Health, State, newest_health_tick_us, no_verdict_reason};
+use crate::status::{Health, State, newest_health_tick_us};
 
 use super::control::{GlanceError, toggle_round_trip};
 use super::model::{Glance, HistoryPoint};
@@ -60,14 +60,10 @@ impl Render for PanelView {
             Some(GlanceError::Protocol(m)) => (None, Some(m.clone())),
             None => (None, None),
         };
-        // The same decision the menu-bar dot is drawn from, so the header and
-        // the status item can never disagree (realm net-observer, node #88).
-        let state = crate::status::state(
-            glance.error.as_ref(),
-            &snapshot,
-            glance.resume_seen_us,
-            now_us,
-        );
+        // The same decision the menu-bar dot and the sparkline ring are drawn
+        // from, so the header can never disagree with either
+        // (realm net-observer, node #88).
+        let state = glance.state(now_us);
 
         div()
             .flex()
@@ -156,10 +152,18 @@ fn header_row(
 ) -> impl IntoElement {
     let (dot, dot_color) = header_dot(state, theme);
 
+    // The left group takes the row's leftover width and may shrink to nothing
+    // (`flex_1` + `min_w_0`), so the controls after it are laid out from the
+    // right edge inwards and never pushed past it — whatever the label says.
+    // Without `min_w_0` a flex item refuses to shrink below its content, and a
+    // label once grew the group past the 320 px panel; the containment test
+    // in `ui::headless_tests` is what caught it.
     let mut left = div()
         .flex()
         .items_center()
         .gap_2()
+        .flex_1()
+        .min_w_0()
         .child(div().text_color(dot_color).text_size(px(10.0)).child(dot))
         .child(
             div()
@@ -169,9 +173,18 @@ fn header_row(
         );
     // A muted state label after the name, only while the daemon is up. Offline
     // is conveyed by a warning glyph next to the (disabled) toggle — no text.
+    // The label is the one line that may be shortened: it fills what the name
+    // leaves, and is cut with an ellipsis rather than allowed to widen the row
+    // (taffy sizes an `overflow_hidden` flex item by its basis, which `flex_1`
+    // makes zero, so the label contributes nothing to the row's minimum).
     if let Some(label) = header_sub_label(state, snapshot) {
         left = left.child(
             div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
                 .text_size(px(11.0))
                 .text_color(rgb(theme.muted))
                 .child(label),
@@ -184,7 +197,6 @@ fn header_row(
         .px_3()
         .py_2p5()
         .child(left)
-        .child(div().flex_1())
         // Offline: a warning glyph with a tooltip, next to the (disabled) toggle.
         .children(offline.map(|reason| warn_offline(reason, theme)))
         // ON only if actually observing AND connected; interactive only online.
@@ -206,21 +218,23 @@ fn header_row(
 /// the tier — and the tier is always named, because "passive" is the
 /// daemon's default and an operator reading the panel must see whether the
 /// wire is silent. When there is no verdict to show ([`Health::NoData`]) the
-/// label says so and why, in the words the menu-bar tooltip uses
-/// ([`no_verdict_reason`]) — `no verdict — probing passive` — so the hollow
-/// header dot is explained where it sits; a stale daemon reads `offline —
-/// last tick <n> s ago`, as the menu-bar tooltip does (realm net-observer,
-/// node #88). Pure over its inputs, so the wording is a testable fact.
-fn header_sub_label(state: &State, snapshot: &StatusSnapshot) -> Option<String> {
+/// label says `no verdict`, so the hollow header dot is named where it sits; a
+/// stale daemon reads `offline`, as the menu-bar dot does (realm net-observer,
+/// node #88). Every label is a word or two on purpose: the header is 320 px
+/// wide and the toggle sits at its right edge, so the *reasons* — why there is
+/// no verdict, how old the last tick is — stay in the menu-bar tooltip
+/// (`status::presentation`) and the footer's date line. Pure over its inputs,
+/// so the wording is a testable fact.
+fn header_sub_label(state: &State, snapshot: &StatusSnapshot) -> Option<&'static str> {
     Some(match state {
         State::Offline(_) => return None,
-        State::BadAnswer(_) => "answer failed".to_string(),
-        State::Paused => "paused".to_string(),
-        State::Stale { age_s } => format!("offline — last tick {age_s} s ago"),
-        State::Live(Health::NoData) => format!("no verdict — {}", no_verdict_reason(snapshot)),
+        State::BadAnswer(_) => "answer failed",
+        State::Paused => "paused",
+        State::Stale { .. } => "offline",
+        State::Live(Health::NoData) => "no verdict",
         State::Live(Health::Ok | Health::Bad) => match snapshot.probing {
-            ProbingTier::Passive => "passive".to_string(),
-            ProbingTier::Active => "probing".to_string(),
+            ProbingTier::Passive => "passive",
+            ProbingTier::Active => "probing",
         },
     })
 }
@@ -801,87 +815,67 @@ mod tests {
     use super::*;
 
     /// The header renders the shared [`State`] the menu-bar dot is drawn
-    /// from, and the words keep the states apart: offline says nothing (the
-    /// warning glyph carries it), a bad answer and a stale daemon say so, paused
-    /// outranks the tier, the tier is named in both directions, and a snapshot
-    /// with no verdict says why in the tooltip's own words
-    /// (realm net-observer, node #88).
+    /// from, in a word or two per state: offline says nothing (the warning
+    /// glyph carries it), a bad answer and a stale daemon say so, paused
+    /// outranks the tier, the tier is named in both directions, and no verdict
+    /// is named without its reason — that stays in the menu-bar tooltip, so
+    /// the label never grows past the 320 px header (realm net-observer,
+    /// node #88).
     #[test]
-    fn header_sub_label_renders_each_state() {
+    fn header_sub_label_renders_each_state_in_a_word_or_two() {
         let snap = |probing: ProbingTier| StatusSnapshot {
             probing,
             ..StatusSnapshot::default()
         };
         let passive = snap(ProbingTier::Passive);
         let active = snap(ProbingTier::Active);
-        // A `SKIP` link tick under the active tier: no verdict, a different why.
-        let active_skip = StatusSnapshot {
-            link: Some(types::LinkSample {
-                ts_us: 1,
-                gw: types::GwVerdict::Skip,
-                gw_rtt_ms: None,
-                direct: types::TcpVerdict::Skip,
-                direct_rtt_ms: None,
-                dhcp_router: None,
-                dhcp_dns: None,
-                gw_arp_mac: None,
-                ssid: None,
-                bssid: None,
-                if_mac: None,
-                medium: None,
-                lease_start_us: None,
-                lease_secs: None,
-                if_mac_private: None,
-                wifi_capture_present: false,
-                lan_probed: None,
-                lan_alive: None,
-                fakeip_route_if: None,
-                singbox_tun_if: None,
-            }),
-            ..snap(ProbingTier::Active)
-        };
 
         assert_eq!(
             header_sub_label(&State::Offline("gone".into()), &passive),
             None
         );
         assert_eq!(
-            header_sub_label(&State::BadAnswer("bad frame".into()), &passive).as_deref(),
+            header_sub_label(&State::BadAnswer("bad frame".into()), &passive),
             Some("answer failed")
         );
+        assert_eq!(header_sub_label(&State::Paused, &active), Some("paused"));
         assert_eq!(
-            header_sub_label(&State::Paused, &active).as_deref(),
-            Some("paused")
+            header_sub_label(&State::Stale { age_s: 40 }, &active),
+            Some("offline")
         );
         assert_eq!(
-            header_sub_label(&State::Stale { age_s: 40 }, &active).as_deref(),
-            Some("offline — last tick 40 s ago")
-        );
-        assert_eq!(
-            header_sub_label(&State::Live(Health::Ok), &passive).as_deref(),
+            header_sub_label(&State::Live(Health::Ok), &passive),
             Some("passive")
         );
         assert_eq!(
-            header_sub_label(&State::Live(Health::Bad), &active).as_deref(),
+            header_sub_label(&State::Live(Health::Bad), &active),
             Some("probing")
         );
-        // No verdict: the reason, in the words the menu-bar tooltip uses.
+        // No verdict is the same two words under either tier: the why is the
+        // tooltip's, not the header's.
         assert_eq!(
-            header_sub_label(&State::Live(Health::NoData), &StatusSnapshot::default()).as_deref(),
-            Some("no verdict — no link or proxy tick yet")
+            header_sub_label(&State::Live(Health::NoData), &passive),
+            Some("no verdict")
         );
         assert_eq!(
-            header_sub_label(&State::Live(Health::NoData), &active_skip).as_deref(),
-            Some("no verdict — gateway probe did not run")
+            header_sub_label(&State::Live(Health::NoData), &active),
+            Some("no verdict")
         );
-        let passive_skip = StatusSnapshot {
-            probing: ProbingTier::Passive,
-            ..active_skip
-        };
-        assert_eq!(
-            header_sub_label(&State::Live(Health::NoData), &passive_skip).as_deref(),
-            Some("no verdict — probing passive")
-        );
+        // Every label fits a header whose toggle sits at the right edge.
+        for state in [
+            State::BadAnswer("bad frame".into()),
+            State::Paused,
+            State::Stale { age_s: 40 },
+            State::Live(Health::NoData),
+            State::Live(Health::Ok),
+            State::Live(Health::Bad),
+        ] {
+            let label = header_sub_label(&state, &passive).expect("a label");
+            assert!(
+                label.chars().count() <= 13,
+                "{state:?}: `{label}` is longer than the header can afford"
+            );
+        }
     }
 
     /// The header dot is muted for every state that has nothing live to judge,

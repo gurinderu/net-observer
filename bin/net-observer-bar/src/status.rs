@@ -29,11 +29,11 @@ use crate::ui::GlanceError;
 /// clock the daemon stamps its samples with, since both run on this Mac.
 pub const STALE_AFTER: Duration = Duration::from_secs(30);
 
-/// Why a snapshot carries no verdict — the words both the tooltip's headline
-/// and the panel header's label put after `no verdict —`, so the two never
-/// explain the same hollow dot differently. Meaningful for a
-/// [`Health::NoData`] snapshot; for any other it names what *would* be the
-/// reason, which no caller shows.
+/// Why a snapshot carries no verdict — the words the tooltip's headline puts
+/// after `no verdict —`. The panel header says only `no verdict` (its label
+/// must fit a 320 px row with the toggle at the edge), so the reason lives
+/// here alone. Meaningful for a [`Health::NoData`] snapshot; for any other it
+/// names what *would* be the reason, which no caller shows.
 ///
 /// - `no link or proxy tick yet` — nothing has arrived at all,
 /// - `probing passive` — the passive tier withheld the gateway echo,

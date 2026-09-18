@@ -634,9 +634,12 @@ graph TD
   collectors need to produce the first sample; a paused daemon outranks
   staleness — it stops ticking by design — and a snapshot with neither a link
   nor a proxy tick is hollow, not grey. The state is decided once
-  (`status::state`, pure, tested without a GUI) and rendered twice: the
-  menu-bar glyph and tooltip (`status::presentation`) and the panel header's
-  dot and label, so the two can never disagree. The
+  (`status::state`, pure, tested without a GUI) and read three times: the
+  menu-bar glyph and tooltip (`status::presentation`), the panel header's dot
+  and one-or-two-word label (the *reasons* stay in the tooltip, so the label
+  can never push the toggle out of the 320 px header), and the sparkline ring,
+  which records a gap for every state but live — a stale daemon's last reply
+  time is not replotted every 3 s as a flat line. The
   popup is a **Tailscale-style** panel: it reads the window's
   `WindowAppearance` and picks a LIGHT or DARK token set (never hardcoded dark),
   laid out as a clean list — a header row with the app name and an
@@ -661,7 +664,7 @@ graph TD
   that 120 one-pixel columns fit the 320pt panel without downsampling, so every
   point drawn is a point measured. Both fields are `Option`, and a tick that
   measured nothing — no sample yet, a paused daemon, the passive tier (`gw =
-  SKIP`), a failed or absent gateway, an unreachable daemon — renders as an **empty
+  SKIP`), a failed or absent gateway, an unreachable, stale or badly-answering daemon — renders as an **empty
   column**, never a zero-height bar on the baseline: plotting a missing
   measurement as a value on the floor is the same lie `SKIP` exists to prevent.
   The plot is a row of thin `div`s (gpui 0.2.2 has no chart primitive) with a

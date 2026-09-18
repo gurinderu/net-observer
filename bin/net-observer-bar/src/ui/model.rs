@@ -6,6 +6,7 @@ use net_observer_ipc::{ControlResult, StatusSnapshot};
 
 use super::control::{GlanceError, read_fresh};
 use super::parts::now_us;
+use crate::status::{self, State};
 
 /// How many refresh ticks the panel's own sparkline history keeps.
 ///
@@ -29,8 +30,9 @@ pub const HISTORY_LEN: usize = 120;
 ///
 /// Both fields are `Option` on purpose. A tick where the measurement did not
 /// happen — no sample yet, a paused daemon, the passive tier (`gw = SKIP`), a
-/// gateway that failed or is absent, or an unreachable daemon — is a **gap**, and a gap is
-/// not a zero. Plotting a missing measurement as a value on the floor is the same
+/// gateway that failed or is absent, an unreachable, stale or badly-answering
+/// daemon — is a **gap**, and a gap is not a zero. Plotting a missing
+/// measurement as a value on the floor is the same
 /// lie the `SKIP` verdict exists to prevent (see `AGENTS.md`, "SKIP, never
 /// silence"): it would draw a flat healthy-looking 0ms line for a gateway that was
 /// never asked.
@@ -44,12 +46,17 @@ pub struct HistoryPoint {
 
 /// Reduce a snapshot to the one plottable point for this tick.
 ///
-/// Pure over its inputs, so the gap rules above are directly testable. `online` is
-/// [`Glance::online`]: an unreachable daemon measured nothing, whatever the stale
-/// snapshot still says.
-pub fn history_point(snapshot: &StatusSnapshot, online: bool) -> HistoryPoint {
-    if !online || !snapshot.observing {
-        // Offline or paused: collection is not running. Nothing was measured.
+/// Pure over its inputs, so the gap rules above are directly testable. `state`
+/// is the status item's [`State`] for this tick ([`Glance::state`]): only a
+/// [`State::Live`] snapshot is measured. An unreachable daemon measured
+/// nothing, whatever the retained snapshot still says; a paused one collects
+/// nothing; a stale one has stopped measuring, and replotting its last sample
+/// every tick would draw the flat healthy line the gap exists to prevent; and
+/// a read whose answer could not be used brought no new sample either
+/// (realm net-observer, node #88).
+pub fn history_point(snapshot: &StatusSnapshot, state: &State) -> HistoryPoint {
+    if !matches!(state, State::Live(_)) {
+        // Nothing was measured this tick.
         return HistoryPoint::default();
     }
     let gw_rtt_ms = snapshot.link.as_ref().and_then(|l| match l.gw {
@@ -159,8 +166,21 @@ impl Glance {
         if self.history.len() == HISTORY_LEN {
             self.history.pop_front();
         }
+        let state = self.state(now_us());
         self.history
-            .push_back(history_point(&self.snapshot, self.online()));
+            .push_back(history_point(&self.snapshot, &state));
+    }
+
+    /// The status item's [`State`] for this model at `now_us` — the one
+    /// decision the menu-bar dot, the panel header and the sparkline ring are
+    /// all drawn from (see `status::state`).
+    pub fn state(&self, now_us: i64) -> State {
+        status::state(
+            self.error.as_ref(),
+            &self.snapshot,
+            self.resume_seen_us,
+            now_us,
+        )
     }
 
     /// Apply the outcome of a read of the daemon — the one way every path that
@@ -298,9 +318,10 @@ mod tests {
     /// as `None`, never as a value on the floor.
     #[test]
     fn unmeasured_ticks_stay_gaps() {
+        let live_ok = State::Live(crate::status::Health::Ok);
         // No sample at all.
         let empty = StatusSnapshot::default();
-        assert_eq!(history_point(&empty, true), HistoryPoint::default());
+        assert_eq!(history_point(&empty, &live_ok), HistoryPoint::default());
 
         // Gateway verdicts that carry no measured reply time. SKIP is the
         // passive tier: the echo was deliberately never sent.
@@ -315,7 +336,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                history_point(&s, true).gw_rtt_ms,
+                history_point(&s, &live_ok).gw_rtt_ms,
                 None,
                 "{gw} must be a gap, not a plotted value"
             );
@@ -326,10 +347,13 @@ mod tests {
             link: Some(link(types::GwVerdict::Ok, None)),
             ..Default::default()
         };
-        assert_eq!(history_point(&s, true).gw_rtt_ms, None);
+        assert_eq!(history_point(&s, &live_ok).gw_rtt_ms, None);
 
-        // A paused daemon collects nothing, however healthy the retained snapshot
-        // looks; and an unreachable daemon measured nothing at all.
+        // Only a live tick is measured: a paused daemon collects nothing,
+        // however healthy the retained snapshot looks; an unreachable one
+        // measured nothing at all; a stale one has stopped measuring, so its
+        // last sample is not replotted as a flat line under an "offline"
+        // header; and an unusable answer brought no sample.
         let live = StatusSnapshot {
             link: Some(link(types::GwVerdict::Ok, Some(12.0))),
             host: Some(types::HostSample {
@@ -344,17 +368,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            history_point(&live, true),
+            history_point(&live, &live_ok),
             HistoryPoint {
                 gw_rtt_ms: Some(12.0),
                 load1: Some(3.0)
             },
             "a live, observing daemon plots both series"
         );
-        let mut paused = live.clone();
-        paused.observing = false;
-        assert_eq!(history_point(&paused, true), HistoryPoint::default());
-        assert_eq!(history_point(&live, false), HistoryPoint::default());
+        for unmeasured in [
+            State::Paused,
+            State::Offline("no socket".into()),
+            State::Stale { age_s: 40 },
+            State::BadAnswer("bad frame".into()),
+        ] {
+            assert_eq!(
+                history_point(&live, &unmeasured),
+                HistoryPoint::default(),
+                "{unmeasured:?} measured nothing this tick"
+            );
+        }
     }
 
     /// The bar's own reachability, not the stale snapshot, decides: a `Glance`
@@ -366,6 +398,27 @@ mod tests {
         g.error = Some(GlanceError::Unreachable("no socket".into()));
         g.record_tick();
         assert_eq!(g.history.back().copied(), Some(HistoryPoint::default()));
+    }
+
+    /// A daemon that answers but whose link tick has gone stale records a gap
+    /// too — its last reply time is not replotted every 3 s as a flat line
+    /// under an "offline" header — while the same tick, fresh, is plotted
+    /// (realm net-observer, node #88). The fixture's link is stamped one
+    /// second after the epoch, which is stale against any real clock.
+    #[test]
+    fn stale_glance_records_a_gap() {
+        let mut g = glance();
+        g.snapshot.link = Some(link(types::GwVerdict::Ok, Some(99.0)));
+        assert!(matches!(g.state(now_us()), State::Stale { .. }));
+        g.record_tick();
+        assert_eq!(g.history.back().copied(), Some(HistoryPoint::default()));
+
+        g.snapshot.link = Some(types::LinkSample {
+            ts_us: now_us(),
+            ..link(types::GwVerdict::Ok, Some(99.0))
+        });
+        g.record_tick();
+        assert_eq!(g.history.back().and_then(|p| p.gw_rtt_ms), Some(99.0));
     }
 
     /// A protocol failure must NOT read as offline: the daemon answered, so the
