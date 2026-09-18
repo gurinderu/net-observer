@@ -1700,10 +1700,37 @@ fn humanize_lasted(opened_us: i64, closed_us: Option<i64>) -> String {
     }
 }
 
-/// Render a generic query result as a [`new_table`]. A column right-aligns
-/// when every one of its cells parses as a number — simple enough to need no
-/// per-diagnosis annotation; an empty table (no rows) stays left-aligned,
-/// since there is nothing to align by.
+/// Whether a cell counts as "no measurement" for [`column_is_numeric`],
+/// rather than as a number: empty (a `SKIP` tick's withheld field — see
+/// "SKIP, never silence" in AGENTS.md) or `-` (the placeholder
+/// `format_status` prints for a value never measured at all). Neither should
+/// flip a column of real numbers to left-alignment, since the diagnosis
+/// tables routinely mix numeric rows with SKIP/gap rows.
+fn is_blank_cell(c: &str) -> bool {
+    let c = c.trim();
+    c.is_empty() || c == "-"
+}
+
+/// Whether column `i` of `table` should right-align in [`format_table`]:
+/// every NON-blank cell ([`is_blank_cell`]) parses as a number AND at least
+/// one cell actually has a value. A column blank throughout (nothing to
+/// align by) or genuinely non-numeric stays left-aligned. Pure over the
+/// table so the rule is unit-tested directly, without parsing alignment back
+/// out of comfy-table's rendered box.
+fn column_is_numeric(table: &Table, i: usize) -> bool {
+    let mut any_value = false;
+    table.rows.iter().all(|r| match r.get(i) {
+        None => true,
+        Some(c) if is_blank_cell(c) => true,
+        Some(c) => {
+            any_value = true;
+            c.trim().parse::<f64>().is_ok()
+        }
+    }) && any_value
+}
+
+/// Render a generic query result as a [`new_table`]. See [`column_is_numeric`]
+/// for which columns right-align.
 fn format_table(table: &Table) -> String {
     let mut t = new_table();
     t.set_header(table.columns.clone());
@@ -1711,12 +1738,7 @@ fn format_table(table: &Table) -> String {
         t.add_row(row.clone());
     }
     for i in 0..table.columns.len() {
-        let numeric = !table.rows.is_empty()
-            && table
-                .rows
-                .iter()
-                .all(|r| r.get(i).is_some_and(|c| c.trim().parse::<f64>().is_ok()));
-        if !numeric {
+        if !column_is_numeric(table, i) {
             continue;
         }
         if let Some(col) = t.column_mut(i) {
@@ -1979,6 +2001,48 @@ mod tests {
         let out = format_table(&table);
         assert!(out.contains("ts_us") && out.contains("gw"));
         assert!(out.contains("42") && out.contains("OK"));
+    }
+
+    /// A column mixing real numbers with a SKIP tick's withheld cell (`""`)
+    /// and the "never measured" placeholder (`-`) still right-aligns: the
+    /// diagnosis tables routinely mix numeric rows with SKIP/gap rows, and
+    /// neither blank shape should flip the whole column to left-alignment.
+    /// A column that is blank throughout has nothing to align by, so it
+    /// stays left-aligned; a column with a genuinely non-numeric value
+    /// anywhere is not numeric either.
+    #[test]
+    fn column_is_numeric_ignores_blanks_but_needs_at_least_one_value() {
+        let mixed = Table {
+            columns: vec!["n".into()],
+            rows: vec![
+                vec!["1".into()],
+                vec!["".into()],
+                vec!["-".into()],
+                vec!["2.5".into()],
+            ],
+        };
+        assert!(
+            column_is_numeric(&mixed, 0),
+            "numbers plus blanks: {mixed:?}"
+        );
+
+        let all_blank = Table {
+            columns: vec!["n".into()],
+            rows: vec![vec!["".into()], vec!["-".into()]],
+        };
+        assert!(
+            !column_is_numeric(&all_blank, 0),
+            "nothing to align by: {all_blank:?}"
+        );
+
+        let mixed_text = Table {
+            columns: vec!["n".into()],
+            rows: vec![vec!["1".into()], vec!["www.google.com".into()]],
+        };
+        assert!(
+            !column_is_numeric(&mixed_text, 0),
+            "one non-numeric cell rules out the column: {mixed_text:?}"
+        );
     }
 
     /// An explicit `--db` means the operator named the record: the socket is
