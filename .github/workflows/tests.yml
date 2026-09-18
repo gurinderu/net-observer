@@ -25,7 +25,7 @@ jobs:
     # take several minutes on a cold cache.
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # rustup reads rust-toolchain.toml and installs the pinned channel.
       - name: Install toolchain

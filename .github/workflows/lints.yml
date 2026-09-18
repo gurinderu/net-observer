@@ -16,7 +16,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # rustup reads rust-toolchain.toml and installs the pinned channel with
       # the rustfmt + clippy components it declares.

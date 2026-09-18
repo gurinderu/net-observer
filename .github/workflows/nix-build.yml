@@ -48,7 +48,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # v31 enables the flakes and nix-command experimental features by
       # default, so no extra_nix_config is needed here.
@@ -106,7 +106,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
       # The same binary cache as the daemon job (realm net-observer, node #133).
@@ -141,7 +141,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
       # The same binary cache as the daemon job (realm net-observer, node #133).
