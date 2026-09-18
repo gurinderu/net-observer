@@ -41,7 +41,7 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::time::Duration;
 use store::{DuckdbStore, QueryTable, Store as _, diagnosis};
-use types::{ConnectionsGroupBy, ProbingTier};
+use types::{ConnectionScope, ConnectionsGroupBy, ProbingTier};
 
 /// The `load1` above which a dead tun reads as host starvation rather than a
 /// proxy wedge. The CLI reads the record with the same threshold the daemon
@@ -269,11 +269,22 @@ enum Command {
     /// shows is a fakeip. A tick on which the API did not answer is one row
     /// saying SKIP, never an empty table. Asks the running daemon first,
     /// reads the DB file only when no daemon answers.
+    ///
+    /// Shows the external flows only by default — the internal ones (every
+    /// app's DNS query to sing-box's own listener is a flow) and the LAN
+    /// ones are counted on a last line instead of listed; `--all` lists
+    /// everything with its scope, `--scope` picks one.
     Connections {
         /// Group the flows by the name asked for, the destination address,
         /// address and port, or the client process.
         #[arg(long, value_enum, default_value_t = GroupByArg::Host)]
         by: GroupByArg,
+        /// List every flow whatever its scope, with a `scope` column.
+        #[arg(long, conflicts_with = "scope")]
+        all: bool,
+        /// List the flows of one scope only (default: external).
+        #[arg(long, value_enum)]
+        scope: Option<ScopeArg>,
     },
     /// The latest slice of the radio environment: every foreign access point
     /// the last scan heard, with its channel, band, width, signal and noise,
@@ -412,6 +423,107 @@ impl GroupByArg {
             GroupByArg::IpPort => ConnectionsGroupBy::IpPort,
             GroupByArg::Process => ConnectionsGroupBy::Process,
         }
+    }
+}
+
+/// The scope accepted by `connections --scope`. A thin CLI mirror of
+/// [`ConnectionScope`], like [`GroupByArg`], so `clap` renders
+/// `<internal|lan|external>` in the help.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ScopeArg {
+    /// Flows that never leave the machine or only reach sing-box's own
+    /// listeners (the TUN address, the DNS pin, loopback, link-local).
+    Internal,
+    /// Flows to a private address on the segment.
+    Lan,
+    /// Flows to the world — the tunnel's own traffic.
+    External,
+}
+
+impl ScopeArg {
+    /// Map to the [`ConnectionScope`] the table's `scope` column spells.
+    fn to_scope(self) -> ConnectionScope {
+        match self {
+            ScopeArg::Internal => ConnectionScope::Internal,
+            ScopeArg::Lan => ConnectionScope::Lan,
+            ScopeArg::External => ConnectionScope::External,
+        }
+    }
+}
+
+/// The reader's half of the connections scope (realm net-observer, node #75):
+/// keep the rows of `keep` and count the rest by scope. The daemon's answer
+/// carries EVERY row with its `scope` — the filtering is the reader's, so one
+/// round trip serves both the table and the last line — and the CLI and the
+/// bar fold the same answer.
+///
+/// The kept table drops the `scope` column (every row shown shares it) and
+/// keeps the empty-tick marker row (`key` empty: the daemon's `SKIP` / empty
+/// `OK`, which is not a flow and belongs to no scope). The hidden counts are
+/// flows (`count` summed), not groups: the figure the operator asked about.
+/// A table without a `scope` column — an older daemon's — has every row
+/// `external`, shown, never hidden. `keep = None` keeps everything, column
+/// and all.
+fn fold_by_scope(table: &Table, keep: Option<ConnectionScope>) -> (Table, [u64; 3]) {
+    let Some(keep) = keep else {
+        return (table.clone(), [0; 3]);
+    };
+    let col = |name: &str| table.columns.iter().position(|c| c == name);
+    let (scope_col, key_col, count_col) = (col("scope"), col("key"), col("count"));
+    let cell = |row: &[String], i: Option<usize>| -> String {
+        i.and_then(|i| row.get(i).cloned()).unwrap_or_default()
+    };
+    let mut hidden = [0u64; 3];
+    let mut rows = Vec::new();
+    for row in &table.rows {
+        let marker = key_col.is_some() && cell(row, key_col).is_empty();
+        let scope = cell(row, scope_col)
+            .parse::<ConnectionScope>()
+            .unwrap_or_default();
+        if marker || scope == keep {
+            let mut row = row.clone();
+            if let Some(i) = scope_col
+                && i < row.len()
+            {
+                row.remove(i);
+            }
+            rows.push(row);
+        } else {
+            let index = ConnectionScope::ALL
+                .iter()
+                .position(|s| *s == scope)
+                .unwrap_or(2);
+            hidden[index] =
+                hidden[index].saturating_add(cell(row, count_col).parse::<u64>().unwrap_or(0));
+        }
+    }
+    let columns = table
+        .columns
+        .iter()
+        .filter(|c| *c != "scope")
+        .cloned()
+        .collect();
+    (Table { columns, rows }, hidden)
+}
+
+/// The last line under a folded connections table: what was hidden, by
+/// scope, in [`ConnectionScope::ALL`]'s order — `+1023 internal
+/// (dns/plumbing), +4 lan hidden — --all shows them`. `None` when nothing
+/// was, so the table stands alone.
+fn hidden_line(hidden: [u64; 3]) -> Option<String> {
+    let parts: Vec<String> = ConnectionScope::ALL
+        .iter()
+        .zip(hidden)
+        .filter(|(_, n)| *n > 0)
+        .map(|(scope, n)| match scope {
+            ConnectionScope::Internal => format!("+{n} internal (dns/plumbing)"),
+            other => format!("+{n} {other}"),
+        })
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("{} hidden — --all shows them", parts.join(", ")))
     }
 }
 
@@ -653,13 +765,20 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             )?;
             print!("{}", format_table(&table));
         }
-        Command::Connections { by } => {
+        Command::Connections { by, all, scope } => {
             let group_by = by.to_group_by();
             let sql = diagnosis::connections_sql(group_by);
             let table = diagnose_table(cli, DiagnosticQuery::Connections { group_by }, |off| {
                 run_query(off, &sql)
             })?;
+            // The daemon answers every scope; the fold is the reader's
+            // (realm net-observer, node #75).
+            let keep = (!all).then(|| scope.map_or(ConnectionScope::External, ScopeArg::to_scope));
+            let (table, hidden) = fold_by_scope(&table, keep);
             print!("{}", format_table(&table));
+            if let Some(line) = hidden_line(hidden) {
+                println!("{line}");
+            }
         }
         Command::Air => {
             // Three reads, one moment: the scan itself (so a SKIP is rendered as
@@ -2371,7 +2490,7 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("{args:?}: {e}"));
             match cli.command {
-                Command::Connections { by } => by,
+                Command::Connections { by, .. } => by,
                 _ => panic!("{args:?} did not parse as `connections`"),
             }
         };
@@ -2387,6 +2506,153 @@ mod tests {
             assert_eq!(by.to_group_by(), wire, "{token}");
         }
         assert!(Cli::try_parse_from(["net-observer-cli", "connections", "--by", "port"]).is_err());
+    }
+
+    /// `connections` shows external flows by default; `--scope` picks one
+    /// scope by its token, `--all` lifts the fold, and the two exclude each
+    /// other.
+    #[test]
+    fn connections_parses_all_and_scope_and_they_exclude_each_other() {
+        let parse = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                std::iter::once("net-observer-cli").chain(args.iter().copied()),
+            )
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            match cli.command {
+                Command::Connections { all, scope, .. } => (all, scope),
+                _ => panic!("{args:?} did not parse as `connections`"),
+            }
+        };
+        assert_eq!(parse(&["connections"]), (false, None));
+        assert_eq!(parse(&["connections", "--all"]), (true, None));
+        for (token, arg, scope) in [
+            ("internal", ScopeArg::Internal, ConnectionScope::Internal),
+            ("lan", ScopeArg::Lan, ConnectionScope::Lan),
+            ("external", ScopeArg::External, ConnectionScope::External),
+        ] {
+            let (all, parsed) = parse(&["connections", "--scope", token]);
+            assert!(!all);
+            assert_eq!(parsed, Some(arg), "{token}");
+            assert_eq!(arg.to_scope(), scope, "{token}");
+        }
+        assert!(
+            Cli::try_parse_from(["net-observer-cli", "connections", "--scope", "vpn"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["net-observer-cli", "connections", "--all", "--scope", "lan"])
+                .is_err(),
+            "--all and --scope contradict each other"
+        );
+    }
+
+    /// The daemon's `Connections` table with its `scope` column: the tick
+    /// measured on the owner's Mac in miniature — 1023 DNS flows to the TUN
+    /// address, four LAN flows, the tunnel's own traffic — plus a `SKIP`
+    /// marker row from a second table.
+    fn scoped_table(rows: Vec<[&str; 8]>) -> Table {
+        Table {
+            columns: [
+                "ts_us", "verdict", "key", "scope", "count", "upload", "download", "hosts",
+            ]
+            .map(String::from)
+            .to_vec(),
+            rows: rows
+                .into_iter()
+                .map(|r| r.map(String::from).to_vec())
+                .collect(),
+        }
+    }
+
+    fn measured_tick() -> Table {
+        scoped_table(vec![
+            ["7", "OK", "172.19.0.1", "internal", "1023", "1", "1", ""],
+            ["7", "OK", "printer.local", "lan", "4", "1", "1", ""],
+            ["7", "OK", "claude.ai", "external", "3", "100", "5006", ""],
+            ["7", "OK", "149.154.167.41", "external", "2", "30", "0", ""],
+        ])
+    }
+
+    /// By default the external rows are listed without the `scope` column
+    /// (every row shown shares it) and the rest are counted, as flows, on
+    /// the last line in the brief's words; `--all` keeps everything; a scope
+    /// with nothing hidden has no last line.
+    #[test]
+    fn the_fold_keeps_one_scope_and_counts_the_hidden_flows() {
+        let (shown, hidden) = fold_by_scope(&measured_tick(), Some(ConnectionScope::External));
+        assert_eq!(
+            shown.columns,
+            [
+                "ts_us", "verdict", "key", "count", "upload", "download", "hosts"
+            ]
+        );
+        let keys: Vec<&str> = shown.rows.iter().map(|r| r[2].as_str()).collect();
+        assert_eq!(keys, ["claude.ai", "149.154.167.41"]);
+        assert_eq!(
+            shown.rows[0],
+            ["7", "OK", "claude.ai", "3", "100", "5006", ""]
+        );
+        assert_eq!(hidden, [1023, 4, 0]);
+        assert_eq!(
+            hidden_line(hidden).as_deref(),
+            Some("+1023 internal (dns/plumbing), +4 lan hidden — --all shows them")
+        );
+
+        let (shown, hidden) = fold_by_scope(&measured_tick(), Some(ConnectionScope::Lan));
+        let keys: Vec<&str> = shown.rows.iter().map(|r| r[2].as_str()).collect();
+        assert_eq!(keys, ["printer.local"]);
+        assert_eq!(hidden, [1023, 0, 5]);
+        assert_eq!(
+            hidden_line(hidden).as_deref(),
+            Some("+1023 internal (dns/plumbing), +5 external hidden — --all shows them")
+        );
+
+        let (shown, hidden) = fold_by_scope(&measured_tick(), None);
+        assert_eq!(shown, measured_tick());
+        assert_eq!(hidden, [0; 3]);
+        assert_eq!(hidden_line(hidden), None);
+    }
+
+    /// The empty-tick marker row is not a flow and belongs to no scope: it
+    /// is kept under every scope, with its `scope` cell dropped like the
+    /// others, and hides nothing.
+    #[test]
+    fn the_fold_keeps_the_empty_tick_marker_under_every_scope() {
+        let skipped = scoped_table(vec![["7", "SKIP", "", "", "", "", "", ""]]);
+        for keep in ConnectionScope::ALL {
+            let (shown, hidden) = fold_by_scope(&skipped, Some(keep));
+            assert_eq!(
+                shown.rows,
+                vec![["7", "SKIP", "", "", "", "", ""]],
+                "{keep}"
+            );
+            assert_eq!(hidden, [0; 3], "{keep}");
+            assert_eq!(hidden_line(hidden), None, "{keep}");
+        }
+    }
+
+    /// An older daemon's table has no `scope` column: every row is
+    /// `external` — shown under the default, never hidden — and the table
+    /// passes through with its columns as they were.
+    #[test]
+    fn a_table_without_a_scope_column_is_all_external() {
+        let older = Table {
+            columns: [
+                "ts_us", "verdict", "key", "count", "upload", "download", "hosts",
+            ]
+            .map(String::from)
+            .to_vec(),
+            rows: vec![
+                ["7", "OK", "172.19.0.1", "1023", "1", "1", ""]
+                    .map(String::from)
+                    .to_vec(),
+            ],
+        };
+        let (shown, hidden) = fold_by_scope(&older, Some(ConnectionScope::External));
+        assert_eq!(shown, older);
+        assert_eq!(hidden, [0; 3]);
+        let (shown, hidden) = fold_by_scope(&older, Some(ConnectionScope::Internal));
+        assert!(shown.rows.is_empty());
+        assert_eq!(hidden, [0, 0, 1023]);
     }
 
     /// `experiment` defaults to the shared default length and waits;

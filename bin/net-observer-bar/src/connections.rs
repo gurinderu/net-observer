@@ -29,6 +29,18 @@
 //! [`uniform_list`], as the event log's are: an `ip:port` tick from one browser
 //! runs to dozens of groups, and a plain column would lay the rest out past the
 //! window's bottom edge, where gpui paints nothing.
+//!
+//! ## External only
+//!
+//! The daemon's answer carries every group with its `scope` (`internal` /
+//! `lan` / `external`, judged once at collection); the fold is this window's.
+//! The **external only** box in the toolbar is on when the window opens and
+//! remembered for the window's life: with it on, the internal groups (every
+//! app's DNS query to sing-box's own listener is a flow — 1023 of 1080 in one
+//! measured tick) and the LAN groups are not listed but counted, as flows, on
+//! one footer line, `+1023 internal (dns/plumbing) · +4 lan`; with it off,
+//! every group is listed. Flipping the box refetches nothing — the answer
+//! already holds every row (realm net-observer, node #75).
 
 use std::ops::Range;
 
@@ -40,7 +52,7 @@ use gpui::{
 };
 
 use net_observer_ipc::Table;
-use types::ConnectionsGroupBy;
+use types::{ConnectionScope, ConnectionsGroupBy};
 
 use crate::ui::{Dating, Glance, Theme, column_index, dated, note, separator};
 
@@ -142,7 +154,8 @@ fn hosts_cell(cell: &str) -> String {
 }
 
 /// One group of the newest tick, as the window draws it: every cell already
-/// worded, so the render carries no parsing.
+/// worded, so the render carries no parsing — plus the two facts the fold
+/// reads, the scope and the count as a number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FlowRow {
     /// The group — a name, an address, `address:port` or a process name; the
@@ -152,6 +165,53 @@ struct FlowRow {
     up: String,
     down: String,
     hosts: String,
+    /// Where the group's destinations lie, as the daemon judged it; a table
+    /// without the column (an older daemon's) is all `external` — shown,
+    /// never hidden.
+    scope: ConnectionScope,
+    /// The live flows in the group, for the footer's sum; `0` when the
+    /// daemon spelled none.
+    count: u64,
+}
+
+/// Whether a row is listed under the box's state: every row with the box
+/// off, the external ones with it on.
+fn is_shown(row: &FlowRow, external_only: bool) -> bool {
+    !external_only || row.scope == ConnectionScope::External
+}
+
+/// What the box hides: the flows (not the groups) of the rows it keeps off
+/// the list, by scope — `[internal, lan]`. Nothing with the box off.
+fn hidden_flows(rows: &[FlowRow], external_only: bool) -> [u64; 2] {
+    let mut hidden = [0u64; 2];
+    for row in rows.iter().filter(|r| !is_shown(r, external_only)) {
+        let i = match row.scope {
+            ConnectionScope::Internal => 0,
+            ConnectionScope::Lan => 1,
+            ConnectionScope::External => continue,
+        };
+        hidden[i] = hidden[i].saturating_add(row.count);
+    }
+    hidden
+}
+
+/// The footer line for what the box hides: `+1023 internal (dns/plumbing) ·
+/// +4 lan`, each part only when it counts something; `None` when nothing is
+/// hidden, so the table stands alone.
+fn hidden_line(hidden: [u64; 2]) -> Option<String> {
+    let [internal, lan] = hidden;
+    let mut parts = Vec::new();
+    if internal > 0 {
+        parts.push(format!("+{internal} internal (dns/plumbing)"));
+    }
+    if lan > 0 {
+        parts.push(format!("+{lan} lan"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" \u{00b7} "))
+    }
 }
 
 /// The newest tick, reduced from the daemon's `Connections` table to what the
@@ -173,9 +233,11 @@ enum Tick {
 ///
 /// Columns are found by NAME, never by position ([`column_index`]): a table
 /// missing one of the seven is an `Err` naming it, so a daemon whose diagnosis
-/// grew or shrank is reported rather than drawn misaligned. A row with an
-/// empty `key` is the daemon's empty-tick marker, never a group. Pure over its
-/// input so the reduction is testable without a window.
+/// grew or shrank is reported rather than drawn misaligned. The eighth,
+/// `scope`, is the one a daemon may lack (it predates the column): then every
+/// group is `external`, which is what the wire type defaults to as well. A
+/// row with an empty `key` is the daemon's empty-tick marker, never a group.
+/// Pure over its input so the reduction is testable without a window.
 fn tick_rows(table: &Table) -> Result<Tick, String> {
     let col = |name: &str| column_index(table, name);
     let ts_us = col("ts_us")?;
@@ -185,6 +247,7 @@ fn tick_rows(table: &Table) -> Result<Tick, String> {
     let upload = col("upload")?;
     let download = col("download")?;
     let hosts = col("hosts")?;
+    let scope = col("scope").ok();
 
     let Some(first) = table.rows.first() else {
         return Ok(Tick::Absent);
@@ -206,6 +269,10 @@ fn tick_rows(table: &Table) -> Result<Tick, String> {
             up: bytes_cell(cell(row, upload)),
             down: bytes_cell(cell(row, download)),
             hosts: hosts_cell(cell(row, hosts)),
+            scope: scope
+                .and_then(|i| cell(row, i).parse::<ConnectionScope>().ok())
+                .unwrap_or_default(),
+            count: cell(row, count).parse::<u64>().unwrap_or(0),
         })
         .collect();
     if rows.is_empty() {
@@ -347,6 +414,10 @@ pub(crate) struct ConnectionsView {
     /// How the daemon is asked to fold the tick. Set by the toolbar; every
     /// switch refetches.
     group_by: ConnectionsGroupBy,
+    /// The **external only** box: on when the window opens, remembered for
+    /// the window's life. Flipping it refetches nothing — the reading holds
+    /// every row and the fold is done at draw time ([`is_shown`]).
+    external_only: bool,
     /// The daemon's last answer to `DiagnosticQuery::Connections`, already
     /// reduced to what the window draws ([`reduce`]): `None` until the first
     /// read returns (and again while a switched grouping is being read), then
@@ -364,9 +435,19 @@ impl ConnectionsView {
         Self {
             model,
             group_by: ConnectionsGroupBy::Host,
+            external_only: true,
             reading: None,
             scroll: UniformListScrollHandle::new(),
         }
+    }
+
+    /// Flip the **external only** box. No read goes out: the reading holds
+    /// every row. The list goes back to its top, because a scroll position
+    /// into one fold means nothing in the other.
+    fn toggle_external_only(&mut self, cx: &mut Context<Self>) {
+        self.external_only = !self.external_only;
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
     }
 
     /// Ask the daemon for the newest tick, grouped as the view is set, on the
@@ -420,17 +501,20 @@ impl Render for ConnectionsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
         let group_by = self.group_by;
+        let external_only = self.external_only;
         let show_hosts = shows_hosts(group_by);
         let now = crate::ui::now_us();
 
         // What stands above the rows — a state in words, or the caption and
-        // the header — and how many rows the list below it has. `flex_none`,
-        // because the list is the one child allowed to take the slack.
+        // the header — how many rows the list below it has (the shown ones:
+        // the box's fold), and what the box hides. `flex_none`, because the
+        // list is the one child allowed to take the slack.
         let head = div().flex().flex_col().flex_none().px_3().py_2();
-        let (head, count) = match &self.reading {
+        let (head, count, hidden) = match &self.reading {
             None => (
                 head.child(note("connections-pending", PENDING, theme.muted)),
                 0,
+                None,
             ),
             Some(Err(why)) => (
                 head.child(note(
@@ -439,10 +523,12 @@ impl Render for ConnectionsView {
                     theme.warn,
                 )),
                 0,
+                None,
             ),
             Some(Ok(Tick::Absent)) => (
                 head.child(note("connections-empty", NO_TICK, theme.muted)),
                 0,
+                None,
             ),
             Some(Ok(Tick::Empty { ts_us, verdict })) => (
                 head.child(note(
@@ -456,22 +542,29 @@ impl Render for ConnectionsView {
                     theme.muted,
                 )),
                 0,
+                None,
             ),
-            Some(Ok(Tick::Flows { ts_us, rows })) => (
-                head.child(note(
-                    "connections-caption",
-                    caption(*ts_us, now, group_by, rows.len()),
-                    theme.muted,
-                ))
-                .child(header_row(show_hosts, theme))
-                .child(separator(theme)),
-                rows.len(),
-            ),
+            Some(Ok(Tick::Flows { ts_us, rows })) => {
+                let shown = rows.iter().filter(|r| is_shown(r, external_only)).count();
+                (
+                    head.child(note(
+                        "connections-caption",
+                        caption(*ts_us, now, group_by, shown),
+                        theme.muted,
+                    ))
+                    .child(header_row(show_hosts, theme))
+                    .child(separator(theme)),
+                    shown,
+                    hidden_line(hidden_flows(rows, external_only)),
+                )
+            }
         };
 
         // Only the rows in `range` are ever built, from the reading the view
-        // holds — the event log's shape. No list at all when there is no row:
-        // the words above already say why.
+        // holds — the event log's shape — and only the shown ones are
+        // indexed: the fold walks the rows rather than copying them, so a
+        // flip of the box costs no reduction. No list at all when there is
+        // no row: the words above already say why.
         let list = (count > 0).then(|| {
             uniform_list(
                 "connections-list",
@@ -480,8 +573,10 @@ impl Render for ConnectionsView {
                     let Some(Ok(Tick::Flows { rows, .. })) = &this.reading else {
                         return Vec::new();
                     };
-                    range
-                        .filter_map(|i| rows.get(i))
+                    rows.iter()
+                        .filter(|r| is_shown(r, external_only))
+                        .skip(range.start)
+                        .take(range.len())
                         .map(|row| flow_row(row, show_hosts, theme))
                         .collect::<Vec<_>>()
                 }),
@@ -494,6 +589,17 @@ impl Render for ConnectionsView {
             .px_3()
         });
 
+        // The footer: what the box keeps off the list, as flows by scope.
+        // The same `note` element as every other state line, so its words
+        // are a selector a headless test can name.
+        let footer = hidden.map(|line| {
+            div().flex_none().px_3().child(separator(theme)).child(note(
+                "connections-hidden",
+                line,
+                theme.muted,
+            ))
+        });
+
         div()
             .flex()
             .flex_col()
@@ -502,18 +608,71 @@ impl Render for ConnectionsView {
             .text_color(rgb(theme.fg))
             .font_family(".SystemUIFont")
             .text_size(px(13.0))
-            .child(toolbar(group_by, theme, cx))
+            .child(toolbar(group_by, external_only, theme, cx))
             .child(separator(theme))
             .child(head)
             .children(list)
+            .children(footer)
     }
 }
 
+/// The **external only** box: a small square, filled with the accent and
+/// ticked when on, with its label beside it. A click flips the fold and
+/// nothing else — no read goes out.
+fn external_only_box(
+    on: bool,
+    theme: Theme,
+    cx: &mut Context<ConnectionsView>,
+) -> impl IntoElement {
+    let mut square = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(12.0))
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if on { theme.accent } else { theme.edge }));
+    if on {
+        square = square
+            .bg(rgb(theme.accent))
+            .text_color(rgb(theme.knob))
+            .text_size(px(9.0))
+            .child("\u{2713}");
+    }
+    div()
+        .id("connections-external-only")
+        // Test handle only: the selector carries the box's state, so a
+        // headless test can read it without reaching into the view.
+        .debug_selector(move || {
+            format!(
+                "connections-external-only:{}",
+                if on { "on" } else { "off" }
+            )
+        })
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.0))
+        .text_color(rgb(theme.muted))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme.hover)))
+        .child(square)
+        .child("external only")
+        .on_click(cx.listener(|view, _, _window, cx| {
+            view.toggle_external_only(cx);
+        }))
+}
+
 /// The window's controls: the grouping switch — four toggles, the selected one
-/// filled the way the map's reading tabs are — and `refresh`. Every press is a
-/// read-only query; nothing here touches the daemon's state or the network.
+/// filled the way the map's reading tabs are — the **external only** box, and
+/// `refresh`. Every press is a read-only query or a fold of the answer already
+/// held; nothing here touches the daemon's state or the network.
 fn toolbar(
     group_by: ConnectionsGroupBy,
+    external_only: bool,
     theme: Theme,
     cx: &mut Context<ConnectionsView>,
 ) -> impl IntoElement {
@@ -587,6 +746,7 @@ fn toolbar(
             cx,
         ))
         .child(div().flex_1())
+        .child(external_only_box(external_only, theme, cx))
         .child(refresh)
 }
 
@@ -759,6 +919,8 @@ mod tests {
                         up: "30 B".to_string(),
                         down: "0 B".to_string(),
                         hosts: "www.google.com".to_string(),
+                        scope: ConnectionScope::External,
+                        count: 2,
                     },
                     FlowRow {
                         key: "claude.ai".to_string(),
@@ -766,10 +928,145 @@ mod tests {
                         up: "100 B".to_string(),
                         down: "5.0 KB".to_string(),
                         hosts: "-".to_string(),
+                        scope: ConnectionScope::External,
+                        count: 1,
                     },
                 ],
             })
         );
+    }
+
+    /// The daemon's `Connections` table with its `scope` column — the tick
+    /// measured on the owner's Mac in miniature: 1023 DNS flows to the TUN
+    /// address, four LAN flows, the tunnel's own traffic.
+    pub(super) fn scoped_table(rows: Vec<[&str; 8]>) -> Table {
+        Table {
+            columns: [
+                "ts_us", "verdict", "key", "scope", "count", "upload", "download", "hosts",
+            ]
+            .map(String::from)
+            .to_vec(),
+            rows: rows
+                .into_iter()
+                .map(|r| r.map(String::from).to_vec())
+                .collect(),
+        }
+    }
+
+    pub(super) fn measured_tick() -> Table {
+        scoped_table(vec![
+            [
+                "1700000000000000",
+                "OK",
+                "172.19.0.1",
+                "internal",
+                "1023",
+                "1",
+                "1",
+                "",
+            ],
+            [
+                "1700000000000000",
+                "OK",
+                "printer.local",
+                "lan",
+                "4",
+                "1",
+                "1",
+                "",
+            ],
+            [
+                "1700000000000000",
+                "OK",
+                "claude.ai",
+                "external",
+                "3",
+                "100",
+                "5006",
+                "",
+            ],
+            [
+                "1700000000000000",
+                "OK",
+                "149.154.167.41",
+                "external",
+                "2",
+                "30",
+                "0",
+                "",
+            ],
+        ])
+    }
+
+    /// Each row carries the daemon's scope and its count as a number; a
+    /// table without the column — an older daemon's — is all `external`,
+    /// and a scope the reader does not know is `external` too: shown, never
+    /// hidden.
+    #[test]
+    fn rows_carry_their_scope_and_an_absent_column_is_all_external() {
+        let Ok(Tick::Flows { rows, .. }) = tick_rows(&measured_tick()) else {
+            panic!("the measured tick has flows");
+        };
+        let scoped: Vec<(ConnectionScope, u64)> = rows.iter().map(|r| (r.scope, r.count)).collect();
+        assert_eq!(
+            scoped,
+            vec![
+                (ConnectionScope::Internal, 1023),
+                (ConnectionScope::Lan, 4),
+                (ConnectionScope::External, 3),
+                (ConnectionScope::External, 2),
+            ]
+        );
+        let older = connections_table(vec![[
+            "1700000000000000",
+            "OK",
+            "172.19.0.1",
+            "1023",
+            "1",
+            "1",
+            "",
+        ]]);
+        let Ok(Tick::Flows { rows, .. }) = tick_rows(&older) else {
+            panic!("the older tick has flows");
+        };
+        assert_eq!(rows[0].scope, ConnectionScope::External);
+        let odd = scoped_table(vec![["7", "OK", "x", "vpn", "1", "0", "0", ""]]);
+        let Ok(Tick::Flows { rows, .. }) = tick_rows(&odd) else {
+            panic!("the odd tick has flows");
+        };
+        assert_eq!(rows[0].scope, ConnectionScope::External);
+    }
+
+    /// With the box on, only the external rows are shown and the rest are
+    /// counted as flows on the footer line in the brief's words; with it
+    /// off, every row is shown and nothing is hidden. A tick with nothing to
+    /// hide has no footer either way.
+    #[test]
+    fn the_box_folds_the_internal_and_lan_flows_into_the_footer() {
+        let Ok(Tick::Flows { rows, .. }) = tick_rows(&measured_tick()) else {
+            panic!("the measured tick has flows");
+        };
+        let shown: Vec<&str> = rows
+            .iter()
+            .filter(|r| is_shown(r, true))
+            .map(|r| r.key.as_str())
+            .collect();
+        assert_eq!(shown, ["claude.ai", "149.154.167.41"]);
+        assert_eq!(hidden_flows(&rows, true), [1023, 4]);
+        assert_eq!(
+            hidden_line(hidden_flows(&rows, true)).as_deref(),
+            Some("+1023 internal (dns/plumbing) \u{00b7} +4 lan")
+        );
+
+        assert!(rows.iter().all(|r| is_shown(r, false)));
+        assert_eq!(hidden_flows(&rows, false), [0, 0]);
+        assert_eq!(hidden_line([0, 0]), None);
+
+        assert_eq!(
+            hidden_line([1023, 0]).as_deref(),
+            Some("+1023 internal (dns/plumbing)")
+        );
+        assert_eq!(hidden_line([0, 4]).as_deref(), Some("+4 lan"));
     }
 
     /// The daemon's one-row empty tick keeps its verdict — `SKIP` and `OK`
@@ -858,7 +1155,7 @@ mod tests {
 /// the sibling suite this one is modelled on.
 #[cfg(test)]
 mod headless_tests {
-    use super::tests::connections_table;
+    use super::tests::{connections_table, measured_tick};
     use super::*;
     use crate::ui::Glance;
     use gpui::{Modifiers, Size, TestAppContext, VisualTestContext};
@@ -880,16 +1177,27 @@ mod headless_tests {
         Box::leak(s.into_boxed_str())
     }
 
-    /// A fresh window over an injected answer, grouped as `group_by` — both set
-    /// before the first paint, like the map's findings window, and for the
-    /// same reason: gpui's debug-bounds map only grows over a window's life, so
-    /// only a window that never drew a row can say there is none. The socket
-    /// is never driven: `ConnectionsView::new` fetches nothing (the open path
+    /// A fresh window over an injected answer, grouped as `group_by`, with the
+    /// **external only** box as the view opens it (on) — all set before the
+    /// first paint, like the map's findings window, and for the same reason:
+    /// gpui's debug-bounds map only grows over a window's life, so only a
+    /// window that never drew a row can say there is none. The socket is
+    /// never driven: `ConnectionsView::new` fetches nothing (the open path
     /// does), so what the window draws is exactly what was injected.
     fn connections_window(
         cx: &mut TestAppContext,
         answer: Option<Result<Table, String>>,
         group_by: ConnectionsGroupBy,
+    ) -> (WindowHandle<ConnectionsView>, VisualTestContext) {
+        connections_window_folded(cx, answer, group_by, true)
+    }
+
+    /// [`connections_window`] with the box set as `external_only`.
+    fn connections_window_folded(
+        cx: &mut TestAppContext,
+        answer: Option<Result<Table, String>>,
+        group_by: ConnectionsGroupBy,
+        external_only: bool,
     ) -> (WindowHandle<ConnectionsView>, VisualTestContext) {
         let model = cx.update(|cx| {
             cx.new(|_| {
@@ -903,6 +1211,7 @@ mod headless_tests {
         let window = cx.add_window(|_, _| {
             let mut view = ConnectionsView::new(model);
             view.group_by = group_by;
+            view.external_only = external_only;
             view.reading = answer.map(reduce);
             view
         });
@@ -944,9 +1253,10 @@ mod headless_tests {
         )
     }
 
-    /// The grouping switch and refresh are the window's control surface: all
-    /// five are drawn, and none is laid out past the window's edge where
-    /// nothing is painted.
+    /// The grouping switch, the **external only** box (on, as the window
+    /// opens) and refresh are the window's control surface: all six are
+    /// drawn, and none is laid out past the window's edge where nothing is
+    /// painted.
     #[gpui::test]
     fn the_four_group_buttons_and_refresh_are_drawn(cx: &mut TestAppContext) {
         let viewport = size(px(WIN_W), px(WIN_H));
@@ -956,6 +1266,7 @@ mod headless_tests {
             "connections-group-ip",
             "connections-group-ip-port",
             "connections-group-process",
+            "connections-external-only:on",
             "connections-refresh",
         ] {
             let bounds = vcx
@@ -1174,5 +1485,120 @@ mod headless_tests {
             matches!(reading, Some(Err(_))),
             "the switch must read the tick again — with no daemon, as words: {reading:?}"
         );
+    }
+
+    /// The footer line the measured tick folds to with the box on.
+    const FOLDED: &str = "connections-hidden:+1023 internal (dns/plumbing) \u{00b7} +4 lan";
+
+    /// With the box on — as the window opens — the internal group is NOT
+    /// drawn and the LAN one is not either, the external ones are, the
+    /// caption counts the two shown, and the footer says what was folded.
+    /// A fresh window, because a window that once drew a row can never say
+    /// it is gone.
+    #[gpui::test]
+    fn with_the_box_on_the_internal_row_is_not_drawn_and_the_footer_is(cx: &mut TestAppContext) {
+        let (_window, mut vcx) =
+            connections_window(cx, Some(Ok(measured_tick())), ConnectionsGroupBy::Host);
+        assert!(
+            vcx.debug_bounds("connections-row:172.19.0.1").is_none(),
+            "the internal group must not be listed with the box on"
+        );
+        assert!(
+            vcx.debug_bounds("connections-row:printer.local").is_none(),
+            "the LAN group must not be listed with the box on"
+        );
+        for row in [
+            "connections-row:claude.ai",
+            "connections-row:149.154.167.41",
+        ] {
+            assert!(
+                vcx.debug_bounds(row).is_some(),
+                "the window did not draw `{row}`"
+            );
+        }
+        let footer = vcx
+            .debug_bounds(FOLDED)
+            .unwrap_or_else(|| panic!("the footer must say `{FOLDED}`"));
+        assert!(
+            contains(size(px(WIN_W), px(WIN_H)), footer),
+            "the footer leaves the window: {footer:?}"
+        );
+        let caption = leak(format!(
+            "connections-caption:{}",
+            caption(TS_US, 0, ConnectionsGroupBy::Host, 2)
+        ));
+        assert!(
+            vcx.debug_bounds(caption).is_some(),
+            "the caption must count the two shown groups: `{caption}`"
+        );
+    }
+
+    /// With the box off, every group is drawn — the internal one included —
+    /// and there is no footer, in a fresh window opened already unfolded.
+    #[gpui::test]
+    fn with_the_box_off_every_row_is_drawn_and_there_is_no_footer(cx: &mut TestAppContext) {
+        let (_window, mut vcx) = connections_window_folded(
+            cx,
+            Some(Ok(measured_tick())),
+            ConnectionsGroupBy::Host,
+            false,
+        );
+        for row in [
+            "connections-row:172.19.0.1",
+            "connections-row:printer.local",
+            "connections-row:claude.ai",
+            "connections-row:149.154.167.41",
+        ] {
+            assert!(
+                vcx.debug_bounds(row).is_some(),
+                "the window did not draw `{row}`"
+            );
+        }
+        assert!(
+            vcx.debug_bounds(FOLDED).is_none(),
+            "nothing is hidden with the box off, so no footer"
+        );
+        assert!(
+            vcx.debug_bounds("connections-external-only:off").is_some(),
+            "the box must show itself off"
+        );
+        let caption = leak(format!(
+            "connections-caption:{}",
+            caption(TS_US, 0, ConnectionsGroupBy::Host, 4)
+        ));
+        assert!(
+            vcx.debug_bounds(caption).is_some(),
+            "the caption must count all four groups: `{caption}`"
+        );
+    }
+
+    /// Clicking the box flips the fold without a read: the box is off and the
+    /// reading the view holds is the one it drew from before. What each
+    /// state draws is the two fresh-window tests above — a window that once
+    /// drew a row can never say it is gone, so neither fold is asserted
+    /// through a click.
+    #[gpui::test]
+    fn clicking_the_box_unfolds_without_a_refetch(cx: &mut TestAppContext) {
+        let (window, mut vcx) =
+            connections_window(cx, Some(Ok(measured_tick())), ConnectionsGroupBy::Host);
+        vcx.update(|window, _| window.activate_window());
+        vcx.run_until_parked();
+        let before = window
+            .update(&mut vcx, |view, _window, _cx| view.reading.clone())
+            .expect("the window is open");
+
+        let button = vcx
+            .debug_bounds("connections-external-only:on")
+            .expect("the box is drawn on");
+        vcx.simulate_click(button.center(), Modifiers::none());
+        vcx.run_until_parked();
+
+        let (external_only, after) = window
+            .update(&mut vcx, |view, _window, _cx| {
+                (view.external_only, view.reading.clone())
+            })
+            .expect("the window is open");
+        assert!(!external_only, "the click must flip the box off");
+        assert_eq!(after, before, "the flip must not read the tick again");
     }
 }
