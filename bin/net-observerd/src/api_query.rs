@@ -233,7 +233,7 @@ mod tests {
                 group_by: types::ConnectionsGroupBy::IpPort,
             },
             &[
-                "ts_us", "verdict", "key", "count", "upload", "download", "hosts",
+                "ts_us", "verdict", "key", "scope", "count", "upload", "download", "hosts",
             ],
         );
         expect(

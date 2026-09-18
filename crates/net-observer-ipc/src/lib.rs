@@ -2935,6 +2935,7 @@ mod tests {
             count,
             upload: 0,
             download: 0,
+            scope: types::ConnectionScope::External,
         };
         let sample = ConnectionsSample {
             ts_us: 99,

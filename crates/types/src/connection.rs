@@ -7,9 +7,144 @@
 //! with the name the client asked for, the real destination, the process behind
 //! it and the outbound it left through.
 
+use std::fmt;
+use std::net::IpAddr;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 use crate::verdict::ConnectionsVerdict;
+
+/// Where a flow's destination lies, judged once at collection from its
+/// address and carried on the row so every reader folds the same way (realm
+/// net-observer, node #75).
+///
+/// Measured on the owner's Mac: ~1080 flows in a tick, of which 1023 were
+/// keyed by the TUN address — every app's DNS query to sing-box's own
+/// `dns-in` listener is a flow — and ~60 were the traffic the operator meant
+/// by "connections". The readers show `external` by default and fold the rest
+/// into one line, so the count on screen is the count that was asked for.
+///
+/// Serialised as lowercase tokens (`internal` / `lan` / `external`), which is
+/// also what the `connection_sample.scope` column holds. `Default` is
+/// `External`: a row from a sender or a record that predates the scope might
+/// be real traffic, and hiding it would be the silent wrong datum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConnectionScope {
+    /// The destination never leaves the machine, or only reaches sing-box's
+    /// own listeners: the TUN inbound's address, the `dns-in` listener,
+    /// loopback, link-local.
+    Internal,
+    /// A private address (RFC 1918 / ULA) that is not one of the listeners
+    /// above — the segment, not the world.
+    Lan,
+    /// Everything else — including a flow whose address the proxy never
+    /// learned (a name resolved on the far side of the tunnel: the bulk of
+    /// the real traffic) and a destination that could not be parsed: it
+    /// might be real traffic, and the honest default is to show it.
+    #[default]
+    External,
+}
+
+impl ConnectionScope {
+    /// The three scopes in the order the readers fold them: the plumbing
+    /// first, then the segment, then the world.
+    pub const ALL: [ConnectionScope; 3] = [
+        ConnectionScope::Internal,
+        ConnectionScope::Lan,
+        ConnectionScope::External,
+    ];
+
+    /// The token the scope travels as — the same one serde writes and the
+    /// column holds.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnectionScope::Internal => "internal",
+            ConnectionScope::Lan => "lan",
+            ConnectionScope::External => "external",
+        }
+    }
+}
+
+impl fmt::Display for ConnectionScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A scope token that names none of the three.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown connection scope: {0} (expected internal, lan or external)")]
+pub struct ParseScopeError(pub String);
+
+impl FromStr for ConnectionScope {
+    type Err = ParseScopeError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ConnectionScope::ALL
+            .into_iter()
+            .find(|scope| scope.as_str() == s)
+            .ok_or_else(|| ParseScopeError(s.to_string()))
+    }
+}
+
+/// Judge one flow's scope from its destination address and sing-box's own
+/// two listeners, read from its rendered config: `tun_addr` is the TUN
+/// inbound's address (`172.19.0.1`), `dns_pin` the `dns-in` listener
+/// (`192.0.2.53`). Neither is hardcoded: the TUN address is RFC 1918 and the
+/// pin is TEST-NET, so without them the one reads as `lan` and the other as
+/// `external` — the collector passes what the config says, and a config it
+/// could not read passes `None` for both.
+///
+/// Pure. An absent or empty destination is `external`, not `internal`: on
+/// the owner's Mac the Clash API lists a flow to `claude.ai` through the
+/// tunnel with `"destinationIP": ""` — the proxy resolves the name on the
+/// far side and never learns an address here (the fixture in
+/// `macos::clash`, realm net-observer, node #127) — so an empty destination
+/// is the very traffic the reader asked for, and hiding it would be the
+/// silent wrong datum. An address that does not parse is `external` for the
+/// same reason: it might be real traffic.
+#[must_use]
+pub fn classify_scope(
+    dst_ip: Option<&str>,
+    tun_addr: Option<&str>,
+    dns_pin: Option<&str>,
+) -> ConnectionScope {
+    let Ok(ip) = dst_ip.map_or("", str::trim).parse::<IpAddr>() else {
+        return ConnectionScope::External;
+    };
+    // An IPv4-mapped v6 address (`::ffff:10.0.0.1`) is judged as its v4.
+    let ip = ip.to_canonical();
+    let is_listener = |own: Option<&str>| {
+        own.and_then(|a| a.trim().parse::<IpAddr>().ok())
+            .is_some_and(|a| a.to_canonical() == ip)
+    };
+    if is_listener(tun_addr) || is_listener(dns_pin) || ip.is_loopback() || is_link_local(ip) {
+        return ConnectionScope::Internal;
+    }
+    if is_private(ip) {
+        ConnectionScope::Lan
+    } else {
+        ConnectionScope::External
+    }
+}
+
+/// `169.254/16` or `fe80::/10`.
+fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
+    }
+}
+
+/// RFC 1918 (`10/8`, `172.16/12`, `192.168/16`) or ULA (`fc00::/7`).
+fn is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => v6.is_unique_local(),
+    }
+}
 
 /// One live flow as the proxy's API reports it. Empty API strings are `None`
 /// here: an absent fact is not an empty name.
@@ -43,8 +178,8 @@ pub struct LiveConnection {
 }
 
 /// One row of the per-tick aggregate: every live flow sharing the key
-/// `(host, dst_ip, dst_port, process, network, chain)`, with how many there
-/// were and their traffic summed.
+/// `(host, dst_ip, dst_port, process, network, chain, scope)`, with how many
+/// there were and their traffic summed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionRow {
     pub host: Option<String>,
@@ -57,6 +192,12 @@ pub struct ConnectionRow {
     pub count: u32,
     pub upload: u64,
     pub download: u64,
+    /// Where `dst_ip` lies, judged by [`classify_scope`] at collection. A
+    /// function of `dst_ip`, so it splits no key. `serde(default)` —
+    /// `External` — so a row from a sender that predates the scope is shown,
+    /// never hidden.
+    #[serde(default)]
+    pub scope: ConnectionScope,
 }
 
 /// One tick of the `connections` collector.
@@ -128,7 +269,102 @@ mod tests {
             count,
             upload: 0,
             download: 0,
+            scope: ConnectionScope::External,
         }
+    }
+
+    /// Loopback, link-local and the two config-derived listeners are
+    /// `internal`; private space is `lan`; the world, a destination the
+    /// proxy never learned (the tunnel's own traffic — `claude.ai` with
+    /// `"destinationIP": ""` in the observed API body) and anything that
+    /// does not parse are `external`.
+    #[test]
+    fn scope_is_judged_from_the_destination_and_the_configured_listeners() {
+        let tun = Some("172.19.0.1");
+        let pin = Some("192.0.2.53");
+        let judge = |dst: &str| classify_scope(Some(dst), tun, pin);
+        assert_eq!(judge("172.19.0.1"), ConnectionScope::Internal);
+        assert_eq!(judge("192.0.2.53"), ConnectionScope::Internal);
+        assert_eq!(judge("127.0.0.1"), ConnectionScope::Internal);
+        assert_eq!(judge("::1"), ConnectionScope::Internal);
+        assert_eq!(judge("169.254.1.1"), ConnectionScope::Internal);
+        assert_eq!(judge("fe80::1"), ConnectionScope::Internal);
+        assert_eq!(judge(""), ConnectionScope::External);
+        assert_eq!(classify_scope(None, tun, pin), ConnectionScope::External);
+        assert_eq!(judge("10.20.0.5"), ConnectionScope::Lan);
+        assert_eq!(judge("172.31.255.1"), ConnectionScope::Lan);
+        assert_eq!(judge("192.168.1.1"), ConnectionScope::Lan);
+        assert_eq!(judge("fd00::1"), ConnectionScope::Lan);
+        assert_eq!(judge("149.154.167.41"), ConnectionScope::External);
+        assert_eq!(judge("2606:4700::1"), ConnectionScope::External);
+        assert_eq!(judge("garbage"), ConnectionScope::External);
+        assert_eq!(judge("172.32.0.1"), ConnectionScope::External);
+        // An IPv4-mapped v6 address is judged as its v4.
+        assert_eq!(judge("::ffff:192.168.1.1"), ConnectionScope::Lan);
+        assert_eq!(judge("::ffff:172.19.0.1"), ConnectionScope::Internal);
+    }
+
+    /// Without the config-derived listeners the TUN address is private space
+    /// and the DNS pin is TEST-NET: `lan` and `external`, not `internal` —
+    /// the classification hardcodes neither.
+    #[test]
+    fn without_the_configured_listeners_their_addresses_are_not_internal() {
+        assert_eq!(
+            classify_scope(Some("172.19.0.1"), None, None),
+            ConnectionScope::Lan
+        );
+        assert_eq!(
+            classify_scope(Some("192.0.2.53"), None, None),
+            ConnectionScope::External
+        );
+        // A listener the config spells in another form still matches.
+        assert_eq!(
+            classify_scope(Some("::ffff:192.0.2.53"), None, Some(" 192.0.2.53 ")),
+            ConnectionScope::Internal
+        );
+        // A listener that is not an address matches nothing.
+        assert_eq!(
+            classify_scope(Some("172.19.0.1"), Some("not an address"), None),
+            ConnectionScope::Lan
+        );
+    }
+
+    /// The scope travels as its lowercase token, parses back from it, and a
+    /// row written before the scope existed decodes as `external` — shown,
+    /// never hidden.
+    #[test]
+    fn scope_serialises_as_lowercase_tokens_and_a_row_without_one_is_external() {
+        for (scope, token) in [
+            (ConnectionScope::Internal, "internal"),
+            (ConnectionScope::Lan, "lan"),
+            (ConnectionScope::External, "external"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&scope).unwrap(),
+                format!("\"{token}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<ConnectionScope>(&format!("\"{token}\"")).unwrap(),
+                scope
+            );
+            assert_eq!(scope.to_string(), token);
+            assert_eq!(token.parse::<ConnectionScope>().unwrap(), scope);
+        }
+        assert!("Internal".parse::<ConnectionScope>().is_err());
+        assert_eq!(ConnectionScope::default(), ConnectionScope::External);
+
+        let older = r#"{"host":"claude.ai","dst_ip":null,"dst_port":443,"process":null,
+            "network":"tcp","chain":null,"count":1,"upload":0,"download":0}"#;
+        let row: ConnectionRow = serde_json::from_str(older).expect("must decode");
+        assert_eq!(row.scope, ConnectionScope::External);
+        let mut scoped = row.clone();
+        scoped.scope = ConnectionScope::Internal;
+        let wire = serde_json::to_string(&scoped).unwrap();
+        assert!(wire.contains(r#""scope":"internal""#), "{wire}");
+        assert_eq!(
+            serde_json::from_str::<ConnectionRow>(&wire).unwrap(),
+            scoped
+        );
     }
 
     #[test]

@@ -144,15 +144,25 @@ flowchart LR
   lists every live flow with the name asked for, the real destination, the
   process and the outbound chain; the collector reads it each tick over the
   loopback (it sends nothing), folds the flows by
-  `(host, dst_ip, dst_port, process, network, chain)` into a
+  `(host, dst_ip, dst_port, process, network, chain, scope)` into a
   `Sample::Connections`, and the consumer stores the rows and publishes the
   tick as a **summary** on the bus (`Event::Connections`: verdict, flow count,
-  host count — never the rows, which can be hundreds per tick). A tick on
-  which the API did not answer is a `SKIP` sample with no rows, distinct from
-  an `OK` tick that listed nothing. The table is read on demand
-  (`DiagnosticQuery::Connections`, `net-observer-cli connections --by …`)
-  rather than carried on the status snapshot (realm net-observer, nodes #75,
-  #127).
+  host count — never the rows, which can be hundreds per tick). Each row's
+  `scope` (`ConnectionScope`: `internal` / `lan` / `external`) is judged
+  here, once, by `types::classify_scope` against sing-box's own two listeners
+  read from its rendered config per tick (the TUN inbound's address and the
+  `dns-in` inbound's `listen` — `OwnListeners`, never hardcoded): a flow to
+  either, to loopback or to link-local is `internal`, one to RFC 1918 / ULA
+  space is `lan`, everything else — the world, a name the proxy resolves on
+  the far side and so lists with no address, an address that does not parse
+  — is `external`, the honest default. The reason: 1023 of ~1080 flows in
+  one measured tick were apps' DNS queries to the TUN address, and the
+  operator asked for the ~60 that were his traffic. The readers filter, not
+  the daemon (see the diagnosis table below). A tick on which the API did
+  not answer is a `SKIP` sample with no rows, distinct from an `OK` tick that
+  listed nothing. The table is read on demand (`DiagnosticQuery::Connections`,
+  `net-observer-cli connections --by …`) rather than carried on the status
+  snapshot (realm net-observer, nodes #75, #127).
 - **`singbox-log`** — what sing-box itself says. Under the passive tier the
   daemon records `SKIP` for the proxy and cannot say why the network died
   through sing-box; sing-box's own log (`/var/log/sing-box.log`, launchd's
@@ -729,22 +739,29 @@ graph TD
   (`bin/net-observer-bar/src/connections.rs`, the menu's **Connections** entry,
   its handle stashed on `Glance` like the map's), whose toolbar is a grouping
   switch — `host · ip · ip:port · process`, the four `ConnectionsGroupBy`
-  values — and a `refresh` button. Every press is one read-only
-  `Query(Connections { group_by })` over the socket on the background executor
-  (`fetch_connections`, the same outcome mapping as the findings read): the
-  window fetches when it opens, on `refresh`, and on every switch of the
-  grouping — never on a timer, and never from the snapshot. The daemon's table
-  (the newest tick, one row per group: `key · flows · up · down · hosts`, bytes
-  spelled `12.3 KB`, the hosts cell cut to three names `+N` and dropped under
-  `host`, where it would repeat the key) is a `uniform_list` like the event
-  log's — an `ip:port` tick runs to dozens of groups — whose key column never
-  gives way (the port sits at its tail), drawn under a line that dates the tick
-  absolutely and counts the groups; a tick that listed nothing is drawn as `no
-  flows in the last tick (<verdict>)`, so `SKIP` (the API did not answer) and
-  `OK` (nothing is talking) stay two different answers, and a daemon that could
-  not answer shows its own words. Every such state is one shared `ui::note`
-  line whose selector carries its words, the same element the map's findings
-  use. (realm net-observer, node #75)
+  values — an **external only** box, and a `refresh` button. Every press of
+  a grouping or of `refresh` is one read-only `Query(Connections { group_by })`
+  over the socket on the background executor (`fetch_connections`, the same
+  outcome mapping as the findings read): the window fetches when it opens, on
+  `refresh`, and on every switch of the grouping — never on a timer, and never
+  from the snapshot. The daemon's table (the newest tick, one row per group
+  and scope: `key · flows · up · down · hosts`, bytes spelled `12.3 KB`, the
+  hosts cell cut to three names `+N` and dropped under `host`, where it would
+  repeat the key) is a `uniform_list` like the event log's — an `ip:port` tick
+  runs to dozens of groups — whose key column never gives way (the port sits at
+  its tail), drawn under a line that dates the tick absolutely and counts the
+  groups shown. The box is on when the window opens and remembered for the
+  window's life: with it on, only the `external` groups are listed and the
+  rest are counted, as flows, on one footer line — `+1023 internal
+  (dns/plumbing) · +4 lan` — with it off every group is listed; flipping it
+  refetches nothing, the answer already holds every row with its `scope`, and
+  a daemon whose table has no `scope` column is read as all `external`. A tick
+  that listed nothing is drawn as `no flows in the last tick (<verdict>)`, so
+  `SKIP` (the API did not answer) and `OK` (nothing is talking) stay two
+  different answers, and a daemon that could not answer shows its own words.
+  Every such state — the footer included — is one shared `ui::note` line whose
+  selector carries its words, the same element the map's findings use. (realm
+  net-observer, node #75)
   gpui's build script runs **bindgen over `dispatch.h`** (libclang plus the SDK
   headers), so the crate is a full workspace member but is excluded from
   `default-members` — a bare `cargo build` needs no GUI toolchain. Build the bar
@@ -768,7 +785,7 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `route_event` | `ts_us, kind, iface, detail` | PF_ROUTE event stream (`kind` = `iface` / `addr` / `route`): iface up/down, addr add/loss, default-route change. |
 | `host_sample` | `ts_us, load1, load5, load15, disk_used_pct, disk_free_mb, swap_used_mb` | Host load averages — the `starvation` discriminator — plus the usage of the volume holding the record (`disk_used_pct` as `df` computes capacity, `disk_free_mb` what a writer can still take, in MiB) and the swap in use in MiB: the ENOSPC and memory-pressure discriminators the shell oracle carried. A store write that fails for want of space is logged as a gap; these columns let the record name the cause. NULL = not measured, never a zero. |
 | `wifi_sample` | `ts_us, wifi, reason, rssi_dbm, noise_dbm, snr_db, tx_rate_mbps, phy_mode, channel, channel_width_mhz, channel_band` | Wi-Fi air quality from CoreWLAN. `rssi_dbm`/`noise_dbm` are the raw pair and `snr_db` is derived (`rssi - noise`), so the derivation can be revisited from the columns actually measured. `wifi = SKIP` with a `reason` when the radio could not be read (no interface, powered off, not associated) — a row every tick, never an absent one. No SSID/BSSID: macOS gates them behind Location Services, which a LaunchDaemon cannot obtain. |
-| `connection_sample` | `ts_us, verdict, host, dst_ip, dst_port, process, network, chain, count, upload, download` | What this machine talks to: the live flows sing-box's Clash API lists (`GET /connections`, realm net-observer, node #127), aggregated per tick by `(host, dst_ip, dst_port, process, network, chain)` — `count` flows shared the key, `upload`/`download` their bytes summed. `host` is the name asked for (a sniffed SNI is whatever the client put there), `dst_ip` the real destination (NULL when the proxy resolves the name on the far side), `process` the client's executable name, `chain` the outbound that actually carried the flow — the first element of the Clash API's `chains` (sing-box lists them node-first; the last is the constant top-level selector). One row per aggregate row per tick with the tick's `verdict` on each; a tick with no rows — the API did not answer (`SKIP`) or it listed nothing (`OK`) — writes ONE row with every key column NULL, so "could not look" and "nothing is talking" are different rows and neither is an absent tick (realm net-observer, node #75). |
+| `connection_sample` | `ts_us, verdict, host, dst_ip, dst_port, process, network, chain, count, upload, download, scope` | What this machine talks to: the live flows sing-box's Clash API lists (`GET /connections`, realm net-observer, node #127), aggregated per tick by `(host, dst_ip, dst_port, process, network, chain, scope)` — `count` flows shared the key, `upload`/`download` their bytes summed. `host` is the name asked for (a sniffed SNI is whatever the client put there), `dst_ip` the real destination (NULL when the proxy resolves the name on the far side), `process` the client's executable name, `chain` the outbound that actually carried the flow — the first element of the Clash API's `chains` (sing-box lists them node-first; the last is the constant top-level selector), `scope` where `dst_ip` lies as the collector judged it (`internal` / `lan` / `external`, see the collector above; added by `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, NULL on rows written before it and read as `external`). One row per aggregate row per tick with the tick's `verdict` on each; a tick with no rows — the API did not answer (`SKIP`) or it listed nothing (`OK`) — writes ONE row with every key column NULL, so "could not look" and "nothing is talking" are different rows and neither is an absent tick (realm net-observer, node #75). |
 | `singbox_log_sample` | `ts_us, class, count, node, sample_message` | What sing-box itself says: its ERROR/WARN lines, read passively from its own log (`/var/log/sing-box.log`, realm net-observer, node #140) and classed — one row per `(class, node)` per tick of the `singbox-log` collector, `count` lines of that class in the tick, `node` the outbound the line names (`using outbound/vless[<node>]`; NULL when it names none), `sample_message` the first such line, ANSI stripped, at most 200 characters. `class` is the kebab-case token of `types::SingboxLogClass` (`no-route`, `unreachable`, `dial-timeout`, `canceled`, `no-default-iface`, `dns-servers-failed`, `dns-exchange-failed`, `dns-bad-packet`, `icmp-reply-timeout`, `stream-closed`, `icmp-unsupported`, `other`, and — the two INFO lines that are evidence — `started` (a restart of sing-box; its message is the sample) and `default-iface-updated`, for which `node` carries the interface name the line took (`en0`, `en13`, …), plus `unreadable`). A tick with no ERROR/WARN line writes NO row — the absence of errors is the healthy state, evidenced by the other collectors' rows for that tick; a tick on which the log could not be read writes one `unreadable` row with `count` 0 and the I/O error as its message, so a stretch where the reader could not look is never read as "no errors" (realm net-observer, node #141). |
 | `neighbor_sample` | `ts_us, network_key, iface, verdict, reason, neighbor_count, heard_frames, own_frames, dropped_obs` | One row per neighbour reading — a neighbour-cache tick, an operator-pressed scan, or an `announce` listener flush — including its `SKIP`s. `heard_frames` / `own_frames` are the listener's counts for the window it flushed: every frame the capture delivered and, of those, the frames this machine itself sent that match the capture filter — the OS's own traffic and, during an operator-pressed scan, the sweep's ARP and the mDNS browse; never the periodic probes (ICMP, TCP and DNS do not pass the filter) — recognised by the interface's own MAC as read at that window's start, counted and never recorded as a neighbour. The count says the listener saw itself and ignored it, nothing more; the passivity proof stays the frozen pcap slice (realm net-observer, node #88). Both NULL on a cache tick or a scan, never a zero: `heard_frames = 0` is a window in which the segment said nothing, and `own_frames` NULL under a non-NULL `heard_frames` is a window whose own MAC could not be read, so nothing was dropped as ours. `dropped_obs` is how many observations that window refused — a sighting past the 512-device cap, an address or service past its per-device cap, a DHCP name past the pending cap, a service a Sleep Proxy announced on a sleeper's behalf — NULL exactly when `heard_frames` is, `0` when nothing was refused; a flush that refused anything is also warned about in the log and carries `dropped=<n>` on its bus line. The neighbour entity tables (`neighbor`, `neighbor_scan`, `neighbor_port`, `neighbor_vuln`) are documented in `crates/store/src/schema.rs`; `neighbor.source` now also takes `announce` — the device said so itself (realm net-observer, node #92). |
 | `neighbor_service` | `network_key, mac, ip, service, kind, detail, first_seen_us, last_seen_us` | A service a neighbour announced, heard passively by the `announce` listener. Keyed by `(network_key, mac, service)` with first/last seen like `neighbor_port`, so an announcement repeated every few seconds is one row: "this device has been announcing `_companion-link._tcp` since X". `service` is what was announced (an mDNS service type, an SSDP notification type, a DHCP role — `dhcp-server`, `vendor-class`), `kind` which protocol carried it (`mdns` / `ssdp` / `dhcp`), `detail` the specifics that came with it (the mDNS instance name, the SSDP `SERVER` string, the DHCP message type or vendor class), `ip` the address it was announced from (NULL for a DHCP client still without one). A later sighting that carries no `ip` or `detail` keeps the ones already learned. |
@@ -870,7 +887,7 @@ carries, lives in `types` for the same reason.
 | `fakeip_bugs()` | `FAKEIP` on a `.ru` name, which is always a bug |
 | `observation_gaps()` | one row per operator pause — frozen shape, pauses only, no `kind` column |
 | `silences()` | every pause, stop, and sleep, plus every stretch the daemon spent withholding its probes, all told apart by `kind` |
-| `connections(group_by)` | the newest `connection_sample` tick, grouped by `host` / `ip` / `ip-port` / `process` (`ConnectionsGroupBy`, in `types` like `HistoryWindow`): `ts_us, verdict, key, count, upload, download, hosts`, ordered by `count DESC`, `hosts` the distinct names seen behind the key; a tick with no rows answers one row carrying only `ts_us` and `verdict`, so a `SKIP` is never an empty table |
+| `connections(group_by)` | the newest `connection_sample` tick, grouped by `host` / `ip` / `ip-port` / `process` (`ConnectionsGroupBy`, in `types` like `HistoryWindow`) AND by `scope`: `ts_us, verdict, key, scope, count, upload, download, hosts`, ordered by `count DESC`, `hosts` the distinct names seen behind the key; a tick with no rows answers one row carrying only `ts_us` and `verdict`, so a `SKIP` is never an empty table. The whole tick travels, every scope: the readers fold it — the CLI's `connections` lists `external` only by default and ends with `+<n> internal (dns/plumbing), +<m> lan hidden — --all shows them` (`--all` lists everything with the `scope` column, `--scope internal\|lan\|external` one scope), the bar's window has the **external only** box — so one round trip serves both the table and the count of what was folded, and nothing was added to the request (realm net-observer, node #75) |
 
 The `layer` vocabulary is `link` / `vless` / `proxy` / `host` / `healthy` /
 `unknown` / `gap`. **The refusals are the point.** No query counts a `SKIP` as

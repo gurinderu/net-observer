@@ -1019,11 +1019,14 @@ async fn run_daemon() -> anyhow::Result<()> {
         )));
     }
     if cfg.collectors.connections.enabled {
-        // Shares the proxy collector's Clash API base: the flow table comes
-        // from the same sing-box the selector is read from. Reads a loopback
-        // API and sends nothing (realm net-observer, node #75).
+        // Shares the proxy collector's Clash API base and rendered config:
+        // the flow table comes from the same sing-box the selector is read
+        // from, and each flow's scope is judged against that sing-box's own
+        // listeners. Reads a loopback API and a local file and sends nothing
+        // (realm net-observer, node #75).
         collectors.push(AnyCollector::Connections(ConnectionsCollector::new(
             Arc::new(ConnectionSystemFacts::new(
+                SINGBOX_CONFIG_PATH,
                 cfg.collectors.proxy.clash_api.clone(),
             )),
             cfg.collectors.connections.interval,

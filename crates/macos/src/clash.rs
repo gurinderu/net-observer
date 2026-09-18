@@ -43,7 +43,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use collector_connections::ConnectionFacts;
+use collector_connections::{ConnectionFacts, OwnListeners};
 use collector_core::Readiness;
 use collector_proxy::{ProxyFacts, ProxyInfo, TunProbe, UrlTestEntry};
 use serde::Deserialize;
@@ -430,17 +430,23 @@ impl ProxyFacts for ProxySystemFacts {
 
 /// macOS implementation of [`ConnectionFacts`]: the live flow list, read from
 /// the same Clash API the proxy facts use (the same [`ClashClient`] type, the
-/// same HTTP client construction and timeout — not a second HTTP stack).
+/// same HTTP client construction and timeout — not a second HTTP stack), and
+/// sing-box's own listeners from the same rendered config the proxy facts
+/// read their node list from.
 #[derive(Debug, Clone)]
 pub struct ConnectionSystemFacts {
+    /// Path to the rendered sing-box config JSON.
+    singbox_config: PathBuf,
     clash: ClashClient,
 }
 
 impl ConnectionSystemFacts {
-    /// Build the adapter over the Clash/Mihomo API at `clash_base`.
+    /// Build the adapter over the rendered sing-box config at
+    /// `singbox_config` and the Clash/Mihomo API at `clash_base`.
     #[must_use]
-    pub fn new(clash_base: impl Into<String>) -> Self {
+    pub fn new(singbox_config: impl Into<PathBuf>, clash_base: impl Into<String>) -> Self {
         Self {
+            singbox_config: singbox_config.into(),
             clash: ClashClient::new(clash_base),
         }
     }
@@ -449,6 +455,22 @@ impl ConnectionSystemFacts {
 impl ConnectionFacts for ConnectionSystemFacts {
     async fn connections(&self) -> Option<Vec<LiveConnection>> {
         self.clash.connections().await
+    }
+
+    /// The TUN inbound's address and the `dns-in` listener from the rendered
+    /// config, read per tick like [`ProxySystemFacts::node_endpoints`] (a
+    /// small local file, an instant synchronous read). A config that cannot
+    /// be read names neither: the fold then judges without them, and says
+    /// `lan` / `external` for those addresses rather than hiding them.
+    async fn own_listeners(&self) -> OwnListeners {
+        let Ok(text) = std::fs::read_to_string(&self.singbox_config) else {
+            tracing::debug!(path = ?self.singbox_config, "sing-box config unreadable");
+            return OwnListeners::default();
+        };
+        OwnListeners {
+            tun_addr: singbox_tun_addr(&text),
+            dns_pin: singbox_dns_pin(&text),
+        }
     }
 
     async fn preflight(&self) -> Readiness {
@@ -538,6 +560,25 @@ pub(crate) fn singbox_tun_addr(config_json: &str) -> Option<String> {
                 .find_map(serde_json::Value::as_str)?;
             Some(addr.split('/').next().unwrap_or(addr).to_string())
         })
+}
+
+/// The address sing-box's own DNS listener sits on: the `listen` of the
+/// first `inbounds[]` entry tagged `dns-in` (the `direct` inbound that
+/// forwards to sing-box's resolver — `192.0.2.53` in the owner's config),
+/// read from the rendered config like the TUN address above, never
+/// hardcoded. Matched by tag, not by type: the tag is the name the config
+/// gives the listener, the type is how it happens to be implemented. `None`
+/// when the config names no such inbound or it carries no `listen`, which
+/// the fold treats as "cannot judge" (realm net-observer, node #75).
+pub(crate) fn singbox_dns_pin(config_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(config_json).ok()?;
+    let inbounds = value.get("inbounds")?.as_array()?;
+    inbounds
+        .iter()
+        .filter(|i| i.get("tag").and_then(|t| t.as_str()) == Some("dns-in"))
+        .find_map(|i| i.get("listen")?.as_str())
+        .filter(|listen| !listen.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -813,6 +854,36 @@ mod tests {
         assert_eq!(singbox_tun_addr(r#"{"inbounds":[{"type":"mixed"}]}"#), None);
         assert_eq!(singbox_tun_addr(r#"{"inbounds":[{"type":"tun"}]}"#), None);
         assert_eq!(singbox_tun_addr("garbage"), None);
+    }
+
+    /// The DNS pin is the `listen` of the inbound tagged `dns-in`, found by
+    /// its tag among the other inbounds; a config without one, or whose
+    /// `dns-in` names no listener, pins nothing.
+    #[test]
+    fn extracts_the_dns_pin_from_the_dns_in_inbound() {
+        let cfg = r#"{
+            "inbounds": [
+                {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1"},
+                {"type": "direct", "tag": "dns-in", "listen": "192.0.2.53", "listen_port": 53,
+                 "override_address": "1.1.1.1", "override_port": 53},
+                {"type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30"]}
+            ]
+        }"#;
+        assert_eq!(singbox_dns_pin(cfg).as_deref(), Some("192.0.2.53"));
+        assert_eq!(singbox_dns_pin("{}"), None);
+        assert_eq!(
+            singbox_dns_pin(r#"{"inbounds":[{"type":"direct","tag":"other","listen":"1.2.3.4"}]}"#),
+            None
+        );
+        assert_eq!(
+            singbox_dns_pin(r#"{"inbounds":[{"type":"direct","tag":"dns-in"}]}"#),
+            None
+        );
+        assert_eq!(
+            singbox_dns_pin(r#"{"inbounds":[{"type":"direct","tag":"dns-in","listen":""}]}"#),
+            None
+        );
+        assert_eq!(singbox_dns_pin("garbage"), None);
     }
 
     /// `GET /connections` as observed on the owner's Mac, verbatim (realm

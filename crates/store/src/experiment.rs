@@ -379,6 +379,7 @@ mod tests {
                     count,
                     upload,
                     download,
+                    scope: types::ConnectionScope::External,
                 })
                 .collect(),
         }))

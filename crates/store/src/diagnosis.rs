@@ -1077,15 +1077,25 @@ ORDER BY last_seen_us DESC, iface, remote_chassis, remote_port"
 /// Reads the newest `connection_sample` tick only: the table is a present-tense
 /// question ("what is talking right now"), and the per-tick rows are already
 /// the aggregate the collector folded. Columns: `ts_us` and `verdict` (the
-/// tick's, replicated on every row), `key` (the group), `count` (live flows in
-/// the group), `upload` / `download` (their bytes summed), and `hosts` — the
-/// distinct names seen in the group, so an address grouping still says which
-/// names sat behind the address. Ordered by `count DESC`.
+/// tick's, replicated on every row), `key` (the group), `scope` (where the
+/// group's destinations lie — see below), `count` (live flows in the group),
+/// `upload` / `download` (their bytes summed), and `hosts` — the distinct
+/// names seen in the group, so an address grouping still says which names sat
+/// behind the address. Ordered by `count DESC`.
 ///
 /// The key of a flow with the grouped fact missing falls back to the next best
 /// (a bare-address flow is keyed by its address under `host`; a flow whose
 /// address the proxy never learned is keyed by its name under `ip`), and to
 /// `-` when nothing is known — never dropped, never a NULL group.
+///
+/// **The scope is a second group key, and the filtering is the reader's.**
+/// `scope` is `internal` / `lan` / `external` as the collector judged each
+/// row (`types::ConnectionScope`); grouping by it too means a process with
+/// both DNS flows to the TUN address and real flows answers two rows, so a
+/// reader can show the `external` one and fold the other into "+N internal"
+/// without a second query — the whole tick travels once, and the CLI and the
+/// bar fold it themselves (realm net-observer, node #75). A row written
+/// before the column existed reads as `external`: shown, never hidden.
 ///
 /// **The refusal is preserved.** A tick with no rows — the API did not answer
 /// (`SKIP`) or it listed nothing (`OK`) — answers ONE row carrying `ts_us`
@@ -1110,17 +1120,17 @@ pub fn connections_sql(group_by: ConnectionsGroupBy) -> String {
   SELECT * FROM connection_sample
   WHERE ts_us = (SELECT max(ts_us) FROM connection_sample)
 )
-SELECT ts_us, verdict, {key} AS key,
+SELECT ts_us, verdict, {key} AS key, coalesce(scope, 'external') AS scope,
        sum(count) AS count, sum(upload) AS upload, sum(download) AS download,
        string_agg(DISTINCT host, ',' ORDER BY host) AS hosts
 FROM tick
 WHERE network IS NOT NULL
-GROUP BY ts_us, verdict, key
+GROUP BY ts_us, verdict, key, coalesce(scope, 'external')
 UNION ALL
-SELECT ts_us, verdict, NULL, NULL, NULL, NULL, NULL
+SELECT ts_us, verdict, NULL, NULL, NULL, NULL, NULL, NULL
 FROM tick
 WHERE network IS NULL
-ORDER BY count DESC NULLS LAST, key"
+ORDER BY count DESC NULLS LAST, key, scope"
     )
 }
 
@@ -3144,6 +3154,9 @@ mod tests {
 
     // ---- connections: what this machine talks to ---------------------------
 
+    /// A row scoped the way the collector would under the owner's listeners
+    /// (`172.19.0.1` the TUN address): the fixture below then carries every
+    /// scope the readers fold.
     fn conn_row(
         host: Option<&str>,
         dst_ip: Option<&str>,
@@ -3162,6 +3175,7 @@ mod tests {
             count,
             upload,
             download: 0,
+            scope: types::classify_scope(dst_ip, Some("172.19.0.1"), Some("192.0.2.53")),
         }
     }
 
@@ -3311,6 +3325,76 @@ mod tests {
         );
         assert!(keys.contains(&"1.1.1.1:53".to_string()), "{keys:?}");
         assert_eq!(keys.len(), 2, "{keys:?}");
+    }
+
+    /// The scope is a second group key: a process with DNS flows to the TUN
+    /// address AND real flows answers two rows under `process`, one per
+    /// scope, so a reader can show the `external` row and fold the other
+    /// into "+N internal" from the same answer (realm net-observer, node
+    /// #75). Every flow row carries a scope; the empty-tick marker none.
+    #[test]
+    fn connections_group_by_scope_too_so_a_reader_can_fold_the_plumbing() {
+        let s = DuckdbStore::in_memory().unwrap();
+        connections(
+            &s,
+            20 * SEC,
+            types::ConnectionsVerdict::Ok,
+            vec![
+                conn_row(
+                    None,
+                    Some("172.19.0.1"),
+                    Some(53),
+                    Some("Telegram"),
+                    1023,
+                    1,
+                ),
+                conn_row(
+                    None,
+                    Some("192.168.1.20"),
+                    Some(631),
+                    Some("Telegram"),
+                    4,
+                    1,
+                ),
+                conn_row(
+                    None,
+                    Some("149.154.167.41"),
+                    Some(443),
+                    Some("Telegram"),
+                    2,
+                    1,
+                ),
+                conn_row(Some("claude.ai"), None, Some(443), Some("stable"), 3, 1),
+            ],
+        );
+        let t = s.connections(ConnectionsGroupBy::Process).unwrap();
+        let rows: Vec<(String, String, String)> = (0..t.rows.len())
+            .map(|i| {
+                (
+                    cell(&t, i, "key"),
+                    cell(&t, i, "scope"),
+                    cell(&t, i, "count"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Telegram".into(), "internal".into(), "1023".into()),
+                ("Telegram".into(), "lan".into(), "4".into()),
+                ("stable".into(), "external".into(), "3".into()),
+                ("Telegram".into(), "external".into(), "2".into()),
+            ]
+        );
+        // Under `host` the same tick is four keys, each with its scope.
+        let t = s.connections(ConnectionsGroupBy::Host).unwrap();
+        let scopes: Vec<String> = (0..t.rows.len()).map(|i| cell(&t, i, "scope")).collect();
+        assert_eq!(scopes, vec!["internal", "lan", "external", "external"]);
+
+        connections(&s, 30 * SEC, types::ConnectionsVerdict::Skip, Vec::new());
+        let t = s.connections(ConnectionsGroupBy::Process).unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(cell(&t, 0, "scope"), "");
     }
 
     /// By process, the two `stable` flows fold with both their names listed,
