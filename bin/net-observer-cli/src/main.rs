@@ -31,13 +31,14 @@ mod diagnose;
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
+use comfy_table::{CellAlignment, ContentArrangement, presets::UTF8_FULL_CONDENSED};
 use config::Config;
 use net_observer_ipc::{
     ControlCmd, ControlResult, DiagnosticQuery, EXPERIMENT_DEFAULT_MINUTES, EventKind,
     IncidentSummary, QueryOutcome, Request, Response, ScanOptions, StatusSnapshot, StreamFrame,
     Table,
 };
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 use store::{DuckdbStore, QueryTable, Store as _, diagnosis};
@@ -107,10 +108,18 @@ enum Command {
     /// read from the running daemon over its socket.
     Status,
     /// List recent incidents, newest first, read live from the daemon socket.
+    ///
+    /// `OPENED` is local wall-clock time as `YYYY-MM-DD HH:MM:SS` — paste it
+    /// straight into `why --at`. `LASTED` is `closed - opened`, humanized;
+    /// a still-open incident reads `open`.
     Incidents {
         /// Maximum number of incidents to fetch.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Also print each incident's full ID as a first column, for
+        /// scripting.
+        #[arg(long)]
+        ids: bool,
     },
     /// Tail the daemon's live event stream, printing each frame
     /// (`HH:MM:SS  label  detail`) as it happens until interrupted (Ctrl-C).
@@ -509,10 +518,10 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             let snap = fetch_status(&cfg.socket_path)?;
             print!("{}", format_status(&snap));
         }
-        Command::Incidents { limit } => {
+        Command::Incidents { limit, ids } => {
             let cfg = load_config(cli)?;
             let incidents = fetch_incidents(&cfg.socket_path, *limit)?;
-            print!("{}", format_incidents(&incidents));
+            print!("{}", format_incidents(&incidents, *ids));
         }
         Command::Events { kind } => {
             let cfg = load_config(cli)?;
@@ -1604,58 +1613,117 @@ fn format_status(snap: &StatusSnapshot) -> String {
     out
 }
 
-/// Render [`IncidentSummary`] rows as a fixed-width table. An open incident (no
-/// `closed_us`) shows `open`. Pure over its input so it is unit-tested directly.
-fn format_incidents(rows: &[IncidentSummary]) -> String {
-    // The instants are `<raw> (<local ISO>)`, so they no longer fit a right-aligned
-    // numeric column — they are left-aligned like the identifiers beside them.
-    let mut out = format!(
-        "{:<20} {:<16} {:<40} {}\n",
-        "ID", "TRIGGER", "OPENED", "CLOSED"
-    );
+/// One table style for every rendered table in this CLI ([`format_incidents`]
+/// and [`format_table`]), so `incidents`, `query` and the diagnoses all look
+/// the same: `UTF8_FULL_CONDENSED` preset, header cells plain (no bold).
+/// `ContentArrangement::Dynamic` wraps a long cell (a signature, a host name)
+/// inside the terminal width instead of letting it overflow — comfy-table
+/// reads the real width itself when stdout is a tty; piped output (no tty)
+/// falls back to comfy-table's own default of 80 columns, too narrow for a
+/// signature, so it is widened to 120 only in that case — an interactive
+/// terminal's own width is never overridden.
+fn new_table() -> comfy_table::Table {
+    let mut t = comfy_table::Table::new();
+    t.load_preset(UTF8_FULL_CONDENSED);
+    t.set_content_arrangement(ContentArrangement::Dynamic);
+    if !std::io::stdout().is_terminal() {
+        t.set_width(120);
+    }
+    t
+}
+
+/// Render [`IncidentSummary`] rows newest first, as the daemon returns them:
+/// `OPENED` (local wall clock, pasteable into `why --at`), `LASTED`
+/// (humanized `closed - opened`, `open` while still open), `TRIGGER`, and
+/// `SIGNATURE` last — the one column left to wrap. `with_ids` prepends the
+/// full `ID` for scripting; there is no other shape. No rows prints
+/// `no incidents` rather than an empty table. Pure over its input so it is
+/// unit-tested directly.
+fn format_incidents(rows: &[IncidentSummary], with_ids: bool) -> String {
+    if rows.is_empty() {
+        return "no incidents\n".to_string();
+    }
+    let mut t = new_table();
+    let mut header: Vec<String> = Vec::new();
+    if with_ids {
+        header.push("ID".to_string());
+    }
+    header.extend(["OPENED", "LASTED", "TRIGGER", "SIGNATURE"].map(String::from));
+    t.set_header(header);
     for i in rows {
-        let closed = match i.closed_us {
-            Some(c) => diagnose::stamp_us(c),
-            None => "open".to_string(),
-        };
-        out.push_str(&format!(
-            "{:<20} {:<16} {:<40} {closed}\n",
-            i.id,
-            i.trigger_id,
-            diagnose::stamp_us(i.opened_us)
-        ));
+        let mut cells: Vec<String> = Vec::new();
+        if with_ids {
+            cells.push(i.id.clone());
+        }
+        cells.push(opened_local(i.opened_us));
+        cells.push(humanize_lasted(i.opened_us, i.closed_us));
+        cells.push(i.trigger_id.clone());
+        cells.push(i.signature.clone());
+        t.add_row(cells);
     }
-    out
+    format!("{t}\n")
 }
 
-/// Render a generic query result as a simple space-padded table.
+/// The `OPENED` cell: the local wall-clock instant as `YYYY-MM-DD HH:MM:SS`,
+/// so it pastes straight into `why --at`. Built by cutting the offset off
+/// [`types::local_instant`]'s ISO rendering rather than reformatting the
+/// timestamp a second way, so the two clocks can never disagree. An
+/// out-of-range instant (no `T` to cut at) passes through
+/// `local_instant`'s own words unchanged.
+fn opened_local(ts_us: i64) -> String {
+    let iso = types::local_instant(ts_us);
+    match iso.split_once('T') {
+        Some((date, rest)) if rest.len() >= 8 => format!("{date} {}", &rest[..8]),
+        _ => iso,
+    }
+}
+
+/// The `LASTED` cell: `closed_us - opened_us`, humanized — `< 60 s` as
+/// `NN s`, `< 1 h` as `Mm SSs` (`2m 05s`), else `Hh MMm`. An open incident
+/// (`closed_us` is `None`) reads `open`. A zero or negative duration reads
+/// `0 s` rather than a negative number — the triggers engine now clamps a
+/// close to never precede its open, but an operator-supplied or stale record
+/// could still carry one, and this must not render as backwards time.
+fn humanize_lasted(opened_us: i64, closed_us: Option<i64>) -> String {
+    let Some(closed_us) = closed_us else {
+        return "open".to_string();
+    };
+    let secs = (closed_us - opened_us).div_euclid(1_000_000);
+    if secs <= 0 {
+        "0 s".to_string()
+    } else if secs < 60 {
+        format!("{secs} s")
+    } else if secs < 3_600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m", secs / 3_600, (secs % 3_600) / 60)
+    }
+}
+
+/// Render a generic query result as a [`new_table`]. A column right-aligns
+/// when every one of its cells parses as a number — simple enough to need no
+/// per-diagnosis annotation; an empty table (no rows) stays left-aligned,
+/// since there is nothing to align by.
 fn format_table(table: &Table) -> String {
-    let mut widths: Vec<usize> = table.columns.iter().map(String::len).collect();
+    let mut t = new_table();
+    t.set_header(table.columns.clone());
     for row in &table.rows {
-        for (i, cell) in row.iter().enumerate() {
-            if i < widths.len() {
-                widths[i] = widths[i].max(cell.len());
-            }
+        t.add_row(row.clone());
+    }
+    for i in 0..table.columns.len() {
+        let numeric = !table.rows.is_empty()
+            && table
+                .rows
+                .iter()
+                .all(|r| r.get(i).is_some_and(|c| c.trim().parse::<f64>().is_ok()));
+        if !numeric {
+            continue;
+        }
+        if let Some(col) = t.column_mut(i) {
+            col.set_cell_alignment(CellAlignment::Right);
         }
     }
-    let mut out = String::new();
-    push_row(&mut out, &table.columns, &widths);
-    for row in &table.rows {
-        push_row(&mut out, row, &widths);
-    }
-    out
-}
-
-fn push_row(out: &mut String, cells: &[String], widths: &[usize]) {
-    for (i, cell) in cells.iter().enumerate() {
-        let width = widths.get(i).copied().unwrap_or(0);
-        out.push_str(cell);
-        for _ in cell.len()..width {
-            out.push(' ');
-        }
-        out.push_str("  ");
-    }
-    out.push('\n');
+    format!("{t}\n")
 }
 
 #[cfg(test)]
@@ -1674,36 +1742,73 @@ mod tests {
         }
     }
 
+    /// A closed row carries the new headers, the local `OPENED` rendering
+    /// (never the raw microseconds alone), the humanized `LASTED`, and the
+    /// trigger/signature — with no `ID` column when `--ids` was not asked
+    /// for.
     #[test]
-    fn format_incidents_renders_rows() {
-        let out = format_incidents(&[incident("i1", "gw-drop", 1000, Some(2000))]);
-        assert!(out.contains("gw-drop") && out.contains("1000") && out.contains("2000"));
+    fn format_incidents_renders_a_closed_row() {
+        let out = format_incidents(
+            &[incident("i1", "gw-drop", 1_000_000, Some(46_000_000))],
+            false,
+        );
+        assert!(
+            out.contains("OPENED")
+                && out.contains("LASTED")
+                && out.contains("TRIGGER")
+                && out.contains("SIGNATURE"),
+            "{out}"
+        );
+        // Column order: OPENED, LASTED, TRIGGER, SIGNATURE.
+        assert!(
+            out.find("OPENED") < out.find("LASTED")
+                && out.find("LASTED") < out.find("TRIGGER")
+                && out.find("TRIGGER") < out.find("SIGNATURE"),
+            "{out}"
+        );
+        assert!(!out.contains("ID"), "no --ids: {out}");
+        assert!(out.contains(&opened_local(1_000_000)), "opened: {out}");
+        assert!(out.contains("45 s"), "lasted: {out}");
+        assert!(out.contains("gw-drop") && out.contains("sig"), "{out}");
     }
 
-    /// Raw microseconds alone are unreadable: both instants must also carry the
-    /// local rendering `diagnose::stamp_us` produces, and the header must name
-    /// the columns for what they now hold.
+    /// An open incident (no `closed_us`) reads `open` in `LASTED`, and the
+    /// dating must not invent a close.
     #[test]
-    fn format_incidents_dates_both_instants() {
-        let out = format_incidents(&[incident("i1", "gw-drop", 1000, Some(2000))]);
-        assert!(out.contains(&diagnose::stamp_us(1000)), "opened: {out}");
-        assert!(out.contains(&diagnose::stamp_us(2000)), "closed: {out}");
-        assert!(out.contains("OPENED") && out.contains("CLOSED"));
+    fn format_incidents_marks_open_incidents_as_open() {
+        let out = format_incidents(&[incident("i2", "wedge", 5_000_000, None)], false);
+        assert!(out.contains(&opened_local(5_000_000)), "opened: {out}");
+        assert!(out.contains("wedge") && out.contains("open"), "{out}");
     }
 
-    /// An open incident still has no close instant — the word stays, and the
-    /// dating must not invent one.
+    /// `--ids` prepends the full incident id as its own column.
     #[test]
-    fn format_incidents_open_row_is_dated_but_not_closed() {
-        let out = format_incidents(&[incident("i2", "wedge", 5000, None)]);
-        assert!(out.contains(&diagnose::stamp_us(5000)), "opened: {out}");
-        assert!(out.contains("open"));
+    fn format_incidents_with_ids_prepends_the_full_id() {
+        let out = format_incidents(
+            &[incident("i1", "gw-drop", 1_000_000, Some(2_000_000))],
+            true,
+        );
+        assert!(out.contains("ID"), "{out}");
+        assert!(out.contains("i1"), "{out}");
     }
 
+    /// No rows prints `no incidents` rather than an empty (or header-only)
+    /// table.
     #[test]
-    fn format_incidents_marks_open_incidents() {
-        let out = format_incidents(&[incident("i2", "wedge", 5000, None)]);
-        assert!(out.contains("wedge") && out.contains("open"));
+    fn format_incidents_of_no_rows_says_so() {
+        assert_eq!(format_incidents(&[], false), "no incidents\n");
+    }
+
+    /// `LASTED`: `< 60 s` as `NN s`, `< 1 h` as `Mm SSs`, else `Hh MMm`; a
+    /// zero/negative duration (a close stamped at or before its open) reads
+    /// `0 s`, never a negative number.
+    #[test]
+    fn humanize_lasted_formats_by_magnitude() {
+        assert_eq!(humanize_lasted(0, Some(5_000_000)), "5 s");
+        assert_eq!(humanize_lasted(0, Some(125_000_000)), "2m 05s");
+        assert_eq!(humanize_lasted(0, Some(3_725_000_000)), "1h 02m");
+        assert_eq!(humanize_lasted(1_000, Some(991)), "0 s");
+        assert_eq!(humanize_lasted(0, None), "open");
     }
 
     /// A populated snapshot (link + proxy, two incidents, one open) whose
@@ -2605,30 +2710,27 @@ mod tests {
             ],
         };
         let out = format_table(&table);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 3, "{out}");
+        for col in &table.columns {
+            assert!(out.contains(col.as_str()), "header {col}: {out}");
+        }
         assert!(
-            lines[0].starts_with("ts_us  verdict  key             count"),
+            out.contains("194.221.250.50") && out.contains("www.google.com"),
             "{out}"
         );
-        assert!(
-            lines[1].contains("194.221.250.50  2      30      0         www.google.com"),
-            "{out}"
-        );
-        assert!(
-            lines[2].contains("claude.ai       1      100     5006      claude.ai"),
-            "{out}"
-        );
+        assert!(out.contains("claude.ai"), "{out}");
+        // Row order preserved: the first row's key precedes the second's.
+        let first = out.find("194.221.250.50").expect("first row present");
+        let second = out.find("claude.ai").expect("second row present");
+        assert!(first < second, "{out}");
 
         let skipped = Table {
             columns: table.columns.clone(),
             rows: vec![["7", "SKIP", "", "", "", "", ""].map(String::from).to_vec()],
         };
         let out = format_table(&skipped);
-        assert_eq!(out.lines().count(), 2, "{out}");
         assert!(
-            out.lines().nth(1).unwrap().starts_with("7      SKIP"),
-            "{out}"
+            out.contains('7') && out.contains("SKIP"),
+            "a SKIP tick's row must still print: {out}"
         );
     }
 

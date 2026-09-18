@@ -13263,6 +13263,10 @@ rec {
             features = [ "derive" ];
           }
           {
+            name = "comfy-table";
+            packageId = "comfy-table";
+          }
+          {
             name = "config";
             packageId = "config";
           }
