@@ -11,10 +11,7 @@ store.workspace = true
 config.workspace = true
 net-observer-ipc.workspace = true
 types.workspace = true
-# `completions <shell>`: prints a zsh/bash/fish completion script for this
-# binary's own clap definition. Only this crate needs it, so it stays a
-# direct dependency rather than a workspace one, like `objc2-*` in the bar.
-clap_complete = "4"
+clap_complete.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 comfy-table.workspace = true

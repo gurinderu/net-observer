@@ -89,6 +89,9 @@ duckdb = { git = "https://github.com/gurinderu/duckdb-rs", rev = "76b8eba", defa
 # neighbour scan — nothing queries mDNS on a timer.
 mdns-sd = "0.21"
 clap = { version = "4", features = ["derive"] }
+# `net-observer-cli completions <shell>`: prints a zsh/bash/fish completion
+# script for the CLI's own clap definition.
+clap_complete = "4"
 # Renders every `net-observer-cli` table (`incidents`, `query`, the
 # diagnoses) so they all look the same: `UTF8_FULL_CONDENSED` preset,
 # `ContentArrangement::Dynamic` wraps long cells (signatures, host names)

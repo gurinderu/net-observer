@@ -422,8 +422,9 @@ enum Command {
     ///
     /// Prints the script to stdout (`net-observer-cli completions zsh`); source
     /// or install it wherever the shell looks for completions. Needs neither a
-    /// running daemon nor the DuckDB file. The nix package already installs the
-    /// zsh one, so on the Mac nothing needs sourcing by hand.
+    /// running daemon nor the DuckDB file. The nix package already installs
+    /// the zsh, bash and fish completions, so on the Mac nothing needs
+    /// sourcing by hand.
     Completions {
         /// The shell to generate a completion script for.
         #[arg(value_enum)]
@@ -3404,5 +3405,23 @@ mod tests {
         assert!(!out.is_empty());
         let script = String::from_utf8(out).expect("bash completion script is UTF-8");
         assert!(script.contains("net-observer-cli"), "{script}");
+    }
+
+    /// Same shape for fish, the third file the nix package installs — a
+    /// `postInstall` `>` redirect doesn't fail on empty output, so this is
+    /// the guard against a clap_complete regression silently shipping a
+    /// truncated fish script.
+    #[test]
+    fn completions_fish_generates_a_named_script() {
+        let mut out: Vec<u8> = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Fish,
+            &mut Cli::command(),
+            "net-observer-cli",
+            &mut out,
+        );
+        assert!(!out.is_empty());
+        let script = String::from_utf8(out).expect("fish completion script is UTF-8");
+        assert!(script.contains("complete -c net-observer-cli"), "{script}");
     }
 }
