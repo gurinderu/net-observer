@@ -204,11 +204,11 @@ impl Ipv4Iface {
 ///
 /// An interface can carry more than one `inet` line, and the first is not
 /// necessarily the sweepable LAN subnet: every Mac here runs a dns-fallback
-/// shell daemon (realm net-observer, node #65) that pins a single-host `/32`
-/// alias, `192.0.2.53` (TEST-NET-1), onto the physical interface — and
-/// `ifconfig` lists that pin before the real address. A `/32` has no host
-/// range, so picking the first `inet` line dead-ended the sweep with "not a
-/// subnet" on every Mac carrying the pin (realm net-observer, node #159).
+/// shell daemon that pins a single-host `/32` alias, `192.0.2.53`
+/// (TEST-NET-1), onto the physical interface — and `ifconfig` lists that pin
+/// before the real address. A `/32` has no host range, so picking the first
+/// `inet` line dead-ended the sweep with "not a subnet" on every Mac carrying
+/// the pin (realm net-observer, node #159, which records the /32-pin cause).
 /// This walks every `inet` line, skips addresses that can never be a
 /// sweepable LAN subnet, and prefers a private (RFC1918) address among what
 /// remains — falling back to the first non-skipped line for a LAN that
@@ -1103,9 +1103,9 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 
     #[test]
     fn skips_the_dns_pin_slash_32_alias_and_picks_the_real_lan_slash_24() {
-        // Real shape observed on the owner's Mac (realm net-observer, node
-        // #159): the dns-fallback daemon's TEST-NET-1 pin (node #65) is
-        // listed before the actual LAN address.
+        // Real shape observed on the owner's Mac: the dns-fallback daemon's
+        // TEST-NET-1 pin is listed before the actual LAN address (realm
+        // net-observer, node #159).
         let out = "\
 en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 \tinet 192.0.2.53 netmask 0xffffffff broadcast 192.0.2.53
@@ -1135,6 +1135,20 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     fn a_public_slash_24_with_no_private_alias_is_the_fallback() {
         let out = "\
 en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 203.0.113.7 netmask 0xffffff00 broadcast 203.0.113.255";
+        let i = parse_ifconfig_inet(out).expect("parsed");
+        assert_eq!(i.addr, Ipv4Addr::new(203, 0, 113, 7));
+        assert_eq!(i.cidr(), "203.0.113.0/24");
+    }
+
+    #[test]
+    fn the_dns_pin_is_skipped_and_a_non_private_survivor_is_still_the_fallback() {
+        // Proves skip and fallback actually interact: a single-line input
+        // can't tell "the new skip logic picked the surviving line" apart
+        // from "the old first-line behavior happened to return it".
+        let out = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.0.2.53 netmask 0xffffffff broadcast 192.0.2.53
 \tinet 203.0.113.7 netmask 0xffffff00 broadcast 203.0.113.255";
         let i = parse_ifconfig_inet(out).expect("parsed");
         assert_eq!(i.addr, Ipv4Addr::new(203, 0, 113, 7));
