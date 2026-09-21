@@ -56,16 +56,19 @@ const LOAD_THRESHOLD: f64 = diagnosis::DEFAULT_STARVATION_LOAD;
     about = "Query the net-observer store (live via socket, offline via SQL)"
 )]
 struct Cli {
-    /// Optional path to the observer config file (TOML). Supplies the daemon
-    /// socket path for every command that talks to the running daemon.
+    /// Optional path to the observer config file (TOML).
+    ///
+    /// Supplies the daemon socket path for every command that talks to the
+    /// running daemon.
     #[arg(long)]
     config: Option<String>,
     /// Path to the observer DuckDB file [default: the `db_path` of the daemon config].
+    ///
     /// Giving it means "read this file": the diagnoses then never ask the
     /// daemon's socket. Without it they ask the running daemon first and read
     /// the config's file only when nothing answers on the socket. `query <SQL>`
-    /// always reads the file. Every diagnosis prints which record
-    /// answered as a `source:` line on stderr.
+    /// always reads the file. Every diagnosis prints which record answered as
+    /// a `source:` line on stderr.
     #[arg(long)]
     db: Option<String>,
     #[command(subcommand)]
@@ -104,10 +107,11 @@ impl Record {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show the live status snapshot (latest sample per collector + incidents),
-    /// read from the running daemon over its socket.
+    /// Live status snapshot: latest sample per collector + incidents.
+    ///
+    /// Read from the running daemon over its socket.
     Status,
-    /// List recent incidents, newest first, read live from the daemon socket.
+    /// Recent incidents, newest first — read live from the daemon socket.
     ///
     /// `OPENED` is local wall-clock time as `YYYY-MM-DD HH:MM:SS` — paste it
     /// straight into `why --at`. `LASTED` is `closed - opened`, humanized;
@@ -121,8 +125,9 @@ enum Command {
         #[arg(long)]
         ids: bool,
     },
-    /// Tail the daemon's live event stream, printing each frame
-    /// (`HH:MM:SS  label  detail`) as it happens until interrupted (Ctrl-C).
+    /// Tail the daemon's live event stream until interrupted (Ctrl-C).
+    ///
+    /// Prints each frame as `HH:MM:SS  label  detail` as it happens.
     ///
     /// This is **pub/sub, not polling**: the CLI opens ONE `Subscribe`
     /// connection over the socket and the daemon *pushes* every frame down it
@@ -143,52 +148,56 @@ enum Command {
         #[arg(long)]
         kind: Option<EventKindArg>,
     },
-    /// Ask the running daemon to restart the sing-box proxy service
-    /// (`launchctl kickstart`), sent as a `Control(KickstartProxy)` request over
-    /// the socket. The daemon runs it as root for any authorised peer; nothing
-    /// in its config has to be switched on. Exits non-zero if the action was
-    /// refused/failed or the daemon is unreachable.
+    /// Restart sing-box via the daemon (`launchctl kickstart`).
+    ///
+    /// Sent as a `Control(KickstartProxy)` request over the socket. The
+    /// daemon runs it as root for any authorised peer; nothing in its config
+    /// has to be switched on. Exits non-zero if the action was refused/failed
+    /// or the daemon is unreachable.
     Kickstart,
-    /// Turn the observer's own collection on or off (pause/resume), sent as a
-    /// `Control(SetObserving)` request over the socket. This controls the
-    /// daemon's OWN observation only — it does **not** touch sing-box or the
-    /// network (benign self-control).
-    /// The daemon stays alive and the socket keeps serving while paused, so the
-    /// switch can be turned back on. Exits non-zero if the request failed or the
-    /// daemon is unreachable.
+    /// Pause or resume the daemon's own collection (benign self-control).
+    ///
+    /// Sent as a `Control(SetObserving)` request over the socket. This
+    /// controls the daemon's OWN observation only — it does **not** touch
+    /// sing-box or the network. The daemon stays alive and the socket keeps
+    /// serving while paused, so the switch can be turned back on. Exits
+    /// non-zero if the request failed or the daemon is unreachable.
     Observe {
         /// `on` resumes collection; `off` pauses it.
         #[arg(value_enum)]
         state: ObserveState,
     },
-    /// Set the daemon's probing tier, sent as a `Control(SetProbing)` request
-    /// over the socket. `passive` (the daemon's default) puts nothing on the
-    /// wire: every link, proxy and dns probe is withheld and lands as `SKIP`,
-    /// and the held reference streams are closed. `active` runs every probe.
-    /// Benign self-control like `observe`, process-scoped, and every real
-    /// switch is recorded as a `probing_edge` row (see `gaps`). Exits non-zero
-    /// if the request failed, the daemon refused it, or the daemon is
-    /// unreachable.
+    /// Set the daemon's probing tier: `passive` (default) or `active`.
+    ///
+    /// Sent as a `Control(SetProbing)` request over the socket. `passive`
+    /// puts nothing on the wire: every link, proxy and dns probe is withheld
+    /// and lands as `SKIP`, and the held reference streams are closed.
+    /// `active` runs every probe. Benign self-control like `observe`,
+    /// process-scoped, and every real switch is recorded as a `probing_edge`
+    /// row (see `gaps`). Exits non-zero if the request failed, the daemon
+    /// refused it, or the daemon is unreachable.
     Probe {
         /// `passive` withholds every probe; `active` sends them.
         #[arg(value_enum)]
         tier: ProbeTier,
     },
-    /// "Is it us or the network": ask the running daemon to run an experiment
-    /// window (`Control(StartExperiment)`). For the window the daemon goes
-    /// passive — nothing of its own on the wire, bracketed by a
-    /// `probing_edge` with reason `experiment` — freezes the pcap ring at the
-    /// start and at the end, restores the previous tier when the window
-    /// elapses, and computes a report: the frames this machine itself sent
-    /// inside the window (from the end freeze, by protocol; the daemon's
-    /// ICMP echoes expected to be 0) next to what the record says the network
-    /// did in the same minutes (route events, incidents, gateway verdicts,
-    /// roams, announce flushes, flow totals, signal range) and one plain
-    /// verdict line. The daemon answers at once with the window's id; this
-    /// command then polls the daemon every 5 s until the report is ready and
-    /// prints it, so a dropped socket does not lose the window. Benign
-    /// self-control like `probe`. Exits non-zero if the daemon refused
-    /// (another window running, a bad length) or is unreachable.
+    /// Run an experiment window: "is it us or the network?"
+    ///
+    /// Ask the running daemon to run the window (`Control(StartExperiment)`).
+    /// For the window the daemon goes passive — nothing of its own on the
+    /// wire, bracketed by a `probing_edge` with reason `experiment` —
+    /// freezes the pcap ring at the start and at the end, restores the
+    /// previous tier when the window elapses, and computes a report: the
+    /// frames this machine itself sent inside the window (from the end
+    /// freeze, by protocol; the daemon's ICMP echoes expected to be 0) next
+    /// to what the record says the network did in the same minutes (route
+    /// events, incidents, gateway verdicts, roams, announce flushes, flow
+    /// totals, signal range) and one plain verdict line. The daemon answers
+    /// at once with the window's id; this command then polls the daemon
+    /// every 5 s until the report is ready and prints it, so a dropped
+    /// socket does not lose the window. Benign self-control like `probe`.
+    /// Exits non-zero if the daemon refused (another window running, a bad
+    /// length) or is unreachable.
     Experiment {
         /// The window's length in minutes, 1 to 60.
         #[arg(long, default_value_t = EXPERIMENT_DEFAULT_MINUTES)]
@@ -198,25 +207,26 @@ enum Command {
         #[arg(long)]
         no_wait: bool,
     },
-    /// The report of a past experiment window, by the id `experiment`
-    /// printed. Asks the running daemon first, reads the DB file's
-    /// `experiment` table only when no daemon answers. A window still
-    /// running is reported as such, not waited for.
+    /// The report of a past experiment window, by its id.
+    ///
+    /// The id is the one `experiment` printed. Asks the running daemon
+    /// first, reads the DB file's `experiment` table only when no daemon
+    /// answers. A window still running is reported as such, not waited for.
     ExperimentReport {
         /// The window's id, `experiment-<start_us>`.
         id: String,
     },
-    /// Ask the running daemon to go and find out who is on this segment NOW:
-    /// sweep the local IPv4 subnet and browse mDNS for names, sent as a
-    /// `Control(ScanNeighbors)` request over the socket.
+    /// Sweep the local IPv4 subnet and mDNS for who's on this segment now.
     ///
-    /// Unlike the passive `neighbors` collector, this **speaks on the network**
-    /// — it addresses every host of the subnet. Nothing in the daemon's config
-    /// has to permit it: the command is the sanction, and every run leaves a
-    /// `neighbor_scan` row saying what was probed. The daemon refuses it with a
-    /// reason when it cannot run (paused, no IPv4 subnet, no scanner on this
-    /// host) or when the peer is not authorised. Exits non-zero if the
-    /// scan was refused/failed or the daemon is unreachable.
+    /// Ask the running daemon, sent as a `Control(ScanNeighbors)` request
+    /// over the socket. Unlike the passive `neighbors` collector, this
+    /// **speaks on the network** — it addresses every host of the subnet.
+    /// Nothing in the daemon's config has to permit it: the command is the
+    /// sanction, and every run leaves a `neighbor_scan` row saying what was
+    /// probed. The daemon refuses it with a reason when it cannot run
+    /// (paused, no IPv4 subnet, no scanner on this host) or when the peer is
+    /// not authorised. Exits non-zero if the scan was refused/failed or the
+    /// daemon is unreachable.
     ScanNeighbors {
         /// Also TCP-connect-scan discovered neighbours' common ports. Off unless
         /// given.
@@ -236,48 +246,53 @@ enum Command {
         #[arg(long)]
         cve: bool,
     },
-    /// The neighbours the record knows on each segment, newest sighting first:
-    /// MAC, address, vendor OUI, name if one was ever learned, and how it came
-    /// to be known. Asks the running daemon first, reads the DB file only when
-    /// no daemon answers.
+    /// The neighbours the record knows on each segment, newest first.
+    ///
+    /// MAC, address, vendor OUI, name if one was ever learned, and how it
+    /// came to be known. Asks the running daemon first, reads the DB file
+    /// only when no daemon answers.
     Neighbors {
         /// Restrict to one segment, by its gateway MAC. Omit for every segment
         /// this machine has recorded.
         #[arg(long)]
         network: Option<String>,
     },
-    /// The CVEs the record hypothesises for open ports, newest sighting first:
+    /// The CVEs the record hypothesises for open ports, newest first.
+    ///
     /// MAC, address, port, CVE id, confidence, whether it is known-exploited,
     /// and CVSS. Each row is a HYPOTHESIS from matching a grabbed banner
     /// against the local snapshot, never an asserted fact — weigh it by its
-    /// confidence and the KEV flag. Asks the running daemon first, reads the DB
-    /// file only when no daemon answers.
+    /// confidence and the KEV flag. Asks the running daemon first, reads the
+    /// DB file only when no daemon answers.
     Vulns {
         /// Restrict to one segment, by its gateway MAC. Omit for every segment
         /// this machine has recorded.
         #[arg(long)]
         network: Option<String>,
     },
-    /// The switch-topology uplinks learned passively from received LLDP/CDP
-    /// frames, newest sighting first: local interface, remote chassis, remote
-    /// port, the switch/AP's system name and capabilities, and whether LLDP or
-    /// CDP carried it. Each row is a HYPOTHESIS — LLDP/CDP are unauthenticated
-    /// and spoofable — never an asserted fact. Asks the running daemon first,
-    /// reads the DB file only when no daemon answers.
+    /// Switch-topology uplinks learned passively from LLDP/CDP, newest first.
+    ///
+    /// Local interface, remote chassis, remote port, the switch/AP's system
+    /// name and capabilities, and whether LLDP or CDP carried it. Each row
+    /// is a HYPOTHESIS — LLDP/CDP are unauthenticated and spoofable — never
+    /// an asserted fact. Asks the running daemon first, reads the DB file
+    /// only when no daemon answers.
     Topology {
         /// Restrict to one local interface (e.g. `en0`). Omit for every
         /// interface this machine has recorded an uplink on.
         #[arg(long)]
         iface: Option<String>,
     },
-    /// What this machine talks to: the newest tick of the live flow table
-    /// sing-box carries (its Clash API lists every flow with the name asked
-    /// for, the real destination, the process and the outbound), grouped and
-    /// ordered by how many flows share the key, with the names seen behind
-    /// each key. `netstat` cannot answer this here — every destination it
-    /// shows is a fakeip. A tick on which the API did not answer is one row
-    /// saying SKIP, never an empty table. Asks the running daemon first,
-    /// reads the DB file only when no daemon answers.
+    /// What this machine talks to: the live sing-box flow table, grouped.
+    ///
+    /// The newest tick of the live flow table sing-box carries (its Clash
+    /// API lists every flow with the name asked for, the real destination,
+    /// the process and the outbound), ordered by how many flows share the
+    /// key, with the names seen behind each key. `netstat` cannot answer
+    /// this here — every destination it shows is a fakeip. A tick on which
+    /// the API did not answer is one row saying SKIP, never an empty table.
+    /// Asks the running daemon first, reads the DB file only when no daemon
+    /// answers.
     ///
     /// Shows the external flows only by default — the internal ones (every
     /// app's DNS query to sing-box's own listener is a flow) and the LAN
@@ -295,25 +310,30 @@ enum Command {
         #[arg(long, value_enum)]
         scope: Option<ScopeArg>,
     },
-    /// The latest slice of the radio environment: every foreign access point
-    /// the last scan heard, with its channel, band, width, signal and noise,
-    /// ordered by how likely it is to be sitting in our own band. Asks the
-    /// running daemon first, reads the DB file only when no daemon answers.
+    /// The latest radio-environment slice: foreign APs from the last scan.
+    ///
+    /// Every foreign access point the last scan heard, with its channel,
+    /// band, width, signal and noise, ordered by how likely it is to be
+    /// sitting in our own band. Asks the running daemon first, reads the DB
+    /// file only when no daemon answers.
     ///
     /// The OVERLAP column is a HYPOTHESIS computed from channel geometry, never
     /// a measurement of interference: macOS reports no channel occupancy to any
     /// program. A scan that could not run is reported as a refusal with its
     /// reason, never as an empty list that would read as clear air.
     Air,
-    /// Run an arbitrary SQL query directly against the DuckDB file (offline
-    /// forensics — only works while `net-observerd` is stopped).
+    /// Run an arbitrary SQL query directly against the DuckDB file.
+    ///
+    /// Offline forensics — only works while `net-observerd` is stopped.
     Query {
         /// The SQL statement to run against the store.
         sql: String,
     },
-    /// Which layer failed at a moment: the state of link, proxy server, tun and
-    /// host load as the record has it, plus the layer it blames. Asks the
-    /// running daemon first, reads the DB file only when no daemon answers.
+    /// Which layer failed at a moment: link, proxy, tun, host load.
+    ///
+    /// The state of each as the record has it, plus the layer it blames.
+    /// Asks the running daemon first, reads the DB file only when no daemon
+    /// answers.
     ///
     /// A moment the daemon was paused for is reported as a refusal — the gap and
     /// its bounds — not as a row of blank measurements.
@@ -325,21 +345,26 @@ enum Command {
         #[arg(long, default_value = "now")]
         at: String,
     },
-    /// Every incident with the layer state just before it opened. Asks the
-    /// running daemon first, reads the DB file only when no daemon answers.
+    /// Every incident with the layer state just before it opened.
+    ///
+    /// Asks the running daemon first, reads the DB file only when no daemon
+    /// answers.
     ///
     /// An incident that opened inside an observation gap gets no context: the
     /// state from before the pause is not context for it, and is marked withheld.
     IncidentContext,
-    /// The wedge-vs-starvation verdict over each recent `tun=000` episode — the
-    /// discriminator that decides whether a restart is the cure. Asks the
-    /// running daemon first, reads the DB file only when no daemon answers.
+    /// The wedge-vs-starvation verdict over each recent `tun=000` episode.
+    ///
+    /// The discriminator that decides whether a restart is the cure. Asks
+    /// the running daemon first, reads the DB file only when no daemon
+    /// answers.
     ///
     /// An episode the record cannot classify is reported `unknown`, not guessed.
     WedgeOrStarvation,
-    /// The gateway RTT series before a drop, with its least-squares slope, so a
-    /// coworking-gateway ramp is visible as data. Asks the running daemon
-    /// first, reads the DB file only when no daemon answers.
+    /// The gateway RTT series before a drop, with its least-squares slope.
+    ///
+    /// So a coworking-gateway ramp is visible as data. Asks the running
+    /// daemon first, reads the DB file only when no daemon answers.
     ///
     /// The slope is refused — "not computed" — when the window crosses an
     /// observation gap.
@@ -352,12 +377,15 @@ enum Command {
         #[arg(long, default_value_t = store::diagnosis::DEFAULT_RAMP_WINDOW_US)]
         window_us: i64,
     },
-    /// The observation gaps the record contains — every interval the daemon
-    /// deliberately collected nothing for, and what closed each. Asks the
-    /// running daemon first, reads the DB file only when no daemon answers.
+    /// The observation gaps the record contains.
+    ///
+    /// Every interval the daemon deliberately collected nothing for, and
+    /// what closed each. Asks the running daemon first, reads the DB file
+    /// only when no daemon answers.
     Gaps,
-    /// The network segments this machine has ever recorded, newest activity
-    /// first: the segment key, a best-effort SSID guess, the gateway IP when
+    /// The network segments this machine has ever recorded, newest first.
+    ///
+    /// The segment key, a best-effort SSID guess, the gateway IP when
     /// recoverable, first/last seen, and how many devices it held. Asks the
     /// running daemon first, reads the DB file only when no daemon answers.
     ///
@@ -365,11 +393,12 @@ enum Command {
     /// daemon does not join an SSID to a segment. A segment recorded under
     /// `unknown` (the gateway MAC was unreadable) is listed like any other.
     Segments,
-    /// One segment's recorded state: the neighbours that were live at an
-    /// instant (`--at`), or active over a window (`--since`/`--until`), each
-    /// with a count of its open ports and hypothesised vulns over that slice.
-    /// Asks the running daemon first, reads the DB file only when no daemon
-    /// answers.
+    /// One segment's recorded state at an instant or over a window.
+    ///
+    /// The neighbours that were live at an instant (`--at`), or active over
+    /// a window (`--since`/`--until`), each with a count of its open ports
+    /// and hypothesised vulns over that slice. Asks the running daemon
+    /// first, reads the DB file only when no daemon answers.
     History {
         /// The segment to read, by its gateway MAC — or the literal `unknown`
         /// for the segment whose gateway MAC was unreadable. A non-key is an
@@ -1870,6 +1899,7 @@ fn format_table(table: &Table) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use net_observer_ipc::{Event, Gap, Ready, StreamError, StreamErrorCode};
     use types::{GwVerdict, LinkSample, ObservingEdge, ProxySample, TcpVerdict};
 
@@ -3283,5 +3313,61 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let end = tail_frames(frames.into_iter(), &mut out);
         assert_eq!(end, TailEnd::Failed("bad frame".into()));
+    }
+
+    /// The top-level `--help` command list carries one short line per
+    /// subcommand — the long prose from each `///` doc must stay confined to
+    /// that subcommand's own `--help`, never leak into the list a first-time
+    /// reader scans.
+    #[test]
+    fn top_level_help_lists_one_short_line_per_subcommand() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        // Every line clap lists under `Commands:`, not just `status`: a
+        // re-joined doc comment (the blank `///` dropped) on ANY variant
+        // would leak its long prose back into the list, so every line is
+        // checked, not a hand-picked one.
+        let commands_section: Vec<&str> = help
+            .lines()
+            .skip_while(|l| *l != "Commands:")
+            .skip(1)
+            .take_while(|l| !l.trim().is_empty())
+            .collect();
+        assert!(
+            !commands_section.is_empty(),
+            "no `Commands:` section found in the top-level help:\n{help}"
+        );
+        for line in &commands_section {
+            assert!(
+                line.len() < 100,
+                "command-list line is {} chars, expected < 100 — a doc comment's \
+                 blank separator was likely dropped, re-joining its prose into \
+                 the summary: {line:?}",
+                line.len()
+            );
+        }
+        // Belt: two long-prose markers that must never survive into the
+        // summary list even if some future variant's line sneaks under the
+        // char cap. `HYPOTHESIS` (the caps row-marker in the long prose of
+        // `vulns`/`topology`/`air`) is distinct from `vulns`' own short
+        // line, which legitimately says "hypothesises" (lowercase verb) —
+        // checking the caps form avoids a false positive there.
+        assert!(
+            !help.contains("HYPOTHESIS") && !help.contains("Asks the running daemon"),
+            "long prose leaked into the top-level help:\n{help}"
+        );
+    }
+
+    /// The prose carved out of a subcommand's short line survives, unabridged,
+    /// in that subcommand's own `--help` — carving the summary must not lose
+    /// a fact, only relocate it.
+    #[test]
+    fn connections_long_help_keeps_the_fakeip_note() {
+        let mut cmd = Cli::command();
+        let sub = cmd
+            .find_subcommand_mut("connections")
+            .expect("`connections` is a subcommand");
+        let long = sub.render_long_help().to_string();
+        assert!(long.contains("fakeip"), "{long}");
     }
 }
