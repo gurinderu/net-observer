@@ -1106,8 +1106,7 @@ pub fn compose_scan_report(
     if let Some(ps) = port_scan {
         let detail = if ports_unattributed > 0 {
             format!(
-                "{} open, {ports_raw} found ({ports_unattributed} not persisted: no segment MAC to key by)",
-                ports.len()
+                "{ports_raw} open ({ports_unattributed} not persisted: no segment MAC to key by)"
             )
         } else {
             format!("{} open", ports.len())
@@ -1129,7 +1128,7 @@ pub fn compose_scan_report(
     if let Some(bg) = banner_grab {
         let detail = if banners_unattributed > 0 {
             format!(
-                "{grabbed} banners, {banners_raw} found ({banners_unattributed} not persisted: no segment MAC to key by)"
+                "{banners_raw} banners ({banners_unattributed} not persisted: no segment MAC to key by)"
             )
         } else {
             format!("{grabbed} banners")
@@ -1785,14 +1784,22 @@ mod tests {
     /// Off-subnet `--target` (owner decision #156, realm net-observer, node
     /// #154): a routed destination's ARP entry, if the kernel holds one at
     /// all, belongs to its GATEWAY, never the destination itself — `found`
-    /// is empty here even though the port scan genuinely found open ports.
-    /// `neighbor_port` is keyed `(network_key, mac, port)`, so nothing can be
-    /// persisted without a MAC to key it by (inventing one would be the
-    /// forbidden silent-wrong-data) — but the report must say what was truly
-    /// found, never "0 open ports" for a target that really had some.
+    /// is empty here even though the port scan and banner grab genuinely
+    /// found something. `neighbor_port`/`neighbor_vuln` are keyed by
+    /// `(network_key, mac, ...)`, so nothing can be persisted without a MAC
+    /// to key it by (inventing one would be the forbidden silent-wrong-data)
+    /// — but BOTH surfaces that carry the finding onward, the live
+    /// `ControlResult.message` AND the durable `neighbor_scan.detail` row a
+    /// later `query` reads back, must lead with what was truly found. Never
+    /// "0 open"/"0 banners" for a target that really had some — that is
+    /// exactly the misread owner decision #156 forbids, and a row a forensics
+    /// query reads later is no less a place that misread can land than the
+    /// live message is.
     #[test]
-    fn an_off_subnet_targets_open_ports_are_reported_honestly_not_as_zero() {
-        use macos::neighbor_scan::{PortFinding, PortScanOutcome};
+    fn an_off_subnet_targets_findings_are_reported_honestly_not_as_zero() {
+        use macos::neighbor_scan::{
+            BannerFinding, BannerGrabOutcome, PortFinding, PortScanOutcome,
+        };
         let ps = PortScanOutcome {
             open: vec![
                 PortFinding {
@@ -1808,6 +1815,15 @@ mod tests {
             ports_per_host: 27,
             duration_ms: 500,
         };
+        let bg = BannerGrabOutcome {
+            banners: vec![BannerFinding {
+                ip: "203.0.113.9".parse().unwrap(),
+                port: 22,
+                banner: "SSH-2.0-OpenSSH_9.6".into(),
+            }],
+            probed: 2,
+            duration_ms: 200,
+        };
         let r = compose_scan_report(
             42,
             None,
@@ -1816,22 +1832,45 @@ mod tests {
             Vec::new(), // no ARP entry: the target is off this segment
             &MdnsOutcome::default(),
             Some(&ps),
-            None,
+            Some(&bg),
         );
         assert!(r.ports.is_empty(), "no MAC to key a persisted row by");
-        let row = r.scans.iter().find(|s| s.method == "ports").unwrap();
-        assert_eq!(row.found, 0, "nothing was actually persisted");
+
+        let ports_row = r.scans.iter().find(|s| s.method == "ports").unwrap();
+        assert_eq!(ports_row.found, 0, "nothing was actually persisted");
+        let ports_detail = ports_row.detail.as_deref().unwrap();
+        assert!(ports_detail.contains("2 open"), "{ports_detail:?}");
         assert!(
-            row.detail.as_deref().unwrap().contains("2 found"),
-            "{:?}",
-            row.detail
+            !ports_detail.contains("0 open"),
+            "the DURABLE row must not lead with the persisted zero either: {ports_detail:?}"
         );
+        assert!(ports_detail.contains("not persisted"), "{ports_detail:?}");
+
+        let banners_row = r.scans.iter().find(|s| s.method == "banners").unwrap();
+        assert_eq!(banners_row.found, 0, "nothing was actually persisted");
+        let banners_detail = banners_row.detail.as_deref().unwrap();
+        assert!(banners_detail.contains("1 banners"), "{banners_detail:?}");
+        assert!(
+            !banners_detail.contains("0 banners"),
+            "the DURABLE row must not lead with the persisted zero either: {banners_detail:?}"
+        );
+        assert!(
+            banners_detail.contains("not persisted"),
+            "{banners_detail:?}"
+        );
+
         assert!(
             !r.message.contains("0 open ports"),
             "an off-subnet target with real open ports must never read as 0: {}",
             r.message
         );
         assert!(r.message.contains("2 open ports"), "{}", r.message);
+        assert!(
+            !r.message.contains("0 banners"),
+            "an off-subnet target with real banners must never read as 0: {}",
+            r.message
+        );
+        assert!(r.message.contains("1 banners"), "{}", r.message);
         assert!(r.message.contains("not persisted"), "{}", r.message);
     }
 
