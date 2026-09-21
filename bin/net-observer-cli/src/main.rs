@@ -30,7 +30,7 @@
 mod diagnose;
 
 use anyhow::{Result, anyhow};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{CellAlignment, ContentArrangement, presets::UTF8_FULL_CONDENSED};
 use config::Config;
 use net_observer_ipc::{
@@ -417,6 +417,17 @@ enum Command {
         /// `--since`.
         #[arg(long, requires = "since")]
         until: Option<String>,
+    },
+    /// Generate shell completions for zsh, bash or fish.
+    ///
+    /// Prints the script to stdout (`net-observer-cli completions zsh`); source
+    /// or install it wherever the shell looks for completions. Needs neither a
+    /// running daemon nor the DuckDB file. The nix package already installs the
+    /// zsh one, so on the Mac nothing needs sourcing by hand.
+    Completions {
+        /// The shell to generate a completion script for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -965,6 +976,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 |off| run_query(off, &sql),
             )?;
             print!("{}", format_table(&table));
+        }
+        Command::Completions { shell } => {
+            clap_complete::generate(
+                *shell,
+                &mut Cli::command(),
+                "net-observer-cli",
+                &mut std::io::stdout(),
+            );
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -3353,5 +3372,37 @@ mod tests {
             .expect("`connections` is a subcommand");
         let long = sub.render_long_help().to_string();
         assert!(long.contains("fakeip"), "{long}");
+    }
+
+    /// `completions zsh` prints a non-empty zsh completion script naming this
+    /// binary — the file the nix package installs to
+    /// `share/zsh/site-functions/_net-observer-cli`.
+    #[test]
+    fn completions_zsh_generates_a_named_script() {
+        let mut out: Vec<u8> = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Zsh,
+            &mut Cli::command(),
+            "net-observer-cli",
+            &mut out,
+        );
+        assert!(!out.is_empty());
+        let script = String::from_utf8(out).expect("zsh completion script is UTF-8");
+        assert!(script.contains("_net-observer-cli"), "{script}");
+    }
+
+    /// Same shape for bash, the second file the nix package installs.
+    #[test]
+    fn completions_bash_generates_a_named_script() {
+        let mut out: Vec<u8> = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut Cli::command(),
+            "net-observer-cli",
+            &mut out,
+        );
+        assert!(!out.is_empty());
+        let script = String::from_utf8(out).expect("bash completion script is UTF-8");
+        assert!(script.contains("net-observer-cli"), "{script}");
     }
 }
