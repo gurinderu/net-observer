@@ -1905,21 +1905,19 @@ mod tests {
         }
     }
 
-    /// A unique socket path under the OS temp dir for a real round-trip test.
-    /// A leftover file from a crashed prior run must not fail `bind`, so any
-    /// stale path is removed before returning it.
-    fn control_test_socket_path(tag: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
+    /// A unique, SHORT socket path for a real round-trip test. A leftover
+    /// file from a crashed prior run must not fail `bind`, so any stale path
+    /// is removed before returning it.
+    fn control_test_socket_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "net-observer-ipc-test-{tag}-{}-{n}-{nanos}.sock",
-            std::process::id()
-        ));
+        // Bound directly under `/tmp`, deliberately NOT `std::env::temp_dir()`:
+        // on macOS that resolves to a long per-process `/var/folders/...` path,
+        // and `sockaddr_un.sun_path` is ~104 bytes there (vs Linux's 108) — a
+        // path built from it can overflow `SUN_LEN` and fail `bind` outright.
+        let path =
+            std::path::PathBuf::from(format!("/tmp/nob-ipc-{}-{n}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
     }
@@ -1931,7 +1929,7 @@ mod tests {
     /// budget, and the client must read that exact [`ControlResult`] back.
     #[test]
     fn control_within_reads_a_delayed_answer_within_its_budget() {
-        let path = control_test_socket_path("scan-ok");
+        let path = control_test_socket_path();
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
@@ -1981,7 +1979,7 @@ mod tests {
     /// read their own client's timeout instead of the daemon's answer).
     #[test]
     fn control_within_gives_up_when_its_own_budget_expires() {
-        let path = control_test_socket_path("scan-silent");
+        let path = control_test_socket_path();
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
