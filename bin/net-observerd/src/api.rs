@@ -2586,9 +2586,19 @@ mod tests {
     }
 
     /// A scratch directory for a socket-bound test.
+    ///
+    /// Based directly under `/tmp`, NOT `std::env::temp_dir()`: on macOS
+    /// that resolves to a long per-process `/var/folders/xx/.../T/` path,
+    /// and `sockaddr_un.sun_path` there is ~104 bytes (vs Linux's 108) — a
+    /// long enough `tag` pushes `<dir>/observer.sock` over that limit and
+    /// `UnixListener::bind` fails; the test then sees no socket file ever
+    /// appear and `wait_for_socket` times out, which reads like the server
+    /// never started rather than the real cause (the path was too long).
+    /// `/tmp` is short on every runner these tests run on, so even the
+    /// longest `tag` in this file stays well under the limit.
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("net-observerd-{tag}-test-{}", std::process::id()));
+            std::path::PathBuf::from("/tmp").join(format!("nob-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
