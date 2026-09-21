@@ -3890,10 +3890,10 @@ rec {
       };
       "clap" = rec {
         crateName = "clap";
-        version = "4.6.4";
+        version = "4.6.7";
         edition = "2024";
         crateBin = [];
-        sha256 = "1dz5brl39xchkml0khm348i87w89misprlinmnk77vwjawa0q7nr";
+        sha256 = "0il98y2rfw75984ck59znd4n592p07bxz8yy3a9blddb02rpd25a";
         dependencies = [
           {
             name = "clap_builder";
@@ -3932,9 +3932,9 @@ rec {
       };
       "clap_builder" = rec {
         crateName = "clap_builder";
-        version = "4.6.2";
+        version = "4.6.7";
         edition = "2024";
-        sha256 = "12sl6fyj6w2djxj0lsc1lkj1h3wpx74fjhb37izvaf65vjpji5ph";
+        sha256 = "0kbhai5rv1vj9r4np52g2b9fmhvy3y82digs9v40c57bgbxrf1zc";
         dependencies = [
           {
             name = "anstream";
@@ -3969,11 +3969,40 @@ rec {
         };
         resolvedDefaultFeatures = [ "color" "error-context" "help" "std" "suggestions" "usage" ];
       };
+      "clap_complete" = rec {
+        crateName = "clap_complete";
+        version = "4.6.11";
+        edition = "2024";
+        sha256 = "0brrz8vdgqg9c0dcdz69096dzmk18vv96l44gvzhlv93j8d2lzh3";
+        dependencies = [
+          {
+            name = "clap";
+            packageId = "clap";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+        ];
+        devDependencies = [
+          {
+            name = "clap";
+            packageId = "clap";
+            usesDefaultFeatures = false;
+            features = [ "std" "derive" "help" ];
+          }
+        ];
+        features = {
+          "debug" = [ "clap/debug" ];
+          "unstable-doc" = [ "unstable-dynamic" ];
+          "unstable-dynamic" = [ "dep:clap_lex" "dep:shlex" "dep:is_executable" "clap/unstable-ext" ];
+          "unstable-shell-tests" = [ "dep:completest" "dep:completest-pty" ];
+        };
+        resolvedDefaultFeatures = [ "default" ];
+      };
       "clap_derive" = rec {
         crateName = "clap_derive";
-        version = "4.6.4";
+        version = "4.6.7";
         edition = "2024";
-        sha256 = "0qd0v7pa2arwxjjinmjim6xrjy61bc28m1yryhc7zjjssswx44nh";
+        sha256 = "1q36bgbkfb9rdz7jcvd0ffv0wwlyw0lg3z6iwdcybm0mjjvm3izr";
         procMacro = true;
         dependencies = [
           {
@@ -13261,6 +13290,10 @@ rec {
             name = "clap";
             packageId = "clap";
             features = [ "derive" ];
+          }
+          {
+            name = "clap_complete";
+            packageId = "clap_complete";
           }
           {
             name = "comfy-table";

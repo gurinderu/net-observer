@@ -11,6 +11,7 @@ store.workspace = true
 config.workspace = true
 net-observer-ipc.workspace = true
 types.workspace = true
+clap_complete.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 comfy-table.workspace = true
