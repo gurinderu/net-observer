@@ -1752,6 +1752,7 @@ impl NeighborScanner for SystemScanner {
                 &mdns,
                 ports.as_ref(),
                 banners.as_ref(),
+                opts.target,
             );
 
             // The `cve` rung: match the banners the report already carries

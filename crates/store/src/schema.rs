@@ -200,7 +200,12 @@ CREATE TABLE IF NOT EXISTS neighbor_scan (
 -- (network_key, mac, port) with first/last seen, like `neighbor`: "445 has been
 -- open on this device since X" is the queryable fact. A port is attributed to a
 -- device by joining the finding's IP to the neighbour that owns it; a port on an
--- address no neighbour claims is dropped, because the row is keyed by MAC.
+-- address no neighbour claims is dropped, because the row is keyed by MAC --
+-- UNLESS it is the address of an explicit single-host `--target` scan: `mac`
+-- then holds the literal string `ip:<addr>`, a self-describing synthetic
+-- identity for a routed, off-subnet host that has no segment MAC (never a
+-- fake MAC address). Design decision and rejected alternatives: realm
+-- net-observer, node #157.
 CREATE TABLE IF NOT EXISTS neighbor_port (
   network_key VARCHAR, mac VARCHAR, ip VARCHAR, port INTEGER,
   first_seen_us BIGINT, last_seen_us BIGINT,
@@ -216,6 +221,10 @@ ALTER TABLE neighbor_port ADD COLUMN IF NOT EXISTS banner VARCHAR;
 -- for 22 on this device since X". Every row is a HYPOTHESIS, not an asserted
 -- fact -- `confidence` (low|medium|high) and `known_exploited` say how much to
 -- trust it, and `cvss` its severity when the record carried one (NULL otherwise).
+-- `mac` carries the same two shapes as `neighbor_port.mac`: a segment MAC for a
+-- neighbour, or the literal `ip:<addr>` for a routed host reached by an
+-- explicit `--target` scan (realm net-observer, node #157) -- a reader must
+-- treat `mac` as "segment MAC OR ip:<addr>", never assume it parses as a MAC.
 CREATE TABLE IF NOT EXISTS neighbor_vuln (
   network_key VARCHAR, mac VARCHAR, port INTEGER, cve_id VARCHAR,
   confidence VARCHAR, known_exploited BOOLEAN, cvss DOUBLE,
