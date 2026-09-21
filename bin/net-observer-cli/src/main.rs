@@ -1762,22 +1762,95 @@ fn await_experiment(
     ))
 }
 
+/// The one line printed to stderr before the blocking wait in
+/// [`fetch_scan_neighbors`] — an operator watching a `--cve`/`--slow` scan
+/// that goes quiet for minutes needs to know it is working, not stuck, and
+/// that Ctrl-C does not stop it on the daemon. Named after the rungs actually
+/// present in `opts`, so a plain scan carries no CVE/slow caveat it does not
+/// run.
+fn scan_starting_line(opts: &ScanOptions) -> String {
+    let mut rungs = Vec::new();
+    if opts.ports {
+        rungs.push("ports");
+    }
+    if opts.banners {
+        rungs.push("banners");
+    }
+    if opts.cve {
+        rungs.push("cve");
+    }
+    if opts.slow {
+        rungs.push("slow");
+    }
+    let rungs = if rungs.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", rungs.join(", "))
+    };
+
+    let mut caveats = Vec::new();
+    if opts.cve {
+        caveats
+            .push("a --cve scan loads a large CVE snapshot the first time after a daemon restart");
+    }
+    if opts.slow {
+        caveats.push("a --slow sweep paces the whole segment");
+    }
+    let caveats = if caveats.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", caveats.join(", "))
+    };
+
+    format!(
+        "scanning neighbours{rungs}… this can take a while{caveats}. Ctrl-C leaves the scan \
+         running on net-observerd; read results later with `net-observer-cli vulns` / \
+         `neighbors`."
+    )
+}
+
+/// Classify a transport failure from a scan's [`net_observer_ipc::control_within`]
+/// call — distinct from [`socket_error`] because a scan's own read timeout
+/// ([`net_observer_ipc::SCAN_TIMEOUT`] elapsed, surfaced as
+/// `WouldBlock`/`TimedOut`) is not a failure: the scan keeps running on the
+/// daemon and its rows still land in the record, so it earns its own message
+/// instead of the raw, cryptic errno line (`Resource temporarily unavailable
+/// (os error 35)`) that `socket_error` would otherwise produce.
+fn scan_socket_error(socket_path: &str, e: &std::io::Error) -> anyhow::Error {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    if matches!(e.kind(), WouldBlock | TimedOut) {
+        anyhow!(
+            "the scan is still running on net-observerd and will finish there — its rows land \
+             in the record. Read them with `net-observer-cli vulns` and `net-observer-cli \
+             neighbors`. (The first --cve scan after a restart loads a large snapshot; a \
+             --slow sweep of a big segment takes minutes.)"
+        )
+    } else if daemon_not_running(e) {
+        anyhow!("net-observerd not running (socket {socket_path} unavailable)")
+    } else {
+        anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
+    }
+}
+
 /// Send `Control(ScanNeighbors)` and return the daemon's verdict.
 ///
 /// Reads with [`net_observer_ipc::SCAN_TIMEOUT`], not the default 2s
 /// [`daemon_query`] budget: the daemon answers only after the whole sweep
 /// (ARP + mDNS, then the ports/banners rungs), tens of seconds on a real
 /// segment, and a client that gives up first reads its own timeout instead of
-/// the daemon's effective/dropped-rungs message. A daemon built before
-/// `ScanNeighbors` existed cannot decode the request; that is reported as
-/// "cannot", not as a refusal, through [`net_observer_ipc::control_within`].
+/// the daemon's effective/dropped-rungs message — [`scan_socket_error`] turns
+/// that timeout into a message saying so, rather than [`socket_error`]'s
+/// generic transport wording. A daemon built before `ScanNeighbors` existed
+/// cannot decode the request; that is reported as "cannot", not as a refusal,
+/// through [`net_observer_ipc::control_within`].
 fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
+    let _ = writeln!(std::io::stderr(), "{}", scan_starting_line(&opts));
     let outcome = net_observer_ipc::control_within(
         socket_path,
         ControlCmd::ScanNeighbors(opts),
         net_observer_ipc::SCAN_TIMEOUT,
     )
-    .map_err(|e| socket_error(socket_path, e))?;
+    .map_err(|e| scan_socket_error(socket_path, &e))?;
     match outcome {
         net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
         net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
@@ -2005,6 +2078,23 @@ fn pager_command() -> (String, Vec<String>) {
     }
 }
 
+/// Whether [`print_paged`] should default the pager child's own `LESS` env
+/// var to `FRX` — git does the same, for the same reason: an operator's
+/// `$PAGER` is often a bare `less -R` (color, no `-F`), so `less` opens
+/// full-screen and waits even for a one-line result. `-F` quits at once when
+/// the content fits one screen, `-R` keeps comfy-table's UTF-8 box-drawing
+/// untouched, `-X` keeps it in scrollback after quitting. `None` when the
+/// operator already set `LESS` themselves — a deliberate choice is never
+/// overridden — and harmless when the pager isn't `less` at all (an
+/// unrelated env var to another program).
+fn pager_less_default() -> Option<&'static str> {
+    if std::env::var_os("LESS").is_none() {
+        Some("FRX")
+    } else {
+        None
+    }
+}
+
 /// Print `content` — git-style: through a pager when stdout is a terminal
 /// and paging was not disabled with `--no-pager` ([`should_page`]), direct
 /// otherwise (a pipe, a redirect, a script — byte-identical to a plain
@@ -2024,10 +2114,12 @@ fn print_paged(content: &str, no_pager: bool) {
         return;
     }
     let (cmd, args) = pager_command();
-    let child = std::process::Command::new(&cmd)
-        .args(&args)
-        .stdin(std::process::Stdio::piped())
-        .spawn();
+    let mut command = std::process::Command::new(&cmd);
+    command.args(&args).stdin(std::process::Stdio::piped());
+    if let Some(less) = pager_less_default() {
+        command.env("LESS", less);
+    }
+    let child = command.spawn();
     let mut child = match child {
         Ok(c) => c,
         Err(_) => {
@@ -2736,6 +2828,34 @@ mod tests {
             match &saved {
                 Some(v) => std::env::set_var("PAGER", v),
                 None => std::env::remove_var("PAGER"),
+            }
+        }
+    }
+
+    /// `pager_less_default` — the `LESS=FRX` git-style default — fires only
+    /// when the operator has not set `LESS` themselves; a set `LESS` (even to
+    /// an empty string) is left alone.
+    #[test]
+    fn pager_less_default_only_when_less_is_unset() {
+        // SAFETY: this test owns `LESS` for its duration — set/read/restored
+        // single-threaded within this one test body — and no other test in
+        // this crate touches the variable (distinct from `PAGER`, which
+        // `pager_command_honors_pager_env_or_falls_back_to_less` owns).
+        let saved = std::env::var("LESS").ok();
+        unsafe {
+            std::env::remove_var("LESS");
+        }
+        assert_eq!(pager_less_default(), Some("FRX"));
+
+        unsafe {
+            std::env::set_var("LESS", "-X");
+        }
+        assert_eq!(pager_less_default(), None);
+
+        unsafe {
+            match &saved {
+                Some(v) => std::env::set_var("LESS", v),
+                None => std::env::remove_var("LESS"),
             }
         }
     }
@@ -4356,5 +4476,92 @@ mod tests {
         assert!(!out.is_empty());
         let script = String::from_utf8(out).expect("fish completion script is UTF-8");
         assert!(script.contains("complete -c net-observer-cli"), "{script}");
+    }
+
+    /// A scan's read timeout (the client gave up after `SCAN_TIMEOUT`, not the
+    /// daemon reporting a failure) gets the "still running, read it later"
+    /// message — never the raw errno line `socket_error` would produce for the
+    /// exact same `WouldBlock`/`TimedOut` kind.
+    #[test]
+    fn scan_socket_error_reports_a_timeout_as_still_running() {
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            let e = std::io::Error::new(kind, "timed out");
+            let msg = scan_socket_error("/tmp/observer.sock", &e).to_string();
+            assert!(msg.contains("vulns"), "{kind:?}: {msg}");
+            assert!(
+                !msg.contains("Resource temporarily unavailable"),
+                "{kind:?}: {msg}"
+            );
+        }
+    }
+
+    /// An absent/refused socket still reads as "not running", the same as
+    /// every other fetcher.
+    #[test]
+    fn scan_socket_error_reports_an_absent_daemon_as_not_running() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            let e = std::io::Error::new(kind, "gone");
+            let msg = scan_socket_error("/tmp/observer.sock", &e).to_string();
+            assert!(msg.contains("not running"), "{kind:?}: {msg}");
+        }
+    }
+
+    /// Any other transport error keeps the generic `socket_error` wording.
+    #[test]
+    fn scan_socket_error_reports_other_errors_generically() {
+        let e = std::io::Error::other("boom");
+        let msg = scan_socket_error("/tmp/observer.sock", &e).to_string();
+        assert!(
+            msg.contains("failed to query net-observerd over socket"),
+            "{msg}"
+        );
+        assert!(msg.contains("boom"), "{msg}");
+    }
+
+    /// Every rung actually in `opts` is named, plus the caveat each of
+    /// `--cve`/`--slow` earns, plus the Ctrl-C/read-later tail every scan
+    /// gets. Substrings, not the exact line — so a wording tweak doesn't
+    /// over-couple this test to `scan_starting_line`'s phrasing.
+    #[test]
+    fn scan_starting_line_names_every_rung_and_caveat() {
+        let opts = ScanOptions {
+            ports: true,
+            banners: true,
+            cve: true,
+            target: None,
+            slow: true,
+            sweep_max: None,
+        };
+        let line = scan_starting_line(&opts);
+        assert!(line.contains("ports"), "{line}");
+        assert!(line.contains("banners"), "{line}");
+        assert!(line.contains("cve"), "{line}");
+        assert!(line.contains("slow"), "{line}");
+        assert!(
+            line.contains("--cve") && line.contains("first time"),
+            "{line}"
+        );
+        assert!(line.contains("--slow") && line.contains("paces"), "{line}");
+        assert!(
+            line.contains("Ctrl-C") && line.contains("vulns") && line.contains("neighbors"),
+            "{line}"
+        );
+    }
+
+    /// A plain scan (no rungs) degrades to the short form: no rung list, no
+    /// `--cve`/`--slow` caveats, but still the same Ctrl-C/read-later tail.
+    #[test]
+    fn scan_starting_line_plain_scan_has_no_rungs_or_caveats() {
+        let line = scan_starting_line(&ScanOptions::default());
+        assert!(!line.contains('('), "{line}");
+        assert!(!line.contains("--cve"), "{line}");
+        assert!(!line.contains("--slow"), "{line}");
+        assert!(
+            line.contains("Ctrl-C") && line.contains("vulns") && line.contains("neighbors"),
+            "{line}"
+        );
     }
 }
