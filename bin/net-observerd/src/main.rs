@@ -1671,9 +1671,32 @@ impl NeighborScanner for SystemScanner {
                     .collect();
                 (sweep, arp, neighbor_scan::MdnsOutcome::default())
             } else {
-                let ipv4 = rt.block_on(neighbor_scan::iface_ipv4(&iface))?;
-                let cap = neighbor_scan::sweep_max_cap(opts.sweep_max);
-                let sweep = neighbor_scan::sweep_probe_blocking(&ipv4, &iface, cap, pace);
+                let sweep = match rt.block_on(neighbor_scan::iface_ipv4(&iface)) {
+                    Some(ipv4) => {
+                        let cap = neighbor_scan::sweep_max_cap(opts.sweep_max);
+                        neighbor_scan::sweep_probe_blocking(&ipv4, &iface, cap, pace)
+                    }
+                    // No line in `ifconfig <iface>` parsed to a sweepable
+                    // subnet — every `inet` was skipped (a /32 alias like the
+                    // dns-fallback daemon's pin, TEST-NET-1, link-local, …;
+                    // realm net-observer, node #159) or the interface carried
+                    // no `inet` line at all. Before `parse_ifconfig_inet`
+                    // learned to skip those addresses, this same interface
+                    // still reached `sweep_probe_blocking` and came back
+                    // refused from `host_addrs`; build the same refusal here
+                    // so the attempt is still durably recorded (the ARP cache
+                    // and mDNS browse below still run) instead of the whole
+                    // scan silently returning nothing.
+                    None => neighbor_scan::SweepStats {
+                        target: iface.clone(),
+                        sent: 0,
+                        total: 0,
+                        duration_ms: 0,
+                        refused: Some(
+                            "no IPv4 subnet found on this interface to sweep".to_string(),
+                        ),
+                    },
+                };
                 // Read the cache the sweep just filled. Everything it now holds
                 // for this interface counts as found: an entry the kernel
                 // resolved because of our probe is indistinguishable from one
