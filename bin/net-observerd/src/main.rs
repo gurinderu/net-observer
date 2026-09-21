@@ -55,8 +55,9 @@ use triggers::handlers::{Handler, RecordHandler};
 use types::{ProbingEdge, ProbingTier, Sample};
 
 use pipeline::{
-    AirScanner, FreezePcapHandler, NeighborScanner, OnDemandAirScan, PcapFreezer, PcapRingSlot,
-    ScanReport, SnapshotHandler, run, spawn_event_collector, spawn_interval_collector,
+    AirScanner, CveLookupOutcome, FreezePcapHandler, NeighborScanner, OnDemandAirScan, PcapFreezer,
+    PcapRingSlot, ScanReport, SnapshotHandler, run, spawn_event_collector,
+    spawn_interval_collector,
 };
 
 /// How often a capture supervisor re-checks its `tcpdump` child — the pcap
@@ -1820,6 +1821,29 @@ impl NeighborScanner for SystemScanner {
 
             Some(report)
         })
+    }
+
+    /// `check-cve --product`'s own path into the SAME cache [`Self::cve_rung`]
+    /// reads/fills — a lookup and a scan's `cve` rung share one cache, so
+    /// whichever asks first loads and classifies the snapshot once, and every
+    /// call after (lookup or scan) answers straight from memory. `vuln_db::
+    /// VulnDb::lookup` is the thin product+version convenience over
+    /// `match_product`; matching itself lives there, not here.
+    fn cve_lookup(&self, product: &str, version: Option<&str>) -> CveLookupOutcome {
+        if let Some(db) = self.cve_cache.get() {
+            return CveLookupOutcome::Matches(db.lookup(product, version));
+        }
+        match load_and_classify(self.cve_snapshot_dir.as_deref()) {
+            CveSnapshot::Ready(db) => {
+                let matches = db.lookup(product, version);
+                // Same race note as `cve_rung`: a concurrent loser's `Arc` is
+                // just as valid a load of the same immutable content, so the
+                // result already computed here is kept rather than redone.
+                let _ = self.cve_cache.set(Arc::clone(&db));
+                CveLookupOutcome::Matches(matches)
+            }
+            CveSnapshot::Unusable(note) => CveLookupOutcome::SnapshotUnavailable(note),
+        }
     }
 }
 

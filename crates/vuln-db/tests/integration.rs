@@ -87,3 +87,21 @@ fn wrong_vendor_filters_out_the_match() {
     );
     assert!(hits.is_empty());
 }
+
+// ---- `lookup` (the `check-cve --product` convenience) ----
+
+#[test]
+fn lookup_matches_a_version_ranged_product_with_no_vendor() {
+    let db = load();
+    let hits = db.lookup("openssh", Some("7.2"));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].cve_id, "CVE-2016-6210");
+    assert_eq!(hits[0].confidence, Confidence::High);
+    assert!(hits[0].known_exploited);
+}
+
+#[test]
+fn lookup_unknown_product_is_empty() {
+    let db = load();
+    assert!(db.lookup("nonesuch", None).is_empty());
+}

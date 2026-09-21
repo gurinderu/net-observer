@@ -744,6 +744,22 @@ impl PcapFreezer for macos::PcapRing {
     }
 }
 
+/// One `check-cve --product` lookup's outcome: either the (possibly loaded
+/// but empty) snapshot was queried, or it could not be used at all. Kept
+/// apart the same way the scan-mode `cve` rung's own two outcomes are
+/// ([`crate::CveSnapshot`] via `SystemScanner::cve_rung`) — an empty match
+/// list must never be read as "the snapshot could not be checked".
+#[derive(Debug, Clone, PartialEq)]
+pub enum CveLookupOutcome {
+    /// The snapshot was queried; here is what it matched (possibly empty —
+    /// a real "no CVEs found for this product").
+    Matches(Vec<vuln_db::VulnMatch>),
+    /// The snapshot could not be used at all (no directory configured, or
+    /// the configured one would not load) — the same wording `cve_rung`
+    /// reports for the scan-mode rung, since both read the SAME cache.
+    SnapshotUnavailable(String),
+}
+
 /// One operator-pressed neighbour scan behind a trait, so `api` holds no
 /// platform code and the control path is testable without putting packets on a
 /// real segment. The production impl is [`crate::SystemScanner`].
@@ -757,6 +773,13 @@ pub trait NeighborScanner: Send + Sync {
     /// to scan (no interface, no IPv4 subnet) — a refusal the caller reports,
     /// not an error it swallows.
     fn scan(&self, opts: &net_observer_ipc::ScanOptions) -> Option<ScanReport>;
+
+    /// `check-cve --product`: match `product`/`version` directly against the
+    /// cached CVE snapshot — no scan, no network, no DuckDB touch. The
+    /// production impl reuses [`crate::SystemScanner`]'s already-loaded
+    /// `cve_cache` (#56) the same way `scan`'s `cve` rung does, and never
+    /// re-walks the ~395k-file snapshot tree on a lookup.
+    fn cve_lookup(&self, product: &str, version: Option<&str>) -> CveLookupOutcome;
 }
 
 /// The shortest gap allowed between two on-demand air scans.
@@ -944,8 +967,11 @@ pub struct ScanReport {
     pub message: String,
 }
 
-/// The lowercase token a [`vuln_db::Confidence`] is stored as.
-fn confidence_token(c: vuln_db::Confidence) -> &'static str {
+/// The lowercase token a [`vuln_db::Confidence`] is stored as. `pub(crate)`
+/// so `api`'s `check-cve --product` table renders the SAME vocabulary the
+/// `vulns`/`check-cve <ip>` `confidence` column already uses, rather than a
+/// second spelling of the same three values.
+pub(crate) fn confidence_token(c: vuln_db::Confidence) -> &'static str {
     match c {
         vuln_db::Confidence::Low => "low",
         vuln_db::Confidence::Medium => "medium",
