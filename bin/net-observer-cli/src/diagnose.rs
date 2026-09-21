@@ -297,9 +297,18 @@ pub(crate) fn format_incident_context(table: &Table) -> Result<String> {
         c.idx("load1")?,
     ];
 
+    // Readable timestamps (owner ask): the three absolute-instant columns
+    // convert to local time before anything below reads them.
+    // `gap_opened_us`/`gap_closed_us` already render through `stamp()` in
+    // `gap_bounds` further down, and no other column here is a timestamp.
+    let mut source_rows = table.rows.clone();
+    for i in [opened, closed, state_ts] {
+        crate::convert_epoch_us_column(&mut source_rows, i);
+    }
+
     let mut rows = Vec::new();
     let (mut any_gap, mut any_absent) = (false, false);
-    for row in &table.rows {
+    for row in &source_rows {
         let in_gap = at(row, layer) == "gap";
         any_gap |= in_gap;
         // Inside a gap the state columns are not missing measurements — they are
@@ -369,10 +378,17 @@ pub(crate) fn format_wedge_vs_starvation(table: &Table) -> Result<String> {
     let (ep, opened, closed) = (c.idx("episode")?, c.idx("opened_us")?, c.idx("closed_us")?);
     let (ticks, load, verdict) = (c.idx("ticks")?, c.idx("max_load1")?, c.idx("verdict")?);
 
+    // Readable timestamps (owner ask): `opened_us`/`closed_us` convert to
+    // local time; `ticks`/`max_load1` are counts, never epochs.
+    let mut source_rows = table.rows.clone();
+    for i in [opened, closed] {
+        crate::convert_epoch_us_column(&mut source_rows, i);
+    }
+
     let mut rows = Vec::new();
     let mut any_unknown = false;
     let mut any_absent = false;
-    for row in &table.rows {
+    for row in &source_rows {
         any_unknown |= at(row, verdict) == "unknown";
         let load1 = measured(row, load, ABSENT);
         any_absent |= load1 == ABSENT;
@@ -432,6 +448,13 @@ pub(crate) fn format_gateway_ramp(
         c.idx("observation_gap_us")?,
     );
 
+    // Readable timestamps (owner ask): only `ts_us` is an absolute instant —
+    // `us_before_drop` is a duration before the drop (never converted, and
+    // never `_us`-suffixed by name either) and `observation_gap_us` a gap
+    // length, both left exactly as the query answered them.
+    let mut source_rows = table.rows.clone();
+    crate::convert_epoch_us_column(&mut source_rows, ts);
+
     let mut out = String::new();
     kv(
         &mut out,
@@ -440,7 +463,7 @@ pub(crate) fn format_gateway_ramp(
     );
     kv(&mut out, "window_us", &window_us.to_string());
 
-    let Some(first) = table.rows.first() else {
+    let Some(first) = source_rows.first() else {
         kv(
             &mut out,
             "slope",
@@ -473,8 +496,7 @@ pub(crate) fn format_gateway_ramp(
         ),
     }
 
-    let rows: Vec<Vec<String>> = table
-        .rows
+    let rows: Vec<Vec<String>> = source_rows
         .iter()
         .map(|row| {
             vec![
@@ -1221,6 +1243,47 @@ mod tests {
         assert!(out.contains("no incidents"), "{out}");
     }
 
+    /// Readable timestamps (owner ask): `opened_us`/`closed_us`/`state_ts_us`
+    /// carry plausible epoch microseconds here, so each renders as local
+    /// time — the raw number never leaks into the output — while `ticks`-like
+    /// small numbers elsewhere in the row are untouched.
+    #[test]
+    fn incident_context_converts_absolute_timestamps_to_local_time() {
+        let opened_us = 1_700_000_000_000_000i64;
+        let closed_us = opened_us + 60_000_000;
+        let state_ts_us = opened_us + 5_000_000;
+        let (opened, closed, state_ts) = (
+            opened_us.to_string(),
+            closed_us.to_string(),
+            state_ts_us.to_string(),
+        );
+        let t = table(
+            CTX_COLS,
+            &[&[
+                "i1",
+                "gw-drop",
+                opened.as_str(),
+                closed.as_str(),
+                state_ts.as_str(),
+                "FAIL",
+                "OK",
+                "OK",
+                "204",
+                "0.5",
+                "link",
+                "",
+                "",
+            ]],
+        );
+        let out = format_incident_context(&t).unwrap();
+        assert!(!out.contains(&opened), "raw epoch leaked: {out}");
+        assert!(!out.contains(&closed), "raw epoch leaked: {out}");
+        assert!(!out.contains(&state_ts), "raw epoch leaked: {out}");
+        assert!(out.contains(&crate::opened_local(opened_us)), "{out}");
+        assert!(out.contains(&crate::opened_local(closed_us)), "{out}");
+        assert!(out.contains(&crate::opened_local(state_ts_us)), "{out}");
+    }
+
     const EPISODE_COLS: &[&str] = &[
         "episode",
         "opened_us",
@@ -1244,6 +1307,33 @@ mod tests {
         assert!(out.contains("REFUSED"), "{out}");
         assert!(out.contains("cannot tell a wedge from starvation"), "{out}");
         assert!(out.contains(ABSENT), "{out}");
+    }
+
+    /// Readable timestamps: `opened_us`/`closed_us` convert to local time;
+    /// `ticks` and `max_load1` — small numbers in the same row — are left
+    /// exactly as the query answered them.
+    #[test]
+    fn wedge_vs_starvation_converts_opened_and_closed_to_local_time() {
+        let opened_us = 2_000_000_000_000_000i64;
+        let closed_us = opened_us + 300_000_000;
+        let (opened, closed) = (opened_us.to_string(), closed_us.to_string());
+        let t = table(
+            EPISODE_COLS,
+            &[&[
+                "1",
+                opened.as_str(),
+                closed.as_str(),
+                "3",
+                "24.0",
+                "starvation",
+            ]],
+        );
+        let out = format_wedge_vs_starvation(&t).unwrap();
+        assert!(!out.contains(&opened), "raw epoch leaked: {out}");
+        assert!(!out.contains(&closed), "raw epoch leaked: {out}");
+        assert!(out.contains(&crate::opened_local(opened_us)), "{out}");
+        assert!(out.contains(&crate::opened_local(closed_us)), "{out}");
+        assert!(out.contains("24.0"), "ticks/load1 stay untouched: {out}");
     }
 
     const RAMP_COLS: &[&str] = &[
@@ -1285,6 +1375,29 @@ mod tests {
         let t = table(RAMP_COLS, &[&["100", "900", "FAIL", "", "12.5", "2", "0"]]);
         let out = format_gateway_ramp(&t, 1000, 900).unwrap();
         assert!(out.contains("(no answer)"), "{out}");
+    }
+
+    /// Readable timestamps: `ts_us` (an absolute instant) converts to local
+    /// time; `us_before_drop` (a duration before the drop, never
+    /// `_us`-suffixed by name either) stays raw — this fold only ever
+    /// converts the column it knows is an absolute instant, never anything
+    /// reached by scanning column names.
+    #[test]
+    fn gateway_ramp_converts_only_the_absolute_ts_us_column() {
+        let ts_us = 1_800_000_000_000_000i64;
+        let ts = ts_us.to_string();
+        let before_drop = "700900";
+        let t = table(
+            RAMP_COLS,
+            &[&[ts.as_str(), before_drop, "OK", "5.0", "12.5", "2", "0"]],
+        );
+        let out = format_gateway_ramp(&t, 1000, 900).unwrap();
+        assert!(!out.contains(&ts), "raw epoch leaked: {out}");
+        assert!(out.contains(&crate::opened_local(ts_us)), "{out}");
+        assert!(
+            out.contains(before_drop),
+            "a duration column must stay raw: {out}"
+        );
     }
 
     const GAP_COLS: &[&str] = &["kind", "gap_opened_us", "gap_closed_us", "gap_closed_by"];

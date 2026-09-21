@@ -198,6 +198,18 @@ pub struct ConnectionRow {
     /// never hidden.
     #[serde(default)]
     pub scope: ConnectionScope,
+    /// The egress interface this flow actually left through, derived from
+    /// `chain` and sing-box's rendered config at collection (realm
+    /// net-observer, node #75): the TUN interface name for a tunneled flow,
+    /// the physical interface for a `direct`-typed outbound, and the literal
+    /// `blocked` for a `block`-typed one. `None` means unknown — an old
+    /// daemon's row, a config that could not be read, or a chain naming an
+    /// outbound the config does not — never invented. `chain` is part of the
+    /// row's key, so `iface` (a function of `chain` plus the config) is
+    /// constant within a row and splits no key. `serde(default)` so an older
+    /// sender's row still decodes.
+    #[serde(default)]
+    pub iface: Option<String>,
 }
 
 /// One tick of the `connections` collector.
@@ -270,6 +282,7 @@ mod tests {
             upload: 0,
             download: 0,
             scope: ConnectionScope::External,
+            iface: None,
         }
     }
 

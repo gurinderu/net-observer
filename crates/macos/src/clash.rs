@@ -462,14 +462,37 @@ impl ConnectionFacts for ConnectionSystemFacts {
     /// small local file, an instant synchronous read). A config that cannot
     /// be read names neither: the fold then judges without them, and says
     /// `lan` / `external` for those addresses rather than hiding them.
+    ///
+    /// Also the iface-derivation facts (realm net-observer, node #75, third
+    /// paragraph): `tun_if` resolved the same way
+    /// `dhcp_arp::SystemFacts::singbox_tun_iface` does — the address from
+    /// THIS read of the config, then one `ifconfig`, through the shared
+    /// [`crate::dhcp_arp::iface_with_inet`] parser — `direct_if` via the
+    /// same route-table resolution the link facts' `phys_iface` falls back
+    /// to ([`crate::dhcp_arp::default_route_iface`]), and the direct/block
+    /// outbound tags from this same config text. All local reads (config
+    /// file, `ifconfig`, `route -n get`) — passive-tier safe, same as the
+    /// rest of this method: no packet on the wire.
     async fn own_listeners(&self) -> OwnListeners {
         let Ok(text) = std::fs::read_to_string(&self.singbox_config) else {
             tracing::debug!(path = ?self.singbox_config, "sing-box config unreadable");
             return OwnListeners::default();
         };
+        let tun_addr = singbox_tun_addr(&text);
+        let tun_if = match &tun_addr {
+            Some(addr) => crate::dhcp_arp::run("ifconfig", &[])
+                .await
+                .and_then(|out| crate::dhcp_arp::iface_with_inet(&out, addr)),
+            None => None,
+        };
+        let (direct_tags, block_tags) = singbox_outbound_tags(&text);
         OwnListeners {
-            tun_addr: singbox_tun_addr(&text),
+            tun_addr,
             dns_pin: singbox_dns_pin(&text),
+            tun_if,
+            direct_if: crate::dhcp_arp::default_route_iface().await,
+            direct_tags,
+            block_tags,
         }
     }
 
@@ -579,6 +602,35 @@ pub(crate) fn singbox_dns_pin(config_json: &str) -> Option<String> {
         .find_map(|i| i.get("listen")?.as_str())
         .filter(|listen| !listen.is_empty())
         .map(str::to_string)
+}
+
+/// The tags of every `type = "direct"` and every `type = "block"` outbound
+/// in a sing-box config, as `(direct_tags, block_tags)` — what
+/// [`collector_connections::OwnListeners::iface_for_chain`] matches a flow's
+/// `chain` against to tell a direct-out flow and a blocked one apart from a
+/// tunneled one. Read by type, never by tag (`direct-out`/`block-out` are
+/// this owner's names, not sing-box's convention — the config renames them
+/// at will), like [`singbox_tun_addr`] reads by the inbound's own type/tag
+/// rather than a hardcoded name. Absent `outbounds`, or a tag-less entry, is
+/// simply not collected — the empty list, not an error. Both lists are in
+/// config order and may contain duplicates if the config does (never
+/// deduplicated: a membership test is unaffected either way).
+pub(crate) fn singbox_outbound_tags(config_json: &str) -> (Vec<String>, Vec<String>) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(config_json) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(outbounds) = value.get("outbounds").and_then(|o| o.as_array()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let tags_of = |kind: &str| -> Vec<String> {
+        outbounds
+            .iter()
+            .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some(kind))
+            .filter_map(|o| o.get("tag").and_then(|t| t.as_str()))
+            .map(str::to_string)
+            .collect()
+    };
+    (tags_of("direct"), tags_of("block"))
 }
 
 #[cfg(test)]
@@ -884,6 +936,41 @@ mod tests {
             None
         );
         assert_eq!(singbox_dns_pin("garbage"), None);
+    }
+
+    /// Direct and block outbound tags are read by `type`, never by a
+    /// hardcoded tag name (`direct-out`/`block-out` are this owner's own
+    /// names, not sing-box's convention): a renamed or duplicated tag is
+    /// still found, and a `vless`/other outbound contributes to neither list.
+    #[test]
+    fn extracts_direct_and_block_outbound_tags_by_type() {
+        let cfg = r#"{
+            "outbounds": [
+                {"type": "vless", "tag": "vless-out-6", "server": "1.1.1.1", "server_port": 443},
+                {"type": "direct", "tag": "direct-egress"},
+                {"type": "block", "tag": "reject-ads"},
+                {"type": "direct", "tag": "another-direct"}
+            ]
+        }"#;
+        assert_eq!(
+            singbox_outbound_tags(cfg),
+            (
+                vec!["direct-egress".to_string(), "another-direct".to_string()],
+                vec!["reject-ads".to_string()]
+            )
+        );
+    }
+
+    /// A config with no `direct`/`block` outbound at all — or no config —
+    /// yields two empty lists, never an invented tag.
+    #[test]
+    fn no_direct_or_block_outbound_is_two_empty_lists() {
+        assert_eq!(singbox_outbound_tags("{}"), (Vec::new(), Vec::new()));
+        assert_eq!(
+            singbox_outbound_tags(r#"{"outbounds":[{"type":"vless","tag":"a"}]}"#),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(singbox_outbound_tags("garbage"), (Vec::new(), Vec::new()));
     }
 
     /// `GET /connections` as observed on the owner's Mac, verbatim (realm

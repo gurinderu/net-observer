@@ -410,7 +410,7 @@ const INSERT_NEIGHBOR: &str = "INSERT INTO neighbor VALUES (?,?,?,?,?,?,?,?,?)
        source = excluded.source,
        last_seen_us = excluded.last_seen_us";
 const INSERT_CONNECTION_SAMPLE: &str =
-    "INSERT INTO connection_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?)";
+    "INSERT INTO connection_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_SINGBOX_LOG_SAMPLE: &str = "INSERT INTO singbox_log_sample VALUES (?,?,?,?,?)";
 const INSERT_NEIGHBOR_SCAN: &str = "INSERT INTO neighbor_scan VALUES (?,?,?,?,?,?,?,?)";
 const INSERT_INCIDENT: &str = "INSERT INTO incident VALUES (?,?,?,?,?)";
@@ -661,7 +661,8 @@ impl Store for DuckdbStore {
                             r.count,
                             r.upload,
                             r.download,
-                            r.scope.as_str()
+                            r.scope.as_str(),
+                            r.iface
                         ],
                     )?;
                 }
@@ -2388,6 +2389,7 @@ mod tests {
             upload: 10 * u64::from(count),
             download: 5000,
             scope: types::ConnectionScope::External,
+            iface: Some("utun10".into()),
         }
     }
 
@@ -2422,7 +2424,7 @@ mod tests {
                 "SELECT count(*) FROM connection_sample WHERE ts_us=8000 AND verdict='OK' \
                  AND host='claude.ai' AND dst_ip IS NULL AND dst_port=443 AND process IS NULL \
                  AND network='tcp' AND chain='vless-out-6' AND count=3 AND upload=30 \
-                 AND download=5000 AND scope='external'"
+                 AND download=5000 AND scope='external' AND iface='utun10'"
             )
             .unwrap(),
             1
@@ -2478,10 +2480,11 @@ mod tests {
         assert!(t.rows.iter().all(|r| r[ts] == "8300"), "{:?}", t.rows);
     }
 
-    /// A record written before the scope existed keeps its eleven-column
-    /// rows, gains the column on open, and this build writes twelve-column
-    /// rows into it — with the old rows reading back as `external` through
-    /// the diagnosis, never hidden (realm net-observer, node #75).
+    /// A record written before `scope`/`iface` existed keeps its
+    /// eleven-column rows, gains both columns on open, and this build writes
+    /// thirteen-column rows into it — with the old rows reading back as
+    /// `external`/unknown-iface through the diagnosis, never hidden (realm
+    /// net-observer, node #75).
     #[test]
     fn an_old_connection_table_without_scope_opens_and_keeps_its_rows() {
         use types::{ConnectionsGroupBy, ConnectionsSample, ConnectionsVerdict};
@@ -2499,11 +2502,11 @@ mod tests {
         assert_eq!(
             s.query_scalar_i64(
                 "SELECT count(*) FROM connection_sample \
-                 WHERE ts_us = 1000 AND count = 9 AND scope IS NULL"
+                 WHERE ts_us = 1000 AND count = 9 AND scope IS NULL AND iface IS NULL"
             )
             .unwrap(),
             1,
-            "the old row must survive the added column"
+            "the old row must survive the added columns"
         );
         let t = s.connections(ConnectionsGroupBy::Ip).unwrap();
         let scope = t.columns.iter().position(|c| c == "scope").unwrap();
@@ -2521,7 +2524,7 @@ mod tests {
         assert_eq!(
             s.query_scalar_i64(
                 "SELECT count(*) FROM connection_sample \
-                 WHERE ts_us = 2000 AND count = 4 AND scope = 'internal'"
+                 WHERE ts_us = 2000 AND count = 4 AND scope = 'internal' AND iface = 'utun10'"
             )
             .unwrap(),
             1

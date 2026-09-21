@@ -261,6 +261,15 @@ CREATE TABLE IF NOT EXISTS connection_sample (
 -- (shown, never hidden). Added after the table first shipped — same migration
 -- treatment as `observing_edge.cause` below.
 ALTER TABLE connection_sample ADD COLUMN IF NOT EXISTS scope VARCHAR;
+-- The egress interface the flow actually left through, derived once by the
+-- collector from `chain` and sing-box's rendered config (realm net-observer,
+-- node #75, third paragraph): the TUN interface name for a tunneled flow,
+-- the physical interface for a `direct`-typed outbound, the literal
+-- 'blocked' for a `block`-typed one. NULL on the empty-tick marker row, on a
+-- chain naming an outbound the config does not, and on rows written before
+-- the column existed — never invented. Same migration treatment as `scope`
+-- above.
+ALTER TABLE connection_sample ADD COLUMN IF NOT EXISTS iface VARCHAR;
 -- sing-box's own ERROR/WARN lines, read passively from its log and classed
 -- (realm net-observer, nodes #140, #141): one row per (class, node) per tick
 -- of the `singbox-log` collector, `count` lines of that class seen in the

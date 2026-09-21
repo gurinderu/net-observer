@@ -93,6 +93,10 @@ mod tests {
             OwnListeners {
                 tun_addr: Some("172.19.0.1".into()),
                 dns_pin: Some("192.0.2.53".into()),
+                tun_if: Some("utun10".into()),
+                direct_if: Some("en0".into()),
+                direct_tags: vec!["direct-egress".into()],
+                block_tags: vec!["reject-ads".into()],
             }
         }
         async fn preflight(&self) -> Readiness {
@@ -151,6 +155,33 @@ mod tests {
         assert_eq!(
             scopes,
             vec![ConnectionScope::Internal, ConnectionScope::External]
+        );
+    }
+
+    /// The tick's rows are stamped with the interface derived from the
+    /// port's listeners: a tunneled flow gets the TUN interface, a
+    /// direct-tagged one the physical egress, a block-tagged one `blocked`
+    /// (realm net-observer, node #75) — this collector never touches the
+    /// derivation itself, only wires the port's facts into the fold.
+    #[tokio::test]
+    async fn the_ticks_rows_are_stamped_with_the_iface_derived_from_the_ports_listeners() {
+        let mut direct = flow("printer.local");
+        direct.chain = Some("direct-egress".into());
+        let mut blocked = flow("ads.example");
+        blocked.chain = Some("reject-ads".into());
+        let c = collector(Some(vec![flow("claude.ai"), direct, blocked]));
+        let samples = c.collect(42).await;
+        let [Sample::Connections(s)] = samples.as_slice() else {
+            panic!("expected one connections sample, got {samples:?}");
+        };
+        let ifaces: Vec<Option<String>> = s.rows.iter().map(|r| r.iface.clone()).collect();
+        assert_eq!(
+            ifaces,
+            vec![
+                Some("utun10".to_string()),
+                Some("en0".to_string()),
+                Some("blocked".to_string()),
+            ]
         );
     }
 

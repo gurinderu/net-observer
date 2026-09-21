@@ -71,6 +71,13 @@ struct Cli {
     /// a `source:` line on stderr.
     #[arg(long)]
     db: Option<String>,
+    /// Never pipe rendered output through a pager, even on a terminal. Every
+    /// table this CLI prints normally pages the way `git log` does — through
+    /// `$PAGER` (or `less -RFX`) on a terminal, direct otherwise (a pipe, a
+    /// redirect, a script never pages either way). Accepted after the
+    /// subcommand too (`connections --no-pager`), not only before it.
+    #[arg(long, global = true)]
+    no_pager: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -298,9 +305,15 @@ enum Command {
     /// app's DNS query to sing-box's own listener is a flow) and the LAN
     /// ones are counted on a last line instead of listed; `--all` lists
     /// everything with its scope, `--scope` picks one.
+    ///
+    /// `iface` names the interface a flow actually left through, derived
+    /// from its outbound chain: a tunneled flow carries the TUN interface
+    /// name, a direct-out flow the machine's physical interface, a blocked
+    /// flow the literal `blocked`. Traffic that never enters the TUN (a
+    /// route exclusion) does not appear here at all.
     Connections {
         /// Group the flows by the name asked for, the destination address,
-        /// address and port, or the client process.
+        /// address and port, the client process, or the egress interface.
         #[arg(long, value_enum, default_value_t = GroupByArg::Host)]
         by: GroupByArg,
         /// List every flow whatever its scope, with a `scope` column.
@@ -309,6 +322,11 @@ enum Command {
         /// List the flows of one scope only (default: external).
         #[arg(long, value_enum)]
         scope: Option<ScopeArg>,
+        /// Keep only flows whose egress interface is exactly this name
+        /// (`blocked` matches the blocked pseudo-value too). Client-side,
+        /// like `--scope`.
+        #[arg(long)]
+        iface: Option<String>,
     },
     /// The latest radio-environment slice: foreign APs from the last scan.
     ///
@@ -449,8 +467,10 @@ impl ObserveState {
 }
 
 /// The grouping accepted by `connections --by`. A thin CLI mirror of
-/// [`ConnectionsGroupBy`] so `clap` renders `<host|ip|ip-port|process>` in the
-/// help without leaking the wire type into the argument surface.
+/// [`ConnectionsGroupBy`] so `clap` renders `<host|ip|ip-port|process|iface>`
+/// in the help without leaking the wire type into the argument surface —
+/// except `Iface`, which the wire type does not have at all (see
+/// [`GroupByArg::to_group_by`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum GroupByArg {
     /// By the name asked for (a bare-address flow is keyed by its address).
@@ -462,13 +482,21 @@ enum GroupByArg {
     IpPort,
     /// By the client process.
     Process,
+    /// By egress interface (the TUN interface name, the physical interface,
+    /// or `blocked`) — answered client-side over the daemon's ordinary
+    /// `host` grouping, since a new wire grouping is a hazard to an older
+    /// receiver (see AGENTS.md wire invariants).
+    Iface,
 }
 
 impl GroupByArg {
     /// Map to the wire [`ConnectionsGroupBy`] the daemon and the SQL take.
+    /// `Iface` has no wire counterpart — it rides on `Host`, and
+    /// [`fold_by_iface`] does the actual folding client-side over that
+    /// answer's rows.
     fn to_group_by(self) -> ConnectionsGroupBy {
         match self {
-            GroupByArg::Host => ConnectionsGroupBy::Host,
+            GroupByArg::Host | GroupByArg::Iface => ConnectionsGroupBy::Host,
             GroupByArg::Ip => ConnectionsGroupBy::Ip,
             GroupByArg::IpPort => ConnectionsGroupBy::IpPort,
             GroupByArg::Process => ConnectionsGroupBy::Process,
@@ -577,6 +605,126 @@ fn hidden_line(hidden: [u64; 3]) -> Option<String> {
     }
 }
 
+/// The `connections` view's own header rename (owner ask, Part B): `ts_us`
+/// converts to local time and its header becomes `ts` — this built-in view
+/// only; the generic `query` path ([`format_table`]) keeps the original
+/// column name, converting only the values. Converts BEFORE renaming, while
+/// the column is still spelled `ts_us` (what the epoch-plausibility gate
+/// keys on). A table without a `ts_us` column (an older daemon's, or
+/// already-renamed) passes through unchanged.
+fn rename_ts_column(table: &Table) -> Table {
+    let mut table = table.clone();
+    if let Some(i) = table.columns.iter().position(|c| c == "ts_us") {
+        convert_epoch_us_column(&mut table.rows, i);
+        table.columns[i] = "ts".to_string();
+    }
+    table
+}
+
+/// `connections --iface <name>`: keep only rows whose `iface` cell equals
+/// `name` exactly (`blocked` matches the blocked pseudo-value too) —
+/// client-side, like [`fold_by_scope`]'s filtering. `None` (no `--iface`
+/// given) keeps everything. The empty-tick marker row (`key` blank) has no
+/// flow to filter and is always kept: dropping it would turn "the API did
+/// not answer" into an empty table indistinguishable from no answer at all.
+/// A table without an `iface` column — an older daemon's — passes through
+/// unfiltered rather than matching nothing.
+fn filter_by_iface(table: &Table, iface: Option<&str>) -> Table {
+    let Some(iface) = iface else {
+        return table.clone();
+    };
+    let col = |name: &str| table.columns.iter().position(|c| c == name);
+    let Some(iface_col) = col("iface") else {
+        return table.clone();
+    };
+    let key_col = col("key");
+    let cell = |row: &[String], i: usize| -> String { row.get(i).cloned().unwrap_or_default() };
+    let rows = table
+        .rows
+        .iter()
+        .filter(|row| {
+            let marker = key_col.is_some_and(|i| cell(row, i).is_empty());
+            marker || cell(row, iface_col) == iface
+        })
+        .cloned()
+        .collect();
+    Table {
+        columns: table.columns.clone(),
+        rows,
+    }
+}
+
+/// `connections --by iface`: fold the table's rows by their `iface` cell,
+/// summing `count`/`upload`/`download` into each interface — client-side,
+/// like [`fold_by_scope`]; there is no server-side `iface` grouping to ask
+/// for instead (see [`GroupByArg::to_group_by`]). An unknown/absent `iface`
+/// folds under `-`. Rows are ordered busiest-first, like the daemon's own
+/// `count DESC`.
+///
+/// The empty-tick marker row (`key` blank) carries no flow to fold, and the
+/// table is returned unchanged when that marker is the ONLY row: folding
+/// "the tick had no flow at all" into the `-` bucket would read exactly like
+/// a real flow whose interface is unknown. A table missing any of the
+/// columns this fold needs — an older daemon's, or already reshaped by an
+/// earlier fold — also passes through unchanged.
+fn fold_by_iface(table: &Table) -> Table {
+    let col = |name: &str| table.columns.iter().position(|c| c == name);
+    let (Some(iface_col), Some(count_col), Some(upload_col), Some(download_col), Some(key_col)) = (
+        col("iface"),
+        col("count"),
+        col("upload"),
+        col("download"),
+        col("key"),
+    ) else {
+        return table.clone();
+    };
+    let cell = |row: &[String], i: usize| -> String { row.get(i).cloned().unwrap_or_default() };
+    if table.rows.iter().all(|r| cell(r, key_col).is_empty()) {
+        return table.clone();
+    }
+    let mut groups: Vec<(String, u64, u64, u64)> = Vec::new();
+    for row in &table.rows {
+        if cell(row, key_col).is_empty() {
+            continue;
+        }
+        let iface = cell(row, iface_col);
+        let iface = if iface.is_empty() {
+            "-".to_string()
+        } else {
+            iface
+        };
+        let count: u64 = cell(row, count_col).parse().unwrap_or(0);
+        let upload: u64 = cell(row, upload_col).parse().unwrap_or(0);
+        let download: u64 = cell(row, download_col).parse().unwrap_or(0);
+        match groups.iter_mut().find(|(i, ..)| *i == iface) {
+            Some((_, c, u, d)) => {
+                *c = c.saturating_add(count);
+                *u = u.saturating_add(upload);
+                *d = d.saturating_add(download);
+            }
+            None => groups.push((iface, count, upload, download)),
+        }
+    }
+    groups.sort_by_key(|(_, count, ..)| std::cmp::Reverse(*count));
+    Table {
+        columns: ["iface", "count", "upload", "download"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        rows: groups
+            .into_iter()
+            .map(|(iface, count, upload, download)| {
+                vec![
+                    iface,
+                    count.to_string(),
+                    upload.to_string(),
+                    download.to_string(),
+                ]
+            })
+            .collect(),
+    }
+}
+
 /// The tier accepted by the `probe` subcommand. A thin CLI mirror of
 /// [`ProbingTier`] so `clap` renders `<passive|active>` in the help without
 /// leaking the wire type into the argument surface.
@@ -669,12 +817,12 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Status => {
             let cfg = load_config(cli)?;
             let snap = fetch_status(&cfg.socket_path)?;
-            print!("{}", format_status(&snap));
+            print_paged(&format_status(&snap), cli.no_pager);
         }
         Command::Incidents { limit, ids } => {
             let cfg = load_config(cli)?;
             let incidents = fetch_incidents(&cfg.socket_path, *limit)?;
-            print!("{}", format_incidents(&incidents, *ids));
+            print_paged(&format_incidents(&incidents, *ids), cli.no_pager);
         }
         Command::Events { kind } => {
             let cfg = load_config(cli)?;
@@ -690,7 +838,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Kickstart => {
             let cfg = load_config(cli)?;
             let result = fetch_kickstart(&cfg.socket_path)?;
-            print!("{}", format_control(&result));
+            print_paged(&format_control(&result), cli.no_pager);
             // A refusal (unauthorised peer) or a failed action is a non-zero
             // exit, even though the request itself round-tripped fine.
             if !result.ok {
@@ -700,7 +848,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Observe { state } => {
             let cfg = load_config(cli)?;
             let result = fetch_set_observing(&cfg.socket_path, state.as_bool())?;
-            print!("{}", format_control(&result));
+            print_paged(&format_control(&result), cli.no_pager);
             // The request round-trips fine; a non-`ok` result means the daemon
             // declined or failed, which is a non-zero exit.
             if !result.ok {
@@ -710,7 +858,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Probe { tier } => {
             let cfg = load_config(cli)?;
             let result = fetch_set_probing(&cfg.socket_path, tier.to_tier())?;
-            print!("{}", format_control(&result));
+            print_paged(&format_control(&result), cli.no_pager);
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
@@ -718,7 +866,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Experiment { minutes, no_wait } => {
             let cfg = load_config(cli)?;
             let result = fetch_start_experiment(&cfg.socket_path, *minutes)?;
-            print!("{}", format_control(&result));
+            print_paged(&format_control(&result), cli.no_pager);
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
@@ -741,7 +889,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 net_observer_ipc::diagnose,
                 std::thread::sleep,
             )?;
-            print!("{}", format_table(&table));
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::ExperimentReport { id } => {
             let table =
@@ -757,7 +905,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         rows: table.rows,
                     })
                 })?;
-            print!("{}", format_table(&table));
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::ScanNeighbors {
             ports,
@@ -773,7 +921,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     cve: *cve,
                 },
             )?;
-            print!("{}", format_control(&result));
+            print_paged(&format_control(&result), cli.no_pager);
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
@@ -791,7 +939,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
-            print!("{}", format_table(&table));
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::Vulns { network } => {
             let sql = diagnosis::vulns_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
@@ -802,7 +950,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
-            print!("{}", format_table(&table));
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::Topology { iface } => {
             let sql = diagnosis::topology_sql(iface.as_deref()).map_err(|e| anyhow!("{e}"))?;
@@ -813,22 +961,36 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
-            print!("{}", format_table(&table));
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
-        Command::Connections { by, all, scope } => {
+        Command::Connections {
+            by,
+            all,
+            scope,
+            iface,
+        } => {
             let group_by = by.to_group_by();
             let sql = diagnosis::connections_sql(group_by);
             let table = diagnose_table(cli, DiagnosticQuery::Connections { group_by }, |off| {
                 run_query(off, &sql)
             })?;
+            let table = rename_ts_column(&table);
+            let table = filter_by_iface(&table, iface.as_deref());
             // The daemon answers every scope; the fold is the reader's
             // (realm net-observer, node #75).
             let keep = (!all).then(|| scope.map_or(ConnectionScope::External, ScopeArg::to_scope));
             let (table, hidden) = fold_by_scope(&table, keep);
-            print!("{}", format_table(&table));
+            let table = if *by == GroupByArg::Iface {
+                fold_by_iface(&table)
+            } else {
+                table
+            };
+            let mut out = format_table(&table, true);
             if let Some(line) = hidden_line(hidden) {
-                println!("{line}");
+                out.push_str(&line);
+                out.push('\n');
             }
+            print_paged(&out, cli.no_pager);
         }
         Command::Air => {
             // Three reads, one moment: the scan itself (so a SKIP is rendered as
@@ -874,24 +1036,29 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         (scan, aps, own)
                     }
                 };
-            print!("{}", diagnose::format_air(&scan, &aps, &own)?);
+            print_paged(&diagnose::format_air(&scan, &aps, &own)?, cli.no_pager);
         }
         Command::Query { sql } => {
             let table = table_from_query(run_query(&file_only(cli)?, sql)?);
-            print!("{}", format_table(&table));
+            // The record's raw/machine-readable carrier (realm net-observer,
+            // node #75): `ts_us` stays microseconds here, never converted to
+            // local time — there is no `--json`/`--raw` flag to route
+            // around the conversion instead, so a script or agent reading
+            // this output must see the integer it asked for.
+            print_paged(&format_table(&table, false), cli.no_pager);
         }
         Command::Why { at } => {
             let ts_us = diagnose::parse_at(at)?;
             let table = diagnose_table(cli, DiagnosticQuery::Why { ts_us }, |off| {
                 run_prepared(off, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))
             })?;
-            print!("{}", diagnose::format_verdict_at(&table, ts_us)?);
+            print_paged(&diagnose::format_verdict_at(&table, ts_us)?, cli.no_pager);
         }
         Command::IncidentContext => {
             let table = diagnose_table(cli, DiagnosticQuery::IncidentContext, |off| {
                 run_prepared(off, &diagnosis::incident_context_sql(LOAD_THRESHOLD))
             })?;
-            print!("{}", diagnose::format_incident_context(&table)?);
+            print_paged(&diagnose::format_incident_context(&table)?, cli.no_pager);
         }
         Command::WedgeOrStarvation => {
             let table = diagnose_table(cli, DiagnosticQuery::WedgeVsStarvation, |off| {
@@ -903,7 +1070,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     ),
                 )
             })?;
-            print!("{}", diagnose::format_wedge_vs_starvation(&table)?);
+            print_paged(&diagnose::format_wedge_vs_starvation(&table)?, cli.no_pager);
         }
         Command::GatewayRamp { drop, window_us } => {
             let drop_ts_us = match drop {
@@ -918,9 +1085,9 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_prepared(off, &diagnosis::gateway_ramp_sql(drop_ts_us, *window_us)),
             )?;
-            print!(
-                "{}",
-                diagnose::format_gateway_ramp(&table, drop_ts_us, *window_us)?
+            print_paged(
+                &diagnose::format_gateway_ramp(&table, drop_ts_us, *window_us)?,
+                cli.no_pager,
             );
         }
         Command::Gaps => {
@@ -942,13 +1109,13 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &diagnosis::silences_sql()),
             )?;
-            print!("{}", diagnose::format_observation_gaps(&table)?);
+            print_paged(&diagnose::format_observation_gaps(&table)?, cli.no_pager);
         }
         Command::Segments => {
             let table = diagnose_table(cli, DiagnosticQuery::Segments, |off| {
                 run_query(off, &diagnosis::segments_sql())
             })?;
-            print!("{}", format_table(&table));
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::History {
             network,
@@ -976,7 +1143,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
-            print!("{}", format_table(&table));
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::Completions { shell } => {
             clap_complete::generate(
@@ -1788,6 +1955,67 @@ fn format_status(snap: &StatusSnapshot) -> String {
     out
 }
 
+/// Whether [`print_paged`] should pipe through a pager (owner ask, Part C):
+/// stdout is a terminal AND paging was not explicitly disabled. Pure over
+/// its inputs — `is_tty` and `no_pager` — so the one real decision in the
+/// pager funnel is unit-tested directly; the TTY check itself cannot run in
+/// a test.
+fn should_page(is_tty: bool, no_pager: bool) -> bool {
+    is_tty && !no_pager
+}
+
+/// The pager command to spawn: `$PAGER` when set and non-blank (split on
+/// whitespace, so `"less -S"` carries its own flag), else `less -RFX` — `-F`
+/// quits at once when the content fits one screen, so a short table feels
+/// unpaged; `-X` keeps it in scrollback after quitting; `-R` lets
+/// comfy-table's UTF-8 box-drawing through untouched.
+fn pager_command() -> (String, Vec<String>) {
+    match std::env::var("PAGER") {
+        Ok(p) if !p.trim().is_empty() => {
+            let mut parts = p.split_whitespace().map(str::to_string);
+            let cmd = parts.next().unwrap_or_else(|| "less".to_string());
+            (cmd, parts.collect())
+        }
+        _ => ("less".to_string(), vec!["-RFX".to_string()]),
+    }
+}
+
+/// Print `content` — git-style: through a pager when stdout is a terminal
+/// and paging was not disabled with `--no-pager` ([`should_page`]), direct
+/// otherwise (a pipe, a redirect, a script — byte-identical to a plain
+/// `print!`). This is the ONE funnel every table-printing subcommand's final
+/// output goes through, so pagination and the `ts_us`→local-time conversion
+/// ([`format_table`], `diagnose`'s own tables) ride together.
+///
+/// If the pager cannot even be spawned, this falls back to a direct print
+/// rather than erroring — a broken `$PAGER` must not block every command.
+/// The pager's stdin is a pipe: the operator quitting early breaks it, and
+/// that write failure is swallowed, never a panic or a reported error; the
+/// child is always waited on so it neither zombies nor races the shell
+/// prompt's return against the pager's own screen paint.
+fn print_paged(content: &str, no_pager: bool) {
+    if !should_page(std::io::stdout().is_terminal(), no_pager) {
+        print!("{content}");
+        return;
+    }
+    let (cmd, args) = pager_command();
+    let child = std::process::Command::new(&cmd)
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(_) => {
+            print!("{content}");
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(content.as_bytes());
+    }
+    let _ = child.wait();
+}
+
 /// One table style for every rendered table in this CLI ([`format_incidents`]
 /// and [`format_table`]), so `incidents`, `query` and the diagnoses all look
 /// the same: `UTF8_FULL_CONDENSED` preset, header cells plain (no bold).
@@ -1904,16 +2132,92 @@ fn column_is_numeric(table: &Table, i: usize) -> bool {
     }) && any_value
 }
 
+/// The epoch-microseconds plausibility gate (owner ask): `s` parses as an
+/// `i64` inside `2001-09-09`..`2096-10-27` in epoch microseconds. A duration
+/// carried in the same `*_us` unit — `rtt_us`, `lasted_us`, a gap length —
+/// never reaches eight-figure-plus microseconds even over a long window, so
+/// checking the VALUE, not just a column's `_us`-suffixed name, keeps a
+/// duration column from being misread as a clock reading.
+fn plausible_epoch_us(s: &str) -> bool {
+    const LOW: i64 = 1_000_000_000_000_000;
+    const HIGH: i64 = 4_000_000_000_000_000;
+    s.trim()
+        .parse::<i64>()
+        .is_ok_and(|v| (LOW..HIGH).contains(&v))
+}
+
+/// Whether column `i` of `rows` should convert to local time: every
+/// non-blank cell ([`is_blank_cell`]) passes [`plausible_epoch_us`], and at
+/// least one cell has a value (a column blank throughout has nothing to
+/// judge). Blank/`-` cells are tolerated throughout, matching
+/// [`column_is_numeric`]'s treatment of a SKIP tick's withheld field.
+fn column_is_epoch_us(rows: &[Vec<String>], i: usize) -> bool {
+    let mut any_value = false;
+    rows.iter().all(|r| match r.get(i) {
+        None => true,
+        Some(c) if is_blank_cell(c) => true,
+        Some(c) => {
+            any_value = true;
+            plausible_epoch_us(c)
+        }
+    }) && any_value
+}
+
+/// Convert column `i` of `rows` to local `YYYY-MM-DD HH:MM:SS`
+/// ([`opened_local`] — the same format `incidents`' OPENED uses, pasteable
+/// into `why --at`) in place, when [`column_is_epoch_us`] passes over it; a
+/// no-op otherwise. Blank cells pass through unchanged either way. The one
+/// site the readable-timestamps rule funnels through: every caller — the
+/// generic [`format_table`], the `connections` view, and each of
+/// `diagnose`'s own hand-rolled tables — converts by calling this on the
+/// specific column index it knows is a `ts_us`/`*_us` epoch, never by
+/// re-deriving the gate.
+fn convert_epoch_us_column(rows: &mut [Vec<String>], i: usize) {
+    if !column_is_epoch_us(rows, i) {
+        return;
+    }
+    for row in rows.iter_mut() {
+        let Some(cell) = row.get_mut(i) else { continue };
+        if is_blank_cell(cell) {
+            continue;
+        }
+        if let Ok(us) = cell.trim().parse::<i64>() {
+            *cell = opened_local(us);
+        }
+    }
+}
+
 /// Render a generic query result as a [`new_table`]. See [`column_is_numeric`]
 /// for which columns right-align.
-fn format_table(table: &Table) -> String {
+///
+/// `readable_time` gates the epoch-microseconds conversion: when `true`,
+/// every column named `ts_us` or ending `_us` converts to local time first
+/// ([`convert_epoch_us_column`]) if [`column_is_epoch_us`] clears it — the
+/// header keeps its original name here (the `connections` view renames
+/// `ts_us` to `ts` itself, before calling this). `query <SQL>` passes
+/// `false`: it IS the record's raw/machine-readable carrier (realm
+/// net-observer, node #75 — "raw queries stay in microseconds"; AGENTS.md's
+/// Reality table names it the way to read the record's own contents), there
+/// is no `--json`/`--raw` flag to route around it instead, and a converted
+/// cell there would silently hand a script or agent a date string where an
+/// integer was asked for. Every other named diagnosis is a human-facing
+/// table and passes `true`.
+fn format_table(table: &Table, readable_time: bool) -> String {
+    let mut table = table.clone();
+    if readable_time {
+        for i in 0..table.columns.len() {
+            if table.columns[i].ends_with("_us") {
+                convert_epoch_us_column(&mut table.rows, i);
+            }
+        }
+    }
     let mut t = new_table();
     t.set_header(table.columns.clone());
     for row in &table.rows {
         t.add_row(row.clone());
     }
     for i in 0..table.columns.len() {
-        if !column_is_numeric(table, i) {
+        if !column_is_numeric(&table, i) {
             continue;
         }
         if let Some(col) = t.column_mut(i) {
@@ -2174,7 +2478,7 @@ mod tests {
             columns: vec!["ts_us".into(), "gw".into()],
             rows: vec![vec!["42".into(), "OK".into()]],
         };
-        let out = format_table(&table);
+        let out = format_table(&table, true);
         assert!(out.contains("ts_us") && out.contains("gw"));
         assert!(out.contains("42") && out.contains("OK"));
     }
@@ -2219,6 +2523,208 @@ mod tests {
             !column_is_numeric(&mixed_text, 0),
             "one non-numeric cell rules out the column: {mixed_text:?}"
         );
+    }
+
+    /// The epoch-us plausibility gate (owner ask, Part B): a value inside
+    /// the range reads as plausible; a duration-shaped `rtt_us`/`lasted_us`
+    /// value — small, even a several-hour one in microseconds — never does,
+    /// so the VALUE decides, not just a `*_us`-suffixed column name.
+    #[test]
+    fn plausible_epoch_us_gates_on_the_value() {
+        assert!(plausible_epoch_us("1700000000000000"));
+        assert!(plausible_epoch_us(" 1700000000000000 "));
+        assert!(!plausible_epoch_us("42"));
+        assert!(!plausible_epoch_us("999999999999")); // a `rtt_us`-shaped value
+        assert!(!plausible_epoch_us("not a number"));
+        assert!(!plausible_epoch_us(""));
+        assert!(!plausible_epoch_us("4000000000000000")); // the gate's own high end, exclusive
+        assert!(plausible_epoch_us("3999999999999999"));
+    }
+
+    /// [`column_is_epoch_us`] tolerates blanks like [`column_is_numeric`]
+    /// does, and needs at least one value to judge; a column mixing a
+    /// plausible epoch with a duration-shaped value is not uniformly epoch,
+    /// so the whole column is left alone.
+    #[test]
+    fn column_is_epoch_us_tolerates_blanks_but_needs_a_value() {
+        let rows = vec![
+            vec!["1700000000000000".to_string()],
+            vec![String::new()],
+            vec!["-".to_string()],
+            vec!["1700000060000000".to_string()],
+        ];
+        assert!(column_is_epoch_us(&rows, 0));
+
+        let all_blank = vec![vec![String::new()], vec!["-".to_string()]];
+        assert!(!column_is_epoch_us(&all_blank, 0));
+
+        let mixed_with_a_duration = vec![
+            vec!["1700000000000000".to_string()],
+            vec!["120".to_string()],
+        ];
+        assert!(!column_is_epoch_us(&mixed_with_a_duration, 0));
+    }
+
+    /// [`convert_epoch_us_column`] rewrites a qualifying column's non-blank
+    /// cells to local time in place, leaves blanks untouched, and is a no-op
+    /// on a column that does not clear [`column_is_epoch_us`].
+    #[test]
+    fn convert_epoch_us_column_converts_in_place_and_skips_non_epoch_columns() {
+        let epoch = 1_700_000_000_000_000i64;
+        let mut rows = vec![
+            vec![epoch.to_string(), "42".to_string()],
+            vec![String::new(), "43".to_string()],
+        ];
+        convert_epoch_us_column(&mut rows, 0);
+        assert_eq!(rows[0][0], opened_local(epoch));
+        assert_eq!(rows[1][0], "", "a blank cell passes through unchanged");
+
+        let mut untouched = vec![vec!["42".to_string()]];
+        convert_epoch_us_column(&mut untouched, 0);
+        assert_eq!(untouched[0][0], "42", "not plausibly epoch: left alone");
+    }
+
+    /// [`format_table`] converts every `_us`-suffixed column that clears the
+    /// plausibility gate, keeps the header name as-is (the `connections`
+    /// view renames it itself — see [`rename_ts_column`]), and leaves a
+    /// duration-shaped `_us` column raw.
+    #[test]
+    fn format_table_converts_epoch_us_columns_but_not_duration_shaped_ones() {
+        let epoch = 1_700_000_000_000_000i64;
+        let table = Table {
+            columns: vec!["ts_us".into(), "rtt_us".into()],
+            rows: vec![vec![epoch.to_string(), "45000".into()]],
+        };
+        let out = format_table(&table, true);
+        assert!(out.contains("ts_us"), "header name is kept: {out}");
+        assert!(!out.contains(&epoch.to_string()), "raw epoch leaked: {out}");
+        assert!(out.contains(&opened_local(epoch)), "{out}");
+        assert!(out.contains("45000"), "a duration column stays raw: {out}");
+    }
+
+    /// `query <SQL>` is the record's raw/machine-readable carrier (realm
+    /// net-observer, node #75 — "raw queries stay in microseconds"): it
+    /// calls `format_table` with `readable_time = false`, so `ts_us` prints
+    /// as the plain digits a script or agent can parse as an integer, never
+    /// a date string — the exact same table read as `readable_time = true`
+    /// (what `connections` and every other named diagnosis pass) converts.
+    #[test]
+    fn format_table_readable_time_false_keeps_query_output_raw() {
+        let epoch = 1_700_000_000_000_000i64;
+        let table = Table {
+            columns: vec!["ts_us".into(), "gw".into()],
+            rows: vec![vec![epoch.to_string(), "OK".into()]],
+        };
+
+        let raw = format_table(&table, false);
+        assert!(
+            raw.contains(&epoch.to_string()),
+            "query's raw path must print the digits: {raw}"
+        );
+        assert!(
+            !raw.contains(&opened_local(epoch)),
+            "query's raw path must not render a date: {raw}"
+        );
+
+        let readable = format_table(&table, true);
+        assert!(
+            !readable.contains(&epoch.to_string()),
+            "the readable path must not leak the raw epoch: {readable}"
+        );
+        assert!(
+            readable.contains(&opened_local(epoch)),
+            "the readable path converts: {readable}"
+        );
+    }
+
+    /// The `connections` view's own rename: `ts_us` converts to local time
+    /// AND its header becomes `ts`; a table without `ts_us` (an older
+    /// daemon's, or already renamed) passes through unchanged.
+    #[test]
+    fn rename_ts_column_converts_and_renames_ts_us_only() {
+        let epoch = 1_700_000_000_000_000i64;
+        let table = Table {
+            columns: vec!["ts_us".into(), "key".into()],
+            rows: vec![vec![epoch.to_string(), "claude.ai".into()]],
+        };
+        let renamed = rename_ts_column(&table);
+        assert_eq!(renamed.columns, vec!["ts", "key"]);
+        assert_eq!(renamed.rows[0][0], opened_local(epoch));
+        assert_eq!(renamed.rows[0][1], "claude.ai");
+
+        let no_ts = Table {
+            columns: vec!["key".into()],
+            rows: vec![vec!["claude.ai".into()]],
+        };
+        assert_eq!(rename_ts_column(&no_ts), no_ts);
+    }
+
+    /// [`should_page`]'s full truth table (owner ask, Part C): pages only
+    /// when stdout is a terminal AND paging was not explicitly disabled.
+    /// This is also the proof the non-TTY path in [`print_paged`] is
+    /// byte-identical to a plain `print!`: `should_page(false, _)` is always
+    /// `false`, and that branch of `print_paged` is exactly `print!` — the
+    /// TTY branch itself is the one piece that cannot run in a test.
+    #[test]
+    fn should_page_truth_table() {
+        assert!(should_page(true, false));
+        assert!(!should_page(true, true));
+        assert!(!should_page(false, false));
+        assert!(!should_page(false, true));
+    }
+
+    /// `pager_command` honours `$PAGER` (split on whitespace, so it carries
+    /// its own flags — `less -S`) when set and non-blank, and falls back to
+    /// `less -RFX` otherwise; a `PAGER` that is empty or only whitespace is
+    /// treated as unset, never as "run nothing".
+    #[test]
+    fn pager_command_honors_pager_env_or_falls_back_to_less() {
+        // SAFETY: this test owns `PAGER` for its duration — set/read/restored
+        // single-threaded within this one test body — and no other test in
+        // this crate touches the variable.
+        let saved = std::env::var("PAGER").ok();
+        unsafe {
+            std::env::set_var("PAGER", "less -S");
+        }
+        assert_eq!(
+            pager_command(),
+            ("less".to_string(), vec!["-S".to_string()])
+        );
+
+        unsafe {
+            std::env::set_var("PAGER", "   ");
+        }
+        assert_eq!(
+            pager_command(),
+            ("less".to_string(), vec!["-RFX".to_string()])
+        );
+
+        unsafe {
+            std::env::remove_var("PAGER");
+        }
+        assert_eq!(
+            pager_command(),
+            ("less".to_string(), vec!["-RFX".to_string()])
+        );
+
+        unsafe {
+            match &saved {
+                Some(v) => std::env::set_var("PAGER", v),
+                None => std::env::remove_var("PAGER"),
+            }
+        }
+    }
+
+    /// `--no-pager` is `global = true`: accepted before the subcommand and
+    /// after it alike, and absent by default.
+    #[test]
+    fn no_pager_flag_parses_before_and_after_the_subcommand() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "status"]).unwrap();
+        assert!(!cli.no_pager);
+        let cli = Cli::try_parse_from(["net-observer-cli", "--no-pager", "status"]).unwrap();
+        assert!(cli.no_pager);
+        let cli = Cli::try_parse_from(["net-observer-cli", "status", "--no-pager"]).unwrap();
+        assert!(cli.no_pager);
     }
 
     /// An explicit `--db` means the operator named the record: the socket is
@@ -2706,8 +3212,10 @@ mod tests {
         assert_eq!(EventKindArg::Link.to_kinds(), vec![EventKind::Link]);
     }
 
-    /// `connections --by` takes the four groupings by their lowercase names,
-    /// defaults to `host`, and maps onto the wire type the daemon reads.
+    /// `connections --by` takes the five groupings by their lowercase names,
+    /// defaults to `host`, and maps onto the wire type the daemon reads —
+    /// `iface` has none of its own and rides on `host` (see
+    /// [`GroupByArg::to_group_by`]).
     #[test]
     fn connections_by_parses_every_grouping_and_defaults_to_host() {
         let parse = |args: &[&str]| {
@@ -2726,12 +3234,38 @@ mod tests {
             ("ip", GroupByArg::Ip, ConnectionsGroupBy::Ip),
             ("ip-port", GroupByArg::IpPort, ConnectionsGroupBy::IpPort),
             ("process", GroupByArg::Process, ConnectionsGroupBy::Process),
+            ("iface", GroupByArg::Iface, ConnectionsGroupBy::Host),
         ] {
             let by = parse(&["connections", "--by", token]);
             assert_eq!(by, arg, "{token}");
             assert_eq!(by.to_group_by(), wire, "{token}");
         }
         assert!(Cli::try_parse_from(["net-observer-cli", "connections", "--by", "port"]).is_err());
+    }
+
+    /// `connections --iface <name>` is a plain string filter, independent of
+    /// `--by`/`--scope`/`--all`; absent by default.
+    #[test]
+    fn connections_iface_flag_parses() {
+        let parse = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                std::iter::once("net-observer-cli").chain(args.iter().copied()),
+            )
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            match cli.command {
+                Command::Connections { iface, .. } => iface,
+                _ => panic!("{args:?} did not parse as `connections`"),
+            }
+        };
+        assert_eq!(parse(&["connections"]), None);
+        assert_eq!(
+            parse(&["connections", "--iface", "utun10"]),
+            Some("utun10".to_string())
+        );
+        assert_eq!(
+            parse(&["connections", "--iface", "blocked", "--by", "iface"]),
+            Some("blocked".to_string())
+        );
     }
 
     /// `connections` shows external flows by default; `--scope` picks one
@@ -2879,6 +3413,306 @@ mod tests {
         let (shown, hidden) = fold_by_scope(&older, Some(ConnectionScope::Internal));
         assert!(shown.rows.is_empty());
         assert_eq!(hidden, [0, 0, 1023]);
+    }
+
+    /// A `connections` table shaped like the current `connections_sql`
+    /// answer, `iface` included — after `key`, before `scope` (realm
+    /// net-observer, node #75).
+    fn iface_table(rows: Vec<[&str; 9]>) -> Table {
+        Table {
+            columns: [
+                "ts_us", "verdict", "key", "iface", "scope", "count", "upload", "download", "hosts",
+            ]
+            .map(String::from)
+            .to_vec(),
+            rows: rows
+                .into_iter()
+                .map(|r| r.map(String::from).to_vec())
+                .collect(),
+        }
+    }
+
+    /// `--iface <name>` keeps exact matches (`blocked` included), keeps the
+    /// empty-tick marker under every filter, and `None` (no `--iface`)
+    /// passes the table through unfiltered.
+    #[test]
+    fn filter_by_iface_keeps_matching_rows_and_the_marker() {
+        let t = iface_table(vec![
+            [
+                "7",
+                "OK",
+                "claude.ai",
+                "utun10",
+                "external",
+                "3",
+                "100",
+                "5006",
+                "",
+            ],
+            ["7", "OK", "printer.local", "en0", "lan", "1", "1", "1", ""],
+            [
+                "7",
+                "OK",
+                "ads.example",
+                "blocked",
+                "external",
+                "1",
+                "1",
+                "0",
+                "",
+            ],
+        ]);
+        let kept = filter_by_iface(&t, Some("utun10"));
+        assert_eq!(kept.rows.len(), 1);
+        assert_eq!(kept.rows[0][2], "claude.ai");
+
+        let blocked = filter_by_iface(&t, Some("blocked"));
+        assert_eq!(blocked.rows.len(), 1);
+        assert_eq!(blocked.rows[0][2], "ads.example");
+
+        assert_eq!(filter_by_iface(&t, None), t);
+
+        let skipped = iface_table(vec![["7", "SKIP", "", "", "", "", "", "", ""]]);
+        assert_eq!(filter_by_iface(&skipped, Some("utun10")), skipped);
+    }
+
+    /// A minimal shape [`fold_by_iface`] needs: `key`, `iface`,
+    /// `count`/`upload`/`download` — what the table looks like after
+    /// [`fold_by_scope`] has already dropped `scope`.
+    fn iface_fold_input(rows: Vec<[&str; 5]>) -> Table {
+        Table {
+            columns: ["key", "iface", "count", "upload", "download"]
+                .map(String::from)
+                .to_vec(),
+            rows: rows
+                .into_iter()
+                .map(|r| r.map(String::from).to_vec())
+                .collect(),
+        }
+    }
+
+    /// `--by iface` sums `count`/`upload`/`download` per interface, an
+    /// absent `iface` folds under `-`, and the busiest interface comes
+    /// first — the daemon's own `count DESC` order, kept by the client fold.
+    #[test]
+    fn fold_by_iface_sums_by_interface_and_defaults_unknown_to_dash() {
+        let t = iface_fold_input(vec![
+            ["claude.ai", "utun10", "3", "100", "5006"],
+            ["o540343.ingest.sentry.io", "utun10", "1", "4", "0"],
+            ["printer.local", "en0", "1", "1", "1"],
+            ["ads.example", "blocked", "1", "1", "0"],
+            ["mystery.example", "", "1", "2", "0"],
+        ]);
+        let folded = fold_by_iface(&t);
+        assert_eq!(
+            folded.columns,
+            ["iface", "count", "upload", "download"],
+            "{folded:?}"
+        );
+        let row = |iface: &str| {
+            folded
+                .rows
+                .iter()
+                .find(|r| r[0] == iface)
+                .unwrap_or_else(|| panic!("no {iface} row in {folded:?}"))
+                .clone()
+        };
+        assert_eq!(row("utun10"), vec!["utun10", "4", "104", "5006"]);
+        assert_eq!(row("en0"), vec!["en0", "1", "1", "1"]);
+        assert_eq!(row("blocked"), vec!["blocked", "1", "1", "0"]);
+        assert_eq!(row("-"), vec!["-", "1", "2", "0"]);
+        assert_eq!(folded.rows[0][0], "utun10", "busiest interface first");
+    }
+
+    /// The empty-tick marker row (`key` blank) carries no flow to fold: the
+    /// table passes through unchanged rather than folding "no flow at all"
+    /// into the `-` bucket alongside a real unknown-interface flow.
+    #[test]
+    fn fold_by_iface_passes_through_an_empty_tick_unchanged() {
+        let skipped = iface_fold_input(vec![["", "", "", "", ""]]);
+        assert_eq!(fold_by_iface(&skipped), skipped);
+    }
+
+    /// A table missing a column this fold needs — an older daemon's, or one
+    /// already reshaped by a different fold — passes through unchanged
+    /// rather than panicking or matching nothing.
+    #[test]
+    fn fold_by_iface_passes_through_a_table_missing_its_columns() {
+        let t = Table {
+            columns: vec!["key".into()],
+            rows: vec![vec!["x".into()]],
+        };
+        assert_eq!(fold_by_iface(&t), t);
+    }
+
+    /// The default `connections` view end to end: `ts_us` becomes `ts` and
+    /// reads local time, `iface` sits between `key` and (the now-dropped)
+    /// `scope`, and the internal/lan rows are counted rather than listed —
+    /// the render an operator actually sees.
+    #[test]
+    fn connections_default_view_renders_the_iface_column() {
+        let epoch_us = 1_700_000_000_000_000i64;
+        let ts = epoch_us.to_string();
+        let t = iface_table(vec![
+            [
+                ts.as_str(),
+                "OK",
+                "172.19.0.1",
+                "",
+                "internal",
+                "1023",
+                "1",
+                "1",
+                "",
+            ],
+            [
+                ts.as_str(),
+                "OK",
+                "printer.local",
+                "en0",
+                "lan",
+                "4",
+                "1",
+                "1",
+                "",
+            ],
+            [
+                ts.as_str(),
+                "OK",
+                "claude.ai",
+                "utun10",
+                "external",
+                "3",
+                "100",
+                "5006",
+                "",
+            ],
+            [
+                ts.as_str(),
+                "OK",
+                "ads.example",
+                "blocked",
+                "external",
+                "1",
+                "1",
+                "0",
+                "",
+            ],
+        ]);
+        let renamed = rename_ts_column(&t);
+        let filtered = filter_by_iface(&renamed, None);
+        let (shown, hidden) = fold_by_scope(&filtered, Some(ConnectionScope::External));
+        assert_eq!(
+            shown.columns,
+            [
+                "ts", "verdict", "key", "iface", "count", "upload", "download", "hosts"
+            ]
+        );
+        let local = opened_local(epoch_us);
+        assert_eq!(
+            shown.rows[0],
+            vec![
+                local.clone(),
+                "OK".to_string(),
+                "claude.ai".to_string(),
+                "utun10".to_string(),
+                "3".to_string(),
+                "100".to_string(),
+                "5006".to_string(),
+                String::new(),
+            ]
+        );
+        assert_eq!(
+            shown.rows[1],
+            vec![
+                local,
+                "OK".to_string(),
+                "ads.example".to_string(),
+                "blocked".to_string(),
+                "1".to_string(),
+                "1".to_string(),
+                "0".to_string(),
+                String::new(),
+            ]
+        );
+        assert_eq!(hidden, [1023, 4, 0]);
+        // Captured for the STATUS report: the rendered header + these rows.
+        println!("{}", format_table(&shown, true));
+    }
+
+    /// `connections --by iface` end to end, chained exactly as `run()`
+    /// chains it: rename the ts column, filter by `--iface` (none given
+    /// here), fold by scope (external only, the default), then fold by
+    /// interface. The internal/lan rows never reach the interface fold —
+    /// they are gone at the scope step — and the three external rows (two
+    /// sharing `utun10`) merge into two interface totals.
+    #[test]
+    fn connections_by_iface_pipeline_chains_filter_scope_and_iface_fold() {
+        let t = iface_table(vec![
+            [
+                "7",
+                "OK",
+                "172.19.0.1",
+                "",
+                "internal",
+                "1023",
+                "1",
+                "1",
+                "",
+            ],
+            ["7", "OK", "printer.local", "en0", "lan", "4", "1", "1", ""],
+            [
+                "7",
+                "OK",
+                "claude.ai",
+                "utun10",
+                "external",
+                "3",
+                "100",
+                "5006",
+                "",
+            ],
+            [
+                "7",
+                "OK",
+                "o540343.ingest.sentry.io",
+                "utun10",
+                "external",
+                "1",
+                "4",
+                "0",
+                "",
+            ],
+            [
+                "7",
+                "OK",
+                "ads.example",
+                "blocked",
+                "external",
+                "1",
+                "1",
+                "0",
+                "",
+            ],
+        ]);
+        let renamed = rename_ts_column(&t);
+        let filtered = filter_by_iface(&renamed, None);
+        let (scoped, hidden) = fold_by_scope(&filtered, Some(ConnectionScope::External));
+        let folded = fold_by_iface(&scoped);
+
+        assert_eq!(hidden, [1023, 4, 0], "internal/lan never reach the fold");
+        assert_eq!(folded.columns, ["iface", "count", "upload", "download"]);
+        let row = |iface: &str| {
+            folded
+                .rows
+                .iter()
+                .find(|r| r[0] == iface)
+                .unwrap_or_else(|| panic!("no {iface} row in {folded:?}"))
+                .clone()
+        };
+        assert_eq!(row("utun10"), vec!["utun10", "4", "104", "5006"]);
+        assert_eq!(row("blocked"), vec!["blocked", "1", "1", "0"]);
+        assert_eq!(folded.rows.len(), 2, "only the two external interfaces");
     }
 
     /// `experiment` defaults to the shared default length and waits;
@@ -3096,7 +3930,7 @@ mod tests {
                     .to_vec(),
             ],
         };
-        let out = format_table(&table);
+        let out = format_table(&table, true);
         for col in &table.columns {
             assert!(out.contains(col.as_str()), "header {col}: {out}");
         }
@@ -3114,7 +3948,7 @@ mod tests {
             columns: table.columns.clone(),
             rows: vec![["7", "SKIP", "", "", "", "", ""].map(String::from).to_vec()],
         };
-        let out = format_table(&skipped);
+        let out = format_table(&skipped, true);
         assert!(
             out.contains('7') && out.contains("SKIP"),
             "a SKIP tick's row must still print: {out}"

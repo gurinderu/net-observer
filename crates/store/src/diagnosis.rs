@@ -1077,11 +1077,12 @@ ORDER BY last_seen_us DESC, iface, remote_chassis, remote_port"
 /// Reads the newest `connection_sample` tick only: the table is a present-tense
 /// question ("what is talking right now"), and the per-tick rows are already
 /// the aggregate the collector folded. Columns: `ts_us` and `verdict` (the
-/// tick's, replicated on every row), `key` (the group), `scope` (where the
-/// group's destinations lie — see below), `count` (live flows in the group),
-/// `upload` / `download` (their bytes summed), and `hosts` — the distinct
-/// names seen in the group, so an address grouping still says which names sat
-/// behind the address. Ordered by `count DESC`.
+/// tick's, replicated on every row), `key` (the group), `iface` (the egress
+/// interface — see below), `scope` (where the group's destinations lie — see
+/// below), `count` (live flows in the group), `upload` / `download` (their
+/// bytes summed), and `hosts` — the distinct names seen in the group, so an
+/// address grouping still says which names sat behind the address. Ordered
+/// by `count DESC`.
 ///
 /// The key of a flow with the grouped fact missing falls back to the next best
 /// (a bare-address flow is keyed by its address under `host`; a flow whose
@@ -1096,6 +1097,15 @@ ORDER BY last_seen_us DESC, iface, remote_chassis, remote_port"
 /// without a second query — the whole tick travels once, and the CLI and the
 /// bar fold it themselves (realm net-observer, node #75). A row written
 /// before the column existed reads as `external`: shown, never hidden.
+///
+/// **`iface` is not a group key — it rides on the existing grouping.** A new
+/// `group_by` wire variant is a hazard to an older receiver (see AGENTS.md
+/// wire invariants), so grouping by interface is the CLI's own client-side
+/// fold over this same answer, not a new value here. When every row folded
+/// into one group agrees on `iface`, that value is reported; when the group
+/// mixes flows across more than one interface (or one with an unknown
+/// interface and one without), `iface` is `NULL` — the common value or
+/// nothing, never a guess.
 ///
 /// **The refusal is preserved.** A tick with no rows — the API did not answer
 /// (`SKIP`) or it listed nothing (`OK`) — answers ONE row carrying `ts_us`
@@ -1120,14 +1130,17 @@ pub fn connections_sql(group_by: ConnectionsGroupBy) -> String {
   SELECT * FROM connection_sample
   WHERE ts_us = (SELECT max(ts_us) FROM connection_sample)
 )
-SELECT ts_us, verdict, {key} AS key, coalesce(scope, 'external') AS scope,
+SELECT ts_us, verdict, {key} AS key,
+       CASE WHEN count(DISTINCT iface) = 1 AND count(iface) = count(*)
+            THEN max(iface) ELSE NULL END AS iface,
+       coalesce(scope, 'external') AS scope,
        sum(count) AS count, sum(upload) AS upload, sum(download) AS download,
        string_agg(DISTINCT host, ',' ORDER BY host) AS hosts
 FROM tick
 WHERE network IS NOT NULL
 GROUP BY ts_us, verdict, key, coalesce(scope, 'external')
 UNION ALL
-SELECT ts_us, verdict, NULL, NULL, NULL, NULL, NULL, NULL
+SELECT ts_us, verdict, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 FROM tick
 WHERE network IS NULL
 ORDER BY count DESC NULLS LAST, key, scope"
@@ -3156,7 +3169,8 @@ mod tests {
 
     /// A row scoped the way the collector would under the owner's listeners
     /// (`172.19.0.1` the TUN address): the fixture below then carries every
-    /// scope the readers fold.
+    /// scope the readers fold. Every row leaves through the same tunneled
+    /// chain, so `iface` is uniformly `utun10` unless a test overrides it.
     fn conn_row(
         host: Option<&str>,
         dst_ip: Option<&str>,
@@ -3176,6 +3190,7 @@ mod tests {
             upload,
             download: 0,
             scope: types::classify_scope(dst_ip, Some("172.19.0.1"), Some("192.0.2.53")),
+            iface: Some("utun10".into()),
         }
     }
 
@@ -3253,9 +3268,58 @@ mod tests {
         assert_eq!(cell(&t, 0, "upload"), "100");
         assert_eq!(cell(&t, 0, "ts_us"), (20 * SEC).to_string());
         assert_eq!(cell(&t, 0, "verdict"), "OK");
+        // Both flows behind the claude.ai group agree on `iface`, so the
+        // merged row reports it rather than NULLing it out.
+        assert_eq!(cell(&t, 0, "iface"), "utun10");
         assert!(keys.contains(&"149.154.167.41".to_string()), "{keys:?}");
         assert!(keys.contains(&"194.221.250.50".to_string()), "{keys:?}");
         assert_eq!(keys.len(), 5, "{keys:?}");
+    }
+
+    /// `iface` is not a group key: two rows a reader's grouping merges (same
+    /// host) but that carry DIFFERENT interfaces (one tunneled, one blocked)
+    /// answer `iface = NULL` — the mix, never one of the two guessed — while
+    /// a merge whose rows agree keeps the common value (realm net-observer,
+    /// node #75).
+    #[test]
+    fn connections_iface_is_the_common_value_or_none_when_the_merge_mixes_them() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let mut mixed = conn_row(Some("claude.ai"), None, Some(443), Some("stable"), 1, 10);
+        mixed.chain = Some("reject-ads".into());
+        mixed.iface = Some("blocked".into());
+        let mut agree = conn_row(Some("mail.example"), None, Some(443), None, 1, 1);
+        agree.iface = Some("utun10".into());
+        let mut agree2 = agree.clone();
+        agree2.process = Some("stable".into());
+        connections(
+            &s,
+            20 * SEC,
+            types::ConnectionsVerdict::Ok,
+            vec![
+                conn_row(Some("claude.ai"), None, Some(443), Some("stable"), 2, 100),
+                mixed,
+                agree,
+                agree2,
+            ],
+        );
+        let t = s.connections(ConnectionsGroupBy::Host).unwrap();
+        let claude = (0..t.rows.len())
+            .find(|&i| cell(&t, i, "key") == "claude.ai")
+            .expect("claude.ai is a key");
+        assert_eq!(cell(&t, claude, "count"), "3", "the merge still happens");
+        assert_eq!(
+            cell(&t, claude, "iface"),
+            "",
+            "a mixed merge reports no interface, not a guessed one"
+        );
+        let mail = (0..t.rows.len())
+            .find(|&i| cell(&t, i, "key") == "mail.example")
+            .expect("mail.example is a key");
+        assert_eq!(
+            cell(&t, mail, "iface"),
+            "utun10",
+            "a merge that agrees keeps the common value"
+        );
     }
 
     /// By address, the two Telegram flows fold into one row that still names
