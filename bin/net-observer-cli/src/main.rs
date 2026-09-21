@@ -39,6 +39,7 @@ use net_observer_ipc::{
     Table,
 };
 use std::io::{IsTerminal, Write};
+use std::net::IpAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 use store::{DuckdbStore, QueryTable, Store as _, diagnosis};
@@ -227,8 +228,9 @@ enum Command {
     ///
     /// Ask the running daemon, sent as a `Control(ScanNeighbors)` request
     /// over the socket. Unlike the passive `neighbors` collector, this
-    /// **speaks on the network** — it addresses every host of the subnet.
-    /// Nothing in the daemon's config has to permit it: the command is the
+    /// **speaks on the network** — it addresses every host of the subnet, or
+    /// exactly one named host with `--target`. Nothing in the daemon's
+    /// config has to permit it: the command is the
     /// sanction, and every run leaves a `neighbor_scan` row saying what was
     /// probed. The daemon refuses it with a reason when it cannot run
     /// (paused, no IPv4 subnet, no scanner on this host) or when the peer is
@@ -252,6 +254,18 @@ enum Command {
         /// findings back with `vulns`.
         #[arg(long)]
         cve: bool,
+        /// Scan just this host instead of sweeping the segment.
+        #[arg(long)]
+        target: Option<IpAddr>,
+        /// Space the probes out to be gentle on a shared segment; the scan
+        /// takes longer.
+        #[arg(long)]
+        slow: bool,
+        /// Override the sweep's host-count ceiling: omit for the built-in
+        /// default, 0 for unlimited, or a specific ceiling. On a large
+        /// subnet combine with --slow to avoid spraying the segment.
+        #[arg(long)]
+        sweep_max: Option<u32>,
     },
     /// The neighbours the record knows on each segment, newest first.
     ///
@@ -911,6 +925,9 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             ports,
             banners,
             cve,
+            target,
+            slow,
+            sweep_max,
         } => {
             let cfg = load_config(cli)?;
             let result = fetch_scan_neighbors(
@@ -919,6 +936,9 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     ports: *ports,
                     banners: *banners,
                     cve: *cve,
+                    target: *target,
+                    slow: *slow,
+                    sweep_max: *sweep_max,
                 },
             )?;
             print_paged(&format_control(&result), cli.no_pager);
@@ -2725,6 +2745,57 @@ mod tests {
         assert!(cli.no_pager);
         let cli = Cli::try_parse_from(["net-observer-cli", "status", "--no-pager"]).unwrap();
         assert!(cli.no_pager);
+    }
+
+    /// `--target`, `--slow` and `--sweep-max` (realm net-observer, node #154)
+    /// parse into the right `ScanNeighbors` fields alongside the existing
+    /// rung flags.
+    #[test]
+    fn scan_neighbors_parses_target_and_slow_and_sweep_max() {
+        let cli = Cli::try_parse_from([
+            "net-observer-cli",
+            "scan-neighbors",
+            "--target",
+            "10.0.0.5",
+            "--ports",
+            "--slow",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::ScanNeighbors {
+                ports,
+                banners,
+                cve,
+                target,
+                slow,
+                sweep_max,
+            } => {
+                assert!(ports);
+                assert!(!banners);
+                assert!(!cve);
+                assert_eq!(target, Some("10.0.0.5".parse().unwrap()));
+                assert!(slow);
+                assert_eq!(sweep_max, None);
+            }
+            _ => panic!("did not parse as `scan-neighbors`"),
+        }
+    }
+
+    /// `--sweep-max` parses as an `Option<u32>`, distinct from `--slow` and
+    /// `--target`; the two flags are independent.
+    #[test]
+    fn scan_neighbors_parses_sweep_max() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "scan-neighbors", "--sweep-max", "500"])
+            .unwrap();
+        match cli.command {
+            Command::ScanNeighbors {
+                target, sweep_max, ..
+            } => {
+                assert_eq!(target, None);
+                assert_eq!(sweep_max, Some(500));
+            }
+            _ => panic!("did not parse as `scan-neighbors`"),
+        }
     }
 
     /// An explicit `--db` means the operator named the record: the socket is
