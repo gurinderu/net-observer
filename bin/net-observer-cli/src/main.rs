@@ -216,7 +216,7 @@ enum Command {
         /// The window's id, `experiment-<start_us>`.
         id: String,
     },
-    /// Sweep the local subnet and mDNS for who's on this segment now.
+    /// Sweep the local IPv4 subnet and mDNS for who's on this segment now.
     ///
     /// Ask the running daemon, sent as a `Control(ScanNeighbors)` request
     /// over the socket. Unlike the passive `neighbors` collector, this
@@ -3323,19 +3323,35 @@ mod tests {
     fn top_level_help_lists_one_short_line_per_subcommand() {
         let mut cmd = Cli::command();
         let help = cmd.render_help().to_string();
-        let status_line = help
+        // Every line clap lists under `Commands:`, not just `status`: a
+        // re-joined doc comment (the blank `///` dropped) on ANY variant
+        // would leak its long prose back into the list, so every line is
+        // checked, not a hand-picked one.
+        let commands_section: Vec<&str> = help
             .lines()
-            .find(|l| l.trim_start().starts_with("status"))
-            .unwrap_or_else(|| panic!("no `status` line in the command list:\n{help}"));
+            .skip_while(|l| *l != "Commands:")
+            .skip(1)
+            .take_while(|l| !l.trim().is_empty())
+            .collect();
         assert!(
-            status_line.len() < 100,
-            "status command-list line is {} chars, expected < 100: {status_line:?}",
-            status_line.len()
+            !commands_section.is_empty(),
+            "no `Commands:` section found in the top-level help:\n{help}"
         );
-        // `HYPOTHESIS` (the caps row-marker in the long prose of `vulns`,
-        // `topology`, `air`) is distinct from `vulns`' own short line, which
-        // legitimately says "hypothesises" (lowercase verb) — checking the
-        // caps form avoids a false positive there.
+        for line in &commands_section {
+            assert!(
+                line.len() < 100,
+                "command-list line is {} chars, expected < 100 — a doc comment's \
+                 blank separator was likely dropped, re-joining its prose into \
+                 the summary: {line:?}",
+                line.len()
+            );
+        }
+        // Belt: two long-prose markers that must never survive into the
+        // summary list even if some future variant's line sneaks under the
+        // char cap. `HYPOTHESIS` (the caps row-marker in the long prose of
+        // `vulns`/`topology`/`air`) is distinct from `vulns`' own short
+        // line, which legitimately says "hypothesises" (lowercase verb) —
+        // checking the caps form avoids a false positive there.
         assert!(
             !help.contains("HYPOTHESIS") && !help.contains("Asks the running daemon"),
             "long prose leaked into the top-level help:\n{help}"
