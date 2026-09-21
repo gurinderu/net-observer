@@ -1527,14 +1527,32 @@ fn await_experiment(
 }
 
 /// Send `Control(ScanNeighbors)` and return the daemon's verdict.
+///
+/// Reads with [`net_observer_ipc::SCAN_TIMEOUT`], not the default 2s
+/// [`daemon_query`] budget: the daemon answers only after the whole sweep
+/// (ARP + mDNS, then the ports/banners rungs), tens of seconds on a real
+/// segment, and a client that gives up first reads its own timeout instead of
+/// the daemon's effective/dropped-rungs message. A daemon built before
+/// `ScanNeighbors` existed cannot decode the request; that is reported as
+/// "cannot", not as a refusal, through [`net_observer_ipc::control_within`].
 fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
-    match daemon_query(
+    let outcome = net_observer_ipc::control_within(
         socket_path,
-        &Request::Control(ControlCmd::ScanNeighbors(opts)),
-    )? {
-        Response::Control(result) => Ok(result),
-        Response::Error(e) => Err(anyhow!("net-observerd returned an error: {e}")),
-        other => Err(anyhow!("unexpected daemon response to Control: {other:?}")),
+        ControlCmd::ScanNeighbors(opts),
+        net_observer_ipc::SCAN_TIMEOUT,
+    )
+    .map_err(|e| {
+        if daemon_not_running(&e) {
+            anyhow!("net-observerd not running (socket {socket_path} unavailable)")
+        } else {
+            anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
+        }
+    })?;
+    match outcome {
+        net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
+        net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
+            "net-observerd cannot scan for neighbours (built before it existed): {e}"
+        )),
     }
 }
 

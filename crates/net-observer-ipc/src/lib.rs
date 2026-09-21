@@ -1291,6 +1291,21 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// instead — a worse report, and one that leaves the daemon's answer unread.
 const DIAGNOSIS_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// The read budget of a [`control_within`] round-trip for `ScanNeighbors`. A
+/// scan sweeps a real segment — ARP settle plus an mDNS browse cost several
+/// seconds on their own, and the ports/banners rungs add a per-host budget on
+/// top of that for a subnet with real hosts on it — so the operator's own
+/// scan needs a budget long enough to outlast the sweep, not the 2s that
+/// suits an instant command.
+///
+/// `net-observerd` sets no single deadline on a scan as a whole — each stage
+/// (the ARP settle, the mDNS browse, the port and banner rungs in
+/// `crates/macos/src/neighbor_scan.rs`) bounds only itself, and their sum is
+/// not capped — so unlike [`DIAGNOSIS_TIMEOUT`] there is no daemon-side
+/// deadline to stay longer than; this budget bounds only the client. Observed
+/// live: a segment with `found=183` (two methods) completed in 40-70s.
+pub const SCAN_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Blocking client for the bar: connect, write one newline-JSON request, read one
 /// newline-JSON response. Framing = serde_json + `'\n'`. Connection-refused / no
 /// socket ⇒ `Err` (the caller renders an "offline" state).
@@ -1546,6 +1561,18 @@ pub enum ControlOutcome {
 /// client-side deserializer complaint and never as a silent failure.
 pub fn control(sock_path: &str, cmd: ControlCmd) -> std::io::Result<ControlOutcome> {
     classify_control(query(sock_path, &Request::Control(cmd))?)
+}
+
+/// [`control`] with an explicit read budget; the write budget stays
+/// [`QUERY_TIMEOUT`], because a command frame is small whatever the daemon's
+/// answer costs. The one caller that needs this: `ScanNeighbors`, whose
+/// answer can arrive minutes later — see [`SCAN_TIMEOUT`].
+pub fn control_within(
+    sock_path: &str,
+    cmd: ControlCmd,
+    read: Duration,
+) -> std::io::Result<ControlOutcome> {
+    classify_control(query_within(sock_path, &Request::Control(cmd), read)?)
 }
 
 /// The pure half of [`control`]: which outcome a given [`Response`] means.
@@ -1876,6 +1903,31 @@ mod tests {
             ControlOutcome::Unsupported(m) => assert!(m.contains("ScanAir"), "{m}"),
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    /// `control_within` shares [`classify_control`] with `control`, so a
+    /// `ScanNeighbors` answer classifies exactly the same way regardless of
+    /// which read budget carried it — only the timeout, never the outcome
+    /// mapping, is supposed to differ.
+    #[test]
+    fn control_within_classifies_the_same_as_control() {
+        let ran = Response::Control(ControlResult {
+            ok: true,
+            message: "found=3 methods=2".to_string(),
+        });
+        assert_eq!(
+            classify_control(ran.clone()).unwrap(),
+            classify_control(ran).unwrap()
+        );
+    }
+
+    /// [`SCAN_TIMEOUT`] exists precisely so `ScanNeighbors` outlasts the 2s
+    /// budget every other control command gets — a regression here silently
+    /// reintroduces the client-times-out-before-the-daemon-answers bug this
+    /// budget fixes.
+    #[test]
+    fn scan_timeout_outlasts_the_default_control_budget() {
+        assert!(SCAN_TIMEOUT > QUERY_TIMEOUT);
     }
 
     /// `ScanAir` must survive the wire intact next to the commands that already
