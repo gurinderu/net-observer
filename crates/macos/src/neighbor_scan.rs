@@ -79,8 +79,10 @@ pub fn effective_pace(slow: bool) -> Option<Duration> {
 /// Translate the operator's `--sweep-max` into the effective ceiling
 /// [`Ipv4Iface::host_addrs`]/[`sweep_probe_blocking`] enforce: `None`
 /// (nothing named) is [`DEFAULT_MAX_SWEEP_HOSTS`]; `Some(0)` lifts the
-/// ceiling entirely — an explicit "no cap", not a refusal to sweep zero
-/// hosts; `Some(n)` is that operator-set ceiling.
+/// ceiling entirely — an explicit "no operator cap", not a refusal to sweep
+/// zero hosts; `Some(n)` is that operator-set ceiling. This is the
+/// OPERATOR's ceiling only: [`HARD_MAX_SWEEP_HOSTS`] applies independently
+/// and `Some(0)` cannot lift that one.
 #[must_use]
 pub fn sweep_max_cap(requested: Option<u32>) -> Option<u32> {
     match requested {
@@ -89,6 +91,26 @@ pub fn sweep_max_cap(requested: Option<u32>) -> Option<u32> {
         Some(n) => Some(n),
     }
 }
+
+/// The absolute ceiling [`Ipv4Iface::host_addrs`] will EVER materialize,
+/// independent of `cap` — even `--sweep-max 0` ("no operator ceiling",
+/// [`sweep_max_cap`]) cannot lift this one.
+///
+/// This guards memory, not politeness: `host_addrs` builds one `Vec<Ipv4Addr>`
+/// entry per host, so "unlimited" against a genuinely huge range (a /8 is
+/// 16.7M hosts; smaller than /8 is worse) means allocating and holding tens
+/// to hundreds of megabytes for a Vec whose every entry is then also queued
+/// for a UDP send — a hazard `--slow`'s pacing does nothing to prevent, since
+/// pacing controls the network's timeline, not the allocation's size. `2^20`
+/// (1,048,576) is chosen to comfortably cover the largest plausible flat L2
+/// segment an operator could legitimately mean by "unlimited" — a /12 (a
+/// carrier-grade private block, 1,048,574 usable hosts) fits under it, while
+/// a /11 and anything larger (2,097,150 hosts and up) is refused outright:
+/// nobody sweeps a /11 host-by-host as a single flat segment, so a request
+/// that size reads as a misparsed range even when explicitly marked
+/// unlimited. `--target` is the way to reach one address inside a range this
+/// large without enumerating it.
+pub const HARD_MAX_SWEEP_HOSTS: u32 = 1 << 20;
 
 /// What the mDNS browse did and found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -118,12 +140,15 @@ pub struct Ipv4Iface {
 
 impl Ipv4Iface {
     /// Every host address of this subnet, excluding the network and broadcast
-    /// addresses and this machine's own. `cap` is the ceiling on subnet size
-    /// (see [`sweep_max_cap`]): `None` is unlimited, `Some(n)` refuses a
-    /// subnet larger than `n` hosts. `Err` names why the sweep is refused
-    /// rather than truncated, so a scan never silently covers less than its
-    /// recorded target: a non-contiguous mask ("not a subnet"), or the
-    /// concrete ceiling `--sweep-max` would raise or lift.
+    /// addresses and this machine's own. `cap` is the OPERATOR's ceiling on
+    /// subnet size (see [`sweep_max_cap`]): `None` is no operator ceiling,
+    /// `Some(n)` refuses a subnet larger than `n` hosts. [`HARD_MAX_SWEEP_HOSTS`]
+    /// applies independently of `cap` and cannot be lifted by it — this
+    /// function never materializes a `Vec` past that absolute bound. `Err`
+    /// names why the sweep is refused rather than truncated, so a scan never
+    /// silently covers less than its recorded target: a non-contiguous mask
+    /// ("not a subnet"), the concrete operator ceiling `--sweep-max` would
+    /// raise or lift, or the hard ceiling even `--sweep-max 0` cannot lift.
     pub fn host_addrs(&self, cap: Option<u32>) -> Result<Vec<Ipv4Addr>, String> {
         let mask = u32::from(self.mask);
         // A netmask must be a run of ones followed by a run of zeros: its
@@ -142,6 +167,14 @@ impl Ipv4Iface {
         {
             return Err(format!(
                 "subnet larger than {c} hosts (--sweep-max raises or lifts this ceiling)"
+            ));
+        }
+        // Independent of `cap`: never build an unbounded Vec, no matter what
+        // the operator asked for (realm net-observer, node #154).
+        if hosts > HARD_MAX_SWEEP_HOSTS {
+            return Err(format!(
+                "range too large to sweep even with --sweep-max 0 ({hosts} hosts); \
+                 scan a narrower subnet or use --target"
             ));
         }
         let net = u32::from(self.addr) & mask;
@@ -262,8 +295,59 @@ pub fn sweep_probe_blocking(
             duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
             refused: Some(reason),
         },
-        Ok(addrs) => probe_addrs_blocking(&addrs, iface.cidr(), iface_name, pace, started),
+        Ok(addrs) => {
+            warn_if_slow_sweep_will_outlast_the_wait(addrs.len(), pace);
+            probe_addrs_blocking(&addrs, iface.cidr(), iface_name, pace, started)
+        }
     }
+}
+
+/// Roughly the CLI's own wait budget for a `ScanNeighbors` round-trip
+/// (`net_observer_ipc::SCAN_TIMEOUT`, 180s) minus headroom for the settle
+/// sleep and any requested ports/banners rung on top of the sweep itself.
+/// Not imported from `net-observer-ipc` — this crate has no dependency on
+/// it, and the figure is a rough visibility threshold, not a contract the
+/// two crates must agree on bit-for-bit.
+const SLOW_SWEEP_WARN_THRESHOLD: Duration = Duration::from_secs(150);
+
+/// The projected duration of a slow sweep's OWN pacing (host count × pace —
+/// ignoring the settle sleep and any ports/banners rung on top, which only
+/// add more), when that projection exceeds [`SLOW_SWEEP_WARN_THRESHOLD`];
+/// `None` when there is nothing to warn about (not slow, or short enough).
+/// Factored out from [`warn_if_slow_sweep_will_outlast_the_wait`] so the
+/// decision is directly testable as a pure function, without a tracing
+/// subscriber.
+fn slow_sweep_overrun(host_count: usize, pace: Option<Duration>) -> Option<Duration> {
+    let pace = pace?;
+    let hosts = u32::try_from(host_count).ok()?;
+    let estimated = pace.saturating_mul(hosts);
+    (estimated > SLOW_SWEEP_WARN_THRESHOLD).then_some(estimated)
+}
+
+/// Warn once, server-side, when [`slow_sweep_overrun`] says a `--slow`
+/// sweep's own pacing is already projected past the CLI's rough wait budget
+/// (realm net-observer, node #154).
+///
+/// The raised [`DEFAULT_MAX_SWEEP_HOSTS`] combined with `--slow` and no
+/// `--sweep-max` override can genuinely take far longer than the CLI's
+/// `SCAN_TIMEOUT` wait: at [`SLOW_PACE`], a full default-ceiling sweep is
+/// ~55 minutes. There is deliberately NO server-side cancellation (out of
+/// scope, v1 = observe + detect): the scan keeps running and its rows are
+/// still readable afterward through `neighbors`/`vulns` — this warning is
+/// the visibility for that gap, not a fix for it.
+fn warn_if_slow_sweep_will_outlast_the_wait(host_count: usize, pace: Option<Duration>) {
+    let Some(estimated) = slow_sweep_overrun(host_count, pace) else {
+        return;
+    };
+    tracing::warn!(
+        hosts = host_count,
+        pace_ms = pace.map(|p| p.as_millis()).unwrap_or(0),
+        estimated_s = estimated.as_secs(),
+        "slow sweep's own pacing already exceeds the CLI's wait budget; \
+         the scan still runs to completion and its rows are readable \
+         afterward via `neighbors`/`vulns`, but the operator's CLI call \
+         may report a timeout before it finishes"
+    );
 }
 
 /// Probe exactly one IPv4 address to provoke ARP resolution — Part A's
@@ -815,6 +899,32 @@ mod tests {
         assert_eq!(effective_pace(true), Some(SLOW_PACE));
     }
 
+    /// The fast path (`pace: None`) never warns, whatever the host count —
+    /// a no-op, not a "never slow enough" special case.
+    #[test]
+    fn fast_sweeps_never_overrun_the_wait_budget() {
+        assert_eq!(slow_sweep_overrun(0, None), None);
+        assert_eq!(slow_sweep_overrun(1_000_000, None), None);
+    }
+
+    /// A slow sweep of the raised default ceiling (65536 hosts) at
+    /// [`SLOW_PACE`] is projected at ~54.6 minutes — well past
+    /// [`SLOW_SWEEP_WARN_THRESHOLD`] (150s) — so it must be flagged.
+    #[test]
+    fn a_slow_sweep_of_the_default_ceiling_overruns_the_wait_budget() {
+        let overrun = slow_sweep_overrun(DEFAULT_MAX_SWEEP_HOSTS as usize, Some(SLOW_PACE))
+            .expect("65536 hosts at 50ms/host must overrun a 150s budget");
+        assert!(overrun > SLOW_SWEEP_WARN_THRESHOLD, "{overrun:?}");
+    }
+
+    /// A slow sweep small enough to finish within the wait budget is not
+    /// flagged — the coworking /21 (2046 hosts) at [`SLOW_PACE`] is ~102s,
+    /// inside the 150s threshold.
+    #[test]
+    fn a_slow_sweep_within_budget_does_not_overrun() {
+        assert_eq!(slow_sweep_overrun(2046, Some(SLOW_PACE)), None);
+    }
+
     /// `--sweep-max` translates as Part D specifies: absent = the built-in
     /// default; `0` = unlimited; `n` = that ceiling.
     #[test]
@@ -973,9 +1083,10 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     }
 
     /// Part D (realm net-observer, node #154): the coworking segment this
-    /// raised default exists for — a /21, 2046 hosts, well above the OLD
-    /// 1024-host cap that used to refuse it — now sweeps with NO flag at
-    /// all, under the new [`DEFAULT_MAX_SWEEP_HOSTS`].
+    /// raised default exists for — a /21, 2046 usable hosts (excluding
+    /// network + broadcast), well above the OLD 1024-host cap that used to
+    /// refuse it — now sweeps with NO flag at all, under the new
+    /// [`DEFAULT_MAX_SWEEP_HOSTS`].
     #[test]
     fn a_slash_21_sweeps_with_the_new_default_and_no_flag() {
         let i = Ipv4Iface {
@@ -986,7 +1097,10 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         let hosts = i
             .host_addrs(sweep_max_cap(None))
             .expect("a /21 must sweep by default under the raised ceiling");
-        assert_eq!(hosts.len(), 2046);
+        // 2046 usable hosts minus this interface's OWN address (10.0.4.5,
+        // itself a host of the /21) = 2045, same exclusion the /24 test
+        // above pins ("but this one"): `host_addrs` never targets `self`.
+        assert_eq!(hosts.len(), 2045);
     }
 
     /// The cap is a refusal, not a truncation: a scan must cover the target it
@@ -1014,7 +1128,28 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         let hosts = i
             .host_addrs(sweep_max_cap(Some(0)))
             .expect("--sweep-max 0 must lift the ceiling");
-        assert_eq!(hosts.len(), 131_070);
+        // 131070 usable hosts minus this interface's OWN address (10.0.0.5),
+        // the same exclusion as the /21 test above.
+        assert_eq!(hosts.len(), 131_069);
+    }
+
+    /// `--sweep-max 0` lifts the OPERATOR's ceiling, but never
+    /// [`HARD_MAX_SWEEP_HOSTS`]: a /8 (16.7M hosts) is refused even
+    /// "unlimited" — `host_addrs` must never materialize a `Vec` that size.
+    /// The refusal is checked before any allocation happens, so this test
+    /// costs nothing even though the range it names is enormous.
+    #[test]
+    fn sweep_max_zero_does_not_lift_the_hard_safety_ceiling() {
+        let i = Ipv4Iface {
+            addr: Ipv4Addr::new(10, 0, 0, 5),
+            mask: Ipv4Addr::new(255, 0, 0, 0),
+        };
+        assert_eq!(i.cidr(), "10.0.0.0/8");
+        let err = i
+            .host_addrs(sweep_max_cap(Some(0)))
+            .expect_err("a /8 must be refused even with --sweep-max 0");
+        assert!(err.contains("--sweep-max 0"), "{err}");
+        assert!(err.contains("--target"), "{err}");
     }
 
     /// `--sweep-max <small>` re-imposes a low ceiling below the built-in

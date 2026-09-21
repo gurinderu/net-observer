@@ -258,12 +258,17 @@ enum Command {
         #[arg(long)]
         target: Option<IpAddr>,
         /// Space the probes out to be gentle on a shared segment; the scan
-        /// takes longer.
+        /// takes longer. On a large subnet this can outlast the time this
+        /// command waits for an answer — the scan still finishes on the
+        /// daemon and its findings are readable afterward with `neighbors`/
+        /// `vulns`, but this command itself may report a timeout.
         #[arg(long)]
         slow: bool,
         /// Override the sweep's host-count ceiling: omit for the built-in
         /// default, 0 for unlimited, or a specific ceiling. On a large
-        /// subnet combine with --slow to avoid spraying the segment.
+        /// subnet combine with --slow to avoid spraying the segment — and
+        /// note that pairing them can outlast the time this command waits
+        /// for an answer; the scan still finishes on the daemon regardless.
         #[arg(long)]
         sweep_max: Option<u32>,
     },

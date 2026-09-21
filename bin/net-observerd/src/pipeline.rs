@@ -1085,7 +1085,33 @@ pub fn compose_scan_report(
             detail: Some(format!("{} service types browsed", mdns.types_browsed)),
         },
     ];
+    // `ports`/`grabbed` above are the PERSISTED (MAC-attributed) counts — the
+    // `neighbor_port` schema is keyed `(network_key, mac, port)`, so a finding
+    // on an address no neighbour's MAC claims cannot become a row (inventing
+    // a placeholder MAC would be exactly the silent-wrong-data this daemon's
+    // SKIP discipline forbids). That is common for an off-subnet `--target`
+    // (realm net-observer, node #154, owner decision #156): the kernel's ARP
+    // table holds a routed destination's GATEWAY, never the destination's own
+    // MAC, so `found` never claims it. `*_raw` below is what the probe
+    // ACTUALLY found, independent of attribution — the honest-report-only
+    // fix owner decision #156 asks for: the operator-facing message and this
+    // row's `detail` always lead with what was truly found, and name the gap
+    // when persistence dropped some of it, rather than silently reading as
+    // "0 open" for a target that really did have open ports. `found` (the
+    // row's own numeric column, and thus what `neighbors`/`vulns` can later
+    // join on) stays the persisted count — the fact `neighbor_port` can
+    // actually answer for.
+    let ports_raw = port_scan.map(|ps| ps.open.len()).unwrap_or(0);
+    let ports_unattributed = ports_raw.saturating_sub(ports.len());
     if let Some(ps) = port_scan {
+        let detail = if ports_unattributed > 0 {
+            format!(
+                "{} open, {ports_raw} found ({ports_unattributed} not persisted: no segment MAC to key by)",
+                ports.len()
+            )
+        } else {
+            format!("{} open", ports.len())
+        };
         scans.push(store::NeighborScan {
             ts_us,
             network_key: network_key.clone(),
@@ -1094,11 +1120,20 @@ pub fn compose_scan_report(
             target: format!("{} hosts x {} ports", ps.hosts, ps.ports_per_host),
             found: count(ports.len()),
             duration_ms: ps.duration_ms,
-            detail: Some(format!("{} open", ports.len())),
+            detail: Some(detail),
         });
     }
     let grabbed = ports.iter().filter(|p| p.banner.is_some()).count();
+    let banners_raw = banner_grab.map(|bg| bg.banners.len()).unwrap_or(0);
+    let banners_unattributed = banners_raw.saturating_sub(grabbed);
     if let Some(bg) = banner_grab {
+        let detail = if banners_unattributed > 0 {
+            format!(
+                "{grabbed} banners, {banners_raw} found ({banners_unattributed} not persisted: no segment MAC to key by)"
+            )
+        } else {
+            format!("{grabbed} banners")
+        };
         scans.push(store::NeighborScan {
             ts_us,
             network_key: network_key.clone(),
@@ -1107,7 +1142,7 @@ pub fn compose_scan_report(
             target: format!("{} open ports", bg.probed),
             found: count(grabbed),
             duration_ms: bg.duration_ms,
-            detail: Some(format!("{grabbed} banners")),
+            detail: Some(detail),
         });
     }
     let message = if swept {
@@ -1127,15 +1162,22 @@ pub fn compose_scan_report(
             named.len()
         )
     };
-    let message = if port_scan.is_some() {
-        format!("{message}; {} open ports", ports.len())
-    } else {
-        message
+    // The TRUE count leads (`ports_raw`/`banners_raw`), never the persisted
+    // one: an off-subnet target with real open ports must never read as "0
+    // open ports" just because none could be attributed to a MAC.
+    let message = match port_scan {
+        Some(_) if ports_unattributed > 0 => format!(
+            "{message}; {ports_raw} open ports ({ports_unattributed} not persisted: no segment MAC)"
+        ),
+        Some(_) => format!("{message}; {ports_raw} open ports"),
+        None => message,
     };
-    let message = if banner_grab.is_some() {
-        format!("{message}, {grabbed} banners")
-    } else {
-        message
+    let message = match banner_grab {
+        Some(_) if banners_unattributed > 0 => format!(
+            "{message}, {banners_raw} banners ({banners_unattributed} not persisted: no segment MAC)"
+        ),
+        Some(_) => format!("{message}, {banners_raw} banners"),
+        None => message,
     };
     ScanReport {
         ts_us,
@@ -1738,6 +1780,59 @@ mod tests {
         assert_eq!(row.found, 1);
         assert_eq!(row.target, "1 open ports");
         assert!(r.message.contains("1 banners"), "{}", r.message);
+    }
+
+    /// Off-subnet `--target` (owner decision #156, realm net-observer, node
+    /// #154): a routed destination's ARP entry, if the kernel holds one at
+    /// all, belongs to its GATEWAY, never the destination itself — `found`
+    /// is empty here even though the port scan genuinely found open ports.
+    /// `neighbor_port` is keyed `(network_key, mac, port)`, so nothing can be
+    /// persisted without a MAC to key it by (inventing one would be the
+    /// forbidden silent-wrong-data) — but the report must say what was truly
+    /// found, never "0 open ports" for a target that really had some.
+    #[test]
+    fn an_off_subnet_targets_open_ports_are_reported_honestly_not_as_zero() {
+        use macos::neighbor_scan::{PortFinding, PortScanOutcome};
+        let ps = PortScanOutcome {
+            open: vec![
+                PortFinding {
+                    ip: "203.0.113.9".parse().unwrap(),
+                    port: 22,
+                },
+                PortFinding {
+                    ip: "203.0.113.9".parse().unwrap(),
+                    port: 80,
+                },
+            ],
+            hosts: 1,
+            ports_per_host: 27,
+            duration_ms: 500,
+        };
+        let r = compose_scan_report(
+            42,
+            None,
+            "en0".into(),
+            &sweep_stats(None),
+            Vec::new(), // no ARP entry: the target is off this segment
+            &MdnsOutcome::default(),
+            Some(&ps),
+            None,
+        );
+        assert!(r.ports.is_empty(), "no MAC to key a persisted row by");
+        let row = r.scans.iter().find(|s| s.method == "ports").unwrap();
+        assert_eq!(row.found, 0, "nothing was actually persisted");
+        assert!(
+            row.detail.as_deref().unwrap().contains("2 found"),
+            "{:?}",
+            row.detail
+        );
+        assert!(
+            !r.message.contains("0 open ports"),
+            "an off-subnet target with real open ports must never read as 0: {}",
+            r.message
+        );
+        assert!(r.message.contains("2 open ports"), "{}", r.message);
+        assert!(r.message.contains("not persisted"), "{}", r.message);
     }
 
     /// Write a minimal CVE snapshot (one matching record plus a KEV flag) into a

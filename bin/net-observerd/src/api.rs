@@ -1534,24 +1534,33 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
             message: "observation is paused; resume before scanning".to_string(),
         };
     }
-    // Part A boundary decision (realm net-observer, node #154): an
-    // off-subnet target is NOT refused here — the socket is IP_BOUND_IF-
-    // pinned to the physical interface regardless, and the operator asked
-    // for exactly this host. Only a category that can never be a real
-    // neighbour on any segment is refused: loopback, multicast, or the
-    // unspecified address. A genuine sing-box fakeip/TUN address is
-    // deliberately NOT filtered here — telling it apart from an ordinary
-    // off-subnet host would need a live read of the rendered sing-box
-    // config, which moves independently of this build (its fakeip pool "has
-    // moved four times", per `macos::clash`); pinned to the physical
-    // interface, a stray fakeip target simply probes and finds nothing, the
-    // same honest outcome as any other unreachable address.
+    // Part A boundary decision (realm net-observer, node #154, owner
+    // decision node #156): an off-subnet target is ALLOWED, not refused —
+    // the operator named the address and owns the responsibility for it; the
+    // socket is IP_BOUND_IF-pinned to the physical interface regardless.
+    // Only a category that can never be a real neighbour on ANY segment is
+    // refused: loopback, multicast, the unspecified address, or (IPv4) the
+    // limited-broadcast address. `is_loopback`/`is_multicast`/`is_unspecified`
+    // already dispatch correctly for an IPv6 target (no separate IPv6 branch
+    // needed); limited broadcast is IPv4-only by definition, hence the extra
+    // check. A genuine sing-box fakeip/TUN address is deliberately NOT
+    // filtered here — telling it apart from an ordinary off-subnet host
+    // would need a live read of the rendered sing-box config, which moves
+    // independently of this build (its fakeip pool "has moved four times",
+    // per `macos::clash`); pinned to the physical interface, a stray fakeip
+    // target simply probes and finds nothing, the same honest outcome as any
+    // other unreachable address.
     if let Some(ip) = requested.target
-        && (ip.is_loopback() || ip.is_multicast() || ip.is_unspecified())
+        && (ip.is_loopback()
+            || ip.is_multicast()
+            || ip.is_unspecified()
+            || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast()))
     {
         return ControlResult {
             ok: false,
-            message: format!("{ip} is not a scannable host (loopback, multicast, or unspecified)"),
+            message: format!(
+                "{ip} is not a scannable host (loopback, multicast, unspecified, or broadcast)"
+            ),
         };
     }
     let Some(scanner) = cx.scanner else {
@@ -3566,6 +3575,72 @@ mod tests {
         assert!(!res.ok, "a multicast target must be refused");
         assert!(res.message.contains("multicast"), "{}", res.message);
         assert!(seen.lock().unwrap().is_none(), "the scanner must not run");
+    }
+
+    /// The IPv4 limited-broadcast address (255.255.255.255) can never be a
+    /// real neighbour either — refused the same way, before the scanner runs.
+    #[test]
+    fn a_limited_broadcast_target_is_refused_before_the_scanner_runs() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                target: Some("255.255.255.255".parse().unwrap()),
+                ..ScanOptions::default()
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(!res.ok, "the limited-broadcast address must be refused");
+        assert!(res.message.contains("broadcast"), "{}", res.message);
+        assert!(seen.lock().unwrap().is_none(), "the scanner must not run");
+    }
+
+    /// An IPv6 loopback/multicast/unspecified target is refused by the same
+    /// checks as IPv4 — `IpAddr::is_loopback`/`is_multicast`/`is_unspecified`
+    /// dispatch correctly per variant, so no separate IPv6 branch is needed.
+    #[test]
+    fn an_ipv6_loopback_and_multicast_target_are_refused_too() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        let cx = test_ctx(&srv);
+
+        let loopback = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                target: Some("::1".parse().unwrap()),
+                ..ScanOptions::default()
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(!loopback.ok, "an IPv6 loopback target must be refused");
+        assert!(
+            loopback.message.contains("loopback"),
+            "{}",
+            loopback.message
+        );
+
+        let multicast = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                target: Some("ff02::1".parse().unwrap()),
+                ..ScanOptions::default()
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(!multicast.ok, "an IPv6 multicast target must be refused");
+        assert!(
+            multicast.message.contains("multicast"),
+            "{}",
+            multicast.message
+        );
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "the scanner must not run for either refused IPv6 target"
+        );
     }
 
     /// An ordinary off-subnet address (Part A's boundary decision) is NOT
