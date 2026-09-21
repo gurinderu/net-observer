@@ -4,8 +4,8 @@ use gpui::prelude::*;
 use gpui::{AsyncApp, Context, Entity};
 
 use net_observer_ipc::{
-    ControlCmd, ControlResult, DiagnosticQuery, QueryOutcome, Request, Response, ScanOptions,
-    StatusSnapshot, Table,
+    ControlCmd, ControlOutcome, ControlResult, DiagnosticQuery, QueryOutcome, Request, Response,
+    ScanOptions, StatusSnapshot, Table,
 };
 use types::{ConnectionsGroupBy, ProbingTier};
 
@@ -128,13 +128,29 @@ pub fn send_freeze_pcap(socket_path: &str) -> Result<ControlResult, String> {
 /// the sanction, no config switch gates it (realm net-observer, node #91) — and
 /// answers `ok: false` with a reason when it cannot (paused, no subnet)
 /// or when the peer uid is not authorised, shown like any other control outcome.
+///
+/// Unlike every other control command, this one is read with
+/// [`net_observer_ipc::SCAN_TIMEOUT`] instead of the 2s `control_query` budget: a
+/// sweep (ARP settle plus an mDNS browse at minimum, the ports/banners rungs far
+/// longer on top) routinely outlasts 2s, and a `query` that times out mid-scan
+/// reads to the panel as the daemon gone offline — the grey dot — while the scan
+/// is still running.
 pub fn send_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult, String> {
-    control_query(socket_path, ControlCmd::ScanNeighbors(opts))
+    match net_observer_ipc::control_within(
+        socket_path,
+        ControlCmd::ScanNeighbors(opts),
+        net_observer_ipc::SCAN_TIMEOUT,
+    ) {
+        Ok(ControlOutcome::Ran(result)) => Ok(result),
+        Ok(ControlOutcome::Unsupported(msg)) => Err(msg),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
-/// The one blocking control round-trip every control action goes through, so the
-/// bar has exactly one socket client (`net_observer_ipc::query`) and one mapping
-/// from its answers to a `Result`.
+/// The blocking control round-trip every control action but the scan goes
+/// through, at the 2s `net_observer_ipc::query` budget that suits an instant
+/// command; `send_scan_neighbors` uses [`net_observer_ipc::control_within`]
+/// directly for the longer [`net_observer_ipc::SCAN_TIMEOUT`] a sweep needs.
 fn control_query(socket_path: &str, cmd: ControlCmd) -> Result<ControlResult, String> {
     match net_observer_ipc::query(socket_path, &Request::Control(cmd)) {
         Ok(Response::Control(result)) => Ok(result),
@@ -569,6 +585,20 @@ mod tests {
     fn the_base_rung_names_no_rung() {
         let base = ScanOptions::default();
         assert!(!base.ports && !base.banners && !base.cve);
+    }
+
+    /// The scan path degrades like every other socket call despite reading with
+    /// `SCAN_TIMEOUT` instead of the 2s budget: an absent socket is an `Err`
+    /// straight away (`connect` fails with `NotFound`/`ConnectionRefused` before
+    /// any read budget applies), never a 180s hang and never a panic.
+    #[test]
+    fn send_scan_neighbors_offline_when_socket_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sock");
+        assert!(
+            send_scan_neighbors(missing.to_str().unwrap(), ScanOptions::default()).is_err(),
+            "absent socket must yield a scan Err, not a hang"
+        );
     }
 
     /// Every non-table outcome becomes a readable line carrying the daemon's own
