@@ -93,6 +93,22 @@
           # into every crate's buildInputs on a darwin host (nixpkgs
           # `build-rust-crate/default.nix`), so an override here would only
           # list it a second time.
+          #
+          # Installs the `completions <shell>` output as the package's own
+          # shell-completion files instead of leaving them for an operator to
+          # generate by hand. `buildRustCrate`'s installPhase populates
+          # `$out/bin` before `postInstall` runs (nixpkgs
+          # `build-rust-crate/install-crate.nix`), and this build is always
+          # native (darwin building darwin), so running the just-built binary
+          # here is no different from any other build-time codegen step.
+          net-observer-cli = _attrs: {
+            postInstall = ''
+              mkdir -p $out/share/zsh/site-functions $out/share/bash-completion/completions $out/share/fish/vendor_completions.d
+              $out/bin/net-observer-cli completions zsh > $out/share/zsh/site-functions/_net-observer-cli
+              $out/bin/net-observer-cli completions bash > $out/share/bash-completion/completions/net-observer-cli
+              $out/bin/net-observer-cli completions fish > $out/share/fish/vendor_completions.d/net-observer-cli.fish
+            '';
+          };
         };
         buildRustCrateForPkgs =
           p:

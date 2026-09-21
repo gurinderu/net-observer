@@ -30,7 +30,7 @@
 mod diagnose;
 
 use anyhow::{Result, anyhow};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{CellAlignment, ContentArrangement, presets::UTF8_FULL_CONDENSED};
 use config::Config;
 use net_observer_ipc::{
@@ -223,7 +223,7 @@ enum Command {
         /// The window's id, `experiment-<start_us>`.
         id: String,
     },
-    /// Sweep the local subnet and mDNS for who's on this segment now.
+    /// Sweep the local IPv4 subnet and mDNS for who's on this segment now.
     ///
     /// Ask the running daemon, sent as a `Control(ScanNeighbors)` request
     /// over the socket. Unlike the passive `neighbors` collector, this
@@ -435,6 +435,18 @@ enum Command {
         /// `--since`.
         #[arg(long, requires = "since")]
         until: Option<String>,
+    },
+    /// Generate shell completions for zsh, bash or fish.
+    ///
+    /// Prints the script to stdout (`net-observer-cli completions zsh`); source
+    /// or install it wherever the shell looks for completions. Needs neither a
+    /// running daemon nor the DuckDB file. The nix package already installs
+    /// the zsh, bash and fish completions, so on the Mac nothing needs
+    /// sourcing by hand.
+    Completions {
+        /// The shell to generate a completion script for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -1133,6 +1145,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             )?;
             print_paged(&format_table(&table, true), cli.no_pager);
         }
+        Command::Completions { shell } => {
+            clap_complete::generate(
+                *shell,
+                &mut Cli::command(),
+                "net-observer-cli",
+                &mut std::io::stdout(),
+            );
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1151,16 +1171,23 @@ fn daemon_not_running(e: &std::io::Error) -> bool {
     matches!(e.kind(), NotFound | ConnectionRefused)
 }
 
+/// Turn a transport failure from `net_observer_ipc` into the message every
+/// socket round-trip in this file reports it with: "not running" when nothing
+/// is there to answer, else the raw error alongside the socket path. Shared by
+/// every fetcher below so the wording — and the [`daemon_not_running`] split —
+/// stays in one place instead of being retyped per command.
+fn socket_error(socket_path: &str, e: std::io::Error) -> anyhow::Error {
+    if daemon_not_running(&e) {
+        anyhow!("net-observerd not running (socket {socket_path} unavailable)")
+    } else {
+        anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
+    }
+}
+
 /// Send one request to the daemon over the socket. An absent / refused socket
 /// (`net-observerd` not running) becomes a clear message, never a panic.
 fn daemon_query(socket_path: &str, req: &Request) -> Result<Response> {
-    net_observer_ipc::query(socket_path, req).map_err(|e| {
-        if daemon_not_running(&e) {
-            anyhow!("net-observerd not running (socket {socket_path} unavailable)")
-        } else {
-            anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
-        }
-    })
+    net_observer_ipc::query(socket_path, req).map_err(|e| socket_error(socket_path, e))
 }
 
 /// Where a diagnosis is read from, with the words that go with it. Decided by
@@ -1610,14 +1637,8 @@ fn fetch_set_observing(socket_path: &str, observing: bool) -> Result<ControlResu
 /// tier existed cannot decode the request; that is reported as "cannot", not
 /// as a refusal, through [`net_observer_ipc::control`]. Never panics.
 fn fetch_set_probing(socket_path: &str, tier: ProbingTier) -> Result<ControlResult> {
-    let outcome =
-        net_observer_ipc::control(socket_path, ControlCmd::SetProbing(tier)).map_err(|e| {
-            if daemon_not_running(&e) {
-                anyhow!("net-observerd not running (socket {socket_path} unavailable)")
-            } else {
-                anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
-            }
-        })?;
+    let outcome = net_observer_ipc::control(socket_path, ControlCmd::SetProbing(tier))
+        .map_err(|e| socket_error(socket_path, e))?;
     match outcome {
         net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
         net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
@@ -1632,13 +1653,7 @@ fn fetch_set_probing(socket_path: &str, tier: ProbingTier) -> Result<ControlResu
 /// daemon built before the window existed is "cannot", not a refusal.
 fn fetch_start_experiment(socket_path: &str, minutes: u32) -> Result<ControlResult> {
     let outcome = net_observer_ipc::control(socket_path, ControlCmd::StartExperiment { minutes })
-        .map_err(|e| {
-        if daemon_not_running(&e) {
-            anyhow!("net-observerd not running (socket {socket_path} unavailable)")
-        } else {
-            anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
-        }
-    })?;
+        .map_err(|e| socket_error(socket_path, e))?;
     match outcome {
         net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
         net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
@@ -1723,14 +1738,26 @@ fn await_experiment(
 }
 
 /// Send `Control(ScanNeighbors)` and return the daemon's verdict.
+///
+/// Reads with [`net_observer_ipc::SCAN_TIMEOUT`], not the default 2s
+/// [`daemon_query`] budget: the daemon answers only after the whole sweep
+/// (ARP + mDNS, then the ports/banners rungs), tens of seconds on a real
+/// segment, and a client that gives up first reads its own timeout instead of
+/// the daemon's effective/dropped-rungs message. A daemon built before
+/// `ScanNeighbors` existed cannot decode the request; that is reported as
+/// "cannot", not as a refusal, through [`net_observer_ipc::control_within`].
 fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
-    match daemon_query(
+    let outcome = net_observer_ipc::control_within(
         socket_path,
-        &Request::Control(ControlCmd::ScanNeighbors(opts)),
-    )? {
-        Response::Control(result) => Ok(result),
-        Response::Error(e) => Err(anyhow!("net-observerd returned an error: {e}")),
-        other => Err(anyhow!("unexpected daemon response to Control: {other:?}")),
+        ControlCmd::ScanNeighbors(opts),
+        net_observer_ipc::SCAN_TIMEOUT,
+    )
+    .map_err(|e| socket_error(socket_path, e))?;
+    match outcome {
+        net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
+        net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
+            "net-observerd cannot scan for neighbours (built before it existed): {e}"
+        )),
     }
 }
 
@@ -4157,19 +4184,35 @@ mod tests {
     fn top_level_help_lists_one_short_line_per_subcommand() {
         let mut cmd = Cli::command();
         let help = cmd.render_help().to_string();
-        let status_line = help
+        // Every line clap lists under `Commands:`, not just `status`: a
+        // re-joined doc comment (the blank `///` dropped) on ANY variant
+        // would leak its long prose back into the list, so every line is
+        // checked, not a hand-picked one.
+        let commands_section: Vec<&str> = help
             .lines()
-            .find(|l| l.trim_start().starts_with("status"))
-            .unwrap_or_else(|| panic!("no `status` line in the command list:\n{help}"));
+            .skip_while(|l| *l != "Commands:")
+            .skip(1)
+            .take_while(|l| !l.trim().is_empty())
+            .collect();
         assert!(
-            status_line.len() < 100,
-            "status command-list line is {} chars, expected < 100: {status_line:?}",
-            status_line.len()
+            !commands_section.is_empty(),
+            "no `Commands:` section found in the top-level help:\n{help}"
         );
-        // `HYPOTHESIS` (the caps row-marker in the long prose of `vulns`,
-        // `topology`, `air`) is distinct from `vulns`' own short line, which
-        // legitimately says "hypothesises" (lowercase verb) — checking the
-        // caps form avoids a false positive there.
+        for line in &commands_section {
+            assert!(
+                line.len() < 100,
+                "command-list line is {} chars, expected < 100 — a doc comment's \
+                 blank separator was likely dropped, re-joining its prose into \
+                 the summary: {line:?}",
+                line.len()
+            );
+        }
+        // Belt: two long-prose markers that must never survive into the
+        // summary list even if some future variant's line sneaks under the
+        // char cap. `HYPOTHESIS` (the caps row-marker in the long prose of
+        // `vulns`/`topology`/`air`) is distinct from `vulns`' own short
+        // line, which legitimately says "hypothesises" (lowercase verb) —
+        // checking the caps form avoids a false positive there.
         assert!(
             !help.contains("HYPOTHESIS") && !help.contains("Asks the running daemon"),
             "long prose leaked into the top-level help:\n{help}"
@@ -4187,5 +4230,55 @@ mod tests {
             .expect("`connections` is a subcommand");
         let long = sub.render_long_help().to_string();
         assert!(long.contains("fakeip"), "{long}");
+    }
+
+    /// `completions zsh` prints a non-empty zsh completion script naming this
+    /// binary — the file the nix package installs to
+    /// `share/zsh/site-functions/_net-observer-cli`.
+    #[test]
+    fn completions_zsh_generates_a_named_script() {
+        let mut out: Vec<u8> = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Zsh,
+            &mut Cli::command(),
+            "net-observer-cli",
+            &mut out,
+        );
+        assert!(!out.is_empty());
+        let script = String::from_utf8(out).expect("zsh completion script is UTF-8");
+        assert!(script.contains("_net-observer-cli"), "{script}");
+    }
+
+    /// Same shape for bash, the second file the nix package installs.
+    #[test]
+    fn completions_bash_generates_a_named_script() {
+        let mut out: Vec<u8> = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut Cli::command(),
+            "net-observer-cli",
+            &mut out,
+        );
+        assert!(!out.is_empty());
+        let script = String::from_utf8(out).expect("bash completion script is UTF-8");
+        assert!(script.contains("net-observer-cli"), "{script}");
+    }
+
+    /// Same shape for fish, the third file the nix package installs — a
+    /// `postInstall` `>` redirect doesn't fail on empty output, so this is
+    /// the guard against a clap_complete regression silently shipping a
+    /// truncated fish script.
+    #[test]
+    fn completions_fish_generates_a_named_script() {
+        let mut out: Vec<u8> = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Fish,
+            &mut Cli::command(),
+            "net-observer-cli",
+            &mut out,
+        );
+        assert!(!out.is_empty());
+        let script = String::from_utf8(out).expect("fish completion script is UTF-8");
+        assert!(script.contains("complete -c net-observer-cli"), "{script}");
     }
 }
