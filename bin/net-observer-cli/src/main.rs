@@ -2179,10 +2179,12 @@ fn pager_command() -> (String, Vec<String>) {
 /// untouched, `-X` keeps it in scrollback after quitting. `None` when the
 /// operator already set `LESS` themselves — a deliberate choice is never
 /// overridden — and harmless when the pager isn't `less` at all (an
-/// unrelated env var to another program). Git treats an empty/whitespace-only
-/// `LESS` (e.g. a shell profile exporting `LESS=`) the same as unset — a
-/// stray empty export is not a deliberate choice of flags — so this does too:
-/// only a `LESS` carrying real content counts as the operator's own.
+/// unrelated env var to another program). An empty/whitespace-only `LESS`
+/// (e.g. a shell profile exporting `LESS=`) is treated the same as unset:
+/// that is almost always a stray export, not a deliberate "run less with no
+/// flags", and leaving it alone would trap the operator in full-screen
+/// `less` on short output — precisely the bug `FRX` exists to avoid. Only a
+/// `LESS` carrying real content counts as the operator's own.
 fn pager_less_default() -> Option<&'static str> {
     let set_deliberately =
         std::env::var_os("LESS").is_some_and(|v| !v.to_string_lossy().trim().is_empty());
@@ -2928,9 +2930,10 @@ mod tests {
 
     /// `pager_less_default` — the `LESS=FRX` git-style default — fires when
     /// the operator has not set `LESS` themselves, and also when `LESS` is
-    /// set but empty/whitespace-only (a stray `LESS=` export, not a
-    /// deliberate flag choice — git treats it the same way); only a `LESS`
-    /// carrying real content is left alone.
+    /// set but empty or whitespace-only (a stray `LESS=` export is not a
+    /// deliberate flag choice, and leaving it alone would trap the operator
+    /// in full-screen `less` on short output); only a `LESS` carrying real
+    /// content is left alone.
     #[test]
     fn pager_less_default_when_less_is_unset_or_empty() {
         // SAFETY: this test owns `LESS` for its duration — set/read/restored
@@ -2945,6 +2948,11 @@ mod tests {
 
         unsafe {
             std::env::set_var("LESS", "");
+        }
+        assert_eq!(pager_less_default(), Some("FRX"));
+
+        unsafe {
+            std::env::set_var("LESS", "  ");
         }
         assert_eq!(pager_less_default(), Some("FRX"));
 
