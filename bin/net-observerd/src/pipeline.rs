@@ -1011,6 +1011,7 @@ pub fn compose_scan_report(
     mdns: &macos::neighbor_scan::MdnsOutcome,
     port_scan: Option<&macos::neighbor_scan::PortScanOutcome>,
     banner_grab: Option<&macos::neighbor_scan::BannerGrabOutcome>,
+    target: Option<std::net::IpAddr>,
 ) -> ScanReport {
     let swept = sweep.refused.is_none();
     let mut found = arp;
@@ -1027,15 +1028,31 @@ pub fn compose_scan_report(
         }
     }
 
-    // Attribute each open port to the neighbour that owns its address; a port on
-    // an address no neighbour claims is dropped — the row is keyed by MAC.
+    // Attribute each open port to the neighbour that owns its address; a port
+    // on an address no neighbour claims is dropped — the row is keyed by MAC
+    // (`neighbor_port`'s PRIMARY KEY), and inventing one would be the
+    // forbidden silent-wrong-data. The one exception is the explicit,
+    // single-address `--target` scan of a routed, off-subnet host: the
+    // kernel's ARP cache holds its GATEWAY's MAC, never its own, so `found`
+    // never claims it, yet the operator asked for exactly this address by
+    // name. For that case only, synthesize a self-describing identity —
+    // `mac = "ip:<addr>"`, never a fake MAC — so the finding still persists
+    // and its CVE hypotheses can surface (design decision + rejected
+    // alternatives: realm net-observer, node #157). A sweep's ownerless
+    // findings (`target` is `None`) still drop honestly, unchanged.
     let ports: Vec<store::NeighborPort> = port_scan
         .map(|ps| {
             ps.open
                 .iter()
                 .filter_map(|f| {
                     let ip = f.ip.to_string();
-                    let owner = found.iter().find(|n| n.ip == ip)?;
+                    let mac = if let Some(owner) = found.iter().find(|n| n.ip == ip) {
+                        owner.mac.clone()
+                    } else if target == Some(f.ip) {
+                        format!("ip:{ip}")
+                    } else {
+                        return None;
+                    };
                     // Attach the banner the grab read for this (ip, port), if the
                     // banner rung ran and found one. No grab, or nothing readable,
                     // leaves it None — never a guess.
@@ -1047,7 +1064,7 @@ pub fn compose_scan_report(
                     });
                     Some(store::NeighborPort {
                         network_key: network_key.clone(),
-                        mac: owner.mac.clone(),
+                        mac,
                         ip,
                         port: f.port,
                         ts_us,
@@ -1087,20 +1104,24 @@ pub fn compose_scan_report(
     ];
     // `ports`/`grabbed` above are the PERSISTED (MAC-attributed) counts — the
     // `neighbor_port` schema is keyed `(network_key, mac, port)`, so a finding
-    // on an address no neighbour's MAC claims cannot become a row (inventing
-    // a placeholder MAC would be exactly the silent-wrong-data this daemon's
-    // SKIP discipline forbids). That is common for an off-subnet `--target`
-    // (realm net-observer, node #154, owner decision #156): the kernel's ARP
-    // table holds a routed destination's GATEWAY, never the destination's own
-    // MAC, so `found` never claims it. `*_raw` below is what the probe
-    // ACTUALLY found, independent of attribution — the honest-report-only
-    // fix owner decision #156 asks for: the operator-facing message and this
-    // row's `detail` always lead with what was truly found, and name the gap
-    // when persistence dropped some of it, rather than silently reading as
-    // "0 open" for a target that really did have open ports. `found` (the
-    // row's own numeric column, and thus what `neighbors`/`vulns` can later
-    // join on) stays the persisted count — the fact `neighbor_port` can
-    // actually answer for.
+    // on an address no neighbour's MAC claims and no explicit `--target`
+    // covers cannot become a row (inventing a placeholder MAC would be
+    // exactly the silent-wrong-data this daemon's SKIP discipline forbids).
+    // An off-subnet `--target` (realm net-observer, node #154, owner decision
+    // #156) is no longer such a case: the kernel's ARP table holds a routed
+    // destination's GATEWAY, never the destination's own MAC, so `found`
+    // never claims it, but the synthetic `ip:<addr>` identity above (node
+    // #157) now persists it anyway — for that scan, `ports_unattributed`
+    // below is `0` and the "not persisted" note does not fire. `*_raw` below
+    // is what the probe ACTUALLY found, independent of attribution — the
+    // remaining case it still guards is a SWEEP finding on an address that
+    // left the ARP cache (`target` is `None`): the operator-facing message
+    // and this row's `detail` always lead with what was truly found, and
+    // name the gap when persistence dropped some of it, rather than silently
+    // reading as "0 open" for a target that really did have open ports.
+    // `found` (the row's own numeric column, and thus what `neighbors`/
+    // `vulns` can later join on) stays the persisted count — the fact
+    // `neighbor_port` can actually answer for.
     let ports_raw = port_scan.map(|ps| ps.open.len()).unwrap_or(0);
     let ports_unattributed = ports_raw.saturating_sub(ports.len());
     if let Some(ps) = port_scan {
@@ -1632,6 +1653,7 @@ mod tests {
             &MdnsOutcome::default(),
             None,
             None,
+            None,
         );
         assert_eq!(r.found[0].source, types::NeighborSource::Arp);
         let sweep_row = r.scans.iter().find(|s| s.method == "sweep").unwrap();
@@ -1652,6 +1674,7 @@ mod tests {
             &sweep_stats(None),
             vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
             &MdnsOutcome::default(),
+            None,
             None,
             None,
         );
@@ -1681,6 +1704,7 @@ mod tests {
                 types_browsed: 4,
                 duration_ms: 3900,
             },
+            None,
             None,
             None,
         );
@@ -1721,6 +1745,7 @@ mod tests {
             vec![arp_obs("11:22:33:44:55:66", "192.168.1.5")],
             &MdnsOutcome::default(),
             Some(&ps),
+            None,
             None,
         );
         assert_eq!(r.ports.len(), 1, "the orphan port on .99 must drop");
@@ -1772,6 +1797,7 @@ mod tests {
             &MdnsOutcome::default(),
             Some(&ps),
             Some(&bg),
+            None,
         );
         assert_eq!(r.ports.len(), 1);
         assert_eq!(r.ports[0].banner.as_deref(), Some("SSH-2.0-OpenSSH_9.6"));
@@ -1782,32 +1808,30 @@ mod tests {
     }
 
     /// Off-subnet `--target` (owner decision #156, realm net-observer, node
-    /// #154): a routed destination's ARP entry, if the kernel holds one at
-    /// all, belongs to its GATEWAY, never the destination itself — `found`
-    /// is empty here even though the port scan and banner grab genuinely
-    /// found something. `neighbor_port`/`neighbor_vuln` are keyed by
-    /// `(network_key, mac, ...)`, so nothing can be persisted without a MAC
-    /// to key it by (inventing one would be the forbidden silent-wrong-data)
-    /// — but BOTH surfaces that carry the finding onward, the live
-    /// `ControlResult.message` AND the durable `neighbor_scan.detail` row a
-    /// later `query` reads back, must lead with what was truly found. Never
-    /// "0 open"/"0 banners" for a target that really had some — that is
-    /// exactly the misread owner decision #156 forbids, and a row a forensics
-    /// query reads later is no less a place that misread can land than the
-    /// live message is.
+    /// #154; persistence decision realm net-observer, node #157): a routed
+    /// destination's ARP entry, if the kernel holds one at all, belongs to
+    /// its GATEWAY, never the destination itself — `found` is empty here
+    /// even though the port scan and banner grab genuinely found something.
+    /// Passing `target = Some(<the scanned address>)` is exactly the signal
+    /// this WAS a single-address `--target` scan of that address, so its
+    /// findings now persist under the synthetic `mac = "ip:<addr>"` identity
+    /// instead of dropping: `neighbor_port` rows exist, the "N not persisted"
+    /// note is gone from both the live `ControlResult.message` and the
+    /// durable `neighbor_scan.detail` row, and each reads the true count.
     #[test]
-    fn an_off_subnet_targets_findings_are_reported_honestly_not_as_zero() {
+    fn an_off_subnet_targets_findings_are_persisted_under_its_ip_key() {
         use macos::neighbor_scan::{
             BannerFinding, BannerGrabOutcome, PortFinding, PortScanOutcome,
         };
+        let target_ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
         let ps = PortScanOutcome {
             open: vec![
                 PortFinding {
-                    ip: "203.0.113.9".parse().unwrap(),
+                    ip: target_ip,
                     port: 22,
                 },
                 PortFinding {
-                    ip: "203.0.113.9".parse().unwrap(),
+                    ip: target_ip,
                     port: 80,
                 },
             ],
@@ -1817,7 +1841,7 @@ mod tests {
         };
         let bg = BannerGrabOutcome {
             banners: vec![BannerFinding {
-                ip: "203.0.113.9".parse().unwrap(),
+                ip: target_ip,
                 port: 22,
                 banner: "SSH-2.0-OpenSSH_9.6".into(),
             }],
@@ -1833,44 +1857,87 @@ mod tests {
             &MdnsOutcome::default(),
             Some(&ps),
             Some(&bg),
+            Some(target_ip),
         );
-        assert!(r.ports.is_empty(), "no MAC to key a persisted row by");
+        assert_eq!(
+            r.ports.len(),
+            2,
+            "both findings on the target persist under its ip: key"
+        );
+        assert!(
+            r.ports.iter().all(|p| p.mac == "ip:203.0.113.9"),
+            "{:?}",
+            r.ports
+        );
+        assert!(
+            r.found.is_empty(),
+            "a routed target is not a segment neighbour — no `neighbor` entity row"
+        );
 
         let ports_row = r.scans.iter().find(|s| s.method == "ports").unwrap();
-        assert_eq!(ports_row.found, 0, "nothing was actually persisted");
+        assert_eq!(ports_row.found, 2, "both ports are now persisted");
         let ports_detail = ports_row.detail.as_deref().unwrap();
-        assert!(ports_detail.contains("2 open"), "{ports_detail:?}");
-        assert!(
-            !ports_detail.contains("0 open"),
-            "the DURABLE row must not lead with the persisted zero either: {ports_detail:?}"
-        );
-        assert!(ports_detail.contains("not persisted"), "{ports_detail:?}");
+        assert_eq!(ports_detail, "2 open");
+        assert!(!ports_detail.contains("not persisted"), "{ports_detail:?}");
 
         let banners_row = r.scans.iter().find(|s| s.method == "banners").unwrap();
-        assert_eq!(banners_row.found, 0, "nothing was actually persisted");
+        assert_eq!(banners_row.found, 1, "the one grabbed banner is persisted");
         let banners_detail = banners_row.detail.as_deref().unwrap();
-        assert!(banners_detail.contains("1 banners"), "{banners_detail:?}");
+        assert_eq!(banners_detail, "1 banners");
         assert!(
-            !banners_detail.contains("0 banners"),
-            "the DURABLE row must not lead with the persisted zero either: {banners_detail:?}"
-        );
-        assert!(
-            banners_detail.contains("not persisted"),
+            !banners_detail.contains("not persisted"),
             "{banners_detail:?}"
         );
 
-        assert!(
-            !r.message.contains("0 open ports"),
-            "an off-subnet target with real open ports must never read as 0: {}",
-            r.message
-        );
         assert!(r.message.contains("2 open ports"), "{}", r.message);
+        assert!(r.message.contains("1 banners"), "{}", r.message);
         assert!(
-            !r.message.contains("0 banners"),
-            "an off-subnet target with real banners must never read as 0: {}",
+            !r.message.contains("not persisted"),
+            "a fully-persisted target reads cleanly: {}",
             r.message
         );
-        assert!(r.message.contains("1 banners"), "{}", r.message);
+    }
+
+    /// A SWEEP (not an explicit `--target`) still drops a genuinely ownerless
+    /// finding: `target` is `None`, so the synthetic `ip:<addr>` identity
+    /// never fires, and a port on an address that left the ARP cache between
+    /// the sweep and the port scan has no MAC to key a row by. This is the
+    /// honest fallback realm net-observer node #157 leaves unchanged.
+    #[test]
+    fn a_sweep_still_drops_a_genuinely_ownerless_finding() {
+        use macos::neighbor_scan::{PortFinding, PortScanOutcome};
+        let ps = PortScanOutcome {
+            open: vec![PortFinding {
+                ip: "192.168.1.99".parse().unwrap(),
+                port: 22,
+            }],
+            hosts: 1,
+            ports_per_host: 27,
+            duration_ms: 500,
+        };
+        let r = compose_scan_report(
+            42,
+            Some("aa:bb:cc:dd:ee:ff".into()),
+            "en0".into(),
+            &sweep_stats(None),
+            Vec::new(), // .99 left the ARP cache: no owner for the sweep to find
+            &MdnsOutcome::default(),
+            Some(&ps),
+            None,
+            None, // a sweep, not an explicit --target
+        );
+        assert!(r.ports.is_empty(), "no MAC to key a persisted row by");
+        let ports_row = r.scans.iter().find(|s| s.method == "ports").unwrap();
+        assert_eq!(ports_row.found, 0, "nothing was actually persisted");
+        assert!(
+            ports_row
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("not persisted"),
+            "{:?}",
+            ports_row.detail
+        );
         assert!(r.message.contains("not persisted"), "{}", r.message);
     }
 
@@ -1941,6 +2008,34 @@ mod tests {
             "attributed to the owning neighbour"
         );
         assert_eq!(v.port, 22);
+    }
+
+    /// A routed `--target`'s `ip:<addr>`-keyed port (realm net-observer, node
+    /// #157) is just another `mac` value to `match_vulns` — the CVE glue does
+    /// not special-case it: a matching banner yields a `neighbor_vuln` row
+    /// keyed by that same synthetic mac, exactly as `vulns_sql`'s join on
+    /// `(network_key, mac, port)` expects.
+    #[test]
+    fn a_matching_banner_on_an_ip_keyed_port_yields_a_cve_finding() {
+        let dir = write_fixture_snapshot();
+        let db = vuln_db::VulnDb::load_from_dir(dir.path()).expect("fixture snapshot loads");
+        let ports = vec![store::NeighborPort {
+            network_key: None,
+            mac: "ip:203.0.113.9".into(),
+            ip: "203.0.113.9".into(),
+            port: 22,
+            ts_us: 42,
+            banner: Some("SSH-2.0-OpenSSH_7.3".into()),
+        }];
+
+        let vulns = match_vulns(&db, &ports, 42);
+        assert_eq!(vulns.len(), 1, "the 7.3 banner falls inside <7.4");
+        assert_eq!(
+            vulns[0].mac, "ip:203.0.113.9",
+            "the synthetic identity carries through to the vuln row unchanged"
+        );
+        assert_eq!(vulns[0].cve_id, "CVE-2016-6210");
+        assert_eq!(vulns[0].port, 22);
     }
 
     /// A port with no banner, and one whose banner does not parse to a product,
