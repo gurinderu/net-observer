@@ -100,6 +100,17 @@ pub fn run_query(
                 )),
             };
         }
+        // Never actually reached: `api::handle_conn` routes `CveLookup` to
+        // `api::cve_lookup_response` BEFORE `query_store` (and therefore
+        // before this function) ever sees it — a name-only lookup is a pure
+        // index read against the cached `VulnDb`, not a SQL diagnosis, and
+        // touches neither the store nor its query gate. This arm exists only
+        // so the match stays exhaustive if that routing is ever removed.
+        DiagnosticQuery::CveLookup { .. } => {
+            return Err(
+                "CveLookup is not a store diagnosis and should never reach run_query".to_string(),
+            );
+        }
     };
     store
         .query_prepared_within(&statement, budget)

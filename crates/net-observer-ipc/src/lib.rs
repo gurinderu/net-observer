@@ -431,6 +431,22 @@ pub enum DiagnosticQuery {
     /// diagnosis: the daemon answers a running window from memory, and only
     /// a finished one from the record.
     Experiment { id: String },
+    /// A product's CVEs, matched by name (and optionally `version`) directly
+    /// against the daemon's already-loaded CVE snapshot — no scan, no
+    /// network, no store read (unlike every other variant here, this one
+    /// never touches DuckDB; see `net-observerd::api::cve_lookup_response`).
+    /// Exists for a device that exposes no service banner and never
+    /// advertises its own version on the wire (a phone, say) but whose
+    /// product+version the OPERATOR already knows. A daemon with no
+    /// configured/loadable snapshot answers `Response::Error` with the same
+    /// wording the scan-mode `cve` rung uses, never a silent empty table. A
+    /// daemon built before this variant existed cannot decode the request at
+    /// all, and [`diagnose`] reports that as [`QueryOutcome::Unsupported`]
+    /// the same as any other new query.
+    CveLookup {
+        product: String,
+        version: Option<String>,
+    },
 }
 
 /// A result table: the daemon's answer to [`Request::Query`], and the shape the

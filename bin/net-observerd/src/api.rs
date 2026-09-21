@@ -49,7 +49,9 @@ use types::{
 };
 
 use crate::acting;
-use crate::pipeline::{AirScanRequest, AirScanner, NeighborScanner, PcapRingSlot};
+use crate::pipeline::{
+    AirScanRequest, AirScanner, CveLookupOutcome, NeighborScanner, PcapRingSlot, confidence_token,
+};
 
 /// The uid `root` runs as. Always authorised for control: root can already stop
 /// and reconfigure the daemon, so refusing it would be theatre.
@@ -807,6 +809,14 @@ async fn handle_conn(
                 None => query_store(srv, DiagnosticQuery::Experiment { id }).await,
             }
         }
+        // `check-cve --product`: a pure local-index read against whichever
+        // `NeighborScanner` is configured, never `query_store` — this never
+        // touches the store's connection mutex or DuckDB at all (unlike
+        // every other `DiagnosticQuery` variant), so it skips the query gate
+        // entirely rather than contending for it.
+        Ok(Request::Query(DiagnosticQuery::CveLookup { product, version })) => {
+            cve_lookup_response(srv, &product, version.as_deref())
+        }
         Ok(Request::Query(q)) => query_store(srv, q).await,
         Ok(Request::Control(cmd)) => {
             let cx = ControlCtx {
@@ -877,6 +887,54 @@ async fn query_store(srv: &ApiServer, q: DiagnosticQuery) -> Response {
                 Err(e) => Response::Error(format!("diagnosis task failed: {e}")),
             }
         }
+    }
+}
+
+/// Answer `check-cve --product`: ask whichever [`NeighborScanner`] is
+/// configured for `cve_lookup` and translate its two outcomes the same way
+/// `query_store` translates a diagnosis's — `SnapshotUnavailable` becomes a
+/// decoded-but-failed [`Response::Error`] (never the `UNDECODABLE_REQUEST_
+/// PREFIX` spelling, which would tell a live client the daemon cannot even
+/// READ this request), not a silent empty table. No scanner configured at
+/// all answers the same wording `scan_now` already uses for the same
+/// condition.
+fn cve_lookup_response(srv: &ApiServer, product: &str, version: Option<&str>) -> Response {
+    let Some(scanner) = srv.scanner.as_deref() else {
+        return Response::Error("neighbour scanning not available".to_string());
+    };
+    match scanner.cve_lookup(product, version) {
+        CveLookupOutcome::Matches(matches) => Response::Table(cve_lookup_table(&matches)),
+        CveLookupOutcome::SnapshotUnavailable(note) => Response::Error(note),
+    }
+}
+
+/// The [`Table`] shape `check-cve --product` renders: one row per
+/// [`vuln_db::VulnMatch`], the same `cvss`/`known_exploited`/`confidence`
+/// vocabulary `vulns`/`check-cve <ip>` already use ([`confidence_token`] is
+/// the same mapping their `confidence` column is written with) minus the
+/// per-host columns (`mac`, `ip`, `port`, `last_seen_us`) a name-only lookup
+/// carries none of, plus `summary` — reachable there only via a join back to
+/// the `cves` catalogue this daemon does not keep, so a name-only lookup
+/// carries it directly instead.
+fn cve_lookup_table(matches: &[vuln_db::VulnMatch]) -> Table {
+    let rows = matches
+        .iter()
+        .map(|m| {
+            vec![
+                m.cve_id.clone(),
+                m.cvss.map(|c| c.to_string()).unwrap_or_default(),
+                m.known_exploited.to_string(),
+                confidence_token(m.confidence).to_string(),
+                m.summary.clone(),
+            ]
+        })
+        .collect();
+    Table {
+        columns: ["cve_id", "cvss", "known_exploited", "confidence", "summary"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        rows,
     }
 }
 
@@ -2528,9 +2586,19 @@ mod tests {
     }
 
     /// A scratch directory for a socket-bound test.
+    ///
+    /// Based directly under `/tmp`, NOT `std::env::temp_dir()`: on macOS
+    /// that resolves to a long per-process `/var/folders/xx/.../T/` path,
+    /// and `sockaddr_un.sun_path` there is ~104 bytes (vs Linux's 108) — a
+    /// long enough `tag` pushes `<dir>/observer.sock` over that limit and
+    /// `UnixListener::bind` fails; the test then sees no socket file ever
+    /// appear and `wait_for_socket` times out, which reads like the server
+    /// never started rather than the real cause (the path was too long).
+    /// `/tmp` is short on every runner these tests run on, so even the
+    /// longest `tag` in this file stays well under the limit.
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("net-observerd-{tag}-test-{}", std::process::id()));
+            std::path::PathBuf::from("/tmp").join(format!("nob-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -2670,6 +2738,131 @@ mod tests {
                 assert!(t.rows.is_empty(), "no pause, no gap: {:?}", t.rows);
             }
             other => panic!("expected Table, got {other:?}"),
+        }
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `check-cve --product`: a pure local-index read through whichever
+    /// `NeighborScanner` is configured — routed BEFORE `query_store`, so it
+    /// never touches the query gate or DuckDB at all. `FakeScanner::
+    /// cve_lookup` answers a fixed fixture; this pins the exact `Table`
+    /// shape the CLI renders it into (`cve_lookup_table`).
+    #[tokio::test]
+    async fn serve_answers_a_cve_lookup_query() {
+        let dir = temp_dir("api-cve-lookup");
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let mut srv = test_server(&sock_str, test_acting(), TEST_DAEMON_UID);
+        srv.scanner = Some(Arc::new(FakeScanner(None)));
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
+
+        let sp = sock_str.clone();
+        let answer = tokio::task::spawn_blocking(move || {
+            net_observer_ipc::query(
+                &sp,
+                &Request::Query(DiagnosticQuery::CveLookup {
+                    product: "openssh".to_string(),
+                    version: Some("7.2".to_string()),
+                }),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        match answer {
+            Response::Table(t) => {
+                assert_eq!(
+                    t.columns,
+                    ["cve_id", "cvss", "known_exploited", "confidence", "summary"]
+                );
+                assert_eq!(
+                    t.rows,
+                    vec![vec![
+                        "CVE-2024-0001".to_string(),
+                        "9.8".to_string(),
+                        "true".to_string(),
+                        "high".to_string(),
+                        "a fixture finding".to_string(),
+                    ]]
+                );
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No `NeighborScanner` configured at all (the daemon's default when
+    /// neighbour scanning is off) — the SAME wording `scan_now` already
+    /// answers for the same condition, not a silent empty table.
+    #[tokio::test]
+    async fn serve_answers_cve_lookup_with_no_scanner_configured() {
+        let dir = temp_dir("api-cve-lookup-no-scanner");
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let srv = test_server(&sock_str, test_acting(), TEST_DAEMON_UID);
+        assert!(srv.scanner.is_none());
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
+
+        let sp = sock_str.clone();
+        let answer = tokio::task::spawn_blocking(move || {
+            net_observer_ipc::query(
+                &sp,
+                &Request::Query(DiagnosticQuery::CveLookup {
+                    product: "openssh".to_string(),
+                    version: None,
+                }),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        match answer {
+            Response::Error(m) => assert_eq!(m, "neighbour scanning not available"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The snapshot cannot be used at all — a decoded-but-failed
+    /// `Response::Error`, never a silent empty table that would read as "no
+    /// CVEs found" (see `cve_lookup_response`'s doc).
+    #[tokio::test]
+    async fn serve_answers_cve_lookup_when_the_snapshot_is_unavailable() {
+        let dir = temp_dir("api-cve-lookup-unavailable");
+        let sock = dir.join("observer.sock");
+        let sock_str = sock.to_str().unwrap().to_string();
+
+        let mut srv = test_server(&sock_str, test_acting(), TEST_DAEMON_UID);
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::new(Mutex::new(None)))));
+        let handle = tokio::spawn(srv.serve());
+        wait_for_socket(&sock).await;
+
+        let sp = sock_str.clone();
+        let answer = tokio::task::spawn_blocking(move || {
+            net_observer_ipc::query(
+                &sp,
+                &Request::Query(DiagnosticQuery::CveLookup {
+                    product: "openssh".to_string(),
+                    version: None,
+                }),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        match answer {
+            Response::Error(m) => assert_eq!(m, "RecordingScanner carries no CVE snapshot"),
+            other => panic!("expected Error, got {other:?}"),
         }
 
         handle.abort();
@@ -3151,6 +3344,19 @@ mod tests {
         fn scan(&self, _opts: &ScanOptions) -> Option<ScanReport> {
             self.0.clone()
         }
+
+        /// Not exercised by the scan-mode tests that build this fixture with
+        /// `scan` in mind; the one test that asks THIS
+        /// (`serve_answers_a_cve_lookup_query`) knows this exact value.
+        fn cve_lookup(&self, _product: &str, _version: Option<&str>) -> CveLookupOutcome {
+            CveLookupOutcome::Matches(vec![vuln_db::VulnMatch {
+                cve_id: "CVE-2024-0001".to_string(),
+                summary: "a fixture finding".to_string(),
+                confidence: vuln_db::Confidence::High,
+                known_exploited: true,
+                cvss: Some(9.8),
+            }])
+        }
     }
 
     /// A scanner that records the EFFECTIVE options it was handed, so a test can
@@ -3160,6 +3366,15 @@ mod tests {
         fn scan(&self, opts: &ScanOptions) -> Option<ScanReport> {
             *self.0.lock().unwrap() = Some(opts.clone());
             Some(fake_report())
+        }
+
+        /// Never asked by any test that builds this fixture (`scan_now`'s
+        /// control-path tests, not a `CveLookup` query) — present only to
+        /// satisfy the trait.
+        fn cve_lookup(&self, _product: &str, _version: Option<&str>) -> CveLookupOutcome {
+            CveLookupOutcome::SnapshotUnavailable(
+                "RecordingScanner carries no CVE snapshot".to_string(),
+            )
         }
     }
 

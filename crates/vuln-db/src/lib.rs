@@ -166,6 +166,21 @@ impl VulnDb {
         });
         out
     }
+
+    /// Convenience over [`match_product`][Self::match_product] for a
+    /// vendor-less product+version query — the shape a name-only lookup
+    /// (`check-cve --product`) always has: the operator names a product and,
+    /// optionally, a version, never a CPE vendor. Builds the [`Cpe`] and
+    /// calls `match_product` directly; matching itself is not reimplemented
+    /// here.
+    pub fn lookup(&self, product: &str, version: Option<&str>) -> Vec<VulnMatch> {
+        let cpe = Cpe {
+            vendor: None,
+            product: product.to_string(),
+            version: version.map(str::to_string),
+        };
+        self.match_product(&cpe)
+    }
 }
 
 /// Decide the confidence with which an affected-product entry matches the

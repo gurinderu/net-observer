@@ -308,13 +308,16 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Scan one host for CVEs and show its hypotheses.
+    /// Scan one host for CVEs, or look a product's CVEs up by name.
     ///
-    /// A convenience over the two-step `scan-neighbors --target <ip> --ports
-    /// --banners --cve` then `vulns`: this runs the same targeted scan
-    /// (ports + banners + cve, against `ip` only) via the daemon's
-    /// `ScanNeighbors` control, then reads the record's vulns back through
-    /// the same query `vulns` uses and prints just this host's rows,
+    /// Two mutually exclusive modes: exactly one of `<ip>` / `--product` is
+    /// required.
+    ///
+    /// `<ip>` (scan mode): a convenience over the two-step `scan-neighbors
+    /// --target <ip> --ports --banners --cve` then `vulns`: this runs the
+    /// same targeted scan (ports + banners + cve, against `ip` only) via the
+    /// daemon's `ScanNeighbors` control, then reads the record's vulns back
+    /// through the same query `vulns` uses and prints just this host's rows,
     /// known-exploited (KEV) first, worst CVSS next. Nothing on the wire is
     /// new — same control command, same diagnosis.
     ///
@@ -332,14 +335,33 @@ enum Command {
     /// as current. `--all` shows this host's full recorded history instead,
     /// stale rows included.
     ///
-    /// Inherently a LIVE operation — it scans the running daemon and reads
-    /// the answer back from that same daemon, so a global `--db` (offline
-    /// file) is refused rather than silently reading an unrelated record.
+    /// `--product <name> [--version <ver>]` (lookup mode): a device like an
+    /// iPhone exposes no service banner and never advertises its own version
+    /// on the network, so it can never reach the scan mode above — but if the
+    /// operator KNOWS the product+version, this looks it up directly against
+    /// the daemon's already-cached CVE snapshot (the same index the `cve`
+    /// rung matches against; loaded once, never reloaded per call). No scan,
+    /// no network, no MAC involved. `--version` is only valid together with
+    /// `--product`; `--all` applies to scan mode only.
+    ///
+    /// Inherently a LIVE operation either way — the daemon holds the only
+    /// scan record / cached snapshot — so a global `--db` (offline file) is
+    /// refused rather than silently reading an unrelated record.
     CheckCve {
-        /// The host to scan.
-        ip: IpAddr,
-        /// Show this host's full recorded history, not just the scan just run.
-        #[arg(long)]
+        /// The host to scan. Mutually exclusive with `--product`; exactly
+        /// one of the two is required.
+        #[arg(required_unless_present = "product")]
+        ip: Option<IpAddr>,
+        /// Look this product up directly in the local CVE snapshot instead
+        /// of scanning a host. Mutually exclusive with `<ip>`.
+        #[arg(long, conflicts_with = "ip", required_unless_present = "ip")]
+        product: Option<String>,
+        /// Narrow the lookup to one version. Only valid with `--product`.
+        #[arg(long, requires = "product")]
+        version: Option<String>,
+        /// Show this host's full recorded history, not just the scan just
+        /// run. Scan mode only.
+        #[arg(long, conflicts_with = "product")]
         all: bool,
     },
     /// Switch-topology uplinks learned passively from LLDP/CDP, newest first.
@@ -903,20 +925,46 @@ fn focus_vulns_for_ip(table: &Table, ip: &IpAddr) -> Table {
             ]
         })
         .collect();
-    // KEV (`known_exploited = true`) first, then CVSS worst (highest) first.
-    // A blank/unparsed cvss sorts last, never first — an unweighed hypothesis
-    // is not "more severe" than one the record actually scored.
+    sort_kev_then_cvss_desc(&mut rows, 4, 2);
+    Table {
+        columns: FOCUSED_VULN_COLUMNS.iter().map(|s| s.to_string()).collect(),
+        rows,
+    }
+}
+
+/// KEV (`known_exploited = true`) first, then CVSS worst (highest) first —
+/// the reading order "what to triage now", shared by [`focus_vulns_for_ip`]
+/// (`check-cve <ip>`) and [`sort_cve_lookup`] (`check-cve --product`), whose
+/// row shapes differ but both carry a `known_exploited`/`cvss` pair.
+/// `kev_col`/`cvss_col` say which column of each row carries which. A
+/// blank/unparsed cvss sorts last, never first — an unweighed hypothesis is
+/// not "more severe" than one the record actually scored.
+fn sort_kev_then_cvss_desc(rows: &mut [Vec<String>], kev_col: usize, cvss_col: usize) {
     rows.sort_by(|a, b| {
-        let kev = |r: &[String]| r[4] == "true";
-        let cvss = |r: &[String]| r[2].parse::<f64>().unwrap_or(f64::NEG_INFINITY);
+        let kev = |r: &[String]| r[kev_col] == "true";
+        let cvss = |r: &[String]| r[cvss_col].parse::<f64>().unwrap_or(f64::NEG_INFINITY);
         kev(b).cmp(&kev(a)).then_with(|| {
             cvss(b)
                 .partial_cmp(&cvss(a))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
     });
+}
+
+/// `check-cve --product`: sort the daemon's [`DiagnosticQuery::CveLookup`]
+/// table the SAME way [`focus_vulns_for_ip`] sorts the scan-mode table — KEV
+/// first, then CVSS worst-first — via the shared [`sort_kev_then_cvss_desc`].
+/// A table missing either column (an older daemon's shape) is returned
+/// unsorted rather than guessing at positions.
+fn sort_cve_lookup(table: &Table) -> Table {
+    let col = |name: &str| table.columns.iter().position(|c| c == name);
+    let (Some(kev_col), Some(cvss_col)) = (col("known_exploited"), col("cvss")) else {
+        return table.clone();
+    };
+    let mut rows = table.rows.clone();
+    sort_kev_then_cvss_desc(&mut rows, kev_col, cvss_col);
     Table {
-        columns: FOCUSED_VULN_COLUMNS.iter().map(|s| s.to_string()).collect(),
+        columns: table.columns.clone(),
         rows,
     }
 }
@@ -1279,7 +1327,61 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             let table = if *all { table } else { keep_last_run(&table) };
             print_paged(&format_table(&table, true), cli.no_pager);
         }
-        Command::CheckCve { ip, all } => {
+        Command::CheckCve {
+            product, version, ..
+        } if product.is_some() => {
+            // Lookup mode is inherently LIVE too: the daemon holds the only
+            // cached CVE index, so `--db` (an unrelated offline file, and one
+            // this variant never reads from anyway) is refused the same way
+            // scan mode refuses it.
+            if cli.db.is_some() {
+                return Err(anyhow!(
+                    "check-cve --product needs the running daemon; --db (offline file) is not \
+                     compatible"
+                ));
+            }
+            let product = product.as_deref().expect("guarded by the match arm");
+            let label = match version {
+                Some(v) => format!("{product} {v}"),
+                None => product.to_string(),
+            };
+            let cfg = load_config(cli)?;
+            let outcome = net_observer_ipc::diagnose(
+                &cfg.socket_path,
+                DiagnosticQuery::CveLookup {
+                    product: product.to_string(),
+                    version: version.clone(),
+                },
+            )
+            .map_err(|e| socket_error(&cfg.socket_path, e))?;
+            eprintln!("CVE for {label}");
+            match outcome {
+                QueryOutcome::Unsupported(m) => {
+                    return Err(anyhow!("this daemon is too old for product lookup ({m})"));
+                }
+                QueryOutcome::Failed(m) => {
+                    return Err(anyhow!("net-observerd returned an error: {m}"));
+                }
+                QueryOutcome::Table(table) => {
+                    let sorted = sort_cve_lookup(&table);
+                    if sorted.rows.is_empty() {
+                        eprintln!(
+                            "no CVEs found for {label} (try another spelling — e.g. iphone_os \
+                             for iOS)"
+                        );
+                    } else {
+                        print_paged(&format_table(&sorted, true), cli.no_pager);
+                    }
+                    eprintln!(
+                        "Names in the CVE data are messy — a product like iOS may be recorded \
+                         as \"iphone_os\"/\"apple\"; try a couple of spellings. Without \
+                         --version, every CVE ever filed for the product is listed. These are \
+                         catalogue entries, not a claim your device is unpatched."
+                    );
+                }
+            }
+        }
+        Command::CheckCve { ip, all, .. } => {
             // check-cve is inherently a LIVE operation: it just told the
             // running daemon to scan `ip`, so the readback must come from
             // that SAME daemon's record. `--db` names an unrelated offline
@@ -1292,6 +1394,10 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                      --db (offline file) is not compatible"
                 ));
             }
+            // clap's `required_unless_present`/`conflicts_with` on `ip` and
+            // `product` guarantee exactly one is present, and this arm is
+            // only reached when `product` was `None`.
+            let ip = ip.expect("clap guarantees <ip> is present when --product is absent");
             let cfg = load_config(cli)?;
             // Captured BEFORE the scan request: see `keep_since`'s doc for
             // why a timestamp, not a max, is what makes the default view
@@ -1303,7 +1409,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     ports: true,
                     banners: true,
                     cve: true,
-                    target: Some(*ip),
+                    target: Some(ip),
                     slow: false,
                     sweep_max: None,
                 },
@@ -1319,7 +1425,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             // This host's rows across ALL of its recorded scans, every
             // column intact — the base both the shown table and
             // `has_history` are read from below.
-            let ip_rows = filter_by_ip(&table, ip);
+            let ip_rows = filter_by_ip(&table, &ip);
             let has_history = !ip_rows.rows.is_empty();
             // `--all`: the full history. Default: only what THIS scan
             // actually wrote — `>= scan_start_us`, never `keep_last_run`'s
@@ -1330,7 +1436,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             } else {
                 keep_since(&ip_rows, scan_start_us)
             };
-            let focused = focus_vulns_for_ip(&shown, ip);
+            let focused = focus_vulns_for_ip(&shown, &ip);
             let cve_ran = !cve_rung_unavailable(&scan.message);
             eprintln!("CVE hypotheses for {ip}");
             eprintln!("scanned: {}", scan.message);
@@ -3420,8 +3526,15 @@ mod tests {
     fn check_cve_parses_the_target_ip() {
         let cli = Cli::try_parse_from(["net-observer-cli", "check-cve", "10.0.0.5"]).unwrap();
         match cli.command {
-            Command::CheckCve { ip, all } => {
-                assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+            Command::CheckCve {
+                ip,
+                product,
+                version,
+                all,
+            } => {
+                assert_eq!(ip, Some("10.0.0.5".parse::<IpAddr>().unwrap()));
+                assert_eq!(product, None);
+                assert_eq!(version, None);
                 assert!(!all);
             }
             _ => panic!("did not parse as `check-cve`"),
@@ -3436,6 +3549,74 @@ mod tests {
             Command::CheckCve { all, .. } => assert!(all),
             _ => panic!("did not parse as `check-cve`"),
         }
+    }
+
+    /// `--product` and `--version` parse into lookup mode, with the positional
+    /// `<ip>` left `None`.
+    #[test]
+    fn check_cve_parses_product_and_version() {
+        let cli = Cli::try_parse_from([
+            "net-observer-cli",
+            "check-cve",
+            "--product",
+            "ios",
+            "--version",
+            "17.2",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::CheckCve {
+                ip,
+                product,
+                version,
+                all,
+            } => {
+                assert_eq!(ip, None);
+                assert_eq!(product.as_deref(), Some("ios"));
+                assert_eq!(version.as_deref(), Some("17.2"));
+                assert!(!all);
+            }
+            _ => panic!("did not parse as `check-cve`"),
+        }
+    }
+
+    /// `<ip>` and `--product` are mutually exclusive — giving both is a clap
+    /// error, not a silent pick of one. `Cli` carries no `Debug` impl, so
+    /// `.err()` (not `.unwrap_err()`, which would need one to format the `Ok`
+    /// side on a mismatch) is how every other clap-rejection test here gets
+    /// at the error.
+    #[test]
+    fn check_cve_rejects_ip_and_product_together() {
+        let err = Cli::try_parse_from([
+            "net-observer-cli",
+            "check-cve",
+            "10.0.0.5",
+            "--product",
+            "openssh",
+        ])
+        .err()
+        .expect("ip and --product together must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// `--version` without `--product` is a clap error: a bare version narrows
+    /// nothing without a product to look up.
+    #[test]
+    fn check_cve_rejects_version_without_product() {
+        let err = Cli::try_parse_from(["net-observer-cli", "check-cve", "--version", "17.2"])
+            .err()
+            .expect("--version without --product must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    /// Neither `<ip>` nor `--product` given: clap refuses rather than silently
+    /// running neither mode.
+    #[test]
+    fn check_cve_rejects_neither_ip_nor_product() {
+        let err = Cli::try_parse_from(["net-observer-cli", "check-cve"])
+            .err()
+            .expect("neither <ip> nor --product must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     #[test]
