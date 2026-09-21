@@ -955,16 +955,23 @@ fn daemon_not_running(e: &std::io::Error) -> bool {
     matches!(e.kind(), NotFound | ConnectionRefused)
 }
 
+/// Turn a transport failure from `net_observer_ipc` into the message every
+/// socket round-trip in this file reports it with: "not running" when nothing
+/// is there to answer, else the raw error alongside the socket path. Shared by
+/// every fetcher below so the wording — and the [`daemon_not_running`] split —
+/// stays in one place instead of being retyped per command.
+fn socket_error(socket_path: &str, e: std::io::Error) -> anyhow::Error {
+    if daemon_not_running(&e) {
+        anyhow!("net-observerd not running (socket {socket_path} unavailable)")
+    } else {
+        anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
+    }
+}
+
 /// Send one request to the daemon over the socket. An absent / refused socket
 /// (`net-observerd` not running) becomes a clear message, never a panic.
 fn daemon_query(socket_path: &str, req: &Request) -> Result<Response> {
-    net_observer_ipc::query(socket_path, req).map_err(|e| {
-        if daemon_not_running(&e) {
-            anyhow!("net-observerd not running (socket {socket_path} unavailable)")
-        } else {
-            anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
-        }
-    })
+    net_observer_ipc::query(socket_path, req).map_err(|e| socket_error(socket_path, e))
 }
 
 /// Where a diagnosis is read from, with the words that go with it. Decided by
@@ -1414,14 +1421,8 @@ fn fetch_set_observing(socket_path: &str, observing: bool) -> Result<ControlResu
 /// tier existed cannot decode the request; that is reported as "cannot", not
 /// as a refusal, through [`net_observer_ipc::control`]. Never panics.
 fn fetch_set_probing(socket_path: &str, tier: ProbingTier) -> Result<ControlResult> {
-    let outcome =
-        net_observer_ipc::control(socket_path, ControlCmd::SetProbing(tier)).map_err(|e| {
-            if daemon_not_running(&e) {
-                anyhow!("net-observerd not running (socket {socket_path} unavailable)")
-            } else {
-                anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
-            }
-        })?;
+    let outcome = net_observer_ipc::control(socket_path, ControlCmd::SetProbing(tier))
+        .map_err(|e| socket_error(socket_path, e))?;
     match outcome {
         net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
         net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
@@ -1436,13 +1437,7 @@ fn fetch_set_probing(socket_path: &str, tier: ProbingTier) -> Result<ControlResu
 /// daemon built before the window existed is "cannot", not a refusal.
 fn fetch_start_experiment(socket_path: &str, minutes: u32) -> Result<ControlResult> {
     let outcome = net_observer_ipc::control(socket_path, ControlCmd::StartExperiment { minutes })
-        .map_err(|e| {
-        if daemon_not_running(&e) {
-            anyhow!("net-observerd not running (socket {socket_path} unavailable)")
-        } else {
-            anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
-        }
-    })?;
+        .map_err(|e| socket_error(socket_path, e))?;
     match outcome {
         net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
         net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
@@ -1541,13 +1536,7 @@ fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlR
         ControlCmd::ScanNeighbors(opts),
         net_observer_ipc::SCAN_TIMEOUT,
     )
-    .map_err(|e| {
-        if daemon_not_running(&e) {
-            anyhow!("net-observerd not running (socket {socket_path} unavailable)")
-        } else {
-            anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
-        }
-    })?;
+    .map_err(|e| socket_error(socket_path, e))?;
     match outcome {
         net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
         net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(

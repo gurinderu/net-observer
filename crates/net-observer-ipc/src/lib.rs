@@ -1905,19 +1905,116 @@ mod tests {
         }
     }
 
-    /// `control_within` shares [`classify_control`] with `control`, so a
-    /// `ScanNeighbors` answer classifies exactly the same way regardless of
-    /// which read budget carried it — only the timeout, never the outcome
-    /// mapping, is supposed to differ.
+    /// A unique socket path under the OS temp dir for a real round-trip test.
+    /// A leftover file from a crashed prior run must not fail `bind`, so any
+    /// stale path is removed before returning it.
+    fn control_test_socket_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "net-observer-ipc-test-{tag}-{}-{n}-{nanos}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// `control_within` over a real [`std::os::unix::net::UnixListener`] — not
+    /// just [`classify_control`], which a wrong delegation (wrong request, a
+    /// budget plumbed to the write half instead of the read half) could still
+    /// satisfy. A server thread answers after a short sleep, well inside the
+    /// budget, and the client must read that exact [`ControlResult`] back.
     #[test]
-    fn control_within_classifies_the_same_as_control() {
-        let ran = Response::Control(ControlResult {
-            ok: true,
-            message: "found=3 methods=2".to_string(),
+    fn control_within_reads_a_delayed_answer_within_its_budget() {
+        let path = control_test_socket_path("scan-ok");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&stream);
+            let req: Request = read_frame(&mut reader).unwrap();
+            assert!(
+                matches!(req, Request::Control(ControlCmd::ScanNeighbors(_))),
+                "expected a ScanNeighbors control request, got {req:?}"
+            );
+            // Well under the client's budget below — proves a slow-but-timely
+            // answer is read, not just an instant one.
+            std::thread::sleep(Duration::from_millis(50));
+            let mut writer = &stream;
+            write_frame(
+                &mut writer,
+                &Response::Control(ControlResult {
+                    ok: true,
+                    message: "found=3 methods=2".to_string(),
+                }),
+            )
+            .unwrap();
         });
-        assert_eq!(
-            classify_control(ran.clone()).unwrap(),
-            classify_control(ran).unwrap()
+
+        let outcome = control_within(
+            path.to_str().unwrap(),
+            ControlCmd::ScanNeighbors(ScanOptions::default()),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        match outcome {
+            ControlOutcome::Ran(result) => {
+                assert!(result.ok);
+                assert_eq!(result.message, "found=3 methods=2");
+            }
+            other => panic!("expected Ran, got {other:?}"),
+        }
+    }
+
+    /// The other half: a daemon that accepts but never answers must make
+    /// `control_within` fail once ITS `read` budget expires — not
+    /// [`QUERY_TIMEOUT`], and not the server's own hold time. Proves `read`
+    /// actually reaches the socket's read timeout, the exact bug this fix
+    /// closes (`ScanNeighbors` used to inherit the 2s default and the operator
+    /// read their own client's timeout instead of the daemon's answer).
+    #[test]
+    fn control_within_gives_up_when_its_own_budget_expires() {
+        let path = control_test_socket_path("scan-silent");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Hold the connection open well past the client's budget without
+            // answering, so the client's read genuinely times out instead of
+            // observing a clean close.
+            std::thread::sleep(Duration::from_millis(1000));
+            drop(stream);
+        });
+
+        let start = std::time::Instant::now();
+        let result = control_within(
+            path.to_str().unwrap(),
+            ControlCmd::ScanNeighbors(ScanOptions::default()),
+            Duration::from_millis(150),
+        );
+        let elapsed = start.elapsed();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let err = result.expect_err("a silent daemon must time out, not succeed");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected WouldBlock/TimedOut (a read-budget expiry), got {:?}: {err}",
+            err.kind()
+        );
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "the client should have given up at its own ~150ms budget, not the server's 1s \
+             hold — took {elapsed:?}"
         );
     }
 
