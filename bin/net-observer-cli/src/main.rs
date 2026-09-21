@@ -4520,4 +4520,48 @@ mod tests {
         );
         assert!(msg.contains("boom"), "{msg}");
     }
+
+    /// Every rung actually in `opts` is named, plus the caveat each of
+    /// `--cve`/`--slow` earns, plus the Ctrl-C/read-later tail every scan
+    /// gets. Substrings, not the exact line — so a wording tweak doesn't
+    /// over-couple this test to `scan_starting_line`'s phrasing.
+    #[test]
+    fn scan_starting_line_names_every_rung_and_caveat() {
+        let opts = ScanOptions {
+            ports: true,
+            banners: true,
+            cve: true,
+            target: None,
+            slow: true,
+            sweep_max: None,
+        };
+        let line = scan_starting_line(&opts);
+        assert!(line.contains("ports"), "{line}");
+        assert!(line.contains("banners"), "{line}");
+        assert!(line.contains("cve"), "{line}");
+        assert!(line.contains("slow"), "{line}");
+        assert!(
+            line.contains("--cve") && line.contains("first time"),
+            "{line}"
+        );
+        assert!(line.contains("--slow") && line.contains("paces"), "{line}");
+        assert!(
+            line.contains("Ctrl-C") && line.contains("vulns") && line.contains("neighbors"),
+            "{line}"
+        );
+    }
+
+    /// A plain scan (no rungs) degrades to the short form: no rung list, no
+    /// `--cve`/`--slow` caveats, but still the same Ctrl-C/read-later tail.
+    #[test]
+    fn scan_starting_line_plain_scan_has_no_rungs_or_caveats() {
+        let line = scan_starting_line(&ScanOptions::default());
+        assert!(!line.contains('('), "{line}");
+        assert!(!line.contains("--cve"), "{line}");
+        assert!(!line.contains("--slow"), "{line}");
+        assert!(
+            line.contains("Ctrl-C") && line.contains("vulns") && line.contains("neighbors"),
+            "{line}"
+        );
+    }
 }
