@@ -922,7 +922,8 @@ pub fn vulns_sql(network: Option<&str>) -> Result<String, BadNetworkKey> {
         }
     };
     Ok(format!(
-        "SELECT v.mac, p.ip, v.port, v.cve_id, v.confidence, v.known_exploited, v.cvss
+        "SELECT v.mac, p.ip, v.port, v.cve_id, v.confidence, v.known_exploited,
+       ROUND(v.cvss, 1) AS cvss
 FROM neighbor_vuln v
 LEFT JOIN neighbor_port p
   ON v.network_key = p.network_key AND v.mac = p.mac AND v.port = p.port
@@ -1367,6 +1368,68 @@ mod tests {
             );
         }
     }
+
+    /// `cvss` arrives from `vuln-db` as `f32` and is widened to `f64` on write
+    /// (`m.cvss.map(f64::from)` in the pipeline) — the widening itself is what
+    /// leaves the trailing float noise (`4.2f32` becomes `4.199999809265137`
+    /// once it is an `f64`). `vulns_sql` rounds the stored DOUBLE back to
+    /// CVSS's own one-decimal precision, and DuckDB's `ROUND` lands on the
+    /// exact `f64` Rust's shortest-round-trip formatter renders as `4.2` — so
+    /// the round trip through the real query is what proves the rendered cell
+    /// is clean, not just that the SQL text contains `ROUND`. A `NULL` cvss
+    /// (no CVSS in the record) must still render blank, never `0.0`.
+    #[test]
+    fn vulns_sql_rounds_the_widened_cvss_to_one_decimal() {
+        let s = DuckdbStore::in_memory().unwrap();
+        let noisy = f64::from(4.2f32);
+        assert_ne!(
+            noisy.to_string(),
+            "4.2",
+            "f32->f64 widening must actually be noisy here, or this test proves nothing"
+        );
+        s.write_neighbor_vuln(&NeighborVuln {
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            mac: "11:22:33:44:55:66".into(),
+            port: 22,
+            cve_id: "CVE-2016-6210".into(),
+            confidence: "high".into(),
+            known_exploited: false,
+            cvss: Some(noisy),
+            ts_us: 1000,
+        })
+        .unwrap();
+        s.write_neighbor_vuln(&NeighborVuln {
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            mac: "11:22:33:44:55:66".into(),
+            port: 23,
+            cve_id: "CVE-2011-0000".into(),
+            confidence: "low".into(),
+            known_exploited: false,
+            cvss: None,
+            ts_us: 1000,
+        })
+        .unwrap();
+
+        let t = s.query_table(&vulns_sql(None).unwrap()).unwrap();
+        assert_eq!(t.rows.len(), 2);
+        let noisy_row = (0..t.rows.len())
+            .find(|&r| cell(&t, r, "cve_id") == "CVE-2016-6210")
+            .expect("the noisy-cvss row must be present");
+        assert_eq!(
+            cell(&t, noisy_row, "cvss"),
+            "4.2",
+            "rendered cell must show CVSS's own precision, not f32->f64 widening noise"
+        );
+        let null_row = (0..t.rows.len())
+            .find(|&r| cell(&t, r, "cve_id") == "CVE-2011-0000")
+            .expect("the NULL-cvss row must be present");
+        assert_eq!(
+            cell(&t, null_row, "cvss"),
+            "",
+            "a NULL cvss must render blank, not 0.0"
+        );
+    }
+
     /// The topology reader validates its interface filter the same way, and
     /// rejects an interpolation attempt rather than matching nothing.
     #[test]
