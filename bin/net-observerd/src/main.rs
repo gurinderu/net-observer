@@ -1497,23 +1497,30 @@ impl AnyCollector {
     }
 }
 
-/// The classified outcome of loading the CVE snapshot directory once — cached
-/// by [`SystemScanner`] so a second `--cve` scan never re-walks the tree. The
-/// `Unusable` reason is exactly the note `scan()` used to compute inline; the
-/// path is immutable for the daemon's life, so a load failure or an
-/// empty/wrong-layout directory is cached too (re-trying it every scan buys
-/// nothing — see [`load_and_classify`]).
+/// The classified outcome of one attempt to load the CVE snapshot directory.
+/// The `Unusable` reason is exactly the note `scan()` used to compute inline.
+/// Only `Ready` is cached by [`SystemScanner`] (see `cve_cache`): the
+/// directory's CONTENT is immutable for the daemon's life, so a successful
+/// load is reused forever, but `Unusable` says nothing about whether the NEXT
+/// attempt succeeds — a missing/empty directory can be provisioned later, and
+/// an `Io` error (fd exhaustion, a one-off blip while walking ~395k files) can
+/// be transient. Caching `Unusable` would permanently disable CVE checking
+/// for the daemon's whole life on a single bad scan, with no self-heal (v1 has
+/// no watchdog) — worse than the per-scan reload this replaced, which at least
+/// retried. So `Unusable` is recomputed every `--cve` scan until it turns
+/// `Ready`, which then latches (realm net-observer, node #158).
 enum CveSnapshot {
     Ready(Arc<vuln_db::VulnDb>),
     Unusable(String),
 }
 
-/// Load and classify the CVE snapshot directory exactly once, as
-/// [`SystemScanner::cve_cache`]'s `OnceLock` initializer. The three honest-note
-/// cases are unchanged from the inline match this replaced: no directory
+/// Load and classify the CVE snapshot directory. The three honest-note cases
+/// are unchanged from the inline match this replaced: no directory
 /// configured, a directory that fails to load, and a directory that loads but
 /// is empty or the wrong layout — all three are `Unusable` with the same
-/// wording; anything else is a ready, matchable index.
+/// wording; anything else is a ready, matchable index. Called by
+/// `SystemScanner::cve_rung` on every scan until it returns `Ready` (see
+/// [`CveSnapshot`] for why `Unusable` is never cached).
 fn load_and_classify(dir: Option<&Path>) -> CveSnapshot {
     match dir {
         None => CveSnapshot::Unusable("cve rung ran without a snapshot directory".to_string()),
@@ -1545,16 +1552,17 @@ pub(crate) struct SystemScanner {
     /// produces no findings — the honest refusal is decided in `api::scan_now`
     /// before the scan runs; this is the loader for a run that got that far.
     cve_snapshot_dir: Option<std::path::PathBuf>,
-    /// The loaded-and-classified snapshot, filled by the FIRST `--cve` scan and
-    /// reused by every scan after. The snapshot is a nix-store path, immutable
-    /// for the daemon's whole life, and the recursive walk+parse of the
-    /// provisioned "all CVEs" tree (~395k files) takes minutes — loading it on
-    /// every scan hung the CLI's request budget. `scan()` takes `&self`
-    /// (`NeighborScanner::scan`), so interior mutability is required;
-    /// `OnceLock` is the right tool because `get_or_init` runs the load exactly
-    /// once and every later call is a plain read, no lock contention on the hot
-    /// path.
-    cve_cache: OnceLock<CveSnapshot>,
+    /// The loaded index, set by whichever `--cve` scan FIRST loads it
+    /// successfully and reused by every scan after — success only, never a
+    /// failure/empty/missing classification (see [`CveSnapshot`] for why: the
+    /// directory's content is immutable, but an `Unusable` outcome is not, and
+    /// must keep retrying). The recursive walk+parse of the provisioned "all
+    /// CVEs" tree (~395k files) takes minutes — loading it on every scan hung
+    /// the CLI's request budget. `scan()` takes `&self` (`NeighborScanner::
+    /// scan`), so interior mutability is required; `OnceLock` is the right
+    /// tool because a set index is a plain read on every later call, no lock
+    /// contention on the hot path.
+    cve_cache: OnceLock<Arc<vuln_db::VulnDb>>,
     /// The shared OUI registry for ROLE inference, loaded once at startup. `None`
     /// when no snapshot is provisioned: roles degrade to gateway/unknown only.
     oui: Option<Arc<oui_db::OuiDb>>,
@@ -1574,22 +1582,34 @@ impl SystemScanner {
         }
     }
 
-    /// The `cve` rung: match the ports' banners against the once-loaded,
-    /// cached snapshot classification. Returns the findings (empty when the
-    /// snapshot is unusable) and, when unusable, the honest reason — the same
-    /// two outcomes `scan()`'s inline match used to compute, now read from the
-    /// cache instead of re-loading.
+    /// The `cve` rung: match the ports' banners against the loaded snapshot.
+    /// Returns the findings (empty when the snapshot is unusable) and, when
+    /// unusable, the honest reason — the same two outcomes `scan()`'s inline
+    /// match used to compute.
+    ///
+    /// A cached `Ready` index is reused without touching disk again. Anything
+    /// else re-runs `load_and_classify` THIS scan and, only on success, sets
+    /// the cache for every scan after — an `Unusable` outcome is returned but
+    /// deliberately not cached, so the next `--cve` scan retries rather than
+    /// staying permanently off on one transient I/O blip (see [`CveSnapshot`]).
     fn cve_rung(
         &self,
         ports: &[store::NeighborPort],
         ts_us: i64,
     ) -> (Vec<store::NeighborVuln>, Option<String>) {
-        match self
-            .cve_cache
-            .get_or_init(|| load_and_classify(self.cve_snapshot_dir.as_deref()))
-        {
-            CveSnapshot::Unusable(note) => (Vec::new(), Some(note.clone())),
-            CveSnapshot::Ready(db) => (pipeline::match_vulns(db, ports, ts_us), None),
+        if let Some(db) = self.cve_cache.get() {
+            return (pipeline::match_vulns(db, ports, ts_us), None);
+        }
+        match load_and_classify(self.cve_snapshot_dir.as_deref()) {
+            CveSnapshot::Ready(db) => {
+                // Another thread may have raced us and already set the cell;
+                // that is fine — either `Arc` is an equally valid load of the
+                // same immutable content, and only the loser's copy is
+                // discarded, not re-fetched.
+                let _ = self.cve_cache.set(Arc::clone(&db));
+                (pipeline::match_vulns(&db, ports, ts_us), None)
+            }
+            CveSnapshot::Unusable(note) => (Vec::new(), Some(note)),
         }
     }
 }
@@ -1718,14 +1738,17 @@ impl NeighborScanner for SystemScanner {
             // is corrupt, or is empty) — log it and record no findings rather
             // than a guess; the ports and their banners are already recorded.
             //
-            // The snapshot is loaded, at most, ONCE per daemon lifetime — the
-            // first `--cve` scan populates `cve_cache` (realm net-observer,
-            // node #158) and every later scan reads the cached classification
-            // instead of re-walking the provisioned tree. The three honest-note
-            // outcomes are unchanged: an existing-but-empty or wrong-layout
-            // directory, or a load error, leaves `vulns` empty AND records a
-            // reason, so the operator never reads "no findings" as "no
-            // vulnerabilities" when the check never really ran.
+            // A successful load is cached and reused by every scan after — the
+            // FIRST `--cve` scan that loads the snapshot populates `cve_cache`
+            // (realm net-observer, node #158), so most scans never re-walk the
+            // provisioned tree. An unusable outcome is NOT cached and is
+            // recomputed every scan instead, so a transient failure (or a
+            // directory provisioned after boot) retries rather than staying
+            // permanently off. The three honest-note outcomes are unchanged:
+            // an existing-but-empty or wrong-layout directory, or a load
+            // error, leaves `vulns` empty AND records a reason, so the
+            // operator never reads "no findings" as "no vulnerabilities" when
+            // the check never really ran.
             if opts.cve {
                 let (vulns, cve_note) = self.cve_rung(&report.ports, ts_us);
                 report.vulns = vulns;
@@ -4187,11 +4210,12 @@ mod tests {
     }
 
     /// The load-once cache (realm net-observer, node #158): two `--cve` runs
-    /// through `SystemScanner::cve_rung` must reuse the SAME loaded index —
-    /// proven here by pointer identity on the cached `Arc<VulnDb>`, which can
-    /// only match if the second call read the `OnceLock` instead of calling
-    /// `VulnDb::load_from_dir` again. Both calls also return identical
-    /// findings, and the cache is populated after the first.
+    /// through `SystemScanner::cve_rung` against a GOOD snapshot must reuse
+    /// the SAME loaded index — proven here by pointer identity on the cached
+    /// `Arc<VulnDb>`, which can only match if the second call read the
+    /// `OnceLock` instead of calling `VulnDb::load_from_dir` again. Both calls
+    /// also return identical findings, and the cache is populated after the
+    /// first.
     #[test]
     fn the_cve_snapshot_loads_once_and_is_cached_across_scans() {
         let dir = write_cve_fixture_snapshot();
@@ -4208,14 +4232,12 @@ mod tests {
         assert!(first_note.is_none(), "{first_note:?}");
         assert_eq!(first_vulns.len(), 1, "the 7.3 banner falls inside <7.4");
 
-        assert!(
-            scanner.cve_cache.get().is_some(),
-            "the first scan must populate the cache"
+        let first_ptr = Arc::as_ptr(
+            scanner
+                .cve_cache
+                .get()
+                .expect("a successful load must populate the cache"),
         );
-        let first_ptr = match scanner.cve_cache.get().unwrap() {
-            CveSnapshot::Ready(db) => Arc::as_ptr(db),
-            CveSnapshot::Unusable(note) => panic!("fixture snapshot must load: {note}"),
-        };
 
         let (second_vulns, second_note) = scanner.cve_rung(&ports, 2_000);
         assert!(second_note.is_none(), "{second_note:?}");
@@ -4225,32 +4247,64 @@ mod tests {
             "a second scan must see the same findings as the first"
         );
 
-        let second_ptr = match scanner.cve_cache.get().unwrap() {
-            CveSnapshot::Ready(db) => Arc::as_ptr(db),
-            CveSnapshot::Unusable(note) => panic!("fixture snapshot must load: {note}"),
-        };
+        let second_ptr = Arc::as_ptr(scanner.cve_cache.get().unwrap());
         assert_eq!(
             first_ptr, second_ptr,
             "the second scan must reuse the SAME loaded snapshot, not reload it"
         );
     }
 
-    /// An unusable classification (no directory) is cached too — a second
-    /// `--cve` scan against the same anomaly must not re-attempt the load, and
-    /// both scans report the identical honest note.
+    /// The regression this cache must NOT reintroduce: caching a transient
+    /// load failure would permanently disable CVE checking for the daemon's
+    /// whole life after one bad scan (v1 has no watchdog to self-heal). An
+    /// `Unusable` outcome (here: no directory configured) must leave the cell
+    /// empty, so the next `--cve` scan retries the load rather than reading a
+    /// frozen failure.
     #[test]
-    fn an_unusable_cve_outcome_is_also_cached_not_retried() {
+    fn an_unusable_cve_outcome_is_not_cached_so_the_next_scan_retries() {
         let scanner = SystemScanner::new(SystemFacts::new(None, None), None, None);
         let ports = vec![cve_port_with_banner("SSH-2.0-OpenSSH_7.3")];
 
         let (first_vulns, first_note) = scanner.cve_rung(&ports, 1_000);
-        let (second_vulns, second_note) = scanner.cve_rung(&ports, 2_000);
-
-        assert!(first_vulns.is_empty() && second_vulns.is_empty());
-        assert_eq!(first_note, second_note);
+        assert!(first_vulns.is_empty());
         assert_eq!(
             first_note.as_deref(),
             Some("cve rung ran without a snapshot directory")
+        );
+        assert!(
+            scanner.cve_cache.get().is_none(),
+            "an unusable outcome must not latch the cache — the next scan has to retry"
+        );
+
+        // A second scan against the same unchanged (still missing) directory
+        // reaches `load_and_classify` again and reports the same note —
+        // proving the retry actually happens rather than the cache silently
+        // absorbing it.
+        let (second_vulns, second_note) = scanner.cve_rung(&ports, 2_000);
+        assert!(second_vulns.is_empty());
+        assert_eq!(first_note, second_note);
+        assert!(scanner.cve_cache.get().is_none());
+    }
+
+    /// The other half of the same guarantee: a `Ready` outcome DOES set the
+    /// cell (proven independently of the identity check above, which only
+    /// exercises the already-cached path).
+    #[test]
+    fn a_ready_cve_outcome_sets_the_cache() {
+        let dir = write_cve_fixture_snapshot();
+        let scanner =
+            SystemScanner::new(SystemFacts::new(None, None), Some(dir.path().into()), None);
+
+        assert!(scanner.cve_cache.get().is_none());
+        let (vulns, note) = scanner.cve_rung(&[], 1_000);
+        assert!(note.is_none(), "{note:?}");
+        assert!(
+            vulns.is_empty(),
+            "no ports means no findings, but no error either"
+        );
+        assert!(
+            scanner.cve_cache.get().is_some(),
+            "a successful load must set the cache even with nothing to match"
         );
     }
 }
