@@ -297,6 +297,25 @@ enum Command {
         #[arg(long)]
         network: Option<String>,
     },
+    /// Scan one host for CVEs and show its hypotheses.
+    ///
+    /// A convenience over the two-step `scan-neighbors --target <ip> --ports
+    /// --banners --cve` then `vulns`: this runs the same targeted scan
+    /// (ports + banners + cve, against `ip` only) via the daemon's
+    /// `ScanNeighbors` control, then reads the record's vulns back through
+    /// the same query `vulns` uses and prints just this host's rows,
+    /// known-exploited (KEV) first, worst CVSS next. Nothing on the wire is
+    /// new — same control command, same diagnosis.
+    ///
+    /// Every row is a HYPOTHESIS from matching a grabbed banner against the
+    /// daemon's local CVE snapshot, never an asserted fact — see `vulns`.
+    /// When the daemon has no usable CVE snapshot the cve rung cannot run at
+    /// all, and that is reported as such, never as an empty "no
+    /// vulnerabilities" table.
+    CheckCve {
+        /// The host to scan.
+        ip: IpAddr,
+    },
     /// Switch-topology uplinks learned passively from LLDP/CDP, newest first.
     ///
     /// Local interface, remote chassis, remote port, the switch/AP's system
@@ -745,6 +764,147 @@ fn fold_by_iface(table: &Table) -> Table {
     }
 }
 
+/// The columns `check-cve` renders, in order — the [`vulns`][diagnosis::vulns_sql]
+/// columns minus `mac`/`ip`, which are constant for one host and shown once in
+/// the header instead.
+const FOCUSED_VULN_COLUMNS: [&str; 5] = ["port", "cve_id", "cvss", "confidence", "known_exploited"];
+
+/// `check-cve <ip>`: filter the full [`vulns`][diagnosis::vulns_sql] table to
+/// `ip`'s rows and sort them KEV first, then CVSS worst-first — the reading
+/// order for "what to triage now". Client-side, like [`filter_by_iface`]: the
+/// query stays the one `vulns` already runs (no IP-filtered SQL variant), and
+/// what the daemon calls "known exploited in the wild" outranks a raw
+/// severity number the same way it does for a human triaging the list by eye.
+///
+/// A table missing any column this needs — an older daemon's shape — returns
+/// the empty focused table rather than guessing at positions.
+fn focus_vulns_for_ip(table: &Table, ip: &IpAddr) -> Table {
+    let empty = Table {
+        columns: FOCUSED_VULN_COLUMNS.iter().map(|s| s.to_string()).collect(),
+        rows: Vec::new(),
+    };
+    let col = |name: &str| table.columns.iter().position(|c| c == name);
+    let (
+        Some(ip_col),
+        Some(port_col),
+        Some(cve_col),
+        Some(conf_col),
+        Some(kev_col),
+        Some(cvss_col),
+    ) = (
+        col("ip"),
+        col("port"),
+        col("cve_id"),
+        col("confidence"),
+        col("known_exploited"),
+        col("cvss"),
+    )
+    else {
+        return empty;
+    };
+    let ip = ip.to_string();
+    let cell = |row: &[String], i: usize| -> String { row.get(i).cloned().unwrap_or_default() };
+    let mut rows: Vec<Vec<String>> = table
+        .rows
+        .iter()
+        .filter(|row| cell(row, ip_col) == ip)
+        .map(|row| {
+            vec![
+                cell(row, port_col),
+                cell(row, cve_col),
+                cell(row, cvss_col),
+                cell(row, conf_col),
+                cell(row, kev_col),
+            ]
+        })
+        .collect();
+    // KEV (`known_exploited = true`) first, then CVSS worst (highest) first.
+    // A blank/unparsed cvss sorts last, never first — an unweighed hypothesis
+    // is not "more severe" than one the record actually scored.
+    rows.sort_by(|a, b| {
+        let kev = |r: &[String]| r[4] == "true";
+        let cvss = |r: &[String]| r[2].parse::<f64>().unwrap_or(f64::NEG_INFINITY);
+        kev(b).cmp(&kev(a)).then_with(|| {
+            cvss(b)
+                .partial_cmp(&cvss(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    Table {
+        columns: FOCUSED_VULN_COLUMNS.iter().map(|s| s.to_string()).collect(),
+        rows,
+    }
+}
+
+/// Which of `check-cve`'s three honest outcomes to print, decided from the
+/// filtered row count and whether the cve rung actually ran (see
+/// [`cve_rung_unavailable`]) — never from the row count alone: a snapshot
+/// that could not run and a snapshot that ran and found nothing both render
+/// as zero rows, and only the daemon's own message tells them apart. Pure
+/// over its two inputs so it is unit-tested directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckCveOutcome {
+    /// The cve rung ran; these are its findings for the host.
+    Findings,
+    /// The cve rung ran and found nothing for the host — a clean scan, not a
+    /// withheld one.
+    EmptyButScanned,
+    /// The cve rung could not run at all (no usable snapshot on the daemon):
+    /// an empty result here is NOT "no vulnerabilities".
+    SnapshotUnavailable,
+}
+
+fn check_cve_outcome(row_count: usize, cve_ran: bool) -> CheckCveOutcome {
+    if !cve_ran {
+        CheckCveOutcome::SnapshotUnavailable
+    } else if row_count == 0 {
+        CheckCveOutcome::EmptyButScanned
+    } else {
+        CheckCveOutcome::Findings
+    }
+}
+
+/// Whether `scan-neighbors`'s [`ControlResult::message`] says the cve rung
+/// could not run — either dropped before it ran (no snapshot directory
+/// configured) or attempted and found the configured one unusable (missing,
+/// unreadable, empty/wrong layout). Matches the honest-note wording
+/// `net-observerd` actually emits for both cases (`bin/net-observerd/src/
+/// main.rs::load_and_classify`, `bin/net-observerd/src/api.rs::scan_now`)
+/// rather than a wire flag — there is none, by design (CLI-only feature, no
+/// wire change).
+fn cve_rung_unavailable(message: &str) -> bool {
+    let m = message.to_lowercase();
+    (m.contains("snapshot")
+        && (m.contains("not") || m.contains("without") || m.contains("unusable")))
+        || m.contains("dropped: cve")
+}
+
+/// Pull `"<N> open ports"`/`"<M> banners"` back out of a scan's
+/// [`ControlResult::message`] for the empty-but-scanned line — the message
+/// already carries the TRUE (pre-attribution) counts (see
+/// `pipeline::compose_scan_report`), so this reads them back rather than
+/// re-deriving anything. `None` for a count whose marker word is not found
+/// (an older/differently-worded daemon), rendered as `?` rather than
+/// dropping the line.
+fn scan_count_before(message: &str, marker: &str) -> Option<u32> {
+    let words: Vec<&str> = message.split_whitespace().collect();
+    let i = words
+        .iter()
+        .position(|w| w.trim_matches(|c: char| !c.is_alphanumeric()) == marker)?;
+    let prev = *words.get(i.checked_sub(1)?)?;
+    prev.trim_matches(|c: char| !c.is_alphanumeric())
+        .parse()
+        .ok()
+}
+
+/// The `(N open ports, M banners read)` clause for the empty-but-scanned
+/// line, built from [`scan_count_before`].
+fn scan_counts_clause(message: &str) -> String {
+    let ports = scan_count_before(message, "open").map_or("?".to_string(), |n| n.to_string());
+    let banners = scan_count_before(message, "banners").map_or("?".to_string(), |n| n.to_string());
+    format!("{ports} open ports, {banners} banners read")
+}
+
 /// The tier accepted by the `probe` subcommand. A thin CLI mirror of
 /// [`ProbingTier`] so `clap` renders `<passive|active>` in the help without
 /// leaking the wire type into the argument surface.
@@ -977,6 +1137,51 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 |off| run_query(off, &sql),
             )?;
             print_paged(&format_table(&table, true), cli.no_pager);
+        }
+        Command::CheckCve { ip } => {
+            let cfg = load_config(cli)?;
+            let scan = fetch_scan_neighbors(
+                &cfg.socket_path,
+                ScanOptions {
+                    ports: true,
+                    banners: true,
+                    cve: true,
+                    target: Some(*ip),
+                    slow: false,
+                    sweep_max: None,
+                },
+            )?;
+            if !scan.ok {
+                eprintln!("scan of {ip} failed: {}", scan.message);
+                return Ok(ExitCode::FAILURE);
+            }
+            let sql = diagnosis::vulns_sql(None).map_err(|e| anyhow!("{e}"))?;
+            let table = diagnose_table(cli, DiagnosticQuery::Vulns { network: None }, |off| {
+                run_query(off, &sql)
+            })?;
+            let focused = focus_vulns_for_ip(&table, ip);
+            let cve_ran = !cve_rung_unavailable(&scan.message);
+            eprintln!("CVE hypotheses for {ip}");
+            eprintln!("scanned: {}", scan.message);
+            match check_cve_outcome(focused.rows.len(), cve_ran) {
+                CheckCveOutcome::SnapshotUnavailable => eprintln!(
+                    "CVE snapshot not available on the daemon — matches were NOT checked \
+                     (not a clean \"no vulnerabilities\")"
+                ),
+                CheckCveOutcome::EmptyButScanned => eprintln!(
+                    "no CVE hypotheses for {ip} ({})",
+                    scan_counts_clause(&scan.message)
+                ),
+                CheckCveOutcome::Findings => {
+                    print_paged(&format_table(&focused, true), cli.no_pager);
+                    eprintln!(
+                        "These are hypotheses matched from the service banner. A backported \
+                         patch can leave a version that looks in-range not actually \
+                         vulnerable; known_exploited=true (KEV) is the CISA \"exploited in \
+                         the wild\" flag — triage those first."
+                    );
+                }
+            }
         }
         Command::Topology { iface } => {
             let sql = diagnosis::topology_sql(iface.as_deref()).map_err(|e| anyhow!("{e}"))?;
@@ -3032,6 +3237,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn check_cve_parses_the_target_ip() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "check-cve", "10.0.0.5"]).unwrap();
+        match cli.command {
+            Command::CheckCve { ip } => assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap()),
+            _ => panic!("did not parse as `check-cve`"),
+        }
+    }
+
+    #[test]
+    fn check_cve_rejects_a_bad_ip() {
+        assert!(Cli::try_parse_from(["net-observer-cli", "check-cve", "not-an-ip"]).is_err());
+    }
+
     /// An explicit `--db` means the operator named the record: the socket is
     /// NOT asked — a daemon answering over a file the operator pointed at
     /// would be an answer from the wrong record, silently.
@@ -3438,6 +3657,151 @@ mod tests {
         assert_eq!(
             out,
             "failed: control refused: peer credentials unavailable\n"
+        );
+    }
+
+    /// The [`focus_vulns_for_ip`] fixture: `mac, ip, port, cve_id, confidence,
+    /// known_exploited, cvss` — exactly [`diagnosis::vulns_sql`]'s column
+    /// order, so a positional slip in the helper would be caught here too.
+    fn vulns_table(rows: Vec<[&str; 7]>) -> Table {
+        Table {
+            columns: [
+                "mac",
+                "ip",
+                "port",
+                "cve_id",
+                "confidence",
+                "known_exploited",
+                "cvss",
+            ]
+            .map(String::from)
+            .to_vec(),
+            rows: rows
+                .into_iter()
+                .map(|r| r.map(String::from).to_vec())
+                .collect(),
+        }
+    }
+
+    /// Two hosts' worth of rows, mixed KEV/non-KEV and CVSS, to prove
+    /// [`focus_vulns_for_ip`] both filters to the one address and sorts KEV
+    /// first, worst CVSS next within each KEV group — and drops `mac`/`ip`.
+    #[test]
+    fn focus_vulns_for_ip_filters_and_sorts_kev_then_cvss() {
+        let t = vulns_table(vec![
+            ["aa:1", "10.0.0.5", "22", "CVE-A", "high", "false", "5.5"],
+            ["aa:1", "10.0.0.5", "443", "CVE-B", "high", "true", "7.5"],
+            ["aa:1", "10.0.0.5", "80", "CVE-C", "medium", "false", "9.1"],
+            ["aa:1", "10.0.0.5", "8080", "CVE-D", "low", "true", "9.8"],
+            // A different host — must not appear in the focused table.
+            ["bb:2", "10.0.0.9", "22", "CVE-E", "high", "true", "9.9"],
+        ]);
+        let ip = "10.0.0.5".parse().unwrap();
+        let focused = focus_vulns_for_ip(&t, &ip);
+
+        assert_eq!(
+            focused.columns,
+            ["port", "cve_id", "cvss", "confidence", "known_exploited"]
+        );
+        let ids: Vec<&str> = focused.rows.iter().map(|r| r[1].as_str()).collect();
+        // KEV (D, B) before non-KEV (C, A); worst CVSS first within each group.
+        assert_eq!(ids, ["CVE-D", "CVE-B", "CVE-C", "CVE-A"]);
+        assert!(focused.rows.iter().all(|r| r.len() == 5));
+    }
+
+    /// A blank `cvss` cell (no CVSS in the record) sorts LAST, not first — an
+    /// unscored hypothesis must never outrank a scored one.
+    #[test]
+    fn focus_vulns_for_ip_sorts_blank_cvss_last() {
+        let t = vulns_table(vec![
+            ["aa:1", "10.0.0.5", "22", "CVE-A", "low", "false", ""],
+            ["aa:1", "10.0.0.5", "23", "CVE-B", "low", "false", "3.1"],
+        ]);
+        let ip = "10.0.0.5".parse().unwrap();
+        let focused = focus_vulns_for_ip(&t, &ip);
+        let ids: Vec<&str> = focused.rows.iter().map(|r| r[1].as_str()).collect();
+        assert_eq!(ids, ["CVE-B", "CVE-A"]);
+    }
+
+    /// A table missing a column `check-cve` needs (an older daemon's shape)
+    /// returns the empty focused table rather than panicking on an index.
+    #[test]
+    fn focus_vulns_for_ip_on_a_table_missing_columns_is_empty_not_a_panic() {
+        let t = Table {
+            columns: vec!["mac".into(), "ip".into()],
+            rows: vec![vec!["aa:1".into(), "10.0.0.5".into()]],
+        };
+        let ip = "10.0.0.5".parse().unwrap();
+        let focused = focus_vulns_for_ip(&t, &ip);
+        assert!(focused.rows.is_empty());
+        assert_eq!(
+            focused.columns,
+            ["port", "cve_id", "cvss", "confidence", "known_exploited"]
+        );
+    }
+
+    #[test]
+    fn check_cve_outcome_picks_the_right_branch() {
+        assert_eq!(
+            check_cve_outcome(0, false),
+            CheckCveOutcome::SnapshotUnavailable
+        );
+        // The cve rung not running outranks an empty row count either way.
+        assert_eq!(
+            check_cve_outcome(3, false),
+            CheckCveOutcome::SnapshotUnavailable
+        );
+        assert_eq!(check_cve_outcome(0, true), CheckCveOutcome::EmptyButScanned);
+        assert_eq!(check_cve_outcome(1, true), CheckCveOutcome::Findings);
+        assert_eq!(check_cve_outcome(5, true), CheckCveOutcome::Findings);
+    }
+
+    /// The three honest-note wordings `net-observerd` actually emits for "the
+    /// cve rung could not run" (`load_and_classify`'s three `Unusable`
+    /// reasons, and `scan_now`'s pre-run drop) all read as unavailable; an
+    /// ordinary scan summary with no mention of a snapshot problem does not.
+    #[test]
+    fn cve_rung_unavailable_matches_the_daemons_own_wordings() {
+        for msg in [
+            "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 3 open ports, \
+             2 banners [cve: cve rung ran without a snapshot directory]",
+            "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 3 open ports, \
+             2 banners [cve: snapshot at /var/lib/observer/cve failed to load: I/O error; \
+             findings NOT checked]",
+            "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 3 open ports, \
+             2 banners [cve: snapshot at /var/lib/observer/cve is empty or wrong layout; \
+             findings NOT checked (not a clean 'no vulnerabilities')]",
+            "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 3 open ports, \
+             2 banners [dropped: cve (no CVE snapshot; set \
+             collectors.neighbors.cve_snapshot_dir to a provisioned directory)]",
+        ] {
+            assert!(cve_rung_unavailable(msg), "{msg}");
+        }
+        let clean = "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 3 open \
+                      ports, 2 banners";
+        assert!(!cve_rung_unavailable(clean), "{clean}");
+    }
+
+    #[test]
+    fn scan_counts_clause_reads_the_true_pre_attribution_counts() {
+        assert_eq!(
+            scan_counts_clause(
+                "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 3 open \
+                 ports, 2 banners"
+            ),
+            "3 open ports, 2 banners read"
+        );
+        // "not persisted" parenthetical still leads with the TRUE count.
+        assert_eq!(
+            scan_counts_clause(
+                "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 5 open \
+                 ports (2 not persisted: no segment MAC), 4 banners"
+            ),
+            "5 open ports, 4 banners read"
+        );
+        assert_eq!(
+            scan_counts_clause("observation is paused; resume before scanning"),
+            "? open ports, ? banners read"
         );
     }
 
