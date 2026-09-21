@@ -41,7 +41,8 @@ use net_observer_ipc::{
 use std::io::{IsTerminal, Write};
 use std::net::IpAddr;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 use store::{DuckdbStore, QueryTable, Store as _, diagnosis};
 use types::{ConnectionScope, ConnectionsGroupBy, ProbingTier};
 
@@ -1832,6 +1833,50 @@ fn scan_socket_error(socket_path: &str, e: &std::io::Error) -> anyhow::Error {
     }
 }
 
+/// How often the main thread wakes to redraw [`fetch_scan_neighbors`]'s
+/// spinner while waiting on the background socket call.
+const SPINNER_TICK: Duration = Duration::from_millis(120);
+
+/// The spinner glyph for tick `n` — cycles through a small braille frame set.
+/// Pure over its input so it is unit-tested directly; the render loop only
+/// calls it in sequence and is not itself tested (see `fetch_scan_neighbors`).
+fn spinner_frame(tick: u64) -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[(tick as usize) % FRAMES.len()]
+}
+
+/// Format an elapsed duration as `M:SS` for the scan spinner line (e.g. 65s
+/// -> `1:05`). Pure over its input so it is unit-tested directly; sub-second
+/// precision is dropped — the spinner glyph itself already shows motion
+/// between whole seconds.
+fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Redraw the live `⠋ scanning… M:SS` line in place: `\r` returns to column 0
+/// so the write overwrites the previous frame instead of scrolling a new
+/// line. Write errors (e.g. a broken stderr pipe) are ignored, never
+/// `eprintln!`'d — same reasoning as [`stream_events`]'s comment: a panic
+/// here would turn a merely closed stderr into a crash.
+fn render_scan_spinner(tick: u64, elapsed: Duration) {
+    let _ = write!(
+        std::io::stderr(),
+        "\r{} scanning… {}",
+        spinner_frame(tick),
+        format_elapsed(elapsed)
+    );
+    let _ = std::io::stderr().flush();
+}
+
+/// Erase the live spinner line — `\r` + clear-to-end-of-line — before the
+/// final result or error prints, so it is never tangled with a half-drawn
+/// spinner frame.
+fn clear_scan_spinner() {
+    let _ = write!(std::io::stderr(), "\r\x1b[K");
+    let _ = std::io::stderr().flush();
+}
+
 /// Send `Control(ScanNeighbors)` and return the daemon's verdict.
 ///
 /// Reads with [`net_observer_ipc::SCAN_TIMEOUT`], not the default 2s
@@ -1843,14 +1888,62 @@ fn scan_socket_error(socket_path: &str, e: &std::io::Error) -> anyhow::Error {
 /// generic transport wording. A daemon built before `ScanNeighbors` existed
 /// cannot decode the request; that is reported as "cannot", not as a refusal,
 /// through [`net_observer_ipc::control_within`].
+///
+/// The blocking socket call runs on a background thread while the main
+/// thread ticks a live spinner + elapsed-time indicator on stderr — client-
+/// side liveness only, not real per-stage progress. Only when stderr is a
+/// TTY: a pipe/redirect/script gets no spinner writes at all and the exact
+/// output a plain call would produce. The worker thread always ends when the
+/// socket call returns (success, error, or the client's own
+/// [`net_observer_ipc::SCAN_TIMEOUT`]), so nothing is leaked even though
+/// Ctrl-C here does not stop the scan on the daemon (see
+/// [`scan_starting_line`]).
 fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
     let _ = writeln!(std::io::stderr(), "{}", scan_starting_line(&opts));
-    let outcome = net_observer_ipc::control_within(
-        socket_path,
-        ControlCmd::ScanNeighbors(opts),
-        net_observer_ipc::SCAN_TIMEOUT,
-    )
-    .map_err(|e| scan_socket_error(socket_path, &e))?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let socket_path_for_thread = socket_path.to_string();
+    std::thread::spawn(move || {
+        let outcome = net_observer_ipc::control_within(
+            &socket_path_for_thread,
+            ControlCmd::ScanNeighbors(opts),
+            net_observer_ipc::SCAN_TIMEOUT,
+        );
+        // The receiver only ever drops after taking the result below, so a
+        // failed send here would mean it dropped first — nothing left to
+        // tell.
+        let _ = tx.send(outcome);
+    });
+
+    let live = std::io::stderr().is_terminal();
+    let start = Instant::now();
+    let mut tick: u64 = 0;
+    let outcome = loop {
+        match rx.recv_timeout(SPINNER_TICK) {
+            Ok(outcome) => {
+                if live {
+                    clear_scan_spinner();
+                }
+                break outcome;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if live {
+                    render_scan_spinner(tick, start.elapsed());
+                    tick += 1;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if live {
+                    clear_scan_spinner();
+                }
+                return Err(anyhow!(
+                    "internal error: the scan's background thread ended without a result"
+                ));
+            }
+        }
+    };
+
+    let outcome = outcome.map_err(|e| scan_socket_error(socket_path, &e))?;
     match outcome {
         net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
         net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
@@ -2086,13 +2179,14 @@ fn pager_command() -> (String, Vec<String>) {
 /// untouched, `-X` keeps it in scrollback after quitting. `None` when the
 /// operator already set `LESS` themselves — a deliberate choice is never
 /// overridden — and harmless when the pager isn't `less` at all (an
-/// unrelated env var to another program).
+/// unrelated env var to another program). Git treats an empty/whitespace-only
+/// `LESS` (e.g. a shell profile exporting `LESS=`) the same as unset — a
+/// stray empty export is not a deliberate choice of flags — so this does too:
+/// only a `LESS` carrying real content counts as the operator's own.
 fn pager_less_default() -> Option<&'static str> {
-    if std::env::var_os("LESS").is_none() {
-        Some("FRX")
-    } else {
-        None
-    }
+    let set_deliberately =
+        std::env::var_os("LESS").is_some_and(|v| !v.to_string_lossy().trim().is_empty());
+    if set_deliberately { None } else { Some("FRX") }
 }
 
 /// Print `content` — git-style: through a pager when stdout is a terminal
@@ -2832,11 +2926,13 @@ mod tests {
         }
     }
 
-    /// `pager_less_default` — the `LESS=FRX` git-style default — fires only
-    /// when the operator has not set `LESS` themselves; a set `LESS` (even to
-    /// an empty string) is left alone.
+    /// `pager_less_default` — the `LESS=FRX` git-style default — fires when
+    /// the operator has not set `LESS` themselves, and also when `LESS` is
+    /// set but empty/whitespace-only (a stray `LESS=` export, not a
+    /// deliberate flag choice — git treats it the same way); only a `LESS`
+    /// carrying real content is left alone.
     #[test]
-    fn pager_less_default_only_when_less_is_unset() {
+    fn pager_less_default_when_less_is_unset_or_empty() {
         // SAFETY: this test owns `LESS` for its duration — set/read/restored
         // single-threaded within this one test body — and no other test in
         // this crate touches the variable (distinct from `PAGER`, which
@@ -2844,6 +2940,11 @@ mod tests {
         let saved = std::env::var("LESS").ok();
         unsafe {
             std::env::remove_var("LESS");
+        }
+        assert_eq!(pager_less_default(), Some("FRX"));
+
+        unsafe {
+            std::env::set_var("LESS", "");
         }
         assert_eq!(pager_less_default(), Some("FRX"));
 
@@ -4476,6 +4577,36 @@ mod tests {
         assert!(!out.is_empty());
         let script = String::from_utf8(out).expect("fish completion script is UTF-8");
         assert!(script.contains("complete -c net-observer-cli"), "{script}");
+    }
+
+    /// `spinner_frame` cycles through the whole ten-glyph braille set and
+    /// wraps back to the first frame rather than panicking or stalling on one
+    /// glyph past the end of the array.
+    #[test]
+    fn spinner_frame_cycles_and_wraps() {
+        let first_cycle: Vec<char> = (0..10u64).map(spinner_frame).collect();
+        let second_cycle: Vec<char> = (10..20u64).map(spinner_frame).collect();
+        assert_eq!(first_cycle, second_cycle, "tick 10..20 should repeat 0..10");
+        assert_eq!(
+            first_cycle.len(),
+            first_cycle
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "all ten frames should be distinct: {first_cycle:?}"
+        );
+        assert_eq!(spinner_frame(0), spinner_frame(10));
+    }
+
+    /// `format_elapsed` renders `M:SS`, zero-padding seconds under ten and
+    /// rolling minutes over without a limit.
+    #[test]
+    fn format_elapsed_renders_minutes_and_seconds() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "0:00");
+        assert_eq!(format_elapsed(Duration::from_secs(5)), "0:05");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1:05");
+        assert_eq!(format_elapsed(Duration::from_secs(600)), "10:00");
+        assert_eq!(format_elapsed(Duration::from_secs(3661)), "61:01");
     }
 
     /// A scan's read timeout (the client gave up after `SCAN_TIMEOUT`, not the
