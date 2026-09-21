@@ -32,14 +32,85 @@ use crate::dhcp_arp::run;
 /// it is only a way to make the kernel ARP for the address.
 const SWEEP_PORT: u16 = 9;
 
-/// Largest subnet the sweep will touch, as a host count. A /22 is 1024 addresses;
-/// beyond that a sweep is neither quick nor discreet, and the daemon refuses
-/// rather than spraying a corporate /16.
-const MAX_SWEEP_HOSTS: u32 = 1024;
+/// The built-in ceiling on subnet size, as a host count, when the operator
+/// names no `--sweep-max` (realm net-observer, node #154).
+///
+/// Raised from the original 1024 (a /22): that guarded only against
+/// "neither quick nor discreet", not against a genuinely absurd range, and
+/// tripped on an ordinary coworking/office segment (a /21 is already 2048
+/// hosts, a /16 is 65534) — refusing the sweep BY DEFAULT on real segments
+/// the operator has every reason to expect it to cover. 65536 keeps a /16 —
+/// "a heavy but plausible single L2 segment" — sweeping with no flag at all,
+/// while still refusing anything an order of magnitude larger (a /15 and up,
+/// a /8 in particular): a range that size is far more likely a misparsed
+/// mask than a real flat segment, and the guard exists for exactly that,
+/// never for an operator's explicit `--sweep-max`.
+pub const DEFAULT_MAX_SWEEP_HOSTS: u32 = 65536;
 
 /// How long the kernel is given to finish resolving before the ARP cache is
 /// re-read.
 const SWEEP_SETTLE: Duration = Duration::from_secs(2);
+
+/// Gap between successive probes when `--slow` is set (realm net-observer,
+/// node #154): between sweep addresses, and between port-connect attempts.
+/// Not for detector stimulation — a gentleness preset for a shared segment,
+/// composed with no trigger/incident coupling.
+///
+/// Chosen at the low end of the brief's 50-100ms range: a real coworking
+/// segment (~2000 hosts on a /21, the segment [`DEFAULT_MAX_SWEEP_HOSTS`]
+/// exists to sweep by default) with `--slow` and no `--sweep-max` override
+/// still finishes inside the CLI's 180s `SCAN_TIMEOUT`
+/// (`net_observer_ipc::SCAN_TIMEOUT`) — roughly 2000 * 50ms ≈ 100s of sweep
+/// pacing, leaving headroom for the settle sleep and any requested
+/// ports/banners rungs. A gentler (larger) pace on a big subnet needs
+/// pairing with a tighter `--sweep-max` to stay inside that budget — the
+/// daemon does not do that pairing for the operator.
+pub const SLOW_PACE: Duration = Duration::from_millis(50);
+
+/// The per-probe pacing `--slow` selects: `None` when the operator did not
+/// ask for it, [`SLOW_PACE`] when they did. A named, pure function so the
+/// choice is directly testable — `SystemScanner::scan` (the caller) needs a
+/// real interface to exercise at all.
+#[must_use]
+pub fn effective_pace(slow: bool) -> Option<Duration> {
+    slow.then_some(SLOW_PACE)
+}
+
+/// Translate the operator's `--sweep-max` into the effective ceiling
+/// [`Ipv4Iface::host_addrs`]/[`sweep_probe_blocking`] enforce: `None`
+/// (nothing named) is [`DEFAULT_MAX_SWEEP_HOSTS`]; `Some(0)` lifts the
+/// ceiling entirely — an explicit "no operator cap", not a refusal to sweep
+/// zero hosts; `Some(n)` is that operator-set ceiling. This is the
+/// OPERATOR's ceiling only: [`HARD_MAX_SWEEP_HOSTS`] applies independently
+/// and `Some(0)` cannot lift that one.
+#[must_use]
+pub fn sweep_max_cap(requested: Option<u32>) -> Option<u32> {
+    match requested {
+        None => Some(DEFAULT_MAX_SWEEP_HOSTS),
+        Some(0) => None,
+        Some(n) => Some(n),
+    }
+}
+
+/// The absolute ceiling [`Ipv4Iface::host_addrs`] will EVER materialize,
+/// independent of `cap` — even `--sweep-max 0` ("no operator ceiling",
+/// [`sweep_max_cap`]) cannot lift this one.
+///
+/// This guards memory, not politeness: `host_addrs` builds one `Vec<Ipv4Addr>`
+/// entry per host, so "unlimited" against a genuinely huge range (a /8 is
+/// 16.7M hosts; smaller than /8 is worse) means allocating and holding tens
+/// to hundreds of megabytes for a Vec whose every entry is then also queued
+/// for a UDP send — a hazard `--slow`'s pacing does nothing to prevent, since
+/// pacing controls the network's timeline, not the allocation's size. `2^20`
+/// (1,048,576) is chosen to comfortably cover the largest plausible flat L2
+/// segment an operator could legitimately mean by "unlimited" — a /12 (a
+/// carrier-grade private block, 1,048,574 usable hosts) fits under it, while
+/// a /11 and anything larger (2,097,150 hosts and up) is refused outright:
+/// nobody sweeps a /11 host-by-host as a single flat segment, so a request
+/// that size reads as a misparsed range even when explicitly marked
+/// unlimited. `--target` is the way to reach one address inside a range this
+/// large without enumerating it.
+pub const HARD_MAX_SWEEP_HOSTS: u32 = 1 << 20;
 
 /// What the mDNS browse did and found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -69,31 +140,50 @@ pub struct Ipv4Iface {
 
 impl Ipv4Iface {
     /// Every host address of this subnet, excluding the network and broadcast
-    /// addresses and this machine's own. `None` when the subnet is larger than
-    /// [`MAX_SWEEP_HOSTS`] — refused rather than truncated, so a scan never
-    /// silently covers less than its recorded target.
-    #[must_use]
-    pub fn host_addrs(&self) -> Option<Vec<Ipv4Addr>> {
+    /// addresses and this machine's own. `cap` is the OPERATOR's ceiling on
+    /// subnet size (see [`sweep_max_cap`]): `None` is no operator ceiling,
+    /// `Some(n)` refuses a subnet larger than `n` hosts. [`HARD_MAX_SWEEP_HOSTS`]
+    /// applies independently of `cap` and cannot be lifted by it — this
+    /// function never materializes a `Vec` past that absolute bound. `Err`
+    /// names why the sweep is refused rather than truncated, so a scan never
+    /// silently covers less than its recorded target: a non-contiguous mask
+    /// ("not a subnet"), the concrete operator ceiling `--sweep-max` would
+    /// raise or lift, or the hard ceiling even `--sweep-max 0` cannot lift.
+    pub fn host_addrs(&self, cap: Option<u32>) -> Result<Vec<Ipv4Addr>, String> {
         let mask = u32::from(self.mask);
         // A netmask must be a run of ones followed by a run of zeros: its
         // complement is then one less than a power of two.
         let inv = !mask;
         if inv & inv.wrapping_add(1) != 0 {
-            return None;
+            return Err("not a subnet".to_string());
         }
-        let hosts = inv.checked_add(1)?.checked_sub(2)?;
-        if hosts == 0 || hosts > MAX_SWEEP_HOSTS {
-            return None;
+        let hosts = inv
+            .checked_add(1)
+            .and_then(|n| n.checked_sub(2))
+            .filter(|&h| h > 0)
+            .ok_or_else(|| "not a subnet".to_string())?;
+        if let Some(c) = cap
+            && hosts > c
+        {
+            return Err(format!(
+                "subnet larger than {c} hosts (--sweep-max raises or lifts this ceiling)"
+            ));
+        }
+        // Independent of `cap`: never build an unbounded Vec, no matter what
+        // the operator asked for (realm net-observer, node #154).
+        if hosts > HARD_MAX_SWEEP_HOSTS {
+            return Err(format!(
+                "range too large to sweep even with --sweep-max 0 ({hosts} hosts); \
+                 scan a narrower subnet or use --target"
+            ));
         }
         let net = u32::from(self.addr) & mask;
         let me = u32::from(self.addr);
-        Some(
-            (1..=hosts)
-                .map(|i| net + i)
-                .filter(|&a| a != me)
-                .map(Ipv4Addr::from)
-                .collect(),
-        )
+        Ok((1..=hosts)
+            .map(|i| net + i)
+            .filter(|&a| a != me)
+            .map(Ipv4Addr::from)
+            .collect())
     }
 
     /// The subnet in CIDR form (`192.168.1.0/24`) — what the scan records as the
@@ -164,10 +254,13 @@ pub fn join_names_onto_arp(
     out
 }
 
-/// What the sweep actually put on the wire.
+/// What the sweep (or Part A's single-target probe) actually put on the
+/// wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepStats {
-    /// The subnet in CIDR form — the target the scan records as covered.
+    /// The target the scan records as covered: the subnet in CIDR form for a
+    /// sweep, the bare address for a single-target probe (realm
+    /// net-observer, node #154).
     pub target: String,
     pub sent: usize,
     pub total: usize,
@@ -181,29 +274,128 @@ pub struct SweepStats {
 /// resolve them. The caller re-reads the ARP cache afterwards — the resolution
 /// this provokes is the entire product, so nothing here parses a reply.
 ///
-/// The socket is pinned to `iface_name` with `IP_BOUND_IF`, like every other
-/// outbound probe in this daemon. Without it a tunnel holding the default route
-/// swallows the datagrams: nothing is ARPed on the segment, yet the recorded row
-/// still names the segment's CIDR — a scan that reports covering ground it never
-/// touched. A failed bind is recorded in `refused` rather than probing anyway.
+/// `cap` is the sweep's ceiling (see [`sweep_max_cap`]); `pace`, when `Some`,
+/// is the gap `--slow` inserts between successive addresses (realm
+/// net-observer, node #154).
 ///
 /// Blocking (a `UdpSocket` and a settle sleep); the daemon drives it on the
 /// blocking pool.
-pub fn sweep_probe_blocking(iface: &Ipv4Iface, iface_name: &str) -> SweepStats {
+pub fn sweep_probe_blocking(
+    iface: &Ipv4Iface,
+    iface_name: &str,
+    cap: Option<u32>,
+    pace: Option<Duration>,
+) -> SweepStats {
     let started = Instant::now();
-    let target = iface.cidr();
+    match iface.host_addrs(cap) {
+        Err(reason) => SweepStats {
+            target: iface.cidr(),
+            sent: 0,
+            total: 0,
+            duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            refused: Some(reason),
+        },
+        Ok(addrs) => {
+            warn_if_slow_sweep_will_outlast_the_wait(addrs.len(), pace);
+            probe_addrs_blocking(&addrs, iface.cidr(), iface_name, pace, started)
+        }
+    }
+}
+
+/// Roughly the CLI's own wait budget for a `ScanNeighbors` round-trip
+/// (`net_observer_ipc::SCAN_TIMEOUT`, 180s) minus headroom for the settle
+/// sleep and any requested ports/banners rung on top of the sweep itself.
+/// Not imported from `net-observer-ipc` — this crate has no dependency on
+/// it, and the figure is a rough visibility threshold, not a contract the
+/// two crates must agree on bit-for-bit.
+const SLOW_SWEEP_WARN_THRESHOLD: Duration = Duration::from_secs(150);
+
+/// The projected duration of a slow sweep's OWN pacing (host count × pace —
+/// ignoring the settle sleep and any ports/banners rung on top, which only
+/// add more), when that projection exceeds [`SLOW_SWEEP_WARN_THRESHOLD`];
+/// `None` when there is nothing to warn about (not slow, or short enough).
+/// Factored out from [`warn_if_slow_sweep_will_outlast_the_wait`] so the
+/// decision is directly testable as a pure function, without a tracing
+/// subscriber.
+fn slow_sweep_overrun(host_count: usize, pace: Option<Duration>) -> Option<Duration> {
+    let pace = pace?;
+    let hosts = u32::try_from(host_count).ok()?;
+    let estimated = pace.saturating_mul(hosts);
+    (estimated > SLOW_SWEEP_WARN_THRESHOLD).then_some(estimated)
+}
+
+/// Warn once, server-side, when [`slow_sweep_overrun`] says a `--slow`
+/// sweep's own pacing is already projected past the CLI's rough wait budget
+/// (realm net-observer, node #154).
+///
+/// The raised [`DEFAULT_MAX_SWEEP_HOSTS`] combined with `--slow` and no
+/// `--sweep-max` override can genuinely take far longer than the CLI's
+/// `SCAN_TIMEOUT` wait: at [`SLOW_PACE`], a full default-ceiling sweep is
+/// ~55 minutes. There is deliberately NO server-side cancellation (out of
+/// scope, v1 = observe + detect): the scan keeps running and its rows are
+/// still readable afterward through `neighbors`/`vulns` — this warning is
+/// the visibility for that gap, not a fix for it.
+fn warn_if_slow_sweep_will_outlast_the_wait(host_count: usize, pace: Option<Duration>) {
+    let Some(estimated) = slow_sweep_overrun(host_count, pace) else {
+        return;
+    };
+    tracing::warn!(
+        hosts = host_count,
+        pace_ms = pace.map(|p| p.as_millis()).unwrap_or(0),
+        estimated_s = estimated.as_secs(),
+        "slow sweep's own pacing already exceeds the CLI's wait budget; \
+         the scan still runs to completion and its rows are readable \
+         afterward via `neighbors`/`vulns`, but the operator's CLI call \
+         may report a timeout before it finishes"
+    );
+}
+
+/// Probe exactly one IPv4 address to provoke ARP resolution — Part A's
+/// single-target scan's analogue of [`sweep_probe_blocking`], without a
+/// subnet or a ceiling: one address is always within budget (realm
+/// net-observer, node #154). `sent`/`total` are 1/1 on success, 0/0 on a
+/// refusal (no socket, or the interface pin failed).
+#[must_use]
+pub fn single_probe_blocking(
+    iface_name: &str,
+    target: Ipv4Addr,
+    pace: Option<Duration>,
+) -> SweepStats {
+    probe_addrs_blocking(
+        &[target],
+        target.to_string(),
+        iface_name,
+        pace,
+        Instant::now(),
+    )
+}
+
+/// Shared by [`sweep_probe_blocking`] and [`single_probe_blocking`]: send one
+/// UDP datagram per address to provoke ARP resolution, then wait
+/// [`SWEEP_SETTLE`] for the kernel to finish. `target_label` is what the row
+/// records as covered (a CIDR for a sweep, the bare address for a single
+/// target); `started` is the caller's own clock, so a refusal before this
+/// point (an oversized subnet) still reports its own elapsed time.
+///
+/// The socket is pinned to `iface_name` with `IP_BOUND_IF`, like every other
+/// outbound probe in this daemon. Without it a tunnel holding the default
+/// route swallows the datagrams: nothing is ARPed on the segment, yet the
+/// recorded row still names the target as covered — a scan that reports
+/// covering ground it never touched. A failed bind is recorded in `refused`
+/// rather than probing anyway.
+fn probe_addrs_blocking(
+    addrs: &[Ipv4Addr],
+    target_label: String,
+    iface_name: &str,
+    pace: Option<Duration>,
+    started: Instant,
+) -> SweepStats {
     let refuse = |detail: String, started: Instant| SweepStats {
-        target: iface.cidr(),
+        target: target_label.clone(),
         sent: 0,
         total: 0,
         duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
         refused: Some(detail),
-    };
-    let Some(addrs) = iface.host_addrs() else {
-        return refuse(
-            format!("subnet larger than {MAX_SWEEP_HOSTS} hosts, or not a subnet"),
-            started,
-        );
     };
     let socket = match UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))) {
         Ok(s) => s,
@@ -211,22 +403,27 @@ pub fn sweep_probe_blocking(iface: &Ipv4Iface, iface_name: &str) -> SweepStats {
     };
     if !crate::net::bind_to_iface_v4(socket.as_raw_fd(), iface_name) {
         return refuse(
-            format!("could not pin the sweep to {iface_name}; the tunnel would have taken it"),
+            format!("could not pin the probe to {iface_name}; the tunnel would have taken it"),
             started,
         );
     }
     let mut sent = 0usize;
-    for a in &addrs {
+    for (i, a) in addrs.iter().enumerate() {
         if socket
             .send_to(&[0u8], SocketAddr::from((*a, SWEEP_PORT)))
             .is_ok()
         {
             sent += 1;
         }
+        if let Some(p) = pace
+            && i + 1 < addrs.len()
+        {
+            std::thread::sleep(p);
+        }
     }
     std::thread::sleep(SWEEP_SETTLE);
     SweepStats {
-        target,
+        target: target_label,
         sent,
         total: addrs.len(),
         duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
@@ -344,12 +541,25 @@ pub struct PortScanOutcome {
 
 /// TCP-connect-scan `ports` on each of `targets`, pinning every connect to
 /// `iface_name` with `IP_BOUND_IF` so the tunnel cannot answer for the segment
-/// (the same invariant the sweep and the underlay TCP prober hold). Bounded
-/// concurrency, short per-connect timeout; blocking, driven on the blocking pool.
+/// (the same invariant the sweep and the underlay TCP prober hold). Short
+/// per-connect timeout; blocking, driven on the blocking pool.
+///
+/// `pace`, when `Some` (`--slow`, realm net-observer, node #154), serialises
+/// the scan to one worker and inserts the gap between successive connects —
+/// "space the probes out", not "run the usual burst but slower" — instead of
+/// [`PORT_SCAN_CONCURRENCY`] concurrent workers each racing through their own
+/// paced share. `None` (the default) is today's bounded-concurrency scan,
+/// unchanged: composes with `--target` and every rung — a slow single-target
+/// port scan simply spaces its connects.
 ///
 /// A closed or filtered port is simply absent from the result — absence is the
 /// signal, no per-port "closed" row.
-pub fn port_scan_blocking(targets: &[IpAddr], ports: &[u16], iface_name: &str) -> PortScanOutcome {
+pub fn port_scan_blocking(
+    targets: &[IpAddr],
+    ports: &[u16],
+    iface_name: &str,
+    pace: Option<Duration>,
+) -> PortScanOutcome {
     let started = Instant::now();
     // Flatten to a work list of (ip, port); a shared cursor hands each worker the
     // next item, so a slow host does not idle the others.
@@ -358,7 +568,11 @@ pub fn port_scan_blocking(targets: &[IpAddr], ports: &[u16], iface_name: &str) -
         .flat_map(|ip| ports.iter().map(move |p| (*ip, *p)))
         .collect();
     let cursor = AtomicUsize::new(0);
-    let workers = PORT_SCAN_CONCURRENCY.min(work.len().max(1));
+    let workers = if pace.is_some() {
+        1
+    } else {
+        PORT_SCAN_CONCURRENCY.min(work.len().max(1))
+    };
 
     let open: Vec<PortFinding> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
@@ -372,6 +586,11 @@ pub fn port_scan_blocking(targets: &[IpAddr], ports: &[u16], iface_name: &str) -
                         };
                         if connect_open(ip, port, iface_name) {
                             found.push(PortFinding { ip, port });
+                        }
+                        if let Some(p) = pace
+                            && i + 1 < work.len()
+                        {
+                            std::thread::sleep(p);
                         }
                     }
                     found
@@ -624,7 +843,7 @@ mod tests {
         let target = IpAddr::V4(Ipv4Addr::LOCALHOST);
         // Empty iface name: bind_to_iface is skipped on loopback (if_nametoindex
         // of "" fails, the connect proceeds unpinned — fine for a loopback test).
-        let out = port_scan_blocking(&[target], &[open_port, closed_port], "");
+        let out = port_scan_blocking(&[target], &[open_port, closed_port], "", None);
         assert!(
             out.open.iter().any(|f| f.port == open_port),
             "the listening port must be found: {:?}",
@@ -636,6 +855,83 @@ mod tests {
         );
         assert_eq!(out.hosts, 1);
         assert_eq!(out.ports_per_host, 2);
+    }
+
+    /// `--slow` (Part B, realm net-observer, node #154) must not change WHAT
+    /// the port scan finds — only how gently it gets there. A tiny pace keeps
+    /// this fast; the pace's VALUE and its timing effect are covered
+    /// separately as plumbing (`effective_pace`), never by a sleep-timing
+    /// assertion (AGENTS.md: "do NOT write a sleep-timing assertion").
+    #[test]
+    fn pacing_a_port_scan_does_not_change_what_it_finds() {
+        use std::net::{Ipv4Addr, TcpListener};
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let open_port = listener.local_addr().unwrap().port();
+        let scratch = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let closed_port = scratch.local_addr().unwrap().port();
+        drop(scratch);
+
+        let target = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let out = port_scan_blocking(
+            &[target],
+            &[open_port, closed_port],
+            "",
+            Some(Duration::from_millis(1)),
+        );
+        assert!(
+            out.open.iter().any(|f| f.port == open_port),
+            "the listening port must still be found when paced: {:?}",
+            out.open
+        );
+        assert!(
+            !out.open.iter().any(|f| f.port == closed_port),
+            "a closed port must still not appear when paced"
+        );
+    }
+
+    /// `--slow` selects a named pace; the fast (default) path selects none.
+    /// The pure plumbing fact `SystemScanner::scan` relies on — that scanner
+    /// itself needs a real interface to exercise (AGENTS.md Reality: a Mac/CI
+    /// claim from this Linux box).
+    #[test]
+    fn slow_selects_the_named_pace_and_fast_selects_none() {
+        assert_eq!(effective_pace(false), None);
+        assert_eq!(effective_pace(true), Some(SLOW_PACE));
+    }
+
+    /// The fast path (`pace: None`) never warns, whatever the host count —
+    /// a no-op, not a "never slow enough" special case.
+    #[test]
+    fn fast_sweeps_never_overrun_the_wait_budget() {
+        assert_eq!(slow_sweep_overrun(0, None), None);
+        assert_eq!(slow_sweep_overrun(1_000_000, None), None);
+    }
+
+    /// A slow sweep of the raised default ceiling (65536 hosts) at
+    /// [`SLOW_PACE`] is projected at ~54.6 minutes — well past
+    /// [`SLOW_SWEEP_WARN_THRESHOLD`] (150s) — so it must be flagged.
+    #[test]
+    fn a_slow_sweep_of_the_default_ceiling_overruns_the_wait_budget() {
+        let overrun = slow_sweep_overrun(DEFAULT_MAX_SWEEP_HOSTS as usize, Some(SLOW_PACE))
+            .expect("65536 hosts at 50ms/host must overrun a 150s budget");
+        assert!(overrun > SLOW_SWEEP_WARN_THRESHOLD, "{overrun:?}");
+    }
+
+    /// A slow sweep small enough to finish within the wait budget is not
+    /// flagged — the coworking /21 (2046 hosts) at [`SLOW_PACE`] is ~102s,
+    /// inside the 150s threshold.
+    #[test]
+    fn a_slow_sweep_within_budget_does_not_overrun() {
+        assert_eq!(slow_sweep_overrun(2046, Some(SLOW_PACE)), None);
+    }
+
+    /// `--sweep-max` translates as Part D specifies: absent = the built-in
+    /// default; `0` = unlimited; `n` = that ceiling.
+    #[test]
+    fn sweep_max_cap_translates_the_operators_choice() {
+        assert_eq!(sweep_max_cap(None), Some(DEFAULT_MAX_SWEEP_HOSTS));
+        assert_eq!(sweep_max_cap(Some(0)), None);
+        assert_eq!(sweep_max_cap(Some(500)), Some(500));
     }
 
     /// How many times a socket test may re-attempt before it counts as a real
@@ -775,7 +1071,9 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             addr: Ipv4Addr::new(192, 168, 1, 23),
             mask: Ipv4Addr::new(255, 255, 255, 0),
         };
-        let hosts = i.host_addrs().expect("sweepable");
+        let hosts = i
+            .host_addrs(Some(DEFAULT_MAX_SWEEP_HOSTS))
+            .expect("sweepable");
         assert_eq!(hosts.len(), 253);
         assert!(hosts.contains(&Ipv4Addr::new(192, 168, 1, 1)));
         assert!(hosts.contains(&Ipv4Addr::new(192, 168, 1, 254)));
@@ -784,16 +1082,92 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         assert!(!hosts.contains(&Ipv4Addr::new(192, 168, 1, 255)));
     }
 
-    /// The cap is a refusal, not a truncation: a scan must cover the target it
-    /// records or none of it.
+    /// Part D (realm net-observer, node #154): the coworking segment this
+    /// raised default exists for — a /21, 2046 usable hosts (excluding
+    /// network + broadcast), well above the OLD 1024-host cap that used to
+    /// refuse it — now sweeps with NO flag at all, under the new
+    /// [`DEFAULT_MAX_SWEEP_HOSTS`].
     #[test]
-    fn a_subnet_above_the_cap_is_refused() {
+    fn a_slash_21_sweeps_with_the_new_default_and_no_flag() {
+        let i = Ipv4Iface {
+            addr: Ipv4Addr::new(10, 0, 4, 5),
+            mask: Ipv4Addr::new(255, 255, 248, 0),
+        };
+        assert_eq!(i.cidr(), "10.0.0.0/21");
+        let hosts = i
+            .host_addrs(sweep_max_cap(None))
+            .expect("a /21 must sweep by default under the raised ceiling");
+        // 2046 usable hosts minus this interface's OWN address (10.0.4.5,
+        // itself a host of the /21) = 2045, same exclusion the /24 test
+        // above pins ("but this one"): `host_addrs` never targets `self`.
+        assert_eq!(hosts.len(), 2045);
+    }
+
+    /// The cap is a refusal, not a truncation: a scan must cover the target it
+    /// records or none of it. A /15 (131070 hosts) is well above the new
+    /// default ceiling — the size class the guard still exists for, an order
+    /// of magnitude past a plausible single flat segment.
+    #[test]
+    fn a_subnet_above_the_new_default_cap_is_refused() {
         let i = Ipv4Iface {
             addr: Ipv4Addr::new(10, 0, 0, 5),
-            mask: Ipv4Addr::new(255, 255, 0, 0),
+            mask: Ipv4Addr::new(255, 254, 0, 0),
         };
-        assert_eq!(i.cidr(), "10.0.0.0/16");
-        assert!(i.host_addrs().is_none());
+        assert_eq!(i.cidr(), "10.0.0.0/15");
+        assert!(i.host_addrs(sweep_max_cap(None)).is_err());
+    }
+
+    /// `--sweep-max 0` lifts the ceiling entirely: the same /15 that the
+    /// built-in default refuses now sweeps.
+    #[test]
+    fn sweep_max_zero_lifts_the_ceiling() {
+        let i = Ipv4Iface {
+            addr: Ipv4Addr::new(10, 0, 0, 5),
+            mask: Ipv4Addr::new(255, 254, 0, 0),
+        };
+        let hosts = i
+            .host_addrs(sweep_max_cap(Some(0)))
+            .expect("--sweep-max 0 must lift the ceiling");
+        // 131070 usable hosts minus this interface's OWN address (10.0.0.5),
+        // the same exclusion as the /21 test above.
+        assert_eq!(hosts.len(), 131_069);
+    }
+
+    /// `--sweep-max 0` lifts the OPERATOR's ceiling, but never
+    /// [`HARD_MAX_SWEEP_HOSTS`]: a /8 (16.7M hosts) is refused even
+    /// "unlimited" — `host_addrs` must never materialize a `Vec` that size.
+    /// The refusal is checked before any allocation happens, so this test
+    /// costs nothing even though the range it names is enormous.
+    #[test]
+    fn sweep_max_zero_does_not_lift_the_hard_safety_ceiling() {
+        let i = Ipv4Iface {
+            addr: Ipv4Addr::new(10, 0, 0, 5),
+            mask: Ipv4Addr::new(255, 0, 0, 0),
+        };
+        assert_eq!(i.cidr(), "10.0.0.0/8");
+        let err = i
+            .host_addrs(sweep_max_cap(Some(0)))
+            .expect_err("a /8 must be refused even with --sweep-max 0");
+        assert!(err.contains("--sweep-max 0"), "{err}");
+        assert!(err.contains("--target"), "{err}");
+    }
+
+    /// `--sweep-max <small>` re-imposes a low ceiling below the built-in
+    /// default, and the refusal names it — checked through
+    /// `sweep_probe_blocking` itself: the refusal is decided before any
+    /// socket is touched, so this needs no real interface.
+    #[test]
+    fn a_small_sweep_max_reimposes_a_low_ceiling_and_names_it() {
+        let i = Ipv4Iface {
+            addr: Ipv4Addr::new(192, 168, 1, 23),
+            mask: Ipv4Addr::new(255, 255, 255, 0), // 253 hosts
+        };
+        let stats = sweep_probe_blocking(&i, "en0", sweep_max_cap(Some(100)), None);
+        let reason = stats
+            .refused
+            .expect("a /24's host count must exceed a 100 ceiling");
+        assert!(reason.contains("100"), "{reason}");
+        assert!(reason.contains("--sweep-max"), "{reason}");
     }
 
     #[test]
@@ -802,7 +1176,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
             addr: Ipv4Addr::new(192, 168, 1, 5),
             mask: Ipv4Addr::new(255, 0, 255, 0),
         };
-        assert!(i.host_addrs().is_none());
+        assert!(i.host_addrs(sweep_max_cap(None)).is_err());
     }
 
     fn arp(mac: &str, ip: &str) -> NeighborObs {

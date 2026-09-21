@@ -33,6 +33,7 @@
 //! the wire format, without telling callers anything the kind does not.
 
 use std::io::{BufRead, BufReader, Write};
+use std::net::IpAddr;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
@@ -281,6 +282,37 @@ pub struct ScanOptions {
     /// match is a hypothesis carrying its confidence, never an asserted fact.
     #[serde(default)]
     pub cve: bool,
+    /// Scan just this one address instead of sweeping the whole segment
+    /// (realm net-observer, node #154): the base rung becomes one probe to
+    /// `target` instead of the whole-segment sweep, and the mDNS browse is
+    /// skipped (this daemon keeps no persistent name cache to consult
+    /// "trivially" for one host); `ports`/`banners`/`cve` then run against
+    /// `target` directly. `None` (the default) is today's whole-segment
+    /// sweep. `#[serde(default)]` covers an old daemon: it decodes this
+    /// request and simply ignores the field, sweeping the segment as it
+    /// always did — a graceful degradation, not a silent wrong answer, since
+    /// the operator still gets a scan, just not the narrowed one they asked
+    /// for.
+    #[serde(default)]
+    pub target: Option<IpAddr>,
+    /// Space probes out to be gentle on a shared segment (realm
+    /// net-observer, node #154): a pacing preset, not a raw delay — the
+    /// concrete gap is the daemon's own to pick and tune
+    /// (`macos::neighbor_scan::SLOW_PACE`). For being a considerate
+    /// neighbour on a coworking/shared segment, NOT for stimulating a
+    /// detector — no trigger/incident coupling reads this field.
+    /// `#[serde(default)]` = `false`, matching an old daemon's only speed.
+    #[serde(default)]
+    pub slow: bool,
+    /// Override the sweep's host-count ceiling (realm net-observer, node
+    /// #154): `None` = the daemon's built-in default ceiling
+    /// (`macos::neighbor_scan::DEFAULT_MAX_SWEEP_HOSTS`); `Some(0)` = no
+    /// ceiling at all; `Some(n)` = that ceiling. Ignored when `target` is
+    /// set — a single-target scan never sweeps, so no ceiling applies.
+    /// `#[serde(default)]` = `None`, matching an old daemon's one built-in
+    /// ceiling.
+    #[serde(default)]
+    pub sweep_max: Option<u32>,
 }
 
 /// The outcome of a [`ControlCmd`]: whether the action ran successfully plus a
@@ -1730,6 +1762,46 @@ pub fn read_frame<R: BufRead, T: DeserializeOwned>(r: &mut R) -> std::io::Result
 mod tests {
     use super::*;
     use types::{DnsVerdict, GwVerdict, TcpVerdict};
+
+    /// `ScanOptions` round-trips through serde with every field, `target` and
+    /// `sweep_max` included — the wire type must agree with itself before
+    /// either side is trusted to decode the other's frame.
+    #[test]
+    fn scan_options_round_trips_every_field() {
+        let opts = ScanOptions {
+            ports: true,
+            banners: true,
+            cve: true,
+            target: Some("192.168.1.5".parse().unwrap()),
+            slow: true,
+            sweep_max: Some(4096),
+        };
+        let json = serde_json::to_string(&opts).unwrap();
+        let back: ScanOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ports, opts.ports);
+        assert_eq!(back.banners, opts.banners);
+        assert_eq!(back.cve, opts.cve);
+        assert_eq!(back.target, opts.target);
+        assert_eq!(back.slow, opts.slow);
+        assert_eq!(back.sweep_max, opts.sweep_max);
+    }
+
+    /// An OLD-shaped `ScanOptions` frame (from before `target`/`slow`/
+    /// `sweep_max` existed) must still decode: `#[serde(default)]` on the new
+    /// fields is the standing mitigation (AGENTS.md wire invariants) — an old
+    /// client's request decodes at a new daemon with the new fields at their
+    /// defaults, which is today's whole-segment, full-speed, default-ceiling
+    /// sweep. Pins the wire-compatibility claim, not just the round-trip.
+    #[test]
+    fn an_old_shaped_scan_options_frame_still_decodes_with_defaults() {
+        let opts: ScanOptions = serde_json::from_str(r#"{"ports":true}"#).unwrap();
+        assert!(opts.ports);
+        assert!(!opts.banners);
+        assert!(!opts.cve);
+        assert_eq!(opts.target, None);
+        assert!(!opts.slow);
+        assert_eq!(opts.sweep_max, None);
+    }
 
     /// The live failure this branch exists for, reproduced without a daemon.
     ///

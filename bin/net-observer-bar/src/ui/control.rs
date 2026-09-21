@@ -254,20 +254,33 @@ pub fn scan_round_trip_base(
 /// it: the daemon drops a `banners` request without `ports` and a `cve` request
 /// without `banners` (and says so), so a rung that did not include the ones
 /// beneath it would ask for what it cannot get. (realm net-observer, node #90)
+// `target`/`slow`/`sweep_max` (realm net-observer, node #154) sit outside the
+// audit ladder — the bar's rung buttons ask no single host and never throttle
+// (that is an operator-typed CLI thing, not a click), so every rung leaves
+// them at their wire defaults.
 const RUNG_PORTS: ScanOptions = ScanOptions {
     ports: true,
     banners: false,
     cve: false,
+    target: None,
+    slow: false,
+    sweep_max: None,
 };
 const RUNG_BANNERS: ScanOptions = ScanOptions {
     ports: true,
     banners: true,
     cve: false,
+    target: None,
+    slow: false,
+    sweep_max: None,
 };
 const RUNG_CVE: ScanOptions = ScanOptions {
     ports: true,
     banners: true,
     cve: true,
+    target: None,
+    slow: false,
+    sweep_max: None,
 };
 // The ladder's shape is pinned where it is declared: a rung that dropped a
 // lower one would ask for what the daemon cannot give, and that is a build

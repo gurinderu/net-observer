@@ -1534,6 +1534,35 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
             message: "observation is paused; resume before scanning".to_string(),
         };
     }
+    // Part A boundary decision (realm net-observer, node #154, owner
+    // decision node #156): an off-subnet target is ALLOWED, not refused —
+    // the operator named the address and owns the responsibility for it; the
+    // socket is IP_BOUND_IF-pinned to the physical interface regardless.
+    // Only a category that can never be a real neighbour on ANY segment is
+    // refused: loopback, multicast, the unspecified address, or (IPv4) the
+    // limited-broadcast address. `is_loopback`/`is_multicast`/`is_unspecified`
+    // already dispatch correctly for an IPv6 target (no separate IPv6 branch
+    // needed); limited broadcast is IPv4-only by definition, hence the extra
+    // check. A genuine sing-box fakeip/TUN address is deliberately NOT
+    // filtered here — telling it apart from an ordinary off-subnet host
+    // would need a live read of the rendered sing-box config, which moves
+    // independently of this build (its fakeip pool "has moved four times",
+    // per `macos::clash`); pinned to the physical interface, a stray fakeip
+    // target simply probes and finds nothing, the same honest outcome as any
+    // other unreachable address.
+    if let Some(ip) = requested.target
+        && (ip.is_loopback()
+            || ip.is_multicast()
+            || ip.is_unspecified()
+            || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast()))
+    {
+        return ControlResult {
+            ok: false,
+            message: format!(
+                "{ip} is not a scannable host (loopback, multicast, unspecified, or broadcast)"
+            ),
+        };
+    }
     let Some(scanner) = cx.scanner else {
         return ControlResult {
             ok: false,
@@ -1555,10 +1584,16 @@ fn scan_now(cx: &ControlCtx<'_>, requested: &ScanOptions, peer_uid: Option<u32>)
     // the `banners` rung is itself effective (a match parses a banner) AND a
     // snapshot is present to match against.
     let cve = requested.cve && banners && snapshot_available;
+    // `target`/`slow`/`sweep_max` gate on no other rung — they pass through
+    // untouched, unlike ports/banners/cve above (realm net-observer, node
+    // #154).
     let effective = ScanOptions {
         ports,
         banners,
         cve,
+        target: requested.target,
+        slow: requested.slow,
+        sweep_max: requested.sweep_max,
     };
     let mut dropped = Vec::new();
     if requested.banners && !banners {
@@ -3301,6 +3336,7 @@ mod tests {
                 ports: true,
                 banners: true,
                 cve: true,
+                ..ScanOptions::default()
             }),
             Some(TEST_DAEMON_UID),
             &cx,
@@ -3334,6 +3370,7 @@ mod tests {
                 ports: false,
                 banners: true,
                 cve: false,
+                ..ScanOptions::default()
             }),
             Some(TEST_DAEMON_UID),
             &cx,
@@ -3366,6 +3403,7 @@ mod tests {
                 ports: true,
                 banners: false,
                 cve: true,
+                ..ScanOptions::default()
             }),
             Some(TEST_DAEMON_UID),
             &cx,
@@ -3395,6 +3433,7 @@ mod tests {
                 ports: true,
                 banners: true,
                 cve: true,
+                ..ScanOptions::default()
             }),
             Some(TEST_DAEMON_UID),
             &cx,
@@ -3420,6 +3459,7 @@ mod tests {
                 ports: true,
                 banners: true,
                 cve: true,
+                ..ScanOptions::default()
             }),
             Some(TEST_DAEMON_UID),
             &cx,
@@ -3431,6 +3471,202 @@ mod tests {
             !eff.cve,
             "an absent snapshot directory means the rung is dropped"
         );
+    }
+
+    /// Part A (`--target`, realm net-observer, node #154): `scan_now` passes
+    /// the requested target straight through to the scanner, untouched by
+    /// the ports/banners/cve dependency ladder — it gates on no other rung.
+    /// The decision to skip the whole-segment sweep for a named target is
+    /// `SystemScanner`'s, which needs a real interface to exercise at all
+    /// (AGENTS.md Reality: a Mac/CI claim from this Linux box); this control
+    /// path is what `api::scan_now` itself owns and can test.
+    #[test]
+    fn scan_now_passes_the_requested_target_straight_through() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        let cx = test_ctx(&srv);
+        let ip: std::net::IpAddr = "192.168.1.77".parse().unwrap();
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                target: Some(ip),
+                ..ScanOptions::default()
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        let eff = seen.lock().unwrap().clone().expect("scanner ran");
+        assert_eq!(eff.target, Some(ip));
+    }
+
+    /// A rung dropped for a missing dependency still reports its message
+    /// even when the request also names a `--target` — `target` gates on no
+    /// other rung, so the two compose independently.
+    #[test]
+    fn a_dropped_rung_still_reports_its_message_alongside_a_target_request() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        let cx = test_ctx(&srv);
+        let ip: std::net::IpAddr = "192.168.1.77".parse().unwrap();
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                target: Some(ip),
+                banners: true, // no ports: the dependency drop still applies
+                ..ScanOptions::default()
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        assert!(
+            res.message.contains("dropped") && res.message.contains("banners"),
+            "{}",
+            res.message
+        );
+        let eff = seen.lock().unwrap().clone().expect("scanner ran");
+        assert_eq!(eff.target, Some(ip));
+        assert!(!eff.banners, "banners needs an effective ports rung");
+    }
+
+    /// Part A boundary decision: a target that can never be a real neighbour
+    /// on any segment — loopback, multicast, unspecified — is refused before
+    /// the scanner ever runs. An ordinary off-subnet address is deliberately
+    /// NOT refused here (see `scan_now`'s doc): that one reaches the
+    /// scanner, which probes it.
+    #[test]
+    fn a_loopback_target_is_refused_before_the_scanner_runs() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                target: Some("127.0.0.1".parse().unwrap()),
+                ..ScanOptions::default()
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(!res.ok, "a loopback target must be refused");
+        assert!(res.message.contains("loopback"), "{}", res.message);
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "the scanner must not run for a refused target"
+        );
+    }
+
+    /// A multicast target is refused the same way, before the scanner runs.
+    #[test]
+    fn a_multicast_target_is_refused_before_the_scanner_runs() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                target: Some("224.0.0.1".parse().unwrap()),
+                ..ScanOptions::default()
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(!res.ok, "a multicast target must be refused");
+        assert!(res.message.contains("multicast"), "{}", res.message);
+        assert!(seen.lock().unwrap().is_none(), "the scanner must not run");
+    }
+
+    /// The IPv4 limited-broadcast address (255.255.255.255) can never be a
+    /// real neighbour either — refused the same way, before the scanner runs.
+    #[test]
+    fn a_limited_broadcast_target_is_refused_before_the_scanner_runs() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        let cx = test_ctx(&srv);
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                target: Some("255.255.255.255".parse().unwrap()),
+                ..ScanOptions::default()
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(!res.ok, "the limited-broadcast address must be refused");
+        assert!(res.message.contains("broadcast"), "{}", res.message);
+        assert!(seen.lock().unwrap().is_none(), "the scanner must not run");
+    }
+
+    /// An IPv6 loopback/multicast/unspecified target is refused by the same
+    /// checks as IPv4 — `IpAddr::is_loopback`/`is_multicast`/`is_unspecified`
+    /// dispatch correctly per variant, so no separate IPv6 branch is needed.
+    #[test]
+    fn an_ipv6_loopback_and_multicast_target_are_refused_too() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        let cx = test_ctx(&srv);
+
+        let loopback = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                target: Some("::1".parse().unwrap()),
+                ..ScanOptions::default()
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(!loopback.ok, "an IPv6 loopback target must be refused");
+        assert!(
+            loopback.message.contains("loopback"),
+            "{}",
+            loopback.message
+        );
+
+        let multicast = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                target: Some("ff02::1".parse().unwrap()),
+                ..ScanOptions::default()
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(!multicast.ok, "an IPv6 multicast target must be refused");
+        assert!(
+            multicast.message.contains("multicast"),
+            "{}",
+            multicast.message
+        );
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "the scanner must not run for either refused IPv6 target"
+        );
+    }
+
+    /// An ordinary off-subnet address (Part A's boundary decision) is NOT
+    /// refused: it reaches the scanner like any other named target — the
+    /// operator asked for exactly this host, and the socket is pinned to the
+    /// physical interface regardless of whether the address shares this
+    /// machine's subnet.
+    #[test]
+    fn an_off_subnet_target_is_not_refused_and_reaches_the_scanner() {
+        let mut srv = test_server("/nonexistent.sock", test_acting(), TEST_DAEMON_UID);
+        let seen = Arc::new(Mutex::new(None));
+        srv.scanner = Some(Arc::new(RecordingScanner(Arc::clone(&seen))));
+        let cx = test_ctx(&srv);
+        // A public, plainly off-segment address — not this machine's subnet.
+        let ip: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+        let res = control_request(
+            ControlCmd::ScanNeighbors(ScanOptions {
+                target: Some(ip),
+                ..ScanOptions::default()
+            }),
+            Some(TEST_DAEMON_UID),
+            &cx,
+        );
+        assert!(res.ok, "{}", res.message);
+        let eff = seen.lock().unwrap().clone().expect("scanner ran");
+        assert_eq!(eff.target, Some(ip));
     }
 
     /// With no ring running, `FreezePcap` is a REFUSAL with a reason — never a

@@ -1543,31 +1543,84 @@ impl NeighborScanner for SystemScanner {
         tokio::task::block_in_place(|| {
             let rt = tokio::runtime::Handle::current();
             let iface = rt.block_on(self.facts.phys_iface())?;
-            let ipv4 = rt.block_on(neighbor_scan::iface_ipv4(&iface))?;
             let network_key = rt.block_on(self.facts.network_key());
+            let pace = neighbor_scan::effective_pace(opts.slow);
 
-            let sweep = neighbor_scan::sweep_probe_blocking(&ipv4, &iface);
-            // Read the cache the sweep just filled. Everything it now holds for
-            // this interface counts as found: an entry the kernel resolved
-            // because of our probe is indistinguishable from one that was
-            // already there, and claiming otherwise would be a guess. What is
-            // NOT guessed is attribution — a refused sweep leaves these entries
-            // marked `arp`, which `compose_scan_report` decides.
-            let arp = rt
-                .block_on(neighbors::read_arp(Some(&iface)))
-                .unwrap_or_default();
-            let mdns = neighbor_scan::mdns_names_blocking();
+            // Part A (realm net-observer, node #154): a named target replaces
+            // the whole-segment sweep with one probe to exactly that address,
+            // and skips the mDNS browse entirely — this daemon keeps no
+            // persistent name cache a single host could consult "trivially",
+            // and a fresh browse costs the same whole-segment seconds `target`
+            // exists to avoid. The ARP cache is still re-read, but narrowed to
+            // this one address: the whole cache would over-report every OTHER
+            // neighbour already cached as if this run found it too.
+            let (sweep, arp, mdns) = if let Some(target) = opts.target {
+                let sweep = match target {
+                    std::net::IpAddr::V4(v4) => {
+                        neighbor_scan::single_probe_blocking(&iface, v4, pace)
+                    }
+                    // NDP, not ARP, resolves an IPv6 neighbour's link layer —
+                    // out of scope here (the whole sweep/ARP machinery is
+                    // IPv4-only). The ports/banners/cve rungs below still run
+                    // against the address directly; only the ARP-forcing probe
+                    // and its "found" entity are skipped, honestly refused
+                    // rather than silently claiming a resolution that never
+                    // happened.
+                    std::net::IpAddr::V6(_) => neighbor_scan::SweepStats {
+                        target: target.to_string(),
+                        sent: 0,
+                        total: 0,
+                        duration_ms: 0,
+                        refused: Some(
+                            "IPv6 targets are not ARP-resolvable; ports/banners/cve still ran"
+                                .to_string(),
+                        ),
+                    },
+                };
+                let target_s = target.to_string();
+                let arp: Vec<types::NeighborObs> = rt
+                    .block_on(neighbors::read_arp(Some(&iface)))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|n| n.ip == target_s)
+                    .collect();
+                (sweep, arp, neighbor_scan::MdnsOutcome::default())
+            } else {
+                let ipv4 = rt.block_on(neighbor_scan::iface_ipv4(&iface))?;
+                let cap = neighbor_scan::sweep_max_cap(opts.sweep_max);
+                let sweep = neighbor_scan::sweep_probe_blocking(&ipv4, &iface, cap, pace);
+                // Read the cache the sweep just filled. Everything it now holds
+                // for this interface counts as found: an entry the kernel
+                // resolved because of our probe is indistinguishable from one
+                // that was already there, and claiming otherwise would be a
+                // guess. What is NOT guessed is attribution — a refused sweep
+                // leaves these entries marked `arp`, which `compose_scan_report`
+                // decides.
+                let arp = rt
+                    .block_on(neighbors::read_arp(Some(&iface)))
+                    .unwrap_or_default();
+                let mdns = neighbor_scan::mdns_names_blocking();
+                (sweep, arp, mdns)
+            };
 
-            // The `ports` rung, only when this run asked for it. Targets are the
-            // addresses the base scan just found, so a port scan never reaches
-            // past the neighbours actually on the segment.
+            // The `ports` rung, only when this run asked for it. A named
+            // target is probed directly by its own address — ARP would hold
+            // its GATEWAY's MAC for a routed, off-subnet host, never the
+            // host's own, so deriving targets from `arp` would silently probe
+            // nothing for exactly the boundary case Part A exists to allow
+            // (realm net-observer, node #154). Without a target, targets are
+            // the addresses the base sweep just found, so a port scan never
+            // reaches past the neighbours actually on the segment.
             let ports = if opts.ports {
-                let targets: Vec<std::net::IpAddr> =
-                    arp.iter().filter_map(|n| n.ip.parse().ok()).collect();
+                let targets: Vec<std::net::IpAddr> = match opts.target {
+                    Some(ip) => vec![ip],
+                    None => arp.iter().filter_map(|n| n.ip.parse().ok()).collect(),
+                };
                 Some(neighbor_scan::port_scan_blocking(
                     &targets,
                     neighbor_scan::COMMON_PORTS,
                     &iface,
+                    pace,
                 ))
             } else {
                 None
