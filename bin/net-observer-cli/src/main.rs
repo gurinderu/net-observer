@@ -2078,6 +2078,23 @@ fn pager_command() -> (String, Vec<String>) {
     }
 }
 
+/// Whether [`print_paged`] should default the pager child's own `LESS` env
+/// var to `FRX` — git does the same, for the same reason: an operator's
+/// `$PAGER` is often a bare `less -R` (color, no `-F`), so `less` opens
+/// full-screen and waits even for a one-line result. `-F` quits at once when
+/// the content fits one screen, `-R` keeps comfy-table's UTF-8 box-drawing
+/// untouched, `-X` keeps it in scrollback after quitting. `None` when the
+/// operator already set `LESS` themselves — a deliberate choice is never
+/// overridden — and harmless when the pager isn't `less` at all (an
+/// unrelated env var to another program).
+fn pager_less_default() -> Option<&'static str> {
+    if std::env::var_os("LESS").is_none() {
+        Some("FRX")
+    } else {
+        None
+    }
+}
+
 /// Print `content` — git-style: through a pager when stdout is a terminal
 /// and paging was not disabled with `--no-pager` ([`should_page`]), direct
 /// otherwise (a pipe, a redirect, a script — byte-identical to a plain
@@ -2097,10 +2114,12 @@ fn print_paged(content: &str, no_pager: bool) {
         return;
     }
     let (cmd, args) = pager_command();
-    let child = std::process::Command::new(&cmd)
-        .args(&args)
-        .stdin(std::process::Stdio::piped())
-        .spawn();
+    let mut command = std::process::Command::new(&cmd);
+    command.args(&args).stdin(std::process::Stdio::piped());
+    if let Some(less) = pager_less_default() {
+        command.env("LESS", less);
+    }
+    let child = command.spawn();
     let mut child = match child {
         Ok(c) => c,
         Err(_) => {
@@ -2809,6 +2828,34 @@ mod tests {
             match &saved {
                 Some(v) => std::env::set_var("PAGER", v),
                 None => std::env::remove_var("PAGER"),
+            }
+        }
+    }
+
+    /// `pager_less_default` — the `LESS=FRX` git-style default — fires only
+    /// when the operator has not set `LESS` themselves; a set `LESS` (even to
+    /// an empty string) is left alone.
+    #[test]
+    fn pager_less_default_only_when_less_is_unset() {
+        // SAFETY: this test owns `LESS` for its duration — set/read/restored
+        // single-threaded within this one test body — and no other test in
+        // this crate touches the variable (distinct from `PAGER`, which
+        // `pager_command_honors_pager_env_or_falls_back_to_less` owns).
+        let saved = std::env::var("LESS").ok();
+        unsafe {
+            std::env::remove_var("LESS");
+        }
+        assert_eq!(pager_less_default(), Some("FRX"));
+
+        unsafe {
+            std::env::set_var("LESS", "-X");
+        }
+        assert_eq!(pager_less_default(), None);
+
+        unsafe {
+            match &saved {
+                Some(v) => std::env::set_var("LESS", v),
+                None => std::env::remove_var("LESS"),
             }
         }
     }
