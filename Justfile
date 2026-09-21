@@ -8,3 +8,13 @@ test:
 
 run *ARGS:
     cargo run -p net-observerd -- {{ARGS}}
+
+# The WHOLE local gate as one call — never assemble the steps by hand: a
+# hand-built chain silently drops a step and still ends green. Run inside
+# `nix develop` (the bar only compiles there; on a Linux box the darwin-only
+# halves stay CI's claim — use the per-crate carriers from AGENTS.md, Reality).
+gate:
+    cargo fmt --all -- --check
+    cargo build --all
+    cargo test --all
+    cargo clippy --all --all-targets --all-features -- -D warnings
