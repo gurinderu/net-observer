@@ -1031,14 +1031,18 @@ pub fn compose_scan_report(
     // Attribute each open port to the neighbour that owns its address; a port
     // on an address no neighbour claims is dropped — the row is keyed by MAC
     // (`neighbor_port`'s PRIMARY KEY), and inventing one would be the
-    // forbidden silent-wrong-data. The one exception is the explicit,
-    // single-address `--target` scan of a routed, off-subnet host: the
-    // kernel's ARP cache holds its GATEWAY's MAC, never its own, so `found`
-    // never claims it, yet the operator asked for exactly this address by
-    // name. For that case only, synthesize a self-describing identity —
-    // `mac = "ip:<addr>"`, never a fake MAC — so the finding still persists
-    // and its CVE hypotheses can surface (design decision + rejected
-    // alternatives: realm net-observer, node #157). A sweep's ownerless
+    // forbidden silent-wrong-data. The one exception: an explicit, single-
+    // address `--target` finding with no resolved ARP owner. The common case
+    // is a routed, off-subnet host — the kernel's ARP cache holds its
+    // GATEWAY's MAC, never its own, so `found` never claims it — but the same
+    // branch also covers an ON-subnet target whose ARP-provoking probe
+    // (`single_probe_blocking`) simply did not resolve (e.g. a firewall
+    // dropping the UDP probe while its TCP ports still answer). Either way,
+    // no MAC is known and the operator asked for exactly this address by
+    // name, so synthesize a self-describing identity — `mac = "ip:<addr>"`,
+    // never a fake MAC — so the finding still persists and its CVE
+    // hypotheses can surface (design decision + rejected alternatives: realm
+    // net-observer, node #157, "без ARP-владельца"). A sweep's ownerless
     // findings (`target` is `None`) still drop honestly, unchanged.
     let ports: Vec<store::NeighborPort> = port_scan
         .map(|ps| {
