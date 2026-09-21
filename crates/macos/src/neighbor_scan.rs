@@ -196,33 +196,69 @@ impl Ipv4Iface {
     }
 }
 
-/// Parse `ifconfig <iface>`'s `inet` line into address and netmask.
+/// Parse `ifconfig <iface>`'s `inet` line(s) into address and netmask.
 ///
 /// The netmask is printed in hex (`netmask 0xffffff00`), which is why this is
 /// parsed rather than assumed to be a /24 — a coworking network is as likely to
 /// hand out a /22.
+///
+/// An interface can carry more than one `inet` line, and the first is not
+/// necessarily the sweepable LAN subnet: every Mac here runs a dns-fallback
+/// shell daemon (realm net-observer, node #65) that pins a single-host `/32`
+/// alias, `192.0.2.53` (TEST-NET-1), onto the physical interface — and
+/// `ifconfig` lists that pin before the real address. A `/32` has no host
+/// range, so picking the first `inet` line dead-ended the sweep with "not a
+/// subnet" on every Mac carrying the pin (realm net-observer, node #159).
+/// This walks every `inet` line, skips addresses that can never be a
+/// sweepable LAN subnet, and prefers a private (RFC1918) address among what
+/// remains — falling back to the first non-skipped line for a LAN that
+/// genuinely isn't RFC1918.
 #[must_use]
 pub fn parse_ifconfig_inet(out: &str) -> Option<Ipv4Iface> {
+    let mut fallback: Option<Ipv4Iface> = None;
     for line in out.lines() {
         let mut fields = line.split_whitespace();
         if fields.next() != Some("inet") {
             continue;
         }
-        let addr: Ipv4Addr = fields.next()?.parse().ok()?;
+        let Some(addr) = fields.next().and_then(|f| f.parse::<Ipv4Addr>().ok()) else {
+            continue;
+        };
         // `netmask` follows, but not always immediately (some lines carry
         // `-->` for point-to-point links first).
         let mut mask = None;
         while let Some(f) = fields.next() {
             if f == "netmask" {
-                let raw = fields.next()?;
+                let Some(raw) = fields.next() else { break };
                 let hex = raw.strip_prefix("0x").unwrap_or(raw);
-                mask = Some(Ipv4Addr::from(u32::from_str_radix(hex, 16).ok()?));
+                mask = u32::from_str_radix(hex, 16).ok().map(Ipv4Addr::from);
                 break;
             }
         }
-        return Some(Ipv4Iface { addr, mask: mask? });
+        let Some(mask) = mask else { continue };
+
+        // Never a sweepable LAN subnet: a single-host /32 alias (the
+        // dns-pin, node #159), the dns-pin's own TEST-NET-1 block
+        // (`Ipv4Addr` has no is_ helper for it, hence the octet check),
+        // link-local, loopback, unspecified, multicast or broadcast.
+        if mask == Ipv4Addr::new(255, 255, 255, 255)
+            || matches!(addr.octets(), [192, 0, 2, _])
+            || addr.is_link_local()
+            || addr.is_loopback()
+            || addr.is_unspecified()
+            || addr.is_multicast()
+            || addr.is_broadcast()
+        {
+            continue;
+        }
+
+        let iface = Ipv4Iface { addr, mask };
+        if addr.is_private() {
+            return Some(iface);
+        }
+        fallback.get_or_insert(iface);
     }
-    None
+    fallback
 }
 
 /// Attach mDNS-discovered names to ARP-known devices by matching addresses.
@@ -1063,6 +1099,46 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     #[test]
     fn an_interface_without_an_inet_line_yields_none() {
         assert!(parse_ifconfig_inet("en5: flags=8822<BROADCAST> mtu 1500\n").is_none());
+    }
+
+    #[test]
+    fn skips_the_dns_pin_slash_32_alias_and_picks_the_real_lan_slash_24() {
+        // Real shape observed on the owner's Mac (realm net-observer, node
+        // #159): the dns-fallback daemon's TEST-NET-1 pin (node #65) is
+        // listed before the actual LAN address.
+        let out = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.0.2.53 netmask 0xffffffff broadcast 192.0.2.53
+\tinet 192.168.2.140 netmask 0xffffff00 broadcast 192.168.2.255";
+        let i = parse_ifconfig_inet(out).expect("parsed");
+        assert_eq!(i.addr, Ipv4Addr::new(192, 168, 2, 140));
+        assert_eq!(i.cidr(), "192.168.2.0/24");
+    }
+
+    #[test]
+    fn a_slash_32_only_interface_yields_none() {
+        let out = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.0.2.53 netmask 0xffffffff broadcast 192.0.2.53";
+        assert!(parse_ifconfig_inet(out).is_none());
+    }
+
+    #[test]
+    fn a_link_local_only_interface_yields_none() {
+        let out = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 169.254.12.34 netmask 0xffff0000 broadcast 169.254.255.255";
+        assert!(parse_ifconfig_inet(out).is_none());
+    }
+
+    #[test]
+    fn a_public_slash_24_with_no_private_alias_is_the_fallback() {
+        let out = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 203.0.113.7 netmask 0xffffff00 broadcast 203.0.113.255";
+        let i = parse_ifconfig_inet(out).expect("parsed");
+        assert_eq!(i.addr, Ipv4Addr::new(203, 0, 113, 7));
+        assert_eq!(i.cidr(), "203.0.113.0/24");
     }
 
     #[test]
