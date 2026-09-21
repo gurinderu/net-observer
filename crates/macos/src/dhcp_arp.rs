@@ -92,8 +92,7 @@ impl LinkFacts for SystemFacts {
         if let Some(iface) = &self.iface_override {
             return Some(iface.clone());
         }
-        let out = run("route", &["-n", "get", "default"]).await?;
-        parse_route_field(&out, "interface")
+        default_route_iface().await
     }
 
     async fn dhcp(&self) -> (Option<String>, Option<String>) {
@@ -218,6 +217,18 @@ fn parse_route_field(text: &str, field: &str) -> Option<String> {
     })
 }
 
+/// The interface the kernel's default route currently resolves to (`route -n
+/// get default`'s own `interface:` field) — a local RTM_GET lookup, no
+/// packet on the wire. The raw resolution [`LinkFacts::phys_iface`] falls
+/// back to without an operator override, and what the connections
+/// collector's own-listeners fact reuses for `direct_if` (realm
+/// net-observer, node #75): the machine's physical egress, the same
+/// interface a `direct`-typed sing-box outbound actually leaves through.
+pub(crate) async fn default_route_iface() -> Option<String> {
+    let out = run("route", &["-n", "get", "default"]).await?;
+    parse_route_field(&out, "interface")
+}
+
 /// From `ipconfig getpacket` output, find the first line whose key matches and
 /// return the first IPv4 literal on it (handles `key (ip): 1.2.3.4` and
 /// `key (ip_mult): {1.2.3.4, 5.6.7.8}` shapes).
@@ -238,7 +249,12 @@ fn first_ipv4(s: &str) -> Option<String> {
 /// are indented (`\tinet 172.19.0.1 --> ...`). The trailing space in the match
 /// keeps `172.19.0.1` from matching `172.19.0.10`, and a literal substring
 /// search (not a regex) keeps the dots from matching anything else.
-fn iface_with_inet(ifconfig_out: &str, addr: &str) -> Option<String> {
+///
+/// `pub(crate)` so the connections collector's own-listeners fact
+/// (`crate::clash::ConnectionSystemFacts::own_listeners`) can resolve
+/// `tun_if` the same way [`LinkFacts::singbox_tun_iface`] does, without
+/// duplicating the parsing.
+pub(crate) fn iface_with_inet(ifconfig_out: &str, addr: &str) -> Option<String> {
     let needle = format!("inet {addr} ");
     let mut current: Option<&str> = None;
     for line in ifconfig_out.lines() {

@@ -380,6 +380,7 @@ mod tests {
                     upload,
                     download,
                     scope: types::ConnectionScope::External,
+                    iface: None,
                 })
                 .collect(),
         }))

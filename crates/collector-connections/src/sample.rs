@@ -19,7 +19,9 @@ use crate::facts::OwnListeners;
 /// `listeners` — the one site that has the config facts — so every reader
 /// folds the same classification (realm net-observer, node #75). The scope
 /// is a function of `dst_ip`, which is already in the key, so it splits no
-/// key.
+/// key. `iface` is judged the same way, from `chain` and `listeners`
+/// ([`OwnListeners::iface_for_chain`]); `chain` is also already in the key,
+/// so `iface` is constant within a row and splits no key either.
 pub fn build_connections_sample(
     ts_us: i64,
     connections: Option<Vec<LiveConnection>>,
@@ -35,6 +37,7 @@ pub fn build_connections_sample(
     let mut rows: Vec<ConnectionRow> = Vec::new();
     for c in connections {
         let scope = listeners.classify(c.dst_ip.as_deref());
+        let iface = listeners.iface_for_chain(c.chain.as_deref());
         match rows.iter_mut().find(|r| same_key(r, &c, scope)) {
             Some(r) => {
                 r.count = r.count.saturating_add(1);
@@ -52,6 +55,7 @@ pub fn build_connections_sample(
                 upload: c.upload,
                 download: c.download,
                 scope,
+                iface,
             }),
         }
     }
@@ -82,6 +86,10 @@ mod tests {
         OwnListeners {
             tun_addr: Some("172.19.0.1".into()),
             dns_pin: Some("192.0.2.53".into()),
+            tun_if: Some("utun10".into()),
+            direct_if: Some("en0".into()),
+            direct_tags: vec!["direct-egress".into()],
+            block_tags: vec!["reject-ads".into()],
         }
     }
 
@@ -217,6 +225,31 @@ mod tests {
                 ConnectionScope::Lan,
                 ConnectionScope::External,
                 ConnectionScope::External,
+            ]
+        );
+    }
+
+    /// Every row carries the interface its chain actually left through —
+    /// tunneled by default, `direct_if` for a direct-tagged chain, `blocked`
+    /// for a block-tagged one — derived once at fold time (realm
+    /// net-observer, node #75).
+    #[test]
+    fn each_row_carries_the_iface_derived_from_its_chain() {
+        let mut direct = flow(Some("printer.local"), Some("192.168.1.20"), 631, 1);
+        direct.chain = Some("direct-egress".into());
+        let mut blocked = flow(Some("ads.example"), None, 443, 1);
+        blocked.chain = Some("reject-ads".into());
+        let s = fold(
+            42,
+            Some(vec![flow(Some("claude.ai"), None, 443, 1), direct, blocked]),
+        );
+        let ifaces: Vec<Option<String>> = s.rows.iter().map(|r| r.iface.clone()).collect();
+        assert_eq!(
+            ifaces,
+            vec![
+                Some("utun10".to_string()),
+                Some("en0".to_string()),
+                Some("blocked".to_string()),
             ]
         );
     }
