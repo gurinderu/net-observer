@@ -287,15 +287,60 @@ enum Command {
     /// The CVEs the record hypothesises for open ports, newest first.
     ///
     /// MAC, address, port, CVE id, confidence, whether it is known-exploited,
-    /// and CVSS. Each row is a HYPOTHESIS from matching a grabbed banner
-    /// against the local snapshot, never an asserted fact — weigh it by its
-    /// confidence and the KEV flag. Asks the running daemon first, reads the
-    /// DB file only when no daemon answers.
+    /// CVSS, and when this hypothesis was last (re)matched. Each row is a
+    /// HYPOTHESIS from matching a grabbed banner against the local snapshot,
+    /// never an asserted fact — weigh it by its confidence and the KEV flag.
+    /// Asks the running daemon first, reads the DB file only when no daemon
+    /// answers.
+    ///
+    /// `neighbor_vuln` is never pruned and is upserted, so without `--all`
+    /// this shows only the LAST cve scan's findings (the rows sharing the
+    /// newest `last_seen_us` — bumped only by an operator scan, never by
+    /// passive collection) rather than every hypothesis ever recorded across
+    /// every network this machine has scanned.
     Vulns {
         /// Restrict to one segment, by its gateway MAC. Omit for every segment
         /// this machine has recorded.
         #[arg(long)]
         network: Option<String>,
+        /// Show every recorded hypothesis, not just the most recent scan
+        /// (findings are never pruned, so this includes stale hosts/networks).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Scan one host for CVEs and show its hypotheses.
+    ///
+    /// A convenience over the two-step `scan-neighbors --target <ip> --ports
+    /// --banners --cve` then `vulns`: this runs the same targeted scan
+    /// (ports + banners + cve, against `ip` only) via the daemon's
+    /// `ScanNeighbors` control, then reads the record's vulns back through
+    /// the same query `vulns` uses and prints just this host's rows,
+    /// known-exploited (KEV) first, worst CVSS next. Nothing on the wire is
+    /// new — same control command, same diagnosis.
+    ///
+    /// Every row is a HYPOTHESIS from matching a grabbed banner against the
+    /// daemon's local CVE snapshot, never an asserted fact — see `vulns`.
+    /// When the daemon has no usable CVE snapshot the cve rung cannot run at
+    /// all, and that is reported as such, never as an empty "no
+    /// vulnerabilities" table.
+    ///
+    /// By default shows only what THIS scan actually wrote (rows at or after
+    /// the instant this run started, not merely the host's newest recorded
+    /// row — a re-scan that finds nothing new writes no row at all, so a max
+    /// could silently be a PREVIOUS scan's finding); a scan that wrote
+    /// nothing fresh but finds older rows says so rather than showing them
+    /// as current. `--all` shows this host's full recorded history instead,
+    /// stale rows included.
+    ///
+    /// Inherently a LIVE operation — it scans the running daemon and reads
+    /// the answer back from that same daemon, so a global `--db` (offline
+    /// file) is refused rather than silently reading an unrelated record.
+    CheckCve {
+        /// The host to scan.
+        ip: IpAddr,
+        /// Show this host's full recorded history, not just the scan just run.
+        #[arg(long)]
+        all: bool,
     },
     /// Switch-topology uplinks learned passively from LLDP/CDP, newest first.
     ///
@@ -745,6 +790,258 @@ fn fold_by_iface(table: &Table) -> Table {
     }
 }
 
+/// `vulns`/`check-cve`'s ip scoping: keep only the rows whose `ip` column
+/// equals `ip`, every original column intact (unlike [`focus_vulns_for_ip`],
+/// which also projects/sorts) — so [`keep_last_run`] can still read
+/// `last_seen_us` afterward. Client-side filter over the same [`vulns`][
+/// diagnosis::vulns_sql] table, like [`filter_by_iface`]. A table missing
+/// `ip` (an older daemon's shape) passes through unfiltered rather than
+/// matching nothing.
+fn filter_by_ip(table: &Table, ip: &IpAddr) -> Table {
+    let Some(ip_col) = table.columns.iter().position(|c| c == "ip") else {
+        return table.clone();
+    };
+    let ip = ip.to_string();
+    let rows = table
+        .rows
+        .iter()
+        .filter(|row| row.get(ip_col).map(String::as_str) == Some(ip.as_str()))
+        .cloned()
+        .collect();
+    Table {
+        columns: table.columns.clone(),
+        rows,
+    }
+}
+
+/// `vulns`'s default (no `--all`): keep only the rows of the LAST recorded
+/// scan — those sharing the MAXIMUM `last_seen_us` in `table`.
+/// `neighbor_vuln.last_seen_us` is bumped ONLY by an operator cve scan
+/// (passive collection never touches it, see AGENTS.md's SKIP rule), so the
+/// max is exactly the last scan's findings; the table itself is never pruned
+/// (`schema::PRUNABLE_TABLES`'s complement) and is upserted, so without this
+/// filter `vulns` accumulates every finding ever recorded, across every
+/// network the operator has ever scanned — including a coworking segment's
+/// stale rows. Scope `table` to one host first ([`filter_by_ip`]) to get
+/// that host's own last scan rather than the whole record's.
+///
+/// A table missing `last_seen_us`, or carrying no parseable value at all (an
+/// older daemon's shape, or an empty table), passes through unchanged rather
+/// than emptying silently.
+fn keep_last_run(table: &Table) -> Table {
+    let Some(ts_col) = table.columns.iter().position(|c| c == "last_seen_us") else {
+        return table.clone();
+    };
+    let ts = |row: &[String]| row.get(ts_col).and_then(|c| c.parse::<i64>().ok());
+    let Some(max_ts) = table.rows.iter().filter_map(|r| ts(r)).max() else {
+        return table.clone();
+    };
+    let rows = table
+        .rows
+        .iter()
+        .filter(|row| ts(row) == Some(max_ts))
+        .cloned()
+        .collect();
+    Table {
+        columns: table.columns.clone(),
+        rows,
+    }
+}
+
+/// The columns `check-cve` renders, in order — the [`vulns`][diagnosis::vulns_sql]
+/// columns minus `mac`/`ip`/`last_seen_us`, which are either constant for one
+/// host (shown once in the header instead) or already spent deciding the
+/// last-run scope by the time this projects the output shape.
+const FOCUSED_VULN_COLUMNS: [&str; 5] = ["port", "cve_id", "cvss", "confidence", "known_exploited"];
+
+/// `check-cve <ip>`: filter the full [`vulns`][diagnosis::vulns_sql] table to
+/// `ip`'s rows and sort them KEV first, then CVSS worst-first — the reading
+/// order for "what to triage now". Client-side, like [`filter_by_iface`]: the
+/// query stays the one `vulns` already runs (no IP-filtered SQL variant), and
+/// what the daemon calls "known exploited in the wild" outranks a raw
+/// severity number the same way it does for a human triaging the list by eye.
+///
+/// A table missing any column this needs — an older daemon's shape — returns
+/// the empty focused table rather than guessing at positions.
+fn focus_vulns_for_ip(table: &Table, ip: &IpAddr) -> Table {
+    let empty = Table {
+        columns: FOCUSED_VULN_COLUMNS.iter().map(|s| s.to_string()).collect(),
+        rows: Vec::new(),
+    };
+    let col = |name: &str| table.columns.iter().position(|c| c == name);
+    let (
+        Some(ip_col),
+        Some(port_col),
+        Some(cve_col),
+        Some(conf_col),
+        Some(kev_col),
+        Some(cvss_col),
+    ) = (
+        col("ip"),
+        col("port"),
+        col("cve_id"),
+        col("confidence"),
+        col("known_exploited"),
+        col("cvss"),
+    )
+    else {
+        return empty;
+    };
+    let ip = ip.to_string();
+    let cell = |row: &[String], i: usize| -> String { row.get(i).cloned().unwrap_or_default() };
+    let mut rows: Vec<Vec<String>> = table
+        .rows
+        .iter()
+        .filter(|row| cell(row, ip_col) == ip)
+        .map(|row| {
+            vec![
+                cell(row, port_col),
+                cell(row, cve_col),
+                cell(row, cvss_col),
+                cell(row, conf_col),
+                cell(row, kev_col),
+            ]
+        })
+        .collect();
+    // KEV (`known_exploited = true`) first, then CVSS worst (highest) first.
+    // A blank/unparsed cvss sorts last, never first — an unweighed hypothesis
+    // is not "more severe" than one the record actually scored.
+    rows.sort_by(|a, b| {
+        let kev = |r: &[String]| r[4] == "true";
+        let cvss = |r: &[String]| r[2].parse::<f64>().unwrap_or(f64::NEG_INFINITY);
+        kev(b).cmp(&kev(a)).then_with(|| {
+            cvss(b)
+                .partial_cmp(&cvss(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    Table {
+        columns: FOCUSED_VULN_COLUMNS.iter().map(|s| s.to_string()).collect(),
+        rows,
+    }
+}
+
+/// Which of `check-cve`'s four honest outcomes to print, decided from how
+/// many rows are about to be shown, whether the host has ANY recorded
+/// history at all, and whether the cve rung actually ran (see
+/// [`cve_rung_unavailable`]) — never from the shown row count alone: a
+/// snapshot that could not run, a fresh scan that found nothing (but the
+/// host has older findings), and a fresh scan that found nothing ever all
+/// render as zero shown rows, and only the other two inputs tell them
+/// apart. Pure over its three inputs so it is unit-tested directly.
+///
+/// `has_history` only ever contradicts a positive `shown_count` when the
+/// caller is showing a FRESHNESS-filtered subset (`check-cve`'s default) —
+/// `--all` shows the host's full history verbatim, so there `shown_count`
+/// and "has history" agree by construction and
+/// [`NoFreshButHasHistory`][CheckCveOutcome::NoFreshButHasHistory] cannot
+/// arise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckCveOutcome {
+    /// Findings to show — this scan's fresh rows (default), or the host's
+    /// full history (`--all`).
+    Findings,
+    /// Nothing to show for THIS scan, but the host has older recorded rows
+    /// — showing them here would present stale data as current (the bug
+    /// this exists to prevent). `--all` shows that history instead.
+    NoFreshButHasHistory,
+    /// Nothing to show and no history either. FAIL-SAFE, not a confident
+    /// "no vulnerabilities": `cve_ran` comes from a string match on the
+    /// daemon's free-text message ([`cve_rung_unavailable`]), which can
+    /// drift and miss a real drop — so this is never rendered as a clean
+    /// all-clear on its own; the caller shows the daemon's own message
+    /// verbatim alongside it.
+    NoFindings,
+    /// The cve rung could not run at all (the message positively matched a
+    /// known drop/unusable wording): an empty result here is NOT "no
+    /// vulnerabilities".
+    SnapshotUnavailable,
+}
+
+fn check_cve_outcome(shown_count: usize, has_history: bool, cve_ran: bool) -> CheckCveOutcome {
+    if !cve_ran {
+        CheckCveOutcome::SnapshotUnavailable
+    } else if shown_count > 0 {
+        CheckCveOutcome::Findings
+    } else if has_history {
+        CheckCveOutcome::NoFreshButHasHistory
+    } else {
+        CheckCveOutcome::NoFindings
+    }
+}
+
+/// Whether `scan-neighbors`'s [`ControlResult::message`] says the cve rung
+/// could not run — either dropped before it ran (no snapshot directory
+/// configured) or attempted and found the configured one unusable (missing,
+/// unreadable, empty/wrong layout). Matches the honest-note wording
+/// `net-observerd` actually emits for both cases (`bin/net-observerd/src/
+/// main.rs::load_and_classify`, `bin/net-observerd/src/api.rs::scan_now`)
+/// rather than a wire flag — there is none, by design (CLI-only feature, no
+/// wire change).
+///
+/// This is a STRING MATCH on free text the daemon did not design as an API,
+/// and can miss a future rewording — an accepted fragility, degraded
+/// honestly: [`check_cve_outcome`]'s [`CheckCveOutcome::NoFindings`] never
+/// treats a `false` from here as positive proof the rung ran cleanly; it
+/// shows the daemon's raw message alongside it, rather than a confident "no
+/// vulnerabilities".
+fn cve_rung_unavailable(message: &str) -> bool {
+    let m = message.to_lowercase();
+    (m.contains("snapshot")
+        && (m.contains("not") || m.contains("without") || m.contains("unusable")))
+        || m.contains("dropped: cve")
+}
+
+/// `check-cve`'s freshness filter for its default view: keep only rows
+/// whose `last_seen_us` is at or after `threshold_us`.
+///
+/// `neighbor_vuln` is upserted ONLY on a match — a clean re-scan that finds
+/// nothing new for a host (patched, port closed) writes NO row at all,
+/// there is no "clean" marker — so [`keep_last_run`]'s table-wide (or
+/// per-ip) MAXIMUM can still be a row a PREVIOUS scan wrote, and presenting
+/// it as this scan's own finding is silent wrong data: "patch SSH,
+/// re-scan, still see the old CVE." Comparing against the instant THIS
+/// scan started answers "did this run write it", which a max cannot once
+/// nothing new was written.
+///
+/// ASSUMPTION, worth stating because it is load-bearing: the CLI and the
+/// daemon run on the SAME machine (AGENTS.md), so `threshold_us` — taken
+/// from this process's own clock just before the scan request — is
+/// comparable to `last_seen_us` values that machine's daemon wrote.
+///
+/// A table missing `last_seen_us` (an older daemon's shape) passes through
+/// unchanged, like [`keep_last_run`].
+fn keep_since(table: &Table, threshold_us: i64) -> Table {
+    let Some(ts_col) = table.columns.iter().position(|c| c == "last_seen_us") else {
+        return table.clone();
+    };
+    let rows = table
+        .rows
+        .iter()
+        .filter(|row| {
+            row.get(ts_col)
+                .and_then(|c| c.parse::<i64>().ok())
+                .is_some_and(|ts| ts >= threshold_us)
+        })
+        .cloned()
+        .collect();
+    Table {
+        columns: table.columns.clone(),
+        rows,
+    }
+}
+
+/// The local time of `table`'s newest `last_seen_us` — for
+/// [`CheckCveOutcome::NoFreshButHasHistory`]'s message, naming when the
+/// stale finding it is refusing to show was actually last matched. `None`
+/// for an empty table or one missing the column.
+fn newest_last_seen_local(table: &Table) -> Option<String> {
+    let newest = keep_last_run(table);
+    let ts_col = newest.columns.iter().position(|c| c == "last_seen_us")?;
+    let us: i64 = newest.rows.first()?.get(ts_col)?.parse().ok()?;
+    Some(opened_local(us))
+}
+
 /// The tier accepted by the `probe` subcommand. A thin CLI mirror of
 /// [`ProbingTier`] so `clap` renders `<passive|active>` in the help without
 /// leaking the wire type into the argument surface.
@@ -967,7 +1264,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             )?;
             print_paged(&format_table(&table, true), cli.no_pager);
         }
-        Command::Vulns { network } => {
+        Command::Vulns { network, all } => {
             let sql = diagnosis::vulns_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
             let table = diagnose_table(
                 cli,
@@ -976,7 +1273,94 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
+            // Filter BEFORE rendering: `format_table`'s readable-time funnel
+            // converts `last_seen_us` in place, and `keep_last_run` needs the
+            // raw epoch value to find the maximum.
+            let table = if *all { table } else { keep_last_run(&table) };
             print_paged(&format_table(&table, true), cli.no_pager);
+        }
+        Command::CheckCve { ip, all } => {
+            // check-cve is inherently a LIVE operation: it just told the
+            // running daemon to scan `ip`, so the readback must come from
+            // that SAME daemon's record. `--db` names an unrelated offline
+            // file — honoring it here would silently report a different
+            // record's (possibly stale, possibly unrelated) history as if
+            // it were this scan's own findings.
+            if cli.db.is_some() {
+                return Err(anyhow!(
+                    "check-cve scans the running daemon and reads back from it; \
+                     --db (offline file) is not compatible"
+                ));
+            }
+            let cfg = load_config(cli)?;
+            // Captured BEFORE the scan request: see `keep_since`'s doc for
+            // why a timestamp, not a max, is what makes the default view
+            // honest.
+            let scan_start_us = types::now_us();
+            let scan = fetch_scan_neighbors(
+                &cfg.socket_path,
+                ScanOptions {
+                    ports: true,
+                    banners: true,
+                    cve: true,
+                    target: Some(*ip),
+                    slow: false,
+                    sweep_max: None,
+                },
+            )?;
+            if !scan.ok {
+                eprintln!("scan of {ip} failed: {}", scan.message);
+                return Ok(ExitCode::FAILURE);
+            }
+            let sql = diagnosis::vulns_sql(None).map_err(|e| anyhow!("{e}"))?;
+            let table = diagnose_table(cli, DiagnosticQuery::Vulns { network: None }, |off| {
+                run_query(off, &sql)
+            })?;
+            // This host's rows across ALL of its recorded scans, every
+            // column intact — the base both the shown table and
+            // `has_history` are read from below.
+            let ip_rows = filter_by_ip(&table, ip);
+            let has_history = !ip_rows.rows.is_empty();
+            // `--all`: the full history. Default: only what THIS scan
+            // actually wrote — `>= scan_start_us`, never `keep_last_run`'s
+            // table-wide max, which a clean re-scan (nothing new to write)
+            // would silently satisfy with a PREVIOUS scan's row.
+            let shown = if *all {
+                ip_rows.clone()
+            } else {
+                keep_since(&ip_rows, scan_start_us)
+            };
+            let focused = focus_vulns_for_ip(&shown, ip);
+            let cve_ran = !cve_rung_unavailable(&scan.message);
+            eprintln!("CVE hypotheses for {ip}");
+            eprintln!("scanned: {}", scan.message);
+            match check_cve_outcome(focused.rows.len(), has_history, cve_ran) {
+                CheckCveOutcome::SnapshotUnavailable => eprintln!(
+                    "CVE snapshot not available on the daemon — matches were NOT checked \
+                     (not a clean \"no vulnerabilities\")"
+                ),
+                CheckCveOutcome::NoFreshButHasHistory => {
+                    let newest = newest_last_seen_local(&ip_rows)
+                        .unwrap_or_else(|| "an unknown time".to_string());
+                    eprintln!(
+                        "no CVE hypotheses from this scan of {ip} — the record has older \
+                         findings (most recent {newest}); see --all"
+                    );
+                }
+                CheckCveOutcome::NoFindings => eprintln!(
+                    "no CVE hypotheses matched for {ip}. daemon: \"{}\"",
+                    scan.message
+                ),
+                CheckCveOutcome::Findings => {
+                    print_paged(&format_table(&focused, true), cli.no_pager);
+                    eprintln!(
+                        "These are hypotheses matched from the service banner. A backported \
+                         patch can leave a version that looks in-range not actually \
+                         vulnerable; known_exploited=true (KEV) is the CISA \"exploited in \
+                         the wild\" flag — triage those first."
+                    );
+                }
+            }
         }
         Command::Topology { iface } => {
             let sql = diagnosis::topology_sql(iface.as_deref()).map_err(|e| anyhow!("{e}"))?;
@@ -3032,6 +3416,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn check_cve_parses_the_target_ip() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "check-cve", "10.0.0.5"]).unwrap();
+        match cli.command {
+            Command::CheckCve { ip, all } => {
+                assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+                assert!(!all);
+            }
+            _ => panic!("did not parse as `check-cve`"),
+        }
+    }
+
+    #[test]
+    fn check_cve_parses_all() {
+        let cli =
+            Cli::try_parse_from(["net-observer-cli", "check-cve", "10.0.0.5", "--all"]).unwrap();
+        match cli.command {
+            Command::CheckCve { all, .. } => assert!(all),
+            _ => panic!("did not parse as `check-cve`"),
+        }
+    }
+
+    #[test]
+    fn vulns_parses_all() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "vulns"]).unwrap();
+        match cli.command {
+            Command::Vulns { all, .. } => assert!(!all),
+            _ => panic!("did not parse as `vulns`"),
+        }
+        let cli = Cli::try_parse_from(["net-observer-cli", "vulns", "--all"]).unwrap();
+        match cli.command {
+            Command::Vulns { all, .. } => assert!(all),
+            _ => panic!("did not parse as `vulns`"),
+        }
+    }
+
+    #[test]
+    fn check_cve_rejects_a_bad_ip() {
+        assert!(Cli::try_parse_from(["net-observer-cli", "check-cve", "not-an-ip"]).is_err());
+    }
+
     /// An explicit `--db` means the operator named the record: the socket is
     /// NOT asked — a daemon answering over a file the operator pointed at
     /// would be an answer from the wrong record, silently.
@@ -3439,6 +3864,335 @@ mod tests {
             out,
             "failed: control refused: peer credentials unavailable\n"
         );
+    }
+
+    /// The [`focus_vulns_for_ip`] fixture: `mac, ip, port, cve_id, confidence,
+    /// known_exploited, cvss` — exactly [`diagnosis::vulns_sql`]'s column
+    /// order, so a positional slip in the helper would be caught here too.
+    fn vulns_table(rows: Vec<[&str; 7]>) -> Table {
+        Table {
+            columns: [
+                "mac",
+                "ip",
+                "port",
+                "cve_id",
+                "confidence",
+                "known_exploited",
+                "cvss",
+            ]
+            .map(String::from)
+            .to_vec(),
+            rows: rows
+                .into_iter()
+                .map(|r| r.map(String::from).to_vec())
+                .collect(),
+        }
+    }
+
+    /// Like [`vulns_table`], plus `last_seen_us` — every column
+    /// [`focus_vulns_for_ip`] AND the freshness/last-run filters need, for a
+    /// test that runs a row through both.
+    fn vulns_table_full(rows: Vec<[&str; 8]>) -> Table {
+        Table {
+            columns: [
+                "mac",
+                "ip",
+                "port",
+                "cve_id",
+                "confidence",
+                "known_exploited",
+                "cvss",
+                "last_seen_us",
+            ]
+            .map(String::from)
+            .to_vec(),
+            rows: rows
+                .into_iter()
+                .map(|r| r.map(String::from).to_vec())
+                .collect(),
+        }
+    }
+
+    /// Two hosts' worth of rows, mixed KEV/non-KEV and CVSS, to prove
+    /// [`focus_vulns_for_ip`] both filters to the one address and sorts KEV
+    /// first, worst CVSS next within each KEV group — and drops `mac`/`ip`.
+    #[test]
+    fn focus_vulns_for_ip_filters_and_sorts_kev_then_cvss() {
+        let t = vulns_table(vec![
+            ["aa:1", "10.0.0.5", "22", "CVE-A", "high", "false", "5.5"],
+            ["aa:1", "10.0.0.5", "443", "CVE-B", "high", "true", "7.5"],
+            ["aa:1", "10.0.0.5", "80", "CVE-C", "medium", "false", "9.1"],
+            ["aa:1", "10.0.0.5", "8080", "CVE-D", "low", "true", "9.8"],
+            // A different host — must not appear in the focused table.
+            ["bb:2", "10.0.0.9", "22", "CVE-E", "high", "true", "9.9"],
+        ]);
+        let ip = "10.0.0.5".parse().unwrap();
+        let focused = focus_vulns_for_ip(&t, &ip);
+
+        assert_eq!(
+            focused.columns,
+            ["port", "cve_id", "cvss", "confidence", "known_exploited"]
+        );
+        let ids: Vec<&str> = focused.rows.iter().map(|r| r[1].as_str()).collect();
+        // KEV (D, B) before non-KEV (C, A); worst CVSS first within each group.
+        assert_eq!(ids, ["CVE-D", "CVE-B", "CVE-C", "CVE-A"]);
+        assert!(focused.rows.iter().all(|r| r.len() == 5));
+    }
+
+    /// A blank `cvss` cell (no CVSS in the record) sorts LAST, not first — an
+    /// unscored hypothesis must never outrank a scored one.
+    #[test]
+    fn focus_vulns_for_ip_sorts_blank_cvss_last() {
+        let t = vulns_table(vec![
+            ["aa:1", "10.0.0.5", "22", "CVE-A", "low", "false", ""],
+            ["aa:1", "10.0.0.5", "23", "CVE-B", "low", "false", "3.1"],
+        ]);
+        let ip = "10.0.0.5".parse().unwrap();
+        let focused = focus_vulns_for_ip(&t, &ip);
+        let ids: Vec<&str> = focused.rows.iter().map(|r| r[1].as_str()).collect();
+        assert_eq!(ids, ["CVE-B", "CVE-A"]);
+    }
+
+    /// A table missing a column `check-cve` needs (an older daemon's shape)
+    /// returns the empty focused table rather than panicking on an index.
+    #[test]
+    fn focus_vulns_for_ip_on_a_table_missing_columns_is_empty_not_a_panic() {
+        let t = Table {
+            columns: vec!["mac".into(), "ip".into()],
+            rows: vec![vec!["aa:1".into(), "10.0.0.5".into()]],
+        };
+        let ip = "10.0.0.5".parse().unwrap();
+        let focused = focus_vulns_for_ip(&t, &ip);
+        assert!(focused.rows.is_empty());
+        assert_eq!(
+            focused.columns,
+            ["port", "cve_id", "cvss", "confidence", "known_exploited"]
+        );
+    }
+
+    /// A fixture with a `last_seen_us` column, for [`keep_last_run`] and
+    /// [`filter_by_ip`].
+    fn vulns_table_with_last_seen(rows: Vec<[&str; 4]>) -> Table {
+        Table {
+            columns: ["ip", "cve_id", "cvss", "last_seen_us"]
+                .map(String::from)
+                .to_vec(),
+            rows: rows
+                .into_iter()
+                .map(|r| r.map(String::from).to_vec())
+                .collect(),
+        }
+    }
+
+    /// `vulns`' default: rows at two different `last_seen_us` values keep
+    /// only the newest scan's rows; `--all` is simply skipping this filter,
+    /// so the untouched table already proves the other half.
+    #[test]
+    fn keep_last_run_keeps_only_the_max_timestamp_rows() {
+        let t = vulns_table_with_last_seen(vec![
+            ["10.0.0.5", "CVE-OLD", "5.0", "1000"],
+            ["10.0.0.5", "CVE-NEW-1", "6.0", "2000"],
+            ["10.0.0.9", "CVE-NEW-2", "7.0", "2000"],
+        ]);
+        let last_run = keep_last_run(&t);
+        let ids: Vec<&str> = last_run.rows.iter().map(|r| r[1].as_str()).collect();
+        assert_eq!(ids, ["CVE-NEW-1", "CVE-NEW-2"]);
+        // `--all` keeps everything — proven by simply not calling the filter.
+        assert_eq!(t.rows.len(), 3);
+    }
+
+    /// A table missing `last_seen_us` (an older daemon's shape) passes
+    /// through unchanged rather than emptying every `vulns` row.
+    #[test]
+    fn keep_last_run_passes_through_a_table_missing_the_column() {
+        let t = Table {
+            columns: vec!["cve_id".into()],
+            rows: vec![vec!["CVE-A".into()]],
+        };
+        assert_eq!(keep_last_run(&t), t);
+    }
+
+    /// The order `check-cve`'s default actually uses: scope to the host
+    /// FIRST, then to the max `last_seen_us` AMONG that host's own rows — a
+    /// different host scanned more recently (`10.0.0.9` at `3000`) must
+    /// neither leak into the result nor suppress `10.0.0.5`'s own latest
+    /// scan (`2000`), which the table's GLOBAL maximum would get wrong.
+    #[test]
+    fn filter_by_ip_then_keep_last_run_gives_this_scan_only() {
+        let t = vulns_table_with_last_seen(vec![
+            ["10.0.0.5", "CVE-OLD-SCAN", "5.0", "1000"],
+            ["10.0.0.5", "CVE-NEW-SCAN", "6.0", "2000"],
+            ["10.0.0.9", "CVE-OTHER-HOST", "9.0", "3000"],
+        ]);
+        let ip = "10.0.0.5".parse().unwrap();
+        let scoped = keep_last_run(&filter_by_ip(&t, &ip));
+        let ids: Vec<&str> = scoped.rows.iter().map(|r| r[1].as_str()).collect();
+        assert_eq!(ids, ["CVE-NEW-SCAN"]);
+    }
+
+    /// `filter_by_ip` alone: a table missing `ip` passes through unfiltered,
+    /// like [`filter_by_iface`]'s equivalent case.
+    #[test]
+    fn filter_by_ip_passes_through_a_table_missing_the_column() {
+        let t = Table {
+            columns: vec!["cve_id".into()],
+            rows: vec![vec!["CVE-A".into()]],
+        };
+        let ip = "10.0.0.5".parse().unwrap();
+        assert_eq!(filter_by_ip(&t, &ip), t);
+    }
+
+    /// `keep_since` keeps a row exactly AT the threshold (this scan's own
+    /// write can land at the same microsecond the clock was read at, given
+    /// how fast the comparison is taken) and drops everything strictly
+    /// before it.
+    #[test]
+    fn keep_since_keeps_rows_at_or_after_the_threshold() {
+        let t = vulns_table_with_last_seen(vec![
+            ["10.0.0.5", "CVE-OLD", "5.0", "1000"],
+            ["10.0.0.5", "CVE-AT-THRESHOLD", "6.0", "5000"],
+            ["10.0.0.5", "CVE-AFTER", "7.0", "6000"],
+        ]);
+        let fresh = keep_since(&t, 5000);
+        let ids: Vec<&str> = fresh.rows.iter().map(|r| r[1].as_str()).collect();
+        assert_eq!(ids, ["CVE-AT-THRESHOLD", "CVE-AFTER"]);
+        assert!(keep_since(&t, 6001).rows.is_empty());
+    }
+
+    /// A table missing `last_seen_us` (an older daemon's shape) passes
+    /// through unchanged rather than emptying every row.
+    #[test]
+    fn keep_since_passes_through_a_table_missing_the_column() {
+        let t = Table {
+            columns: vec!["cve_id".into()],
+            rows: vec![vec!["CVE-A".into()]],
+        };
+        assert_eq!(keep_since(&t, 1000), t);
+    }
+
+    #[test]
+    fn newest_last_seen_local_reads_the_tables_max_timestamp() {
+        let t = vulns_table_with_last_seen(vec![
+            ["10.0.0.5", "CVE-OLD", "5.0", "1000"],
+            ["10.0.0.5", "CVE-NEW", "6.0", "5000"],
+        ]);
+        assert_eq!(newest_last_seen_local(&t), Some(opened_local(5000)));
+        assert_eq!(newest_last_seen_local(&Table::default()), None);
+    }
+
+    /// The regression case fix #1 exists for: a re-scan that finds nothing
+    /// NEW for the host (patched, port closed — `neighbor_vuln` is upserted
+    /// only on a match, so a clean re-scan writes no row at all) must not
+    /// fall back to a PREVIOUS scan's row and present it as this scan's own
+    /// finding. `check-cve`'s default composes `filter_by_ip` then
+    /// `keep_since(scan_start_us)`, exactly as the `CheckCve` arm does —
+    /// proving the shown table is empty (never the stale row) and that
+    /// `check_cve_outcome` reports the honest `NoFreshButHasHistory`, not a
+    /// silent "no vulnerabilities".
+    #[test]
+    fn check_cve_default_reports_stale_history_instead_of_showing_it() {
+        let t = vulns_table_full(vec![[
+            "aa:bb:cc:dd:ee:01",
+            "10.0.0.5",
+            "22",
+            "CVE-OLD",
+            "high",
+            "false",
+            "5.0",
+            "1000",
+        ]]);
+        let ip = "10.0.0.5".parse().unwrap();
+        // The scan started strictly after the only recorded row was written
+        // — exactly what "found nothing new" looks like from the CLI side.
+        let scan_start_us = 5000;
+
+        let ip_rows = filter_by_ip(&t, &ip);
+        let has_history = !ip_rows.rows.is_empty();
+        let fresh = keep_since(&ip_rows, scan_start_us);
+        let focused = focus_vulns_for_ip(&fresh, &ip);
+
+        assert!(
+            focused.rows.is_empty(),
+            "the stale row must never be shown as this scan's finding: {focused:?}"
+        );
+        assert!(has_history, "the host does have an older recorded row");
+        assert_eq!(
+            check_cve_outcome(focused.rows.len(), has_history, true),
+            CheckCveOutcome::NoFreshButHasHistory
+        );
+    }
+
+    /// `check-cve` is a live operation — it just scanned the running daemon
+    /// — so a global `--db` naming an unrelated offline file is refused
+    /// before any socket or file is touched, rather than silently reading
+    /// that file's history back as if it were this scan's.
+    #[test]
+    fn check_cve_refuses_an_explicit_db() {
+        let cli = Cli::try_parse_from([
+            "net-observer-cli",
+            "--db",
+            "/tmp/some-other-record.duckdb",
+            "check-cve",
+            "10.0.0.5",
+        ])
+        .unwrap();
+        let err = run(&cli).unwrap_err().to_string();
+        assert!(err.contains("--db"), "{err}");
+        assert!(err.contains("not compatible"), "{err}");
+    }
+
+    #[test]
+    fn check_cve_outcome_picks_the_right_branch() {
+        // The cve rung not running outranks everything else, whatever the
+        // shown count or history say.
+        assert_eq!(
+            check_cve_outcome(0, false, false),
+            CheckCveOutcome::SnapshotUnavailable
+        );
+        assert_eq!(
+            check_cve_outcome(3, true, false),
+            CheckCveOutcome::SnapshotUnavailable
+        );
+        // Nothing shown, but the host has older rows: the honest "stale, not
+        // current" message — never the rows themselves.
+        assert_eq!(
+            check_cve_outcome(0, true, true),
+            CheckCveOutcome::NoFreshButHasHistory
+        );
+        // Nothing shown and no history at all: the fail-safe fallback, never
+        // a confident "no vulnerabilities" on its own.
+        assert_eq!(
+            check_cve_outcome(0, false, true),
+            CheckCveOutcome::NoFindings
+        );
+        assert_eq!(check_cve_outcome(1, true, true), CheckCveOutcome::Findings);
+        assert_eq!(check_cve_outcome(5, false, true), CheckCveOutcome::Findings);
+    }
+
+    /// The three honest-note wordings `net-observerd` actually emits for "the
+    /// cve rung could not run" (`load_and_classify`'s three `Unusable`
+    /// reasons, and `scan_now`'s pre-run drop) all read as unavailable; an
+    /// ordinary scan summary with no mention of a snapshot problem does not.
+    #[test]
+    fn cve_rung_unavailable_matches_the_daemons_own_wordings() {
+        for msg in [
+            "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 3 open ports, \
+             2 banners [cve: cve rung ran without a snapshot directory]",
+            "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 3 open ports, \
+             2 banners [cve: snapshot at /var/lib/observer/cve failed to load: I/O error; \
+             findings NOT checked]",
+            "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 3 open ports, \
+             2 banners [cve: snapshot at /var/lib/observer/cve is empty or wrong layout; \
+             findings NOT checked (not a clean 'no vulnerabilities')]",
+            "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 3 open ports, \
+             2 banners [dropped: cve (no CVE snapshot; set \
+             collectors.neighbors.cve_snapshot_dir to a provisioned directory)]",
+        ] {
+            assert!(cve_rung_unavailable(msg), "{msg}");
+        }
+        let clean = "swept 192.168.1.0/24 (12/12 probed): 3 neighbours, 1 named; 3 open \
+                      ports, 2 banners";
+        assert!(!cve_rung_unavailable(clean), "{clean}");
     }
 
     #[test]

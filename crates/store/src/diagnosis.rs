@@ -911,6 +911,15 @@ ORDER BY last_seen_us DESC, mac"
 /// (low|medium|high) and `known_exploited` say how much to weigh it, `cvss` the
 /// severity when the record carried one.
 ///
+/// Carries `last_seen_us` (bumped ONLY by an operator cve scan; passive
+/// collection never touches `neighbor_vuln`) so a reader can tell the last
+/// scan's findings apart from the accumulated history: the table is never
+/// pruned and is upserted, so without this column a caller has no way to
+/// isolate "what the most recent scan found" from every finding ever
+/// recorded, across every network ever scanned. `net-observer-cli`'s `vulns
+/// --all` / `check-cve` filter on it client-side; this SQL itself still
+/// returns the full history, unfiltered, exactly as before.
+///
 /// Returns `Err` for a key that cannot exist rather than a query that matches
 /// nothing, exactly like [`neighbors_sql`].
 pub fn vulns_sql(network: Option<&str>) -> Result<String, BadNetworkKey> {
@@ -923,7 +932,7 @@ pub fn vulns_sql(network: Option<&str>) -> Result<String, BadNetworkKey> {
     };
     Ok(format!(
         "SELECT v.mac, p.ip, v.port, v.cve_id, v.confidence, v.known_exploited,
-       ROUND(v.cvss, 1) AS cvss
+       ROUND(v.cvss, 1) AS cvss, v.last_seen_us
 FROM neighbor_vuln v
 LEFT JOIN neighbor_port p
   ON v.network_key = p.network_key AND v.mac = p.mac AND v.port = p.port
@@ -1428,6 +1437,35 @@ mod tests {
             "",
             "a NULL cvss must render blank, not 0.0"
         );
+    }
+
+    /// `last_seen_us` rides alongside the other columns so a caller (the CLI's
+    /// `vulns --all` / `check-cve` last-run filter) can tell the most recent
+    /// scan's findings apart from the accumulated history without a second
+    /// query — `neighbor_vuln` is never pruned and is upserted, so the table
+    /// otherwise carries every finding ever recorded.
+    #[test]
+    fn vulns_sql_carries_last_seen_us_for_the_last_run_filter() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_neighbor_vuln(&NeighborVuln {
+            network_key: Some("aa:bb:cc:dd:ee:ff".into()),
+            mac: "11:22:33:44:55:66".into(),
+            port: 22,
+            cve_id: "CVE-2016-6210".into(),
+            confidence: "high".into(),
+            known_exploited: false,
+            cvss: None,
+            ts_us: 12_345,
+        })
+        .unwrap();
+
+        let t = s.query_table(&vulns_sql(None).unwrap()).unwrap();
+        assert!(
+            t.columns.iter().any(|c| c == "last_seen_us"),
+            "{:?}",
+            t.columns
+        );
+        assert_eq!(cell(&t, 0, "last_seen_us"), "12345");
     }
 
     /// The topology reader validates its interface filter the same way, and
