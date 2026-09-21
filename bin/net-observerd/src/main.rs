@@ -4355,4 +4355,161 @@ mod tests {
             "a successful load must set the cache even with nothing to match"
         );
     }
+
+    /// The load-once cache, proven for `cve_lookup` (`check-cve --product`)
+    /// instead of `cve_rung`: two lookups against a GOOD snapshot must reuse
+    /// the SAME loaded index — pointer identity on the cached `Arc<VulnDb>`
+    /// can only match if the second call read the `OnceLock` instead of
+    /// calling `VulnDb::load_from_dir` again. This is the test the "no
+    /// 395k-file reload per lookup" claim on `cve_lookup`'s doc actually
+    /// rests on; without it, a future edit could reintroduce a per-lookup
+    /// reload with nothing here to catch it.
+    #[test]
+    fn cve_lookup_loads_once_and_is_cached_across_lookups() {
+        let dir = write_cve_fixture_snapshot();
+        let scanner =
+            SystemScanner::new(SystemFacts::new(None, None), Some(dir.path().into()), None);
+
+        assert!(
+            scanner.cve_cache.get().is_none(),
+            "the cache must be empty before the first lookup"
+        );
+
+        let first_len = match scanner.cve_lookup("openssh", Some("7.3")) {
+            CveLookupOutcome::Matches(m) => m.len(),
+            CveLookupOutcome::SnapshotUnavailable(note) => {
+                panic!("fixture snapshot must load: {note}")
+            }
+        };
+        assert_eq!(first_len, 1, "7.3 falls inside the fixture's <7.4 range");
+
+        let first_ptr = Arc::as_ptr(
+            scanner
+                .cve_cache
+                .get()
+                .expect("a successful load must populate the cache"),
+        );
+
+        let second_len = match scanner.cve_lookup("openssh", Some("7.3")) {
+            CveLookupOutcome::Matches(m) => m.len(),
+            CveLookupOutcome::SnapshotUnavailable(note) => {
+                panic!("a cached lookup must not fail: {note}")
+            }
+        };
+        assert_eq!(
+            second_len, first_len,
+            "a second lookup must see the same findings as the first"
+        );
+
+        let second_ptr = Arc::as_ptr(scanner.cve_cache.get().unwrap());
+        assert_eq!(
+            first_ptr, second_ptr,
+            "the second lookup must reuse the SAME loaded snapshot, not reload it"
+        );
+    }
+
+    /// Cross-method cache sharing — half of `cve_lookup`'s doc claim
+    /// ("whichever asks first loads... every call after — lookup or scan —
+    /// answers from memory"): `cve_rung` primes the cache first, and
+    /// `cve_lookup` must then reuse the SAME `Arc` rather than reload.
+    #[test]
+    fn cve_rung_primes_the_cache_and_cve_lookup_reuses_it() {
+        let dir = write_cve_fixture_snapshot();
+        let scanner =
+            SystemScanner::new(SystemFacts::new(None, None), Some(dir.path().into()), None);
+        let ports = vec![cve_port_with_banner("SSH-2.0-OpenSSH_7.3")];
+
+        let (vulns, note) = scanner.cve_rung(&ports, 1_000);
+        assert!(note.is_none(), "{note:?}");
+        assert_eq!(vulns.len(), 1);
+        let rung_ptr = Arc::as_ptr(
+            scanner
+                .cve_cache
+                .get()
+                .expect("cve_rung's successful load must populate the cache"),
+        );
+
+        let lookup_len = match scanner.cve_lookup("openssh", Some("7.3")) {
+            CveLookupOutcome::Matches(m) => m.len(),
+            CveLookupOutcome::SnapshotUnavailable(n) => {
+                panic!("a cached lookup must not fail: {n}")
+            }
+        };
+        assert_eq!(lookup_len, 1);
+        let lookup_ptr = Arc::as_ptr(scanner.cve_cache.get().unwrap());
+        assert_eq!(
+            rung_ptr, lookup_ptr,
+            "cve_lookup must reuse the snapshot cve_rung already loaded, not reload it"
+        );
+    }
+
+    /// The other direction of the same claim: `cve_lookup` primes the cache
+    /// first, and `cve_rung` (an ordinary scan's own `cve` rung) reuses the
+    /// SAME loaded snapshot rather than reload it.
+    #[test]
+    fn cve_lookup_primes_the_cache_and_cve_rung_reuses_it() {
+        let dir = write_cve_fixture_snapshot();
+        let scanner =
+            SystemScanner::new(SystemFacts::new(None, None), Some(dir.path().into()), None);
+        let ports = vec![cve_port_with_banner("SSH-2.0-OpenSSH_7.3")];
+
+        let lookup_len = match scanner.cve_lookup("openssh", Some("7.3")) {
+            CveLookupOutcome::Matches(m) => m.len(),
+            CveLookupOutcome::SnapshotUnavailable(n) => {
+                panic!("fixture snapshot must load: {n}")
+            }
+        };
+        assert_eq!(lookup_len, 1);
+        let lookup_ptr = Arc::as_ptr(
+            scanner
+                .cve_cache
+                .get()
+                .expect("cve_lookup's successful load must populate the cache"),
+        );
+
+        let (vulns, note) = scanner.cve_rung(&ports, 1_000);
+        assert!(note.is_none(), "{note:?}");
+        assert_eq!(vulns.len(), 1);
+        let rung_ptr = Arc::as_ptr(scanner.cve_cache.get().unwrap());
+        assert_eq!(
+            lookup_ptr, rung_ptr,
+            "cve_rung must reuse the snapshot cve_lookup already loaded, not reload it"
+        );
+    }
+
+    /// The same non-latching guarantee as
+    /// `an_unusable_cve_outcome_is_not_cached_so_the_next_scan_retries`, for
+    /// `cve_lookup`: a lookup against a scanner with no snapshot directory
+    /// configured must not cache the `Unusable` outcome, so the next lookup
+    /// retries rather than reading a frozen failure forever (v1 has no
+    /// watchdog to self-heal).
+    #[test]
+    fn an_unusable_cve_lookup_is_not_cached_so_the_next_lookup_retries() {
+        let scanner = SystemScanner::new(SystemFacts::new(None, None), None, None);
+
+        let first_note = match scanner.cve_lookup("openssh", Some("7.3")) {
+            CveLookupOutcome::SnapshotUnavailable(note) => note,
+            CveLookupOutcome::Matches(m) => {
+                panic!("no directory configured must never match: {m:?}")
+            }
+        };
+        assert_eq!(first_note, "cve rung ran without a snapshot directory");
+        assert!(
+            scanner.cve_cache.get().is_none(),
+            "an unusable outcome must not latch the cache — the next lookup has to retry"
+        );
+
+        // A second lookup against the same unchanged (still missing)
+        // directory reaches `load_and_classify` again and reports the same
+        // note — proving the retry actually happens rather than the cache
+        // silently absorbing it.
+        let second_note = match scanner.cve_lookup("openssh", Some("7.3")) {
+            CveLookupOutcome::SnapshotUnavailable(note) => note,
+            CveLookupOutcome::Matches(m) => {
+                panic!("no directory configured must never match: {m:?}")
+            }
+        };
+        assert_eq!(first_note, second_note);
+        assert!(scanner.cve_cache.get().is_none());
+    }
 }
