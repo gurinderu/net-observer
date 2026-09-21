@@ -1762,22 +1762,95 @@ fn await_experiment(
     ))
 }
 
+/// The one line printed to stderr before the blocking wait in
+/// [`fetch_scan_neighbors`] — an operator watching a `--cve`/`--slow` scan
+/// that goes quiet for minutes needs to know it is working, not stuck, and
+/// that Ctrl-C does not stop it on the daemon. Named after the rungs actually
+/// present in `opts`, so a plain scan carries no CVE/slow caveat it does not
+/// run.
+fn scan_starting_line(opts: &ScanOptions) -> String {
+    let mut rungs = Vec::new();
+    if opts.ports {
+        rungs.push("ports");
+    }
+    if opts.banners {
+        rungs.push("banners");
+    }
+    if opts.cve {
+        rungs.push("cve");
+    }
+    if opts.slow {
+        rungs.push("slow");
+    }
+    let rungs = if rungs.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", rungs.join(", "))
+    };
+
+    let mut caveats = Vec::new();
+    if opts.cve {
+        caveats
+            .push("a --cve scan loads a large CVE snapshot the first time after a daemon restart");
+    }
+    if opts.slow {
+        caveats.push("a --slow sweep paces the whole segment");
+    }
+    let caveats = if caveats.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", caveats.join(", "))
+    };
+
+    format!(
+        "scanning neighbours{rungs}… this can take a while{caveats}. Ctrl-C leaves the scan \
+         running on net-observerd; read results later with `net-observer-cli vulns` / \
+         `neighbors`."
+    )
+}
+
+/// Classify a transport failure from a scan's [`net_observer_ipc::control_within`]
+/// call — distinct from [`socket_error`] because a scan's own read timeout
+/// ([`net_observer_ipc::SCAN_TIMEOUT`] elapsed, surfaced as
+/// `WouldBlock`/`TimedOut`) is not a failure: the scan keeps running on the
+/// daemon and its rows still land in the record, so it earns its own message
+/// instead of the raw, cryptic errno line (`Resource temporarily unavailable
+/// (os error 35)`) that `socket_error` would otherwise produce.
+fn scan_socket_error(socket_path: &str, e: &std::io::Error) -> anyhow::Error {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    if matches!(e.kind(), WouldBlock | TimedOut) {
+        anyhow!(
+            "the scan is still running on net-observerd and will finish there — its rows land \
+             in the record. Read them with `net-observer-cli vulns` and `net-observer-cli \
+             neighbors`. (The first --cve scan after a restart loads a large snapshot; a \
+             --slow sweep of a big segment takes minutes.)"
+        )
+    } else if daemon_not_running(e) {
+        anyhow!("net-observerd not running (socket {socket_path} unavailable)")
+    } else {
+        anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
+    }
+}
+
 /// Send `Control(ScanNeighbors)` and return the daemon's verdict.
 ///
 /// Reads with [`net_observer_ipc::SCAN_TIMEOUT`], not the default 2s
 /// [`daemon_query`] budget: the daemon answers only after the whole sweep
 /// (ARP + mDNS, then the ports/banners rungs), tens of seconds on a real
 /// segment, and a client that gives up first reads its own timeout instead of
-/// the daemon's effective/dropped-rungs message. A daemon built before
-/// `ScanNeighbors` existed cannot decode the request; that is reported as
-/// "cannot", not as a refusal, through [`net_observer_ipc::control_within`].
+/// the daemon's effective/dropped-rungs message — [`scan_socket_error`] turns
+/// that timeout into a message saying so, rather than [`socket_error`]'s
+/// generic transport wording. A daemon built before `ScanNeighbors` existed
+/// cannot decode the request; that is reported as "cannot", not as a refusal,
+/// through [`net_observer_ipc::control_within`].
 fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
+    let _ = writeln!(std::io::stderr(), "{}", scan_starting_line(&opts));
     let outcome = net_observer_ipc::control_within(
         socket_path,
         ControlCmd::ScanNeighbors(opts),
         net_observer_ipc::SCAN_TIMEOUT,
     )
-    .map_err(|e| socket_error(socket_path, e))?;
+    .map_err(|e| scan_socket_error(socket_path, &e))?;
     match outcome {
         net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
         net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
@@ -4356,5 +4429,48 @@ mod tests {
         assert!(!out.is_empty());
         let script = String::from_utf8(out).expect("fish completion script is UTF-8");
         assert!(script.contains("complete -c net-observer-cli"), "{script}");
+    }
+
+    /// A scan's read timeout (the client gave up after `SCAN_TIMEOUT`, not the
+    /// daemon reporting a failure) gets the "still running, read it later"
+    /// message — never the raw errno line `socket_error` would produce for the
+    /// exact same `WouldBlock`/`TimedOut` kind.
+    #[test]
+    fn scan_socket_error_reports_a_timeout_as_still_running() {
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            let e = std::io::Error::new(kind, "timed out");
+            let msg = scan_socket_error("/tmp/observer.sock", &e).to_string();
+            assert!(msg.contains("vulns"), "{kind:?}: {msg}");
+            assert!(
+                !msg.contains("Resource temporarily unavailable"),
+                "{kind:?}: {msg}"
+            );
+        }
+    }
+
+    /// An absent/refused socket still reads as "not running", the same as
+    /// every other fetcher.
+    #[test]
+    fn scan_socket_error_reports_an_absent_daemon_as_not_running() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            let e = std::io::Error::new(kind, "gone");
+            let msg = scan_socket_error("/tmp/observer.sock", &e).to_string();
+            assert!(msg.contains("not running"), "{kind:?}: {msg}");
+        }
+    }
+
+    /// Any other transport error keeps the generic `socket_error` wording.
+    #[test]
+    fn scan_socket_error_reports_other_errors_generically() {
+        let e = std::io::Error::other("boom");
+        let msg = scan_socket_error("/tmp/observer.sock", &e).to_string();
+        assert!(
+            msg.contains("failed to query net-observerd over socket"),
+            "{msg}"
+        );
+        assert!(msg.contains("boom"), "{msg}");
     }
 }
