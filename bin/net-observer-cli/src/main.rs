@@ -877,7 +877,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 net_observer_ipc::diagnose,
                 std::thread::sleep,
             )?;
-            print_paged(&format_table(&table), cli.no_pager);
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::ExperimentReport { id } => {
             let table =
@@ -893,7 +893,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         rows: table.rows,
                     })
                 })?;
-            print_paged(&format_table(&table), cli.no_pager);
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::ScanNeighbors {
             ports,
@@ -927,7 +927,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
-            print_paged(&format_table(&table), cli.no_pager);
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::Vulns { network } => {
             let sql = diagnosis::vulns_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
@@ -938,7 +938,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
-            print_paged(&format_table(&table), cli.no_pager);
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::Topology { iface } => {
             let sql = diagnosis::topology_sql(iface.as_deref()).map_err(|e| anyhow!("{e}"))?;
@@ -949,7 +949,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
-            print_paged(&format_table(&table), cli.no_pager);
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::Connections {
             by,
@@ -973,7 +973,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             } else {
                 table
             };
-            let mut out = format_table(&table);
+            let mut out = format_table(&table, true);
             if let Some(line) = hidden_line(hidden) {
                 out.push_str(&line);
                 out.push('\n');
@@ -1028,7 +1028,12 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
         Command::Query { sql } => {
             let table = table_from_query(run_query(&file_only(cli)?, sql)?);
-            print_paged(&format_table(&table), cli.no_pager);
+            // The record's raw/machine-readable carrier (realm net-observer,
+            // node #75): `ts_us` stays microseconds here, never converted to
+            // local time — there is no `--json`/`--raw` flag to route
+            // around the conversion instead, so a script or agent reading
+            // this output must see the integer it asked for.
+            print_paged(&format_table(&table, false), cli.no_pager);
         }
         Command::Why { at } => {
             let ts_us = diagnose::parse_at(at)?;
@@ -1098,7 +1103,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             let table = diagnose_table(cli, DiagnosticQuery::Segments, |off| {
                 run_query(off, &diagnosis::segments_sql())
             })?;
-            print_paged(&format_table(&table), cli.no_pager);
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
         Command::History {
             network,
@@ -1126,7 +1131,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
-            print_paged(&format_table(&table), cli.no_pager);
+            print_paged(&format_table(&table, true), cli.no_pager);
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -2158,17 +2163,25 @@ fn convert_epoch_us_column(rows: &mut [Vec<String>], i: usize) {
 /// Render a generic query result as a [`new_table`]. See [`column_is_numeric`]
 /// for which columns right-align.
 ///
-/// Every column named `ts_us` or ending `_us` converts to local time first
+/// `readable_time` gates the epoch-microseconds conversion: when `true`,
+/// every column named `ts_us` or ending `_us` converts to local time first
 /// ([`convert_epoch_us_column`]) if [`column_is_epoch_us`] clears it — the
 /// header keeps its original name here (the `connections` view renames
-/// `ts_us` to `ts` itself, before calling this); `--json` and any other
-/// machine-readable path never goes through this function, so raw
-/// microseconds stay raw there.
-fn format_table(table: &Table) -> String {
+/// `ts_us` to `ts` itself, before calling this). `query <SQL>` passes
+/// `false`: it IS the record's raw/machine-readable carrier (realm
+/// net-observer, node #75 — "raw queries stay in microseconds"; AGENTS.md's
+/// Reality table names it the way to read the record's own contents), there
+/// is no `--json`/`--raw` flag to route around it instead, and a converted
+/// cell there would silently hand a script or agent a date string where an
+/// integer was asked for. Every other named diagnosis is a human-facing
+/// table and passes `true`.
+fn format_table(table: &Table, readable_time: bool) -> String {
     let mut table = table.clone();
-    for i in 0..table.columns.len() {
-        if table.columns[i].ends_with("_us") {
-            convert_epoch_us_column(&mut table.rows, i);
+    if readable_time {
+        for i in 0..table.columns.len() {
+            if table.columns[i].ends_with("_us") {
+                convert_epoch_us_column(&mut table.rows, i);
+            }
         }
     }
     let mut t = new_table();
@@ -2438,7 +2451,7 @@ mod tests {
             columns: vec!["ts_us".into(), "gw".into()],
             rows: vec![vec!["42".into(), "OK".into()]],
         };
-        let out = format_table(&table);
+        let out = format_table(&table, true);
         assert!(out.contains("ts_us") && out.contains("gw"));
         assert!(out.contains("42") && out.contains("OK"));
     }
@@ -2555,11 +2568,46 @@ mod tests {
             columns: vec!["ts_us".into(), "rtt_us".into()],
             rows: vec![vec![epoch.to_string(), "45000".into()]],
         };
-        let out = format_table(&table);
+        let out = format_table(&table, true);
         assert!(out.contains("ts_us"), "header name is kept: {out}");
         assert!(!out.contains(&epoch.to_string()), "raw epoch leaked: {out}");
         assert!(out.contains(&opened_local(epoch)), "{out}");
         assert!(out.contains("45000"), "a duration column stays raw: {out}");
+    }
+
+    /// `query <SQL>` is the record's raw/machine-readable carrier (realm
+    /// net-observer, node #75 — "raw queries stay in microseconds"): it
+    /// calls `format_table` with `readable_time = false`, so `ts_us` prints
+    /// as the plain digits a script or agent can parse as an integer, never
+    /// a date string — the exact same table read as `readable_time = true`
+    /// (what `connections` and every other named diagnosis pass) converts.
+    #[test]
+    fn format_table_readable_time_false_keeps_query_output_raw() {
+        let epoch = 1_700_000_000_000_000i64;
+        let table = Table {
+            columns: vec!["ts_us".into(), "gw".into()],
+            rows: vec![vec![epoch.to_string(), "OK".into()]],
+        };
+
+        let raw = format_table(&table, false);
+        assert!(
+            raw.contains(&epoch.to_string()),
+            "query's raw path must print the digits: {raw}"
+        );
+        assert!(
+            !raw.contains(&opened_local(epoch)),
+            "query's raw path must not render a date: {raw}"
+        );
+
+        let readable = format_table(&table, true);
+        assert!(
+            !readable.contains(&epoch.to_string()),
+            "the readable path must not leak the raw epoch: {readable}"
+        );
+        assert!(
+            readable.contains(&opened_local(epoch)),
+            "the readable path converts: {readable}"
+        );
     }
 
     /// The `connections` view's own rename: `ts_us` converts to local time
@@ -3562,7 +3610,82 @@ mod tests {
         );
         assert_eq!(hidden, [1023, 4, 0]);
         // Captured for the STATUS report: the rendered header + these rows.
-        println!("{}", format_table(&shown));
+        println!("{}", format_table(&shown, true));
+    }
+
+    /// `connections --by iface` end to end, chained exactly as `run()`
+    /// chains it: rename the ts column, filter by `--iface` (none given
+    /// here), fold by scope (external only, the default), then fold by
+    /// interface. The internal/lan rows never reach the interface fold —
+    /// they are gone at the scope step — and the three external rows (two
+    /// sharing `utun10`) merge into two interface totals.
+    #[test]
+    fn connections_by_iface_pipeline_chains_filter_scope_and_iface_fold() {
+        let t = iface_table(vec![
+            [
+                "7",
+                "OK",
+                "172.19.0.1",
+                "",
+                "internal",
+                "1023",
+                "1",
+                "1",
+                "",
+            ],
+            ["7", "OK", "printer.local", "en0", "lan", "4", "1", "1", ""],
+            [
+                "7",
+                "OK",
+                "claude.ai",
+                "utun10",
+                "external",
+                "3",
+                "100",
+                "5006",
+                "",
+            ],
+            [
+                "7",
+                "OK",
+                "o540343.ingest.sentry.io",
+                "utun10",
+                "external",
+                "1",
+                "4",
+                "0",
+                "",
+            ],
+            [
+                "7",
+                "OK",
+                "ads.example",
+                "blocked",
+                "external",
+                "1",
+                "1",
+                "0",
+                "",
+            ],
+        ]);
+        let renamed = rename_ts_column(&t);
+        let filtered = filter_by_iface(&renamed, None);
+        let (scoped, hidden) = fold_by_scope(&filtered, Some(ConnectionScope::External));
+        let folded = fold_by_iface(&scoped);
+
+        assert_eq!(hidden, [1023, 4, 0], "internal/lan never reach the fold");
+        assert_eq!(folded.columns, ["iface", "count", "upload", "download"]);
+        let row = |iface: &str| {
+            folded
+                .rows
+                .iter()
+                .find(|r| r[0] == iface)
+                .unwrap_or_else(|| panic!("no {iface} row in {folded:?}"))
+                .clone()
+        };
+        assert_eq!(row("utun10"), vec!["utun10", "4", "104", "5006"]);
+        assert_eq!(row("blocked"), vec!["blocked", "1", "1", "0"]);
+        assert_eq!(folded.rows.len(), 2, "only the two external interfaces");
     }
 
     /// `experiment` defaults to the shared default length and waits;
@@ -3780,7 +3903,7 @@ mod tests {
                     .to_vec(),
             ],
         };
-        let out = format_table(&table);
+        let out = format_table(&table, true);
         for col in &table.columns {
             assert!(out.contains(col.as_str()), "header {col}: {out}");
         }
@@ -3798,7 +3921,7 @@ mod tests {
             columns: table.columns.clone(),
             rows: vec![["7", "SKIP", "", "", "", "", ""].map(String::from).to_vec()],
         };
-        let out = format_table(&skipped);
+        let out = format_table(&skipped, true);
         assert!(
             out.contains('7') && out.contains("SKIP"),
             "a SKIP tick's row must still print: {out}"
