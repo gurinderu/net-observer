@@ -166,6 +166,10 @@ enum Command {
     /// daemon runs it as root for any authorised peer; nothing in its config
     /// has to be switched on. Exits non-zero if the action was refused/failed
     /// or the daemon is unreachable.
+    ///
+    /// Hidden alias for `daemon kickstart` — kept flat for old scripts and
+    /// muscle memory.
+    #[command(hide = true)]
     Kickstart,
     /// Pause or resume the daemon's own collection (benign self-control).
     ///
@@ -174,6 +178,10 @@ enum Command {
     /// sing-box or the network. The daemon stays alive and the socket keeps
     /// serving while paused, so the switch can be turned back on. Exits
     /// non-zero if the request failed or the daemon is unreachable.
+    ///
+    /// Hidden alias for `daemon observe` — kept flat for old scripts and
+    /// muscle memory.
+    #[command(hide = true)]
     Observe {
         /// `on` resumes collection; `off` pauses it.
         #[arg(value_enum)]
@@ -188,6 +196,10 @@ enum Command {
     /// process-scoped, and every real switch is recorded as a `probing_edge`
     /// row (see `gaps`). Exits non-zero if the request failed, the daemon
     /// refused it, or the daemon is unreachable.
+    ///
+    /// Hidden alias for `daemon probe` — kept flat for old scripts and
+    /// muscle memory.
+    #[command(hide = true)]
     Probe {
         /// `passive` withholds every probe; `active` sends them.
         #[arg(value_enum)]
@@ -210,6 +222,10 @@ enum Command {
     /// socket does not lose the window. Benign self-control like `probe`.
     /// Exits non-zero if the daemon refused (another window running, a bad
     /// length) or is unreachable.
+    ///
+    /// Hidden alias for `daemon experiment` — kept flat for old scripts and
+    /// muscle memory.
+    #[command(hide = true)]
     Experiment {
         /// The window's length in minutes, 1 to 60.
         #[arg(long, default_value_t = EXPERIMENT_DEFAULT_MINUTES)]
@@ -224,6 +240,10 @@ enum Command {
     /// The id is the one `experiment` printed. Asks the running daemon
     /// first, reads the DB file's `experiment` table only when no daemon
     /// answers. A window still running is reported as such, not waited for.
+    ///
+    /// Hidden alias for `daemon experiment-report` — kept flat for old
+    /// scripts and muscle memory.
+    #[command(hide = true)]
     ExperimentReport {
         /// The window's id, `experiment-<start_us>`.
         id: String,
@@ -240,6 +260,10 @@ enum Command {
     /// (paused, no IPv4 subnet, no scanner on this host) or when the peer is
     /// not authorised. Exits non-zero if the scan was refused/failed or the
     /// daemon is unreachable.
+    ///
+    /// Hidden alias for `scan neighbors` — kept flat for old scripts and
+    /// muscle memory.
+    #[command(hide = true)]
     ScanNeighbors {
         /// Also TCP-connect-scan discovered neighbours' common ports. Off unless
         /// given.
@@ -468,6 +492,10 @@ enum Command {
     ///
     /// A moment the daemon was paused for is reported as a refusal — the gap and
     /// its bounds — not as a row of blank measurements.
+    ///
+    /// Hidden alias for `diag why` — kept flat for old scripts and muscle
+    /// memory.
+    #[command(hide = true)]
     Why {
         /// The moment to read, defaulting to now. Accepts `now`, raw epoch
         /// microseconds (`ts_us`), `YYYY-MM-DD[T ]HH:MM[:SS]` in local time, an
@@ -483,6 +511,10 @@ enum Command {
     ///
     /// An incident that opened inside an observation gap gets no context: the
     /// state from before the pause is not context for it, and is marked withheld.
+    ///
+    /// Hidden alias for `diag incident-context` — kept flat for old scripts
+    /// and muscle memory.
+    #[command(hide = true)]
     IncidentContext,
     /// The wedge-vs-starvation verdict over each recent `tun=000` episode.
     ///
@@ -491,6 +523,10 @@ enum Command {
     /// answers.
     ///
     /// An episode the record cannot classify is reported `unknown`, not guessed.
+    ///
+    /// Hidden alias for `diag wedge` (renamed, shorter) — kept flat for old
+    /// scripts and muscle memory.
+    #[command(hide = true)]
     WedgeOrStarvation,
     /// The gateway RTT series before a drop, with its least-squares slope.
     ///
@@ -499,6 +535,10 @@ enum Command {
     ///
     /// The slope is refused — "not computed" — when the window crosses an
     /// observation gap.
+    ///
+    /// Hidden alias for `diag gateway-ramp` — kept flat for old scripts and
+    /// muscle memory.
+    #[command(hide = true)]
     GatewayRamp {
         /// The drop to look back from, in any form `why --at` accepts. Defaults
         /// to the most recent gateway drop in the record.
@@ -513,6 +553,10 @@ enum Command {
     /// Every interval the daemon deliberately collected nothing for, and
     /// what closed each. Asks the running daemon first, reads the DB file
     /// only when no daemon answers.
+    ///
+    /// Hidden alias for `diag gaps` — kept flat for old scripts and muscle
+    /// memory.
+    #[command(hide = true)]
     Gaps,
     /// The network segments this machine has ever recorded, newest first.
     ///
@@ -560,6 +604,203 @@ enum Command {
         /// The shell to generate a completion script for.
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+    /// Operator-triggered active scans (put packets on the wire).
+    #[command(subcommand)]
+    Scan(ScanCmd),
+    /// Post-outage forensics: why a layer failed.
+    #[command(subcommand)]
+    Diag(DiagCmd),
+    /// Control the running daemon.
+    #[command(subcommand)]
+    Daemon(DaemonCmd),
+}
+
+/// Operator-triggered active scans — commands that put packets on the wire,
+/// grouped under `scan` (realm net-observer, node #164).
+#[derive(Subcommand)]
+enum ScanCmd {
+    /// Sweep the local IPv4 subnet and mDNS for who's on this segment now.
+    ///
+    /// Ask the running daemon, sent as a `Control(ScanNeighbors)` request
+    /// over the socket. Unlike the passive `neighbors` collector, this
+    /// **speaks on the network** — it addresses every host of the subnet, or
+    /// exactly one named host with `--target`. Nothing in the daemon's
+    /// config has to permit it: the command is the
+    /// sanction, and every run leaves a `neighbor_scan` row saying what was
+    /// probed. The daemon refuses it with a reason when it cannot run
+    /// (paused, no IPv4 subnet, no scanner on this host) or when the peer is
+    /// not authorised. Exits non-zero if the scan was refused/failed or the
+    /// daemon is unreachable.
+    Neighbors {
+        /// Also TCP-connect-scan discovered neighbours' common ports. Off unless
+        /// given.
+        #[arg(long)]
+        ports: bool,
+        /// Also grab the banner each open port volunteers. Needs `--ports` (a
+        /// banner grab reads from an open port); without an effective port scan
+        /// the daemon drops it and says so. Off unless given.
+        #[arg(long)]
+        banners: bool,
+        /// Also match the grabbed banners against the daemon's local CVE
+        /// snapshot. Needs `--banners` (a match parses a banner) and a
+        /// provisioned `collectors.neighbors.cve_snapshot_dir` in the daemon's
+        /// config; without both the daemon drops it and says so. Each stored
+        /// match is a hypothesis, not a fact. Off unless given. Read the
+        /// findings back with `vulns`.
+        #[arg(long)]
+        cve: bool,
+        /// Scan just this host instead of sweeping the segment.
+        #[arg(long)]
+        target: Option<IpAddr>,
+        /// Space the probes out to be gentle on a shared segment; the scan
+        /// takes longer. On a large subnet this can outlast the time this
+        /// command waits for an answer — the scan still finishes on the
+        /// daemon and its findings are readable afterward with `neighbors`/
+        /// `vulns`, but this command itself may report a timeout.
+        #[arg(long)]
+        slow: bool,
+        /// Override the sweep's host-count ceiling: omit for the built-in
+        /// default, 0 for unlimited, or a specific ceiling. On a large
+        /// subnet combine with --slow to avoid spraying the segment — and
+        /// note that pairing them can outlast the time this command waits
+        /// for an answer; the scan still finishes on the daemon regardless.
+        #[arg(long)]
+        sweep_max: Option<u32>,
+    },
+}
+
+/// Post-outage forensics — the named diagnoses that answer "which layer
+/// failed", grouped under `diag` (realm net-observer, node #164).
+#[derive(Subcommand)]
+enum DiagCmd {
+    /// Which layer failed at a moment: link, proxy, tun, host load.
+    ///
+    /// The state of each as the record has it, plus the layer it blames.
+    /// Asks the running daemon first, reads the DB file only when no daemon
+    /// answers.
+    ///
+    /// A moment the daemon was paused for is reported as a refusal — the gap and
+    /// its bounds — not as a row of blank measurements.
+    Why {
+        /// The moment to read, defaulting to now. Accepts `now`, raw epoch
+        /// microseconds (`ts_us`), `YYYY-MM-DD[T ]HH:MM[:SS]` in local time, an
+        /// ISO instant with an offset (`2026-09-01T14:05:00Z`), or `HH:MM[:SS]`
+        /// for that time today.
+        #[arg(long, default_value = "now")]
+        at: String,
+    },
+    /// Every incident with the layer state just before it opened.
+    ///
+    /// Asks the running daemon first, reads the DB file only when no daemon
+    /// answers.
+    ///
+    /// An incident that opened inside an observation gap gets no context: the
+    /// state from before the pause is not context for it, and is marked withheld.
+    IncidentContext,
+    /// The wedge-vs-starvation verdict over each recent `tun=000` episode.
+    ///
+    /// The discriminator that decides whether a restart is the cure. Asks
+    /// the running daemon first, reads the DB file only when no daemon
+    /// answers.
+    ///
+    /// An episode the record cannot classify is reported `unknown`, not guessed.
+    Wedge,
+    /// The gateway RTT series before a drop, with its least-squares slope.
+    ///
+    /// So a coworking-gateway ramp is visible as data. Asks the running
+    /// daemon first, reads the DB file only when no daemon answers.
+    ///
+    /// The slope is refused — "not computed" — when the window crosses an
+    /// observation gap.
+    GatewayRamp {
+        /// The drop to look back from, in any form `why --at` accepts. Defaults
+        /// to the most recent gateway drop in the record.
+        #[arg(long)]
+        drop: Option<String>,
+        /// How far back to plot, in microseconds.
+        #[arg(long, default_value_t = store::diagnosis::DEFAULT_RAMP_WINDOW_US)]
+        window_us: i64,
+    },
+    /// The observation gaps the record contains.
+    ///
+    /// Every interval the daemon deliberately collected nothing for, and
+    /// what closed each. Asks the running daemon first, reads the DB file
+    /// only when no daemon answers.
+    Gaps,
+}
+
+/// Daemon control — benign self-control of the running daemon, grouped under
+/// `daemon` (realm net-observer, node #164).
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Restart sing-box via the daemon (`launchctl kickstart`).
+    ///
+    /// Sent as a `Control(KickstartProxy)` request over the socket. The
+    /// daemon runs it as root for any authorised peer; nothing in its config
+    /// has to be switched on. Exits non-zero if the action was refused/failed
+    /// or the daemon is unreachable.
+    Kickstart,
+    /// Pause or resume the daemon's own collection (benign self-control).
+    ///
+    /// Sent as a `Control(SetObserving)` request over the socket. This
+    /// controls the daemon's OWN observation only — it does **not** touch
+    /// sing-box or the network. The daemon stays alive and the socket keeps
+    /// serving while paused, so the switch can be turned back on. Exits
+    /// non-zero if the request failed or the daemon is unreachable.
+    Observe {
+        /// `on` resumes collection; `off` pauses it.
+        #[arg(value_enum)]
+        state: ObserveState,
+    },
+    /// Set the daemon's probing tier: `passive` (default) or `active`.
+    ///
+    /// Sent as a `Control(SetProbing)` request over the socket. `passive`
+    /// puts nothing on the wire: every link, proxy and dns probe is withheld
+    /// and lands as `SKIP`, and the held reference streams are closed.
+    /// `active` runs every probe. Benign self-control like `observe`,
+    /// process-scoped, and every real switch is recorded as a `probing_edge`
+    /// row (see `gaps`). Exits non-zero if the request failed, the daemon
+    /// refused it, or the daemon is unreachable.
+    Probe {
+        /// `passive` withholds every probe; `active` sends them.
+        #[arg(value_enum)]
+        tier: ProbeTier,
+    },
+    /// Run an experiment window: "is it us or the network?"
+    ///
+    /// Ask the running daemon to run the window (`Control(StartExperiment)`).
+    /// For the window the daemon goes passive — nothing of its own on the
+    /// wire, bracketed by a `probing_edge` with reason `experiment` —
+    /// freezes the pcap ring at the start and at the end, restores the
+    /// previous tier when the window elapses, and computes a report: the
+    /// frames this machine itself sent inside the window (from the end
+    /// freeze, by protocol; the daemon's ICMP echoes expected to be 0) next
+    /// to what the record says the network did in the same minutes (route
+    /// events, incidents, gateway verdicts, roams, announce flushes, flow
+    /// totals, signal range) and one plain verdict line. The daemon answers
+    /// at once with the window's id; this command then polls the daemon
+    /// every 5 s until the report is ready and prints it, so a dropped
+    /// socket does not lose the window. Benign self-control like `probe`.
+    /// Exits non-zero if the daemon refused (another window running, a bad
+    /// length) or is unreachable.
+    Experiment {
+        /// The window's length in minutes, 1 to 60.
+        #[arg(long, default_value_t = EXPERIMENT_DEFAULT_MINUTES)]
+        minutes: u32,
+        /// Print the id and return at once instead of waiting for the report;
+        /// read it later with `experiment-report <id>`.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// The report of a past experiment window, by its id.
+    ///
+    /// The id is the one `experiment` printed. Asks the running daemon
+    /// first, reads the DB file's `experiment` table only when no daemon
+    /// answers. A window still running is reported as such, not waited for.
+    ExperimentReport {
+        /// The window's id, `experiment-<start_us>`.
+        id: String,
     },
 }
 
@@ -1233,7 +1474,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             // though the stream stopped (see [`TailEnd`]).
             return stream_events(&cfg.socket_path, kinds);
         }
-        Command::Kickstart => {
+        Command::Daemon(DaemonCmd::Kickstart) | Command::Kickstart => {
             let cfg = load_config(cli)?;
             let result = fetch_kickstart(&cfg.socket_path)?;
             print!("{}", format_control(&result));
@@ -1243,7 +1484,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
-        Command::Observe { state } => {
+        Command::Daemon(DaemonCmd::Observe { state }) | Command::Observe { state } => {
             let cfg = load_config(cli)?;
             let result = fetch_set_observing(&cfg.socket_path, state.as_bool())?;
             print!("{}", format_control(&result));
@@ -1253,7 +1494,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
-        Command::Probe { tier } => {
+        Command::Daemon(DaemonCmd::Probe { tier }) | Command::Probe { tier } => {
             let cfg = load_config(cli)?;
             let result = fetch_set_probing(&cfg.socket_path, tier.to_tier())?;
             print!("{}", format_control(&result));
@@ -1261,7 +1502,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         }
-        Command::Experiment { minutes, no_wait } => {
+        Command::Daemon(DaemonCmd::Experiment { minutes, no_wait })
+        | Command::Experiment { minutes, no_wait } => {
             let cfg = load_config(cli)?;
             let result = fetch_start_experiment(&cfg.socket_path, *minutes)?;
             print!("{}", format_control(&result));
@@ -1289,7 +1531,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             )?;
             print_table(&table, true, cli.full);
         }
-        Command::ExperimentReport { id } => {
+        Command::Daemon(DaemonCmd::ExperimentReport { id }) | Command::ExperimentReport { id } => {
             let table =
                 diagnose_table(cli, DiagnosticQuery::Experiment { id: id.clone() }, |off| {
                     let record = open_store(off)?
@@ -1305,7 +1547,15 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 })?;
             print_table(&table, true, cli.full);
         }
-        Command::ScanNeighbors {
+        Command::Scan(ScanCmd::Neighbors {
+            ports,
+            banners,
+            cve,
+            target,
+            slow,
+            sweep_max,
+        })
+        | Command::ScanNeighbors {
             ports,
             banners,
             cve,
@@ -1599,14 +1849,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             // this output must see the integer it asked for.
             print_table(&table, false, cli.full);
         }
-        Command::Why { at } => {
+        Command::Diag(DiagCmd::Why { at }) | Command::Why { at } => {
             let ts_us = diagnose::parse_at(at)?;
             let table = diagnose_table(cli, DiagnosticQuery::Why { ts_us }, |off| {
                 run_prepared(off, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))
             })?;
             print!("{}", diagnose::format_verdict_at(&table, ts_us)?);
         }
-        Command::IncidentContext => {
+        Command::Diag(DiagCmd::IncidentContext) | Command::IncidentContext => {
             let table = diagnose_table(cli, DiagnosticQuery::IncidentContext, |off| {
                 run_prepared(off, &diagnosis::incident_context_sql(LOAD_THRESHOLD))
             })?;
@@ -1619,7 +1869,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 )?
             );
         }
-        Command::WedgeOrStarvation => {
+        Command::Diag(DiagCmd::Wedge) | Command::WedgeOrStarvation => {
             let table = diagnose_table(cli, DiagnosticQuery::WedgeVsStarvation, |off| {
                 run_prepared(
                     off,
@@ -1638,7 +1888,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 )?
             );
         }
-        Command::GatewayRamp { drop, window_us } => {
+        Command::Diag(DiagCmd::GatewayRamp { drop, window_us })
+        | Command::GatewayRamp { drop, window_us } => {
             let drop_ts_us = match drop {
                 Some(d) => diagnose::parse_at(d)?,
                 None => latest_gw_drop(cli)?,
@@ -1662,7 +1913,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 )?
             );
         }
-        Command::Gaps => {
+        Command::Diag(DiagCmd::Gaps) | Command::Gaps => {
             // Every bracketed silence — pauses AND passive stretches — is
             // `Silences`. A daemon built before it cannot read that request;
             // it is then asked `Gaps`, the pauses-only shape it has, and the
@@ -3569,6 +3820,136 @@ mod tests {
             }
             _ => panic!("did not parse as `scan-neighbors`"),
         }
+    }
+
+    /// The nested `scan neighbors --ports` form parses exactly like the old
+    /// flat `scan-neighbors --ports` did (realm net-observer, node #164).
+    #[test]
+    fn scan_neighbors_nested_form_parses() {
+        let cli =
+            Cli::try_parse_from(["net-observer-cli", "scan", "neighbors", "--ports"]).unwrap();
+        match cli.command {
+            Command::Scan(ScanCmd::Neighbors {
+                ports,
+                banners,
+                cve,
+                target,
+                slow,
+                sweep_max,
+            }) => {
+                assert!(ports);
+                assert!(!banners);
+                assert!(!cve);
+                assert_eq!(target, None);
+                assert!(!slow);
+                assert_eq!(sweep_max, None);
+            }
+            _ => panic!("did not parse as `scan neighbors`"),
+        }
+    }
+
+    /// `diag why --at …` parses into the nested form, same as the old flat
+    /// `why --at …` (realm net-observer, node #164).
+    #[test]
+    fn diag_why_nested_form_parses() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "diag", "why", "--at", "now"]).unwrap();
+        match cli.command {
+            Command::Diag(DiagCmd::Why { at }) => assert_eq!(at, "now"),
+            _ => panic!("did not parse as `diag why`"),
+        }
+        // The old flat `why` invocation still works too.
+        let cli = Cli::try_parse_from(["net-observer-cli", "why", "--at", "now"]).unwrap();
+        match cli.command {
+            Command::Why { at } => assert_eq!(at, "now"),
+            _ => panic!("did not parse as `why` (legacy alias)"),
+        }
+    }
+
+    /// `diag wedge` is the renamed, shorter nested form of the old
+    /// `wedge-or-starvation`, which still parses as a hidden alias (realm
+    /// net-observer, node #164).
+    #[test]
+    fn diag_wedge_nested_form_parses_and_old_alias_still_works() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "diag", "wedge"]).unwrap();
+        assert!(matches!(cli.command, Command::Diag(DiagCmd::Wedge)));
+        let cli = Cli::try_parse_from(["net-observer-cli", "wedge-or-starvation"]).unwrap();
+        assert!(matches!(cli.command, Command::WedgeOrStarvation));
+    }
+
+    /// `daemon observe on`/`daemon probe active` parse into the nested form;
+    /// the old flat `observe`/`probe` invocations still work as hidden
+    /// aliases (realm net-observer, node #164).
+    #[test]
+    fn daemon_observe_and_probe_nested_form_parses() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "daemon", "observe", "on"]).unwrap();
+        match cli.command {
+            Command::Daemon(DaemonCmd::Observe { state }) => assert!(state.as_bool()),
+            _ => panic!("did not parse as `daemon observe`"),
+        }
+        let cli = Cli::try_parse_from(["net-observer-cli", "observe", "off"]).unwrap();
+        match cli.command {
+            Command::Observe { state } => assert!(!state.as_bool()),
+            _ => panic!("did not parse as `observe` (legacy alias)"),
+        }
+        let cli = Cli::try_parse_from(["net-observer-cli", "daemon", "probe", "active"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Daemon(DaemonCmd::Probe {
+                tier: ProbeTier::Active
+            })
+        ));
+    }
+
+    /// `daemon kickstart`/`daemon experiment-report <id>` parse into the
+    /// nested form (realm net-observer, node #164).
+    #[test]
+    fn daemon_kickstart_and_experiment_report_nested_form_parses() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "daemon", "kickstart"]).unwrap();
+        assert!(matches!(cli.command, Command::Daemon(DaemonCmd::Kickstart)));
+        let cli = Cli::try_parse_from([
+            "net-observer-cli",
+            "daemon",
+            "experiment-report",
+            "experiment-42",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Daemon(DaemonCmd::ExperimentReport { id }) => {
+                assert_eq!(id, "experiment-42");
+            }
+            _ => panic!("did not parse as `daemon experiment-report`"),
+        }
+    }
+
+    /// The shallow, frequently-used commands still parse directly at the top
+    /// level, unaffected by the scan/diag/daemon grouping (realm
+    /// net-observer, node #164).
+    #[test]
+    fn shallow_commands_still_parse_at_top_level() {
+        assert!(matches!(
+            Cli::try_parse_from(["net-observer-cli", "status"])
+                .unwrap()
+                .command,
+            Command::Status
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["net-observer-cli", "query", "select 1"])
+                .unwrap()
+                .command,
+            Command::Query { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["net-observer-cli", "segments"])
+                .unwrap()
+                .command,
+            Command::Segments
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["net-observer-cli", "air"])
+                .unwrap()
+                .command,
+            Command::Air
+        ));
     }
 
     #[test]
@@ -5561,6 +5942,70 @@ mod tests {
         );
     }
 
+    /// The scan/diag/daemon grouping (realm net-observer, node #164): the
+    /// top-level help lists the three groups as single entries and no longer
+    /// lists the renamed/moved commands flat — they still parse (hidden
+    /// aliases), but do not clutter the list a first-time reader scans.
+    #[test]
+    fn top_level_help_shows_groups_not_legacy_flat_names() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        let commands_section: Vec<&str> = help
+            .lines()
+            .skip_while(|l| *l != "Commands:")
+            .skip(1)
+            .take_while(|l| !l.trim().is_empty())
+            .collect();
+        let names: Vec<&str> = commands_section
+            .iter()
+            .map(|l| l.split_whitespace().next().unwrap_or(""))
+            .collect();
+        for group in ["scan", "diag", "daemon"] {
+            assert!(
+                names.contains(&group),
+                "expected `{group}` listed as a top-level group, got: {names:?}"
+            );
+        }
+        for legacy in [
+            "scan-neighbors",
+            "why",
+            "incident-context",
+            "wedge-or-starvation",
+            "gateway-ramp",
+            "gaps",
+            "kickstart",
+            "observe",
+            "probe",
+            "experiment",
+            "experiment-report",
+        ] {
+            assert!(
+                !names.contains(&legacy),
+                "`{legacy}` is a hidden alias and must not appear in the top-level list: {names:?}"
+            );
+        }
+        // The frequently-used commands stay shallow, listed by name.
+        for shallow in [
+            "status",
+            "events",
+            "connections",
+            "neighbors",
+            "vulns",
+            "check-cve",
+            "topology",
+            "air",
+            "segments",
+            "history",
+            "query",
+            "completions",
+        ] {
+            assert!(
+                names.contains(&shallow),
+                "expected shallow command `{shallow}` listed at top level, got: {names:?}"
+            );
+        }
+    }
+
     /// The prose carved out of a subcommand's short line survives, unabridged,
     /// in that subcommand's own `--help` — carving the summary must not lose
     /// a fact, only relocate it.
@@ -5572,6 +6017,49 @@ mod tests {
             .expect("`connections` is a subcommand");
         let long = sub.render_long_help().to_string();
         assert!(long.contains("fakeip"), "{long}");
+    }
+
+    /// `scan --help`/`diag --help`/`daemon --help` each list their own
+    /// nested subcommands (realm net-observer, node #164).
+    #[test]
+    fn group_help_lists_its_nested_subcommands() {
+        let mut cmd = Cli::command();
+        let scan = cmd
+            .find_subcommand_mut("scan")
+            .expect("`scan` is a subcommand")
+            .render_help()
+            .to_string();
+        assert!(scan.contains("neighbors"), "{scan}");
+
+        let mut cmd = Cli::command();
+        let diag = cmd
+            .find_subcommand_mut("diag")
+            .expect("`diag` is a subcommand")
+            .render_help()
+            .to_string();
+        for name in ["why", "incident-context", "wedge", "gateway-ramp", "gaps"] {
+            assert!(diag.contains(name), "missing `{name}` in:\n{diag}");
+        }
+        // The renamed `wedge` shows; the old `wedge-or-starvation` name does
+        // not appear as a nested entry under `diag` (it lives only as a
+        // hidden top-level alias).
+        assert!(!diag.contains("wedge-or-starvation"), "{diag}");
+
+        let mut cmd = Cli::command();
+        let daemon = cmd
+            .find_subcommand_mut("daemon")
+            .expect("`daemon` is a subcommand")
+            .render_help()
+            .to_string();
+        for name in [
+            "kickstart",
+            "observe",
+            "probe",
+            "experiment",
+            "experiment-report",
+        ] {
+            assert!(daemon.contains(name), "missing `{name}` in:\n{daemon}");
+        }
     }
 
     /// `completions zsh` prints a non-empty zsh completion script naming this
@@ -5622,6 +6110,62 @@ mod tests {
         assert!(!out.is_empty());
         let script = String::from_utf8(out).expect("fish completion script is UTF-8");
         assert!(script.contains("complete -c net-observer-cli"), "{script}");
+    }
+
+    /// `clap_complete` does NOT honor `#[command(hide = true)]`: unlike
+    /// `--help`'s `Commands:` list, the generated completion script still
+    /// offers every hidden legacy alias alongside the new scan/diag/daemon
+    /// groups — checked by exact token match on the root command's `opts=`
+    /// line, not substring `contains`, since several of these names (`why`,
+    /// `gaps`, `probe`) are short enough to false-positive inside another
+    /// word. Pinned here so a future clap_complete upgrade that starts
+    /// respecting `hide` is noticed rather than silently changing the
+    /// discoverable completion surface (realm net-observer, node #164).
+    #[test]
+    fn completions_include_hidden_aliases_alongside_new_groups() {
+        let mut out: Vec<u8> = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut Cli::command(),
+            "net-observer-cli",
+            &mut out,
+        );
+        let script = String::from_utf8(out).expect("bash completion script is UTF-8");
+        let opts_line = script
+            .lines()
+            .find(|l| l.trim_start().starts_with("opts=") && l.contains("kickstart"))
+            .unwrap_or_else(|| panic!("no root `opts=` line found in:\n{script}"));
+        let tokens: std::collections::HashSet<&str> = opts_line
+            .trim()
+            .trim_start_matches("opts=\"")
+            .trim_end_matches('"')
+            .split_whitespace()
+            .collect();
+        // The new groups are offered.
+        for group in ["scan", "diag", "daemon"] {
+            assert!(tokens.contains(group), "missing `{group}` in: {opts_line}");
+        }
+        // Every hidden legacy alias still completes — clap_complete has no
+        // notion of `hide` at all, so this is current reality, not a choice
+        // this crate makes.
+        for legacy in [
+            "scan-neighbors",
+            "why",
+            "incident-context",
+            "wedge-or-starvation",
+            "gateway-ramp",
+            "gaps",
+            "kickstart",
+            "observe",
+            "probe",
+            "experiment",
+            "experiment-report",
+        ] {
+            assert!(
+                tokens.contains(legacy),
+                "expected hidden alias `{legacy}` to still complete: {opts_line}"
+            );
+        }
     }
 
     /// `spinner_frame` cycles through the whole ten-glyph braille set and
