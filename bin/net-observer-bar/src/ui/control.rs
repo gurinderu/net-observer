@@ -693,6 +693,7 @@ mod tests {
             ConnectionsGroupBy::Ip,
             ConnectionsGroupBy::IpPort,
             ConnectionsGroupBy::Process,
+            ConnectionsGroupBy::ProcessHost,
         ] {
             assert!(
                 fetch_connections(missing.to_str().unwrap(), group_by).is_err(),
