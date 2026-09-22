@@ -1212,8 +1212,15 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         }
         Command::Incidents { limit, ids } => {
             let cfg = load_config(cli)?;
-            let incidents = fetch_incidents(&cfg.socket_path, *limit)?;
+            let mut incidents = fetch_incidents(&cfg.socket_path, *limit)?;
+            // `--limit` bounds the query (default 50, over `DEFAULT_ROW_LIMIT`);
+            // the cap bounds the interactive display — the same two-axis split
+            // `check-cve --all` has against the row cap.
+            let note = cap_rows(&mut incidents, std::io::stdout().is_terminal(), cli.full);
             print!("{}", format_incidents(&incidents, *ids));
+            if let Some(note) = note {
+                print!("{note}");
+            }
         }
         Command::Events { kind } => {
             let cfg = load_config(cli)?;
@@ -1578,7 +1585,10 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         (scan, aps, own)
                     }
                 };
-            print!("{}", diagnose::format_air(&scan, &aps, &own, cli.full)?);
+            print!(
+                "{}",
+                diagnose::format_air(&scan, &aps, &own, std::io::stdout().is_terminal(), cli.full)?
+            );
         }
         Command::Query { sql } => {
             let table = table_from_query(run_query(&file_only(cli)?, sql)?);
@@ -1600,7 +1610,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             let table = diagnose_table(cli, DiagnosticQuery::IncidentContext, |off| {
                 run_prepared(off, &diagnosis::incident_context_sql(LOAD_THRESHOLD))
             })?;
-            print!("{}", diagnose::format_incident_context(&table, cli.full)?);
+            print!(
+                "{}",
+                diagnose::format_incident_context(
+                    &table,
+                    std::io::stdout().is_terminal(),
+                    cli.full
+                )?
+            );
         }
         Command::WedgeOrStarvation => {
             let table = diagnose_table(cli, DiagnosticQuery::WedgeVsStarvation, |off| {
@@ -1614,7 +1631,11 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             })?;
             print!(
                 "{}",
-                diagnose::format_wedge_vs_starvation(&table, cli.full)?
+                diagnose::format_wedge_vs_starvation(
+                    &table,
+                    std::io::stdout().is_terminal(),
+                    cli.full
+                )?
             );
         }
         Command::GatewayRamp { drop, window_us } => {
@@ -1632,7 +1653,13 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             )?;
             print!(
                 "{}",
-                diagnose::format_gateway_ramp(&table, drop_ts_us, *window_us, cli.full)?
+                diagnose::format_gateway_ramp(
+                    &table,
+                    drop_ts_us,
+                    *window_us,
+                    std::io::stdout().is_terminal(),
+                    cli.full
+                )?
             );
         }
         Command::Gaps => {
@@ -1654,7 +1681,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &diagnosis::silences_sql()),
             )?;
-            print!("{}", diagnose::format_observation_gaps(&table, cli.full)?);
+            print!(
+                "{}",
+                diagnose::format_observation_gaps(
+                    &table,
+                    std::io::stdout().is_terminal(),
+                    cli.full
+                )?
+            );
         }
         Command::Segments => {
             let table = diagnose_table(cli, DiagnosticQuery::Segments, |off| {
@@ -2697,23 +2731,38 @@ fn more_rows_note(total_rows: usize, shown: usize) -> String {
     )
 }
 
+/// The ONE place `total_rows → row_cap → truncate → note` happens: truncates
+/// `rows` in place to [`DEFAULT_ROW_LIMIT`] when [`row_cap`] says to, and
+/// returns the trailing note to append when it did (`None` otherwise).
+/// Generic over the row type so every renderer shares this exact sequence —
+/// [`render_table_capped`]'s `Table.rows`, `diagnose`'s hand-rolled
+/// `Vec<Vec<String>>`/ranked-AP rows, and `Command::Incidents`'s
+/// `Vec<IncidentSummary>` alike — rather than each hand-rolling its own
+/// `if let Some(shown) = row_cap(...) { rows.truncate(shown); }` copy. Pure
+/// over `is_tty`/`full` (a real terminal check happens only at the call
+/// site), so a renderer's cap wiring is unit-tested without one.
+fn cap_rows<T>(rows: &mut Vec<T>, is_tty: bool, full: bool) -> Option<String> {
+    let total = rows.len();
+    row_cap(is_tty, full, total).map(|shown| {
+        rows.truncate(shown);
+        more_rows_note(total, shown)
+    })
+}
+
 /// Render `table` the way [`format_table`] does, capped to
 /// [`DEFAULT_ROW_LIMIT`] rows with a trailing note when `is_tty && !full` and
-/// the table does not fit ([`row_cap`]); every row otherwise. Pure over its
-/// inputs — including a simulated `is_tty` — so the capped rendering is
-/// unit-tested without a real terminal; [`print_table`] is the thin
-/// real-stdout wrapper around it.
+/// the table does not fit ([`row_cap`], via [`cap_rows`]); every row
+/// otherwise. Pure over its inputs — including a simulated `is_tty` — so the
+/// capped rendering is unit-tested without a real terminal; [`print_table`]
+/// is the thin real-stdout wrapper around it.
 fn render_table_capped(table: &Table, readable_time: bool, is_tty: bool, full: bool) -> String {
-    match row_cap(is_tty, full, table.rows.len()) {
-        Some(shown) => {
-            let mut capped = table.clone();
-            capped.rows.truncate(shown);
-            let mut out = format_table(&capped, readable_time);
-            out.push_str(&more_rows_note(table.rows.len(), shown));
-            out
-        }
-        None => format_table(table, readable_time),
+    let mut capped = table.clone();
+    let note = cap_rows(&mut capped.rows, is_tty, full);
+    let mut out = format_table(&capped, readable_time);
+    if let Some(note) = note {
+        out.push_str(&note);
     }
+    out
 }
 
 /// Print a [`Table`] through [`render_table_capped`] against the real
@@ -3388,6 +3437,30 @@ mod tests {
         let total = DEFAULT_ROW_LIMIT + 7;
         let shown = row_cap(true, false, total).unwrap();
         assert_eq!(total - shown, 7);
+    }
+
+    /// [`cap_rows`] is the ONE place `total_rows → row_cap → truncate → note`
+    /// happens, shared by every renderer (the comfy_table path here and
+    /// diagnose.rs's five hand-rolled tables alike) — pinned generically over
+    /// a plain `Vec<usize>` rather than through any one renderer's shape.
+    #[test]
+    fn cap_rows_truncates_and_notes_when_capped() {
+        let mut rows: Vec<usize> = (0..DEFAULT_ROW_LIMIT + 3).collect();
+        let note = cap_rows(&mut rows, true, false);
+        assert_eq!(rows, (0..DEFAULT_ROW_LIMIT).collect::<Vec<_>>());
+        assert!(note.unwrap().contains("3 more rows"));
+    }
+
+    /// Off a terminal (or with `--full`), `cap_rows` leaves `rows` untouched
+    /// and returns no note — the complement of the case above.
+    #[test]
+    fn cap_rows_leaves_everything_when_not_capped() {
+        let mut rows: Vec<usize> = (0..DEFAULT_ROW_LIMIT + 3).collect();
+        let original = rows.clone();
+        assert!(cap_rows(&mut rows, false, false).is_none());
+        assert_eq!(rows, original);
+        assert!(cap_rows(&mut rows, true, true).is_none());
+        assert_eq!(rows, original);
     }
 
     /// A table of `n` rows, each cell a fixed-width `row-NN` label so no

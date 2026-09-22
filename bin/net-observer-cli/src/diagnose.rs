@@ -40,7 +40,6 @@
 
 use anyhow::{Result, anyhow};
 use net_observer_ipc::Table;
-use std::io::IsTerminal;
 
 /// Printed for a value the record withheld because the moment lies inside an
 /// observation gap. Not a measurement, and not a missing one either.
@@ -282,12 +281,15 @@ pub(crate) fn format_verdict_at(table: &Table, asked_ts_us: i64) -> Result<Strin
 }
 
 /// **Incidents with the layer state just before each opened** — renders
-/// [`store::diagnosis::incident_context_sql`]. `full` is the CLI's `--full`
-/// flag: on an interactive terminal, without it, only the first
-/// `DEFAULT_ROW_LIMIT` incidents render and a trailing note says how many
-/// more exist (see `crate::row_cap`) — piping/redirecting always renders
-/// every incident.
-pub(crate) fn format_incident_context(table: &Table, full: bool) -> Result<String> {
+/// [`store::diagnosis::incident_context_sql`]. `is_tty`/`full` gate the row
+/// cap ([`crate::cap_rows`]): on an interactive terminal (`is_tty`), without
+/// `--full`, only the first `DEFAULT_ROW_LIMIT` incidents render and a
+/// trailing note says how many more exist — piping/redirecting
+/// (`is_tty = false`) always renders every incident. The caller passes the
+/// real `std::io::stdout().is_terminal()`; taking it as a parameter (rather
+/// than calling it in here) is what makes the capped branch reachable from a
+/// test.
+pub(crate) fn format_incident_context(table: &Table, is_tty: bool, full: bool) -> Result<String> {
     let c = Cols(&table.columns);
     let (id, trg) = (c.idx("id")?, c.idx("trigger_id")?);
     let (opened, closed) = (c.idx("opened_us")?, c.idx("closed_us")?);
@@ -312,11 +314,7 @@ pub(crate) fn format_incident_context(table: &Table, full: bool) -> Result<Strin
     }
     // Cap BEFORE the loop below, so the legend flags (`any_gap`/`any_absent`)
     // are computed over exactly the incidents actually shown.
-    let total_rows = source_rows.len();
-    let cap = crate::row_cap(std::io::stdout().is_terminal(), full, total_rows);
-    if let Some(shown) = cap {
-        source_rows.truncate(shown);
-    }
+    let cap_note = crate::cap_rows(&mut source_rows, is_tty, full);
 
     let mut rows = Vec::new();
     let (mut any_gap, mut any_absent) = (false, false);
@@ -380,16 +378,20 @@ pub(crate) fn format_incident_context(table: &Table, full: bool) -> Result<Strin
     if any_absent {
         out.push_str(&format!("{ABSENT}  the record carries no value here.\n"));
     }
-    if let Some(shown) = cap {
-        out.push_str(&crate::more_rows_note(total_rows, shown));
+    if let Some(note) = cap_note {
+        out.push_str(&note);
     }
     Ok(out)
 }
 
 /// **Wedge vs starvation** — renders
-/// [`store::diagnosis::wedge_vs_starvation_sql`]. `full` gates the row cap
-/// the same way [`format_incident_context`] does.
-pub(crate) fn format_wedge_vs_starvation(table: &Table, full: bool) -> Result<String> {
+/// [`store::diagnosis::wedge_vs_starvation_sql`]. `is_tty`/`full` gate the
+/// row cap the same way [`format_incident_context`] does.
+pub(crate) fn format_wedge_vs_starvation(
+    table: &Table,
+    is_tty: bool,
+    full: bool,
+) -> Result<String> {
     let c = Cols(&table.columns);
     let (ep, opened, closed) = (c.idx("episode")?, c.idx("opened_us")?, c.idx("closed_us")?);
     let (ticks, load, verdict) = (c.idx("ticks")?, c.idx("max_load1")?, c.idx("verdict")?);
@@ -400,11 +402,7 @@ pub(crate) fn format_wedge_vs_starvation(table: &Table, full: bool) -> Result<St
     for i in [opened, closed] {
         crate::convert_epoch_us_column(&mut source_rows, i);
     }
-    let total_rows = source_rows.len();
-    let cap = crate::row_cap(std::io::stdout().is_terminal(), full, total_rows);
-    if let Some(shown) = cap {
-        source_rows.truncate(shown);
-    }
+    let cap_note = crate::cap_rows(&mut source_rows, is_tty, full);
 
     let mut rows = Vec::new();
     let mut any_unknown = false;
@@ -448,8 +446,8 @@ pub(crate) fn format_wedge_vs_starvation(table: &Table, full: bool) -> Result<St
             "{ABSENT}   no host load was recorded for the episode.\n"
         ));
     }
-    if let Some(shown) = cap {
-        out.push_str(&crate::more_rows_note(total_rows, shown));
+    if let Some(note) = cap_note {
+        out.push_str(&note);
     }
     Ok(out)
 }
@@ -457,13 +455,14 @@ pub(crate) fn format_wedge_vs_starvation(table: &Table, full: bool) -> Result<St
 /// **The gateway RTT ramp before a drop** — renders
 /// [`store::diagnosis::gateway_ramp_sql`].
 ///
-/// A `NULL` slope is stated as "not computed", never as flat. `full` gates
-/// the row cap over the plotted samples the same way
+/// A `NULL` slope is stated as "not computed", never as flat. `is_tty`/`full`
+/// gate the row cap over the plotted samples the same way
 /// [`format_incident_context`] does.
 pub(crate) fn format_gateway_ramp(
     table: &Table,
     drop_ts_us: i64,
     window_us: i64,
+    is_tty: bool,
     full: bool,
 ) -> Result<String> {
     let c = Cols(&table.columns);
@@ -481,11 +480,7 @@ pub(crate) fn format_gateway_ramp(
     // length, both left exactly as the query answered them.
     let mut source_rows = table.rows.clone();
     crate::convert_epoch_us_column(&mut source_rows, ts);
-    let total_rows = source_rows.len();
-    let cap = crate::row_cap(std::io::stdout().is_terminal(), full, total_rows);
-    if let Some(shown) = cap {
-        source_rows.truncate(shown);
-    }
+    let cap_note = crate::cap_rows(&mut source_rows, is_tty, full);
 
     let mut out = String::new();
     kv(
@@ -545,8 +540,8 @@ pub(crate) fn format_gateway_ramp(
         &rows,
     ));
     out.push_str("\n(no answer)  the probe did not answer at this tick, so it feeds no slope.\n");
-    if let Some(shown) = cap {
-        out.push_str(&crate::more_rows_note(total_rows, shown));
+    if let Some(note) = cap_note {
+        out.push_str(&note);
     }
     Ok(out)
 }
@@ -556,9 +551,10 @@ pub(crate) fn format_gateway_ramp(
 /// passive stretch, told apart by `KIND`. Also renders the frozen, pauses-only
 /// [`store::diagnosis::observation_gaps_sql`]: no `kind` column at all, so
 /// every row it has is a pause, whether it came from a current daemon (which
-/// filters to pauses itself) or one built before either query existed. `full`
-/// gates the row cap the same way [`format_incident_context`] does.
-pub(crate) fn format_observation_gaps(table: &Table, full: bool) -> Result<String> {
+/// filters to pauses itself) or one built before either query existed.
+/// `is_tty`/`full` gate the row cap the same way [`format_incident_context`]
+/// does.
+pub(crate) fn format_observation_gaps(table: &Table, is_tty: bool, full: bool) -> Result<String> {
     let c = Cols(&table.columns);
     let (go, gc, by) = (
         c.idx("gap_opened_us")?,
@@ -566,16 +562,12 @@ pub(crate) fn format_observation_gaps(table: &Table, full: bool) -> Result<Strin
         c.idx("gap_closed_by")?,
     );
     let kind = c.idx("kind").ok();
-    let total_rows = table.rows.len();
-    let cap = crate::row_cap(std::io::stdout().is_terminal(), full, total_rows);
-    let shown_rows = match cap {
-        Some(shown) => &table.rows[..shown],
-        None => &table.rows[..],
-    };
+    let mut source_rows = table.rows.clone();
+    let cap_note = crate::cap_rows(&mut source_rows, is_tty, full);
     let mut rows = Vec::new();
     let mut open_ended = false;
     let mut passive = false;
-    for row in shown_rows {
+    for row in &source_rows {
         let closed = at(row, gc);
         open_ended |= closed.is_empty();
         let k = kind.map_or("pause", |i| at(row, i));
@@ -606,8 +598,8 @@ pub(crate) fn format_observation_gaps(table: &Table, full: bool) -> Result<Strin
              exist and their probe verdicts read SKIP.\n",
         );
     }
-    if let Some(shown) = cap {
-        out.push_str(&crate::more_rows_note(total_rows, shown));
+    if let Some(note) = cap_note {
+        out.push_str(&note);
     }
     Ok(out)
 }
@@ -635,10 +627,17 @@ pub(crate) fn format_observation_gaps(table: &Table, full: bool) -> Result<Strin
 /// the RSSI-noise gap, never its configuration. WHY carries the reasons
 /// behind both.
 ///
-/// `full` gates the row cap over the AP list, applied AFTER the rank sort
-/// below so a capped view still shows the strongest hypotheses first
-/// (see `crate::row_cap`), not an arbitrary prefix of the scan's own order.
-pub(crate) fn format_air(scan: &Table, aps: &Table, own: &Table, full: bool) -> Result<String> {
+/// `is_tty`/`full` gate the row cap over the AP list, applied AFTER the rank
+/// sort below so a capped view still shows the strongest hypotheses first
+/// (see [`crate::cap_rows`]), not an arbitrary prefix of the scan's own
+/// order.
+pub(crate) fn format_air(
+    scan: &Table,
+    aps: &Table,
+    own: &Table,
+    is_tty: bool,
+    full: bool,
+) -> Result<String> {
     let c = Cols(&scan.columns);
     let (ts_i, air_i, reason_i, count_i) = (
         c.idx("ts_us")?,
@@ -811,11 +810,7 @@ pub(crate) fn format_air(scan: &Table, aps: &Table, own: &Table, full: bool) -> 
     ranked.sort_by_key(|a| std::cmp::Reverse(a.0));
     // Capped AFTER the rank sort, so the rows dropped are the weakest
     // hypotheses, not an arbitrary prefix of the scan's own order.
-    let total_rows = ranked.len();
-    let cap = crate::row_cap(std::io::stdout().is_terminal(), full, total_rows);
-    if let Some(shown) = cap {
-        ranked.truncate(shown);
-    }
+    let cap_note = crate::cap_rows(&mut ranked, is_tty, full);
     let rows: Vec<Vec<String>> = ranked.into_iter().map(|(_, r)| r).collect();
     out.push('\n');
     out.push_str(&aligned(
@@ -826,8 +821,8 @@ pub(crate) fn format_air(scan: &Table, aps: &Table, own: &Table, full: bool) -> 
         &rows,
     ));
     out.push_str(AIR_LEGEND);
-    if let Some(shown) = cap {
-        out.push_str(&crate::more_rows_note(total_rows, shown));
+    if let Some(note) = cap_note {
+        out.push_str(&note);
     }
     Ok(out)
 }
@@ -935,6 +930,7 @@ mod tests {
             &table(AIR_AP_COLS, &[]),
             &own_on("36", "5ghz", "80"),
             false,
+            false,
         )
         .unwrap();
         assert!(out.contains("SKIP"));
@@ -955,6 +951,7 @@ mod tests {
             &table(AIR_AP_COLS, &[]),
             &own_on("36", "5ghz", "80"),
             false,
+            false,
         )
         .unwrap();
         assert!(out.contains("heard no other access point"));
@@ -966,6 +963,7 @@ mod tests {
             &table(AIR_SCAN_COLS, &[]),
             &table(AIR_AP_COLS, &[]),
             &table(AIR_OWN_COLS, &[]),
+            false,
             false,
         )
         .unwrap();
@@ -986,7 +984,7 @@ mod tests {
                 &["36", "5ghz", "80", "802.11ax", "wpa3", "-80", "-95"],
             ],
         );
-        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false).unwrap();
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false, false).unwrap();
         let on_channel = out.find("-80").expect("the on-channel AP is listed");
         let off_channel = out.find("-40").expect("the off-channel AP is listed");
         assert!(
@@ -1010,7 +1008,7 @@ mod tests {
             &[&["40", "5ghz", "20", "802.11ax", "wpa3", "-70", "-95"]],
         );
         let own = table(AIR_OWN_COLS, &[&["0", "36", "5ghz", "80"]]);
-        let out = format_air(&scan, &aps, &own, false).unwrap();
+        let out = format_air(&scan, &aps, &own, false, false).unwrap();
         assert!(
             out.contains("BEFORE this scan"),
             "a stale own channel must be called stale:\n{out}"
@@ -1019,7 +1017,7 @@ mod tests {
 
         // A reading from the same minute carries its moment but no warning.
         let own = table(AIR_OWN_COLS, &[&["14400000000", "36", "5ghz", "80"]]);
-        let out = format_air(&scan, &aps, &own, false).unwrap();
+        let out = format_air(&scan, &aps, &own, false, false).unwrap();
         assert!(out.contains("read "), "the moment is always shown:\n{out}");
         assert!(!out.contains("BEFORE this scan"));
     }
@@ -1033,7 +1031,7 @@ mod tests {
             AIR_AP_COLS,
             &[&["40", "5ghz", "20", "802.11ax", "wpa3", "-70", "-95"]],
         );
-        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false).unwrap();
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false, false).unwrap();
         assert!(out.contains("HYPOTHESIS"));
         assert!(out.contains("NOT measured"));
         assert!(out.contains("no channel occupancy"));
@@ -1055,7 +1053,7 @@ mod tests {
             AIR_AP_COLS,
             &[&["40", "5ghz", "20", "802.11ax", "wpa3", "-70", "-95"]],
         );
-        let out = format_air(&scan, &aps, &table(AIR_OWN_COLS, &[]), false).unwrap();
+        let out = format_air(&scan, &aps, &table(AIR_OWN_COLS, &[]), false, false).unwrap();
         assert!(out.contains("overlap not computed"));
         assert!(out.contains(ABSENT));
         assert!(!out.contains("0%"));
@@ -1073,7 +1071,7 @@ mod tests {
                 &["36", "5ghz", "80", "802.11ax", "wpa3", "-80", "-95"],
             ],
         );
-        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false).unwrap();
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false, false).unwrap();
         assert!(out.contains(ABSENT));
         // And it sorts last, below everything that could be placed at all.
         let unplaceable = out.find("-55").unwrap();
@@ -1092,7 +1090,7 @@ mod tests {
             AIR_AP_COLS,
             &[&["36", "5ghz", "80", "802.11ax", "wpa3", "-50", "-90"]],
         );
-        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false).unwrap();
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false, false).unwrap();
         assert!(out.contains("GRADE"), "{out}");
         assert!(out.contains("SIGNAL"), "{out}");
         assert!(out.contains("WHY"), "{out}");
@@ -1117,7 +1115,7 @@ mod tests {
             // security column blank: the report did not carry it.
             &[&["36", "5ghz", "80", "802.11ax", "", "-50", "-90"]],
         );
-        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false).unwrap();
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false, false).unwrap();
         assert!(out.contains("A?"), "{out}");
         assert!(out.contains("security: unmeasured"), "{out}");
     }
@@ -1130,7 +1128,7 @@ mod tests {
             AIR_AP_COLS,
             &[&["6", "2ghz", "20", "802.11n", "open", "-50", "-90"]],
         );
-        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false).unwrap();
+        let out = format_air(&scan, &aps, &own_on("36", "5ghz", "80"), false, false).unwrap();
         assert!(
             out.contains("open, legacy or unrecognised security"),
             "{out}"
@@ -1300,7 +1298,7 @@ mod tests {
                 ],
             ],
         );
-        let out = format_incident_context(&t, false).unwrap();
+        let out = format_incident_context(&t, false, false).unwrap();
         assert!(out.contains("withheld"), "{out}");
         assert!(out.contains("opened 4000"), "{out}");
         // The measured incident keeps its values; the gap one shows the token.
@@ -1311,8 +1309,56 @@ mod tests {
 
     #[test]
     fn incident_context_reports_an_empty_record() {
-        let out = format_incident_context(&table(CTX_COLS, &[]), false).unwrap();
+        let out = format_incident_context(&table(CTX_COLS, &[]), false, false).unwrap();
         assert!(out.contains("no incidents"), "{out}");
+    }
+
+    /// The row cap ([`crate::cap_rows`]) reaches `format_incident_context`
+    /// through its `is_tty` parameter — taking it as an argument, rather than
+    /// calling `std::io::stdout().is_terminal()` inline, is what makes this
+    /// branch reachable from a test at all. A simulated interactive terminal
+    /// over a record with more than `DEFAULT_ROW_LIMIT` incidents renders
+    /// only the first 40 and notes the rest; off a terminal every incident
+    /// renders. The other four diagnose.rs renderers wire the same
+    /// `crate::cap_rows` call identically.
+    #[test]
+    fn incident_context_caps_on_a_tty_and_shows_everything_off_one() {
+        let n = crate::DEFAULT_ROW_LIMIT + 5;
+        let rows: Vec<Vec<String>> = (0..n)
+            .map(|i| {
+                vec![
+                    format!("i{i:02}"),
+                    "gw-drop".to_string(),
+                    (1000 + i as i64).to_string(),
+                    String::new(),
+                    String::new(),
+                    "OK".to_string(),
+                    "OK".to_string(),
+                    "OK".to_string(),
+                    "0".to_string(),
+                    "0.1".to_string(),
+                    "link".to_string(),
+                    String::new(),
+                    String::new(),
+                ]
+            })
+            .collect();
+        let t = Table {
+            columns: CTX_COLS.iter().map(|c| (*c).to_string()).collect(),
+            rows,
+        };
+
+        let capped = format_incident_context(&t, true, false).unwrap();
+        assert_eq!(
+            capped.matches("gw-drop").count(),
+            crate::DEFAULT_ROW_LIMIT,
+            "{capped}"
+        );
+        assert!(capped.contains("5 more rows"), "{capped}");
+
+        let full = format_incident_context(&t, false, false).unwrap();
+        assert_eq!(full.matches("gw-drop").count(), n, "{full}");
+        assert!(!full.contains("more rows"), "{full}");
     }
 
     /// Readable timestamps (owner ask): `opened_us`/`closed_us`/`state_ts_us`
@@ -1347,7 +1393,7 @@ mod tests {
                 "",
             ]],
         );
-        let out = format_incident_context(&t, false).unwrap();
+        let out = format_incident_context(&t, false, false).unwrap();
         assert!(!out.contains(&opened), "raw epoch leaked: {out}");
         assert!(!out.contains(&closed), "raw epoch leaked: {out}");
         assert!(!out.contains(&state_ts), "raw epoch leaked: {out}");
@@ -1374,7 +1420,7 @@ mod tests {
                 &["2", "30", "40", "2", "", "unknown"],
             ],
         );
-        let out = format_wedge_vs_starvation(&t, false).unwrap();
+        let out = format_wedge_vs_starvation(&t, false, false).unwrap();
         assert!(out.contains("starvation"), "{out}");
         assert!(out.contains("REFUSED"), "{out}");
         assert!(out.contains("cannot tell a wedge from starvation"), "{out}");
@@ -1400,7 +1446,7 @@ mod tests {
                 "starvation",
             ]],
         );
-        let out = format_wedge_vs_starvation(&t, false).unwrap();
+        let out = format_wedge_vs_starvation(&t, false, false).unwrap();
         assert!(!out.contains(&opened), "raw epoch leaked: {out}");
         assert!(!out.contains(&closed), "raw epoch leaked: {out}");
         assert!(out.contains(&crate::opened_local(opened_us)), "{out}");
@@ -1427,7 +1473,7 @@ mod tests {
                 &["500", "500", "OK", "9.0", "12.5", "2", "0"],
             ],
         );
-        let out = format_gateway_ramp(&t, 1000, 900, false).unwrap();
+        let out = format_gateway_ramp(&t, 1000, 900, false, false).unwrap();
         assert!(out.contains("12.5 ms/s over 2 fitted samples"), "{out}");
         assert!(!out.contains("not computed"), "{out}");
     }
@@ -1436,7 +1482,7 @@ mod tests {
     #[test]
     fn gateway_ramp_refuses_a_slope_across_a_gap() {
         let t = table(RAMP_COLS, &[&["100", "900", "OK", "5.0", "", "", "400000"]]);
-        let out = format_gateway_ramp(&t, 1000, 900, false).unwrap();
+        let out = format_gateway_ramp(&t, 1000, 900, false, false).unwrap();
         assert!(out.contains("not computed"), "{out}");
         assert!(out.contains("400000 us of observation gap"), "{out}");
         assert!(!out.contains("0 ms/s"), "{out}");
@@ -1445,7 +1491,7 @@ mod tests {
     #[test]
     fn gateway_ramp_marks_an_unanswered_tick() {
         let t = table(RAMP_COLS, &[&["100", "900", "FAIL", "", "12.5", "2", "0"]]);
-        let out = format_gateway_ramp(&t, 1000, 900, false).unwrap();
+        let out = format_gateway_ramp(&t, 1000, 900, false, false).unwrap();
         assert!(out.contains("(no answer)"), "{out}");
     }
 
@@ -1463,7 +1509,7 @@ mod tests {
             RAMP_COLS,
             &[&[ts.as_str(), before_drop, "OK", "5.0", "12.5", "2", "0"]],
         );
-        let out = format_gateway_ramp(&t, 1000, 900, false).unwrap();
+        let out = format_gateway_ramp(&t, 1000, 900, false, false).unwrap();
         assert!(!out.contains(&ts), "raw epoch leaked: {out}");
         assert!(out.contains(&crate::opened_local(ts_us)), "{out}");
         assert!(
@@ -1483,7 +1529,7 @@ mod tests {
                 &["pause", "9000", "", ""],
             ],
         );
-        let out = format_observation_gaps(&t, false).unwrap();
+        let out = format_observation_gaps(&t, false, false).unwrap();
         assert!(out.contains("resume"), "{out}");
         assert!(out.contains("(still open)"), "{out}");
         assert!(out.contains("nothing closes it"), "{out}");
@@ -1501,7 +1547,7 @@ mod tests {
                 &["pause", "2000", "3000", "resume"],
             ],
         );
-        let out = format_observation_gaps(&t, false).unwrap();
+        let out = format_observation_gaps(&t, false, false).unwrap();
         assert!(out.contains("KIND"), "{out}");
         assert!(out.contains("passive"), "{out}");
         assert!(out.contains("withheld every probe"), "{out}");
@@ -1519,7 +1565,7 @@ mod tests {
                 &["sleep", "3000", "4000", "sample"],
             ],
         );
-        let out = format_observation_gaps(&t, false).unwrap();
+        let out = format_observation_gaps(&t, false, false).unwrap();
         assert!(out.contains("stop"), "{out}");
         assert!(out.contains("sleep"), "{out}");
         assert!(!out.contains("withheld every probe"), "{out}");
@@ -1532,14 +1578,14 @@ mod tests {
     fn observation_gaps_from_a_pre_tier_daemon_are_all_pauses() {
         let old = &["gap_opened_us", "gap_closed_us", "gap_closed_by"];
         let t = table(old, &[&["1000", "2000", "resume"]]);
-        let out = format_observation_gaps(&t, false).unwrap();
+        let out = format_observation_gaps(&t, false, false).unwrap();
         assert!(out.contains("pause"), "{out}");
         assert!(!out.contains("withheld every probe"), "{out}");
     }
 
     #[test]
     fn observation_gaps_report_an_unbroken_record() {
-        let out = format_observation_gaps(&table(GAP_COLS, &[]), false).unwrap();
+        let out = format_observation_gaps(&table(GAP_COLS, &[]), false, false).unwrap();
         assert!(out.contains("unbroken"), "{out}");
     }
 
