@@ -1897,7 +1897,11 @@ pub(crate) struct SystemTopologyScanner {
 }
 
 impl SystemTopologyScanner {
-    fn new(facts: SystemFacts, store: Arc<DuckdbStore>, snapshot: Arc<Mutex<StatusSnapshot>>) -> Self {
+    fn new(
+        facts: SystemFacts,
+        store: Arc<DuckdbStore>,
+        snapshot: Arc<Mutex<StatusSnapshot>>,
+    ) -> Self {
         Self {
             facts,
             store,
@@ -2798,6 +2802,75 @@ mod tests {
         fn freeze(&self, dest_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
             vec![dest_dir.join("ring.pcap0")]
         }
+    }
+
+    /// `run_topology_capture` is the ONE body the patrol and a forced
+    /// `scan topology` share: it must write the record AND mirror the live
+    /// snapshot the socket serves, so a forced capture reaches the bar's map at
+    /// once, not only on the next patrol tick (realm net-observer, node #43). A
+    /// later capture that hears nothing must leave the last set in place, never
+    /// blank it.
+    #[test]
+    fn run_topology_capture_writes_the_store_and_mirrors_the_snapshot() {
+        /// A fake LLDP capture returning canned raw ethernet frames — no
+        /// tcpdump, no root.
+        struct FakeCapture(Vec<Vec<u8>>);
+        impl LldpCapture for FakeCapture {
+            fn capture(&self, _budget: Duration) -> Vec<Vec<u8>> {
+                self.0.clone()
+            }
+        }
+
+        // One synthetic LLDP frame `types::link_from_frame` maps to an edge:
+        // chassis 00:11:22:33:44:55, port "Gi0/1" — the same PDU the types
+        // crate's own decode tests build (eth header + LLDP EtherType + LLDPDU).
+        let frame: Vec<u8> = vec![
+            0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e, // dst: LLDP multicast
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // src
+            0x88, 0xcc, // EtherType: LLDP
+            0x02, 0x07, 0x04, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // chassis id: MAC
+            0x04, 0x06, 0x05, b'G', b'i', b'0', b'/', b'1', // port id: "Gi0/1"
+            0x06, 0x02, 0x00, 0x78, // ttl: 120
+            0x0e, 0x04, 0x00, 0x04, 0x00, 0x04, // system capabilities
+            0x0a, 0x03, b's', b'w', b'1', // system name: "sw1"
+            0x00, 0x00, // end
+        ];
+
+        let store = DuckdbStore::in_memory().unwrap();
+        let snapshot = Mutex::new(StatusSnapshot::default());
+
+        let found = run_topology_capture(&FakeCapture(vec![frame]), &store, &snapshot, "en0", 100);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].remote_chassis, "00:11:22:33:44:55");
+
+        // The durable record has the row...
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM topology_link")
+                .unwrap(),
+            1,
+            "the capture must write the uplink to the record"
+        );
+        // ...and the live snapshot mirrors it for the socket and the bar's map.
+        {
+            let snap = snapshot.lock().unwrap();
+            assert_eq!(
+                snap.topology.len(),
+                1,
+                "the snapshot must mirror the uplink"
+            );
+            assert_eq!(snap.topology[0].remote_chassis, "00:11:22:33:44:55");
+        }
+
+        // A capture that hears nothing must NOT blank the last discovered set.
+        let none = run_topology_capture(&FakeCapture(vec![]), &store, &snapshot, "en0", 200);
+        assert!(none.is_empty());
+        let snap = snapshot.lock().unwrap();
+        assert_eq!(
+            snap.topology.len(),
+            1,
+            "an empty capture must leave the last set in place, not blank it"
+        );
     }
 
     /// A fake ring whose liveness can be flipped, standing in for a `tcpdump`

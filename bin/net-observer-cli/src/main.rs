@@ -2714,27 +2714,6 @@ fn clear_scan_spinner() {
     let _ = std::io::stderr().flush();
 }
 
-/// Send `Control(ScanNeighbors)` and return the daemon's verdict.
-///
-/// Reads with [`net_observer_ipc::SCAN_TIMEOUT`], not the default 2s
-/// [`daemon_query`] budget: the daemon answers only after the whole sweep
-/// (ARP + mDNS, then the ports/banners rungs), tens of seconds on a real
-/// segment, and a client that gives up first reads its own timeout instead of
-/// the daemon's effective/dropped-rungs message — [`scan_socket_error`] turns
-/// that timeout into a message saying so, rather than [`socket_error`]'s
-/// generic transport wording. A daemon built before `ScanNeighbors` existed
-/// cannot decode the request; that is reported as "cannot", not as a refusal,
-/// through [`net_observer_ipc::control_within`].
-///
-/// The blocking socket call runs on a background thread while the main
-/// thread ticks a live spinner + elapsed-time indicator on stderr — client-
-/// side liveness only, not real per-stage progress. Only when stderr is a
-/// TTY: a pipe/redirect/script gets no spinner writes at all and the exact
-/// output a plain call would produce. The worker thread always ends when the
-/// socket call returns (success, error, or the client's own
-/// [`net_observer_ipc::SCAN_TIMEOUT`]), so nothing is leaked even though
-/// Ctrl-C here does not stop the scan on the daemon (see
-/// [`scan_starting_line`]).
 /// Send one long-running control command and show a spinner on a TTY until the
 /// daemon answers, reading with [`net_observer_ipc::SCAN_TIMEOUT`] rather than
 /// the default 2s budget: the daemon replies only after the whole capture/scan
@@ -2743,6 +2722,15 @@ fn clear_scan_spinner() {
 /// for every such command — [`fetch_scan_neighbors`] and [`fetch_scan_topology`]
 /// call this one body (AGENTS.md principle 4); only the starting line, the
 /// command, and the two failure messages differ, so those are parameters.
+///
+/// The blocking socket call runs on a background thread while the main thread
+/// ticks a live spinner + elapsed-time indicator on stderr — client-side
+/// liveness only, not real per-stage progress, and only when stderr is a TTY: a
+/// pipe/redirect/script gets no spinner writes and the exact output a plain call
+/// would produce. The worker thread always ends when the socket call returns
+/// (success, error, or the client's own [`net_observer_ipc::SCAN_TIMEOUT`]), so
+/// nothing is leaked even though Ctrl-C here does not stop the work on the daemon
+/// (see [`scan_starting_line`]).
 fn run_scan_with_spinner(
     socket_path: &str,
     cmd: ControlCmd,
@@ -2755,8 +2743,11 @@ fn run_scan_with_spinner(
     let (tx, rx) = std::sync::mpsc::channel();
     let socket_path_for_thread = socket_path.to_string();
     std::thread::spawn(move || {
-        let outcome =
-            net_observer_ipc::control_within(&socket_path_for_thread, cmd, net_observer_ipc::SCAN_TIMEOUT);
+        let outcome = net_observer_ipc::control_within(
+            &socket_path_for_thread,
+            cmd,
+            net_observer_ipc::SCAN_TIMEOUT,
+        );
         // The receiver only ever drops after taking the result below, so a
         // failed send here would mean it dropped first — nothing left to
         // tell.
@@ -2798,6 +2789,16 @@ fn run_scan_with_spinner(
     }
 }
 
+/// Send `Control(ScanNeighbors)` and return the daemon's verdict, over the
+/// shared [`run_scan_with_spinner`] machinery.
+///
+/// The daemon answers only after the whole sweep (ARP + mDNS, then the
+/// ports/banners rungs) — tens of seconds on a real segment — so a client that
+/// gives up first reads its own timeout instead of the daemon's
+/// effective/dropped-rungs message; [`scan_socket_error`] turns that timeout
+/// into a message saying so, rather than [`socket_error`]'s generic transport
+/// wording. A daemon built before `ScanNeighbors` existed cannot decode the
+/// request; that is reported as "cannot", not as a refusal.
 fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
     let starting_line = scan_starting_line(&opts);
     run_scan_with_spinner(
