@@ -6112,6 +6112,62 @@ mod tests {
         assert!(script.contains("complete -c net-observer-cli"), "{script}");
     }
 
+    /// `clap_complete` does NOT honor `#[command(hide = true)]`: unlike
+    /// `--help`'s `Commands:` list, the generated completion script still
+    /// offers every hidden legacy alias alongside the new scan/diag/daemon
+    /// groups — checked by exact token match on the root command's `opts=`
+    /// line, not substring `contains`, since several of these names (`why`,
+    /// `gaps`, `probe`) are short enough to false-positive inside another
+    /// word. Pinned here so a future clap_complete upgrade that starts
+    /// respecting `hide` is noticed rather than silently changing the
+    /// discoverable completion surface (realm net-observer, node #164).
+    #[test]
+    fn completions_include_hidden_aliases_alongside_new_groups() {
+        let mut out: Vec<u8> = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut Cli::command(),
+            "net-observer-cli",
+            &mut out,
+        );
+        let script = String::from_utf8(out).expect("bash completion script is UTF-8");
+        let opts_line = script
+            .lines()
+            .find(|l| l.trim_start().starts_with("opts=") && l.contains("kickstart"))
+            .unwrap_or_else(|| panic!("no root `opts=` line found in:\n{script}"));
+        let tokens: std::collections::HashSet<&str> = opts_line
+            .trim()
+            .trim_start_matches("opts=\"")
+            .trim_end_matches('"')
+            .split_whitespace()
+            .collect();
+        // The new groups are offered.
+        for group in ["scan", "diag", "daemon"] {
+            assert!(tokens.contains(group), "missing `{group}` in: {opts_line}");
+        }
+        // Every hidden legacy alias still completes — clap_complete has no
+        // notion of `hide` at all, so this is current reality, not a choice
+        // this crate makes.
+        for legacy in [
+            "scan-neighbors",
+            "why",
+            "incident-context",
+            "wedge-or-starvation",
+            "gateway-ramp",
+            "gaps",
+            "kickstart",
+            "observe",
+            "probe",
+            "experiment",
+            "experiment-report",
+        ] {
+            assert!(
+                tokens.contains(legacy),
+                "expected hidden alias `{legacy}` to still complete: {opts_line}"
+            );
+        }
+    }
+
     /// `spinner_frame` cycles through the whole ten-glyph braille set and
     /// wraps back to the first frame rather than panicking or stalling on one
     /// glyph past the end of the array.

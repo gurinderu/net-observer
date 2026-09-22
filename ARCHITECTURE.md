@@ -1045,9 +1045,10 @@ the durable record; the socket is the live, low-latency read path.
   - `Request::Status` → `Response::Status(StatusSnapshot)`
   - `Request::Incidents { limit }` → `Response::Incidents(Vec<IncidentSummary>)`
   - `Request::Query(DiagnosticQuery)` → `Response::Table(Table)` — one of the
-    named diagnoses of [Diagnosis queries](#diagnosis-queries) (`why`,
-    `incident-context`, `wedge-or-starvation`, `gateway-ramp` and the drop list
-    it defaults from, `gaps` and `silences` — the latter every bracketed
+    named diagnoses of [Diagnosis queries](#diagnosis-queries) (`diag why`,
+    `diag incident-context`, `diag wedge` (renamed from `wedge-or-starvation`),
+    `diag gateway-ramp` and the drop list
+    it defaults from, `diag gaps` and `silences` — the latter every bracketed
     silence with a `kind` column: pause, stop, sleep, and passive stretches;
     `Gaps` keeps its frozen, pauses-only shape (no `kind` column at all),
     because a reader built before the tier asks for it by that id and would
@@ -1452,7 +1453,7 @@ already-authorised command:
    service via `launchctl kickstart -k <service>` (the service name is the one
    parameter `config::ActingCfg` holds). The client only *sends the request* —
    it never runs `launchctl` itself; the root daemon is the sole actor. This
-   capability lives in the CLI (`net-observer-cli kickstart`); it is **not**
+   capability lives in the CLI (`net-observer-cli daemon kickstart`); it is **not**
    surfaced in the bar (the bar has no "Restart sing-box" control).
 
 2. **Self-control — `ControlCmd::SetObserving(b)`**
@@ -1511,7 +1512,7 @@ already-authorised command:
    that names the instant either way; the first passive `SKIP`s never read as
    a recovery, and dead ticks from before a stretch stay out of the count
    after it. Clients: the bar menu's **Probe network**/**Stop probing**
-   row and `net-observer-cli probe passive|active`; `gaps` asks the `Silences`
+   row and `net-observer-cli daemon probe passive|active`; `diag gaps` asks the `Silences`
    diagnosis, which lists passive stretches as `kind = passive` next to the
    pause/stop/sleep gaps (`Gaps` itself stays frozen and pauses-only, for
    readers built before the tier; when an older daemon answers `Gaps` the CLI
@@ -1618,11 +1619,11 @@ already-authorised command:
    goes through the gated `api_query` path to the `experiment` table, and an
    id the record does not hold is a plain failure — the cue that the daemon
    restarted mid-window, its tier back at the configured default and the
-   report never computed. Clients: `net-observer-cli experiment [--minutes N]
+   report never computed. Clients: `net-observer-cli daemon experiment [--minutes N]
    [--no-wait]`, which prints the id and polls every 5 s until the table
    comes (waiting through socket errors up to a minute, since the window runs
-   in the daemon), and `experiment-report <id>`, which asks the daemon first
-   and reads the file's `experiment` table when none answers. In `gaps`, a
+   in the daemon), and `daemon experiment-report <id>`, which asks the daemon first
+   and reads the file's `experiment` table when none answers. In `diag gaps`, a
    passive stretch an experiment opened on an active daemon closes with
    `gap_closed_by = experiment` (read from the closing edge's `reason`; rows
    without one keep the `peer_uid` derivation), and on the event stream a
