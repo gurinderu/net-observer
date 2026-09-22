@@ -162,6 +162,25 @@ pub enum ControlCmd {
     /// is reported `ok: true` — absence is the honest answer on a segment
     /// with no managed switch or enterprise AP, never a failure.
     ScanTopology,
+    /// Capture what physically leaves the egress interface NOW: a fresh
+    /// short-lived `tcpdump -Q out` on the physical uplink for ~5s, folding the
+    /// outgoing IP packets by destination address (realm net-observer, node
+    /// #170). This is the physical complement to [`DiagnosticQuery::Connections`],
+    /// which reads sing-box's *tunneled* view and structurally cannot see the
+    /// encrypted uplink or route-excluded traffic.
+    ///
+    /// **Self-control, like [`ControlCmd::ScanTopology`]:** the daemon opens its
+    /// own capture on an interface it already owns and originates no frame of
+    /// its own — it only reads what this machine was already sending. The
+    /// round-trip is SYNCHRONOUS for the same reason `ScanTopology` is: the ~5s
+    /// budget fits well inside [`SCAN_TIMEOUT`], so the daemon answers with the
+    /// real destination/byte totals. A capture that could not run answers a SKIP
+    /// with its reason (`ok: false`); a capture that ran and saw nothing answers
+    /// `ok: true` with a zero — the two are never conflated, because under an
+    /// active tunnel a false "nothing observed" would mislead exactly the
+    /// question this scan answers. The destinations are read back with
+    /// [`DiagnosticQuery::EgressScan`] / [`DiagnosticQuery::EgressDsts`].
+    ScanEgress,
     /// Run an experiment window of `minutes` (realm net-observer, node #61):
     /// "is it us or the network", as a command. The daemon goes passive for
     /// the window — bracketed by a `probing_edge` whose reason is
@@ -408,6 +427,21 @@ pub enum DiagnosticQuery {
     /// The switch-topology uplinks, on every interface or on `iface`
     /// (`topology_sql`).
     Topology { iface: Option<String> },
+    /// The latest egress scan itself: when it ran, its interface, its verdict,
+    /// why it was skipped if it was, and the true totals across every
+    /// destination (`EGRESS_LATEST_SCAN_SQL`; realm net-observer, node #170).
+    /// Read first, its `ts_us` then pinning [`DiagnosticQuery::EgressDsts`] — a
+    /// `SKIP` row means the capture could not run, and its empty destination
+    /// list must never be presented as "nothing leaves this interface".
+    EgressScan,
+    /// The destinations ONE egress scan's outgoing packets went to, one row
+    /// each (`egress_dsts_at_sql`), top by bytes. `scan_ts_us` is the `ts_us`
+    /// the caller already read from `EgressScan`, not re-derived as "the
+    /// newest" here: the operator can run a second scan between a live client's
+    /// two round trips, and re-deriving would pair that scan's header with a
+    /// different scan's destinations — the same race `AirAps` closes (realm
+    /// net-observer, nodes #99, #170).
+    EgressDsts { scan_ts_us: i64 },
     /// What this machine talks to — the newest tick of the live flow table,
     /// grouped by `group_by` (`connections_sql`). `serde(default)` so a
     /// sender that names no grouping asks by host.
@@ -2181,6 +2215,50 @@ mod tests {
         }
     }
 
+    /// `ScanEgress` must survive the wire intact next to the commands that
+    /// already exist — the CLI's `scan egress` and the daemon's dispatch read
+    /// the same variant.
+    #[test]
+    fn scan_egress_round_trips_as_a_control_command() {
+        let line =
+            String::from_utf8(encode_frame(&Request::Control(ControlCmd::ScanEgress)).unwrap())
+                .unwrap();
+        match serde_json::from_str::<Request>(&line).unwrap() {
+            Request::Control(ControlCmd::ScanEgress) => {}
+            other => panic!("expected ScanEgress, got {other:?}"),
+        }
+    }
+
+    /// The `ScanTopology` precedent: a daemon built before `ScanEgress` existed
+    /// cannot decode the request and answers its one-shot
+    /// `Response::Error("bad request: …")`, which the client must read as
+    /// `Unsupported` — never as a refusal, which would claim the daemon CAN
+    /// capture the egress and declined to.
+    #[test]
+    fn an_old_daemon_rejects_scan_egress_as_unsupported_not_refused() {
+        /// The control vocabulary as a pre-egress daemon decodes it.
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        enum OldControlCmd {
+            KickstartProxy,
+            SetObserving(bool),
+            FreezePcap,
+            SetProbing(ProbingTier),
+            ScanNeighbors(ScanOptions),
+            ScanAir,
+            ScanTopology,
+            StartExperiment { minutes: u32 },
+        }
+        let line = String::from_utf8(encode_frame(&ControlCmd::ScanEgress).unwrap()).unwrap();
+        let e = serde_json::from_str::<OldControlCmd>(&line)
+            .expect_err("an old daemon cannot decode ScanEgress");
+        let answer = Response::Error(format!("{UNDECODABLE_REQUEST_PREFIX}{e}"));
+        match classify_control(answer).unwrap() {
+            ControlOutcome::Unsupported(m) => assert!(m.contains("ScanEgress"), "{m}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
     /// `SetProbing` must survive the wire with its tier intact, spelled in the
     /// lowercase vocabulary the config file and the DB column use — the bar's
     /// row, the CLI's `probe` and the daemon's dispatch read the same variant.
@@ -2267,6 +2345,10 @@ mod tests {
             DiagnosticQuery::Topology { iface: None },
             DiagnosticQuery::Topology {
                 iface: Some("en0".into()),
+            },
+            DiagnosticQuery::EgressScan,
+            DiagnosticQuery::EgressDsts {
+                scan_ts_us: 1_756_731_900_000_000,
             },
             DiagnosticQuery::Connections {
                 group_by: ConnectionsGroupBy::Host,

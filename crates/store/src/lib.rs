@@ -4,8 +4,8 @@ pub mod experiment;
 mod schema;
 
 pub use duckdb_store::{
-    DuckdbStore, ExperimentRecord, NeighborPort, NeighborScan, NeighborVuln, QueryTable,
-    SchemaDrift, StoreError,
+    DuckdbStore, EgressDst, EgressScanHeader, ExperimentRecord, NeighborPort, NeighborScan,
+    NeighborVuln, QueryTable, SchemaDrift, StoreError,
 };
 pub use schema::{AIR_SLICE, PRUNABLE_TABLES, SAMPLE_TABLES};
 use types::{
@@ -65,6 +65,18 @@ pub trait Store {
     /// `(iface, remote_chassis, remote_port)`, preserving `first_seen_us`. Every
     /// row is a hypothesis — LLDP/CDP are unauthenticated — never an asserted fact.
     fn write_topology_link(&self, l: &TopologyLink) -> Result<(), StoreError>;
+    /// Record one on-demand egress scan (see the `egress_scan` and `egress_dst`
+    /// tables; realm net-observer, node #170): the header row and its
+    /// destination rows in one transaction. On the `Store` trait rather than on
+    /// `DuckdbStore` alone because the control socket writes it — an egress scan
+    /// is the daemon reading its own uplink on operator demand, and the row
+    /// saying it did so goes through the same interface every other durable
+    /// record does. A `SKIP` header carries no rows.
+    fn write_egress_scan(
+        &self,
+        header: &EgressScanHeader,
+        rows: &[EgressDst],
+    ) -> Result<(), StoreError>;
     /// The lifetime bounds the record keeps for every neighbour on one segment
     /// (`network_key`; `None` folds to the same "unidentified network" key the
     /// writer uses).

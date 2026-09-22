@@ -1353,6 +1353,43 @@ WHERE wifi = 'OK' AND channel IS NOT NULL AND channel_band IS NOT NULL
 ORDER BY ts_us DESC
 LIMIT 1";
 
+/// **The latest egress scan itself** — when it ran, on which interface, its
+/// verdict, why it was skipped if it was, and the true totals across every
+/// destination it saw (realm net-observer, node #170).
+///
+/// Read FIRST, its `ts_us` then pinning [`egress_dsts_at_sql`]: a `SKIP` row
+/// means the capture could not run, and its empty destination list must never
+/// be presented as "nothing leaves this interface" — under an active tunnel a
+/// false zero would mislead exactly the question this scan answers. The two
+/// reads pin to one `ts_us` (bound rather than re-derived as `max(ts_us)`) for
+/// the same reason `AirScan`/`AirAps` do (realm net-observer, node #99): a
+/// second scan the operator runs between two round trips must not pair one
+/// scan's header with another's destinations.
+pub const EGRESS_LATEST_SCAN_SQL: &str = "\
+SELECT ts_us, iface, verdict, reason, duration_ms, packet_count, dst_count, byte_count
+FROM egress_scan
+ORDER BY ts_us DESC
+LIMIT 1";
+
+/// **The destinations one specific egress scan's outgoing packets went to** —
+/// one row each, filtered to the scan the caller already read
+/// (`WHERE ts_us = ?`, bound rather than re-selected as `max(ts_us)`; realm
+/// net-observer, node #170). Ordered by `bytes` descending: the scan stored
+/// only its heaviest destinations, and the reader shows what physically left
+/// the interface loudest first. A slice of one scan, not a history — a
+/// destination here cannot be matched to one in another scan.
+pub fn egress_dsts_at_sql(scan_ts_us: i64) -> PreparedSql {
+    PreparedSql {
+        sql: "\
+SELECT dst_ip, packets, bytes
+FROM egress_dst
+WHERE ts_us = ?
+ORDER BY bytes DESC, dst_ip"
+            .to_string(),
+        params: vec![Value::BigInt(scan_ts_us)],
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3757,5 +3794,52 @@ mod tests {
         let newer = s.query_prepared(&air_aps_at_sql(20 * SEC)).unwrap();
         assert_eq!(newer.rows.len(), 1);
         assert_eq!(cell(&newer, 0, "channel"), "149");
+    }
+
+    // ---- egress: pin the destination list to the scan the reader saw --------
+
+    fn egress_scan(s: &DuckdbStore, ts_us: i64, dst_ip: &str) {
+        s.write_egress_scan(
+            &crate::EgressScanHeader {
+                ts_us,
+                iface: "en0".into(),
+                verdict: "OK".into(),
+                reason: None,
+                duration_ms: 5000,
+                packet_count: 10,
+                dst_count: 1,
+                byte_count: 5000,
+            },
+            &[crate::EgressDst {
+                ts_us,
+                dst_ip: dst_ip.into(),
+                packets: 10,
+                bytes: 5000,
+            }],
+        )
+        .unwrap();
+    }
+
+    /// Two egress scans in the record, each with its own destination: pinning by
+    /// `ts_us` returns only the named scan's rows, never the other's — the same
+    /// race `egress_dsts_at_sql` closes for the air read (realm net-observer,
+    /// nodes #99, #170). Newest header comes back from `EGRESS_LATEST_SCAN_SQL`.
+    #[test]
+    fn egress_dsts_at_sql_returns_only_the_pinned_scans_rows() {
+        let s = DuckdbStore::in_memory().unwrap();
+        egress_scan(&s, 10 * SEC, "203.0.113.7");
+        egress_scan(&s, 20 * SEC, "198.51.100.9");
+
+        let latest = s.query_table(EGRESS_LATEST_SCAN_SQL).unwrap();
+        assert_eq!(latest.rows.len(), 1);
+        assert_eq!(cell(&latest, 0, "ts_us"), (20 * SEC).to_string());
+
+        let older = s.query_prepared(&egress_dsts_at_sql(10 * SEC)).unwrap();
+        assert_eq!(older.rows.len(), 1);
+        assert_eq!(cell(&older, 0, "dst_ip"), "203.0.113.7");
+
+        let newer = s.query_prepared(&egress_dsts_at_sql(20 * SEC)).unwrap();
+        assert_eq!(newer.rows.len(), 1);
+        assert_eq!(cell(&newer, 0, "dst_ip"), "198.51.100.9");
     }
 }

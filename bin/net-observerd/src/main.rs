@@ -38,9 +38,9 @@ use config::Config;
 use macos::LldpCapture;
 use macos::{
     AnnounceCapture, BoundTcpProber, ConnectionSystemFacts, CoreWlanFacts, DnsResolver,
-    FreezeAccess, HeldReferenceStreams, HostLoad, IcmpPinger, PcapRing, PfRouteSource,
-    ProxySystemFacts, SystemFacts, SystemNeighbors, SystemProfilerAir, SystemSegment,
-    TcpdumpLldpCapture,
+    EgressCapture, EgressCaptureOutcome, FreezeAccess, HeldReferenceStreams, HostLoad, IcmpPinger,
+    PcapRing, PfRouteSource, ProxySystemFacts, SystemFacts, SystemNeighbors, SystemProfilerAir,
+    SystemSegment, TcpdumpEgressCapture, TcpdumpLldpCapture,
 };
 use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
@@ -55,9 +55,9 @@ use triggers::handlers::{Handler, RecordHandler};
 use types::{ProbingEdge, ProbingTier, Sample};
 
 use pipeline::{
-    AirScanner, CveLookupOutcome, FreezePcapHandler, NeighborScanner, OnDemandAirScan, PcapFreezer,
-    PcapRingSlot, ScanReport, SnapshotHandler, TopologyScanner, run, spawn_event_collector,
-    spawn_interval_collector,
+    AirScanner, CveLookupOutcome, EgressScanOutcome, EgressScanner, FreezePcapHandler,
+    NeighborScanner, OnDemandAirScan, PcapFreezer, PcapRingSlot, ScanReport, SnapshotHandler,
+    TopologyScanner, run, spawn_event_collector, spawn_interval_collector,
 };
 
 /// How often a capture supervisor re-checks its `tcpdump` child — the pcap
@@ -77,6 +77,20 @@ const TOPOLOGY_PATROL_INTERVAL: Duration = Duration::from_secs(300);
 /// span a switch's advertisement interval, short enough that the throwaway
 /// capture is plainly bounded.
 const TOPOLOGY_CAPTURE_BUDGET: Duration = Duration::from_secs(65);
+
+/// How long an on-demand egress capture listens before it is stopped (realm
+/// net-observer, node #170). A short window: the scan is a snapshot of what is
+/// leaving the uplink right now, and ~5s captures enough of an active flow to
+/// name its destinations while keeping the synchronous round-trip well inside
+/// the CLI's `SCAN_TIMEOUT`.
+const EGRESS_CAPTURE_BUDGET: Duration = Duration::from_secs(5);
+
+/// How many destinations one egress scan stores, heaviest by bytes. The header
+/// keeps the TRUE totals across every destination; only this top slice is
+/// written to `egress_dst`, so a scan of a busy uplink cannot write thousands of
+/// rows while the operator only ever reads the loudest few (realm net-observer,
+/// node #170).
+const EGRESS_TOP_N: usize = 50;
 
 /// How often the record's retention sweep runs after the one at startup: once
 /// a day, the unit the retention window is counted in (realm net-observer,
@@ -353,6 +367,109 @@ fn spawn_topology_patrol(
             }
         }
     })
+}
+
+/// Capture the physical interface's outgoing IP packets once, fold them by
+/// destination, write the result to the store, and return it — the body the
+/// on-demand `ScanEgress` runs (realm net-observer, node #170). There is no
+/// egress patrol: unlike topology, this is operator-pressed only.
+///
+/// A capture that could not run writes a `SKIP` header (no rows) and returns it;
+/// a capture that ran writes an `OK` header carrying the TRUE totals across
+/// every destination, plus the top-[`EGRESS_TOP_N`] rows by bytes. The two are
+/// never conflated — SKIP is not silence, and on a tunneled uplink a false zero
+/// would mislead exactly the question this scan answers.
+///
+/// Blocking end to end: `capture.capture()` spawns a `tcpdump` child and waits
+/// up to its budget, so a caller on the async runtime must run this off the
+/// reactor — the on-demand scanner via `block_in_place` (see
+/// [`SystemEgressScanner::scan`]).
+fn run_egress_capture(
+    capture: &dyn EgressCapture,
+    store: &dyn store::Store,
+    iface: &str,
+    now: i64,
+) -> EgressScanOutcome {
+    let start = std::time::Instant::now();
+    let captured = capture.capture(EGRESS_CAPTURE_BUDGET);
+    let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+
+    let (header, rows) = match captured {
+        // The capture never ran: a SKIP with its reason and no destinations,
+        // never an OK zero.
+        EgressCaptureOutcome::CouldNotStart(reason) => (
+            store::EgressScanHeader {
+                ts_us: now,
+                iface: iface.to_string(),
+                verdict: "SKIP".to_string(),
+                reason: Some(reason),
+                duration_ms,
+                packet_count: 0,
+                dst_count: 0,
+                byte_count: 0,
+            },
+            Vec::new(),
+        ),
+        // The capture ran (possibly seeing nothing): fold the outgoing frames
+        // by destination.
+        EgressCaptureOutcome::Ran(frames) => {
+            let mut by_dst: std::collections::HashMap<std::net::IpAddr, (i64, u64)> =
+                std::collections::HashMap::new();
+            let mut packet_count: i64 = 0;
+            let mut byte_count: u64 = 0;
+            for frame in &frames {
+                let Some(pkt) = types::dst_and_len(frame) else {
+                    continue;
+                };
+                let entry = by_dst.entry(pkt.dst_ip).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 = entry.1.saturating_add(u64::from(pkt.bytes));
+                packet_count += 1;
+                byte_count = byte_count.saturating_add(u64::from(pkt.bytes));
+            }
+            let dst_count = by_dst.len();
+
+            // Heaviest by bytes first (ties broken by address for a stable
+            // order); the stored rows are only the top slice, but the header's
+            // counts above are the TRUE totals across every destination.
+            let mut sorted: Vec<(std::net::IpAddr, (i64, u64))> = by_dst.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.1.cmp(&a.1.1).then_with(|| a.0.cmp(&b.0)));
+            let rows: Vec<store::EgressDst> = sorted
+                .into_iter()
+                .take(EGRESS_TOP_N)
+                .map(|(ip, (packets, bytes))| store::EgressDst {
+                    ts_us: now,
+                    dst_ip: ip.to_string(),
+                    packets: i32::try_from(packets).unwrap_or(i32::MAX),
+                    bytes,
+                })
+                .collect();
+
+            (
+                store::EgressScanHeader {
+                    ts_us: now,
+                    iface: iface.to_string(),
+                    verdict: "OK".to_string(),
+                    reason: None,
+                    duration_ms,
+                    packet_count: i32::try_from(packet_count).unwrap_or(i32::MAX),
+                    dst_count: i32::try_from(dst_count).unwrap_or(i32::MAX),
+                    byte_count,
+                },
+                rows,
+            )
+        }
+    };
+
+    // A store write failure is logged as a gap, never swallowed — the operator
+    // still gets the live answer from the returned outcome, but the record says
+    // it was not persisted.
+    if let Err(e) = store.write_egress_scan(&header, &rows) {
+        tracing::warn!(error = %e,
+            "store write failed; egress scan dropped from DB (gap logged)");
+    }
+
+    EgressScanOutcome { header, rows }
 }
 
 /// The retention plan a configuration asks for: `None` for keep-forever
@@ -1938,6 +2055,72 @@ impl TopologyScanner for SystemTopologyScanner {
     }
 }
 
+/// The production [`EgressScanner`]: resolves the physical interface fresh at
+/// scan time — never a boot-time value, the same "ask the OS now" precedent
+/// [`SystemScanner`] and [`SystemTopologyScanner`] use — then runs
+/// [`run_egress_capture`] on it through the SAME store handle every other
+/// durable record goes through (realm net-observer, node #170). No live
+/// snapshot to mirror into: unlike topology, the egress scan is a record read
+/// back on demand, not part of the bar's status view.
+pub(crate) struct SystemEgressScanner {
+    facts: SystemFacts,
+    store: Arc<DuckdbStore>,
+}
+
+impl SystemEgressScanner {
+    fn new(facts: SystemFacts, store: Arc<DuckdbStore>) -> Self {
+        Self { facts, store }
+    }
+}
+
+impl EgressScanner for SystemEgressScanner {
+    /// Blocking work (an async interface lookup, then a `tcpdump` child held
+    /// open for ~5s) inside an async request handler, so it runs under
+    /// `block_in_place` exactly like [`SystemTopologyScanner::scan`]: the
+    /// worker thread is handed back to the runtime for the duration instead of
+    /// stalling every other connection behind one capture.
+    ///
+    /// **Requires the multi-thread runtime** — see `SystemScanner::scan`'s doc
+    /// for why that always holds here. A physical interface that cannot be
+    /// resolved is a SKIP with its reason, never a silent zero.
+    fn scan(&self) -> EgressScanOutcome {
+        // The no-interface SKIP branch below writes through the concrete
+        // `Arc<DuckdbStore>`, so the `Store` trait must be in scope here (a
+        // trait method on a concrete type, unlike `run_egress_capture`'s
+        // `&dyn Store`, needs the trait imported).
+        use store::Store as _;
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            let now = types::now_us();
+            let Some(iface) = rt.block_on(self.facts.phys_iface()) else {
+                tracing::info!(
+                    "egress scan: no physical interface resolved; SKIP (nothing to capture)"
+                );
+                let header = store::EgressScanHeader {
+                    ts_us: now,
+                    iface: String::new(),
+                    verdict: "SKIP".to_string(),
+                    reason: Some("no physical interface resolved".to_string()),
+                    duration_ms: 0,
+                    packet_count: 0,
+                    dst_count: 0,
+                    byte_count: 0,
+                };
+                if let Err(e) = self.store.write_egress_scan(&header, &[]) {
+                    tracing::warn!(error = %e,
+                        "store write failed; egress SKIP dropped from DB (gap logged)");
+                }
+                return EgressScanOutcome {
+                    header,
+                    rows: Vec::new(),
+                };
+            };
+            let capture = TcpdumpEgressCapture::new(iface.clone());
+            run_egress_capture(&capture, self.store.as_ref(), &iface, now)
+        })
+    }
+}
+
 /// A test-only interval collector whose readiness the test flips at will, so the
 /// per-tick preflight retry in `spawn_interval_collector` can be driven directly.
 /// Every real collector in `AnyCollector` is a concrete type wired to real ports
@@ -2428,6 +2611,17 @@ fn build_api_server(
             Arc::clone(&store),
             Arc::clone(&snapshot),
         )) as Arc<dyn TopologyScanner>),
+        // Built unconditionally, exactly like `topology_scanner`: whether there
+        // is a physical interface and anything to see leaving it is decided per
+        // request, not once at boot (realm net-observer, nodes #91, #170).
+        // Shares the SAME store handle the other writers use.
+        egress_scanner: Some(Arc::new(SystemEgressScanner::new(
+            SystemFacts::new(
+                cfg.collectors.link.gw.clone(),
+                cfg.collectors.link.phys_iface.clone(),
+            ),
+            Arc::clone(&store),
+        )) as Arc<dyn EgressScanner>),
         // Where the `cve` rung loads its snapshot; the availability check in
         // `scan_now` decides whether the rung is effective this run.
         scan_cve_snapshot: cfg
@@ -3409,6 +3603,14 @@ mod tests {
         assert!(
             srv.air_scanner.is_some(),
             "the air scan button must have something to call"
+        );
+
+        // The egress scanner is wired unconditionally too (realm net-observer,
+        // node #170): whether there is anything to capture is decided per
+        // request, not once at boot.
+        assert!(
+            srv.egress_scanner.is_some(),
+            "the egress scan command must have something to call"
         );
 
         // The config reaches the socket verbatim.

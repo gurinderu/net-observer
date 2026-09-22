@@ -314,6 +314,21 @@ enum Command {
     /// muscle memory.
     #[command(hide = true)]
     ScanTopology,
+    /// Capture what physically leaves the egress interface now (~5s), folded by
+    /// destination IP.
+    ///
+    /// Sent as a `Control(ScanEgress)` request over the socket. The daemon opens
+    /// its own short-lived `tcpdump -Q out` on the physical uplink and reads
+    /// only what this machine was already sending — the physical complement to
+    /// `connections`, which reads sing-box's tunneled view and cannot see the
+    /// encrypted uplink or route-excluded traffic. A capture that could not run
+    /// exits non-zero with its reason; one that ran — even seeing nothing —
+    /// succeeds. Read the destinations back with `egress`.
+    ///
+    /// Hidden alias for `scan egress` — kept flat for old scripts and muscle
+    /// memory (realm net-observer, node #170).
+    #[command(hide = true)]
+    ScanEgress,
     /// The neighbours the record knows on each segment, newest tick first.
     ///
     /// MAC, address, vendor OUI, name if one was ever learned, and how it
@@ -441,6 +456,18 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// What physically left the egress interface in the latest scan, by
+    /// destination IP.
+    ///
+    /// The destinations the most recent `scan egress` capture's outgoing
+    /// packets went to — destination IP, packet count, and on-wire bytes,
+    /// loudest by bytes first. This is what physically leaves the uplink (the
+    /// encrypted sing-box tunnel and anything routed around it), which
+    /// `connections` — sing-box's tunneled view — structurally cannot show.
+    /// Run `scan egress` first to record a scan; this reads the newest one.
+    /// Asks the running daemon first, reads the DB file only when no daemon
+    /// answers. (realm net-observer, node #170)
+    Egress,
     /// What this machine talks to: the live sing-box flow table, grouped.
     ///
     /// The newest tick of the live flow table sing-box carries (its Clash
@@ -693,6 +720,18 @@ enum ScanCmd {
     /// switches and enterprise APs advertise LLDP/CDP at all. Exits non-zero
     /// if the capture was refused or the daemon is unreachable.
     Topology,
+    /// Capture what physically leaves the egress interface now (~5s), folded by
+    /// destination IP.
+    ///
+    /// Sent as a `Control(ScanEgress)` request over the socket. The daemon opens
+    /// its own short-lived `tcpdump -Q out` on the physical uplink and reads
+    /// only the packets this machine was already sending — the physical
+    /// complement to `connections`, which reads sing-box's tunneled view and
+    /// cannot see the encrypted uplink or route-excluded traffic. A capture that
+    /// could not run exits non-zero with its reason; one that ran — even seeing
+    /// nothing — succeeds. Read the destinations back with `egress`. (realm
+    /// net-observer, node #170)
+    Egress,
 }
 
 /// Post-outage forensics — the named diagnoses that answer "which layer
@@ -1618,6 +1657,15 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             }
             eprintln!("read the uplinks with `net-observer-cli topology`");
         }
+        Command::Scan(ScanCmd::Egress) | Command::ScanEgress => {
+            let cfg = load_config(cli)?;
+            let result = fetch_scan_egress(&cfg.socket_path)?;
+            print!("{}", format_control(&result));
+            if !result.ok {
+                return Ok(ExitCode::FAILURE);
+            }
+            eprintln!("read it with `net-observer-cli egress`");
+        }
         // The named diagnoses: the filter is validated HERE, before any socket
         // or file is touched, so a bad key is the builder's own error and never
         // a round-trip — then the daemon is asked, and the file read only when
@@ -1801,6 +1849,56 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             )?;
             let table = if *all { table } else { keep_last_run(&table) };
             print_table(&table, true, cli.full);
+        }
+        Command::Egress => {
+            // Two reads pinned to one scan (realm net-observer, nodes #99,
+            // #170): the header names the newest scan and its `ts_us`, and the
+            // destinations are read at that exact `ts_us` so a scan the operator
+            // runs between the two round trips cannot pair one scan's header
+            // with another's destinations.
+            let record = Record::resolve(cli)?;
+            let (scan, dsts) =
+                match route_egress(record.socket.as_deref(), net_observer_ipc::diagnose)? {
+                    EgressRoute::Live { scan, dsts, via } => {
+                        eprintln!("source: net-observerd via {via}");
+                        (scan, dsts)
+                    }
+                    EgressRoute::Offline { why, locked } => {
+                        if let Some(why) = why {
+                            eprintln!("{why}; reading the file instead");
+                        }
+                        eprintln!("source: file {}", record.db_path);
+                        let offline = Offline {
+                            db_path: record.db_path,
+                            locked,
+                        };
+                        let scan = table_from_query(run_query(
+                            &offline,
+                            diagnosis::EGRESS_LATEST_SCAN_SQL,
+                        )?);
+                        let dsts = match scan_ts_us(&scan) {
+                            Some(ts) => table_from_query(run_prepared(
+                                &offline,
+                                &diagnosis::egress_dsts_at_sql(ts),
+                            )?),
+                            None => Table::default(),
+                        };
+                        (scan, dsts)
+                    }
+                };
+            // No scan on record at all: say so plainly rather than print an
+            // empty table that reads as "nothing leaves the interface".
+            if scan.rows.is_empty() {
+                println!("no egress scan recorded yet; run `net-observer-cli scan egress` first");
+            } else {
+                // SKIP-never-silence: when the latest scan could not capture,
+                // the empty destination table must not be read as a real zero
+                // (realm net-observer, node #170).
+                if let Some(note) = egress_skip_note(&scan) {
+                    eprintln!("{note}");
+                }
+                print_table(&dsts, true, cli.full);
+            }
         }
         Command::Connections {
             by,
@@ -2238,6 +2336,86 @@ fn ask_air_table(
             "net-observerd at {via} answered AirScan but cannot decode {q:?} ({m})"
         )),
     }
+}
+
+/// Where the `egress` read came from, once decided (realm net-observer, node
+/// #170). `Live` carries the scan header and its destination rows: [`route_egress`]
+/// asks `EgressDsts` over the same socket the header answered on, so a daemon
+/// that reads one reads both — they shipped together.
+#[derive(Debug, Clone, PartialEq)]
+enum EgressRoute {
+    Live {
+        scan: Table,
+        dsts: Table,
+        via: String,
+    },
+    Offline {
+        why: Option<String>,
+        locked: String,
+    },
+}
+
+/// [`route`] the `egress` read from ONE question — `EgressScan` — and reuse
+/// that choice for `EgressDsts`, pinned to the header's own `ts_us`: a daemon or
+/// a file is decided once, so the destinations can never be paired with a
+/// different scan's header than the one just read (realm net-observer, nodes
+/// #99, #170).
+fn route_egress(
+    socket: Option<&str>,
+    ask: impl Fn(&str, DiagnosticQuery) -> std::io::Result<QueryOutcome>,
+) -> Result<EgressRoute> {
+    match route(socket, |s| ask(s, DiagnosticQuery::EgressScan))? {
+        Route::Live { table: scan, via } => {
+            let dsts = match scan_ts_us(&scan) {
+                Some(scan_ts_us) => ask_egress_dsts(&via, &ask, scan_ts_us)?,
+                None => Table::default(),
+            };
+            Ok(EgressRoute::Live { scan, dsts, via })
+        }
+        Route::Offline { why, locked } => Ok(EgressRoute::Offline { why, locked }),
+    }
+}
+
+/// One more live read over a socket [`route_egress`] already committed to,
+/// mapping a daemon that stops answering mid-read to an error rather than a
+/// silent fall to the file — a fall back there would mix a live header with an
+/// offline destination list from a possibly different moment.
+fn ask_egress_dsts(
+    via: &str,
+    ask: &impl Fn(&str, DiagnosticQuery) -> std::io::Result<QueryOutcome>,
+    scan_ts_us: i64,
+) -> Result<Table> {
+    let q = DiagnosticQuery::EgressDsts { scan_ts_us };
+    match ask(via, q.clone())? {
+        QueryOutcome::Table(t) => Ok(t),
+        QueryOutcome::Failed(m) => Err(anyhow!("net-observerd returned an error: {m}")),
+        QueryOutcome::Unsupported(m) => Err(anyhow!(
+            "net-observerd at {via} answered EgressScan but cannot decode {q:?} ({m})"
+        )),
+    }
+}
+
+/// When the latest egress scan was a `SKIP`, the one-line reason to print before
+/// the (empty) destination table — so an empty table after a failed capture is
+/// never read as "nothing physically left the interface" (realm net-observer,
+/// node #170). `None` on an `OK` scan. Pure over its input.
+fn egress_skip_note(scan: &Table) -> Option<String> {
+    let verdict_i = scan.columns.iter().position(|c| c == "verdict")?;
+    let row = scan.rows.first()?;
+    if row.get(verdict_i).map(String::as_str) != Some("SKIP") {
+        return None;
+    }
+    let reason = scan
+        .columns
+        .iter()
+        .position(|c| c == "reason")
+        .and_then(|i| row.get(i))
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| "the capture could not run".to_string(), String::clone);
+    Some(format!(
+        "the latest egress scan could not capture ({reason}); no destinations recorded — \
+         this is not \"nothing left the interface\""
+    ))
 }
 
 /// [`diagnose_table`] with the socket round-trip itself injected, for a
@@ -2843,6 +3021,36 @@ fn fetch_scan_topology(socket_path: &str) -> Result<ControlResult> {
             }
         },
         |e| anyhow!("net-observerd cannot force a topology capture (built before it existed): {e}"),
+    )
+}
+
+/// Send `Control(ScanEgress)` and return the daemon's verdict.
+///
+/// Shares the spinner/timeout machinery of [`run_scan_with_spinner`] with
+/// [`fetch_scan_topology`] — the daemon answers only after the ~5s capture
+/// finishes, so this reads with [`net_observer_ipc::SCAN_TIMEOUT`], not the
+/// default 2s budget. Only the starting line and the two egress-specific
+/// failure messages differ (realm net-observer, node #170).
+fn fetch_scan_egress(socket_path: &str) -> Result<ControlResult> {
+    run_scan_with_spinner(
+        socket_path,
+        ControlCmd::ScanEgress,
+        "capturing en0 egress for ~5s… this is normal, not stuck. Ctrl-C leaves the capture \
+         running on net-observerd; read results later with `net-observer-cli egress`.",
+        |socket_path, e| {
+            use std::io::ErrorKind::{TimedOut, WouldBlock};
+            if matches!(e.kind(), WouldBlock | TimedOut) {
+                anyhow!(
+                    "the capture is still running on net-observerd and will finish there — its \
+                     destinations land in the record. Read them with `net-observer-cli egress`."
+                )
+            } else if daemon_not_running(e) {
+                anyhow!("net-observerd not running (socket {socket_path} unavailable)")
+            } else {
+                anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
+            }
+        },
+        |e| anyhow!("net-observerd cannot capture egress (built before it existed): {e}"),
     )
 }
 
@@ -3952,6 +4160,81 @@ mod tests {
     fn scan_topology_flat_alias_parses() {
         let cli = Cli::try_parse_from(["net-observer-cli", "scan-topology"]).unwrap();
         assert!(matches!(cli.command, Command::ScanTopology));
+    }
+
+    /// The nested `scan egress` form parses as `ScanCmd::Egress` (realm
+    /// net-observer, node #170).
+    #[test]
+    fn scan_egress_nested_form_parses() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "scan", "egress"]).unwrap();
+        assert!(matches!(cli.command, Command::Scan(ScanCmd::Egress)));
+    }
+
+    /// The flat `scan-egress` hidden alias still parses — kept for muscle
+    /// memory, like `scan-topology`.
+    #[test]
+    fn scan_egress_flat_alias_parses() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "scan-egress"]).unwrap();
+        assert!(matches!(cli.command, Command::ScanEgress));
+    }
+
+    /// The `egress` read command parses.
+    #[test]
+    fn egress_read_command_parses() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "egress"]).unwrap();
+        assert!(matches!(cli.command, Command::Egress));
+    }
+
+    /// A `SKIP` header yields the note that keeps an empty destination table
+    /// from reading as "nothing left the interface"; an `OK` header yields
+    /// none (realm net-observer, node #170).
+    #[test]
+    fn egress_skip_note_fires_only_on_a_skip_header() {
+        let cols = || {
+            vec![
+                "ts_us".to_string(),
+                "iface".to_string(),
+                "verdict".to_string(),
+                "reason".to_string(),
+                "duration_ms".to_string(),
+                "packet_count".to_string(),
+                "dst_count".to_string(),
+                "byte_count".to_string(),
+            ]
+        };
+        let skip = Table {
+            columns: cols(),
+            rows: vec![vec![
+                "1".into(),
+                "en0".into(),
+                "SKIP".into(),
+                "could not start tcpdump (needs root + BPF)".into(),
+                "0".into(),
+                "0".into(),
+                "0".into(),
+                "0".into(),
+            ]],
+        };
+        let note = egress_skip_note(&skip).expect("a SKIP header must produce a note");
+        assert!(note.contains("could not start tcpdump"), "{note}");
+
+        let ok = Table {
+            columns: cols(),
+            rows: vec![vec![
+                "1".into(),
+                "en0".into(),
+                "OK".into(),
+                String::new(),
+                "5000".into(),
+                "900".into(),
+                "3".into(),
+                "1234".into(),
+            ]],
+        };
+        assert!(egress_skip_note(&ok).is_none());
+
+        // No scan at all: no note (the caller prints its own "run scan egress").
+        assert!(egress_skip_note(&Table::default()).is_none());
     }
 
     /// `diag why --at …` parses into the nested form, same as the old flat
