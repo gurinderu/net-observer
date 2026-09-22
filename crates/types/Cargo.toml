@@ -7,6 +7,7 @@ serde.workspace = true
 thiserror.workspace = true
 jiff.workspace = true
 lldp.workspace = true
+etherparse.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

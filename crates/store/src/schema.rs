@@ -292,6 +292,29 @@ ALTER TABLE connection_sample ADD COLUMN IF NOT EXISTS iface VARCHAR;
 -- open like `topology_link` above.
 CREATE TABLE IF NOT EXISTS singbox_log_sample (
   ts_us BIGINT, class VARCHAR, count UINTEGER, node VARCHAR, sample_message VARCHAR);
+-- What physically leaves the egress interface, captured on operator demand
+-- (realm net-observer, node #170). Two tables, the header+slice shape `air`
+-- uses: `egress_scan` is one row per on-demand scan (its verdict included, so a
+-- SKIP stays visible), and `egress_dst` the destinations that one scan's
+-- outgoing packets went to, joined back by `ts_us`. `connections` reads
+-- sing-box's tunneled view and structurally cannot see the encrypted uplink or
+-- route-excluded traffic; this is the physical complement.
+-- `verdict = 'OK'` with `dst_count = 0` is a real reading — the capture ran and
+-- this machine sent nothing on the interface in the window. `verdict = 'SKIP'`
+-- is the different fact that the capture could not run (needs root + BPF, or the
+-- interface was gone), and `reason` says why; the two must never be conflated —
+-- under an active tunnel a false zero would mislead exactly the question this
+-- answers. `packet_count` / `dst_count` / `byte_count` are the TRUE totals
+-- across every destination; `egress_dst` holds only the top rows by bytes. On-
+-- demand records like `neighbor_scan`, so not pruned. Added after the store
+-- first shipped, so an older DB file gains the tables on open like
+-- `topology_link` above.
+CREATE TABLE IF NOT EXISTS egress_scan (
+  ts_us BIGINT, iface VARCHAR, verdict VARCHAR, reason VARCHAR, duration_ms BIGINT,
+  packet_count INTEGER, dst_count INTEGER, byte_count UBIGINT);
+CREATE TABLE IF NOT EXISTS egress_dst (
+  ts_us BIGINT, dst_ip VARCHAR, packets INTEGER, bytes UBIGINT,
+  PRIMARY KEY (ts_us, dst_ip));
 CREATE TABLE IF NOT EXISTS observing_edge (
   ts_us BIGINT, observing BOOLEAN, peer_uid BIGINT, cause VARCHAR);
 -- `cause` was added after the first daemon shipped rows without it. A database
@@ -354,9 +377,10 @@ CREATE TABLE IF NOT EXISTS record_prune (
 ///
 /// Not here: `incident`, `blob_ref`, `trigger_fired` (evidence),
 /// `observing_edge` / `probing_edge` / `record_prune` (brackets),
-/// `neighbor_scan` (the record of the daemon having spoken on the segment),
-/// `experiment`, and the keyed entity tables (`neighbor*`, `topology_link`),
-/// which hold one row per thing seen and do not grow per tick.
+/// `neighbor_scan` and `egress_scan` / `egress_dst` (records of an
+/// operator-pressed scan; realm net-observer, node #170), `experiment`, and the
+/// keyed entity tables (`neighbor*`, `topology_link`), which hold one row per
+/// thing seen and do not grow per tick.
 pub const SAMPLE_TABLES: &[&str] = &[
     "link_sample",
     "proxy_sample",

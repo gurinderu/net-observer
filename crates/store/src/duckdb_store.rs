@@ -89,6 +89,43 @@ pub struct NeighborScan {
     pub detail: Option<String>,
 }
 
+/// The header row of one on-demand egress scan, as written to `egress_scan`
+/// (realm net-observer, node #170).
+///
+/// `verdict` is `SKIP` when the capture could not run (`reason` says why) and
+/// `OK` when it ran — including a run that saw nothing, which is `OK` with
+/// `dst_count = 0`, never `SKIP`. The three counts are the TRUE totals across
+/// every destination the capture saw; the rows a scan writes to `egress_dst`
+/// are only its top slice by bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressScanHeader {
+    pub ts_us: i64,
+    pub iface: String,
+    /// `OK` | `SKIP`.
+    pub verdict: String,
+    /// Why the capture was skipped; `None` on an `OK` scan.
+    pub reason: Option<String>,
+    pub duration_ms: i64,
+    /// Total outgoing packets the capture folded, across all destinations.
+    pub packet_count: i32,
+    /// Distinct destination IPs seen, across all destinations (not just the
+    /// stored top slice).
+    pub dst_count: i32,
+    /// Total on-wire bytes summed across all destinations.
+    pub byte_count: u64,
+}
+
+/// One destination an egress scan's outgoing packets went to, as written to
+/// `egress_dst` (realm net-observer, node #170). A scan stores only its top
+/// destinations by `bytes`; the header carries the true totals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressDst {
+    pub ts_us: i64,
+    pub dst_ip: String,
+    pub packets: i32,
+    pub bytes: u64,
+}
+
 /// What a store call can fail with.
 ///
 /// Two variants exist because the connection is shared with the writer: a
@@ -413,6 +450,8 @@ const INSERT_CONNECTION_SAMPLE: &str =
     "INSERT INTO connection_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_SINGBOX_LOG_SAMPLE: &str = "INSERT INTO singbox_log_sample VALUES (?,?,?,?,?)";
 const INSERT_NEIGHBOR_SCAN: &str = "INSERT INTO neighbor_scan VALUES (?,?,?,?,?,?,?,?)";
+const INSERT_EGRESS_SCAN: &str = "INSERT INTO egress_scan VALUES (?,?,?,?,?,?,?,?)";
+const INSERT_EGRESS_DST: &str = "INSERT INTO egress_dst VALUES (?,?,?,?)";
 const INSERT_INCIDENT: &str = "INSERT INTO incident VALUES (?,?,?,?,?)";
 const INSERT_BLOB_REF: &str = "INSERT INTO blob_ref VALUES (?,?,?,?,?)";
 const INSERT_TRIGGER_FIRED: &str = "INSERT INTO trigger_fired VALUES (?,?,?,?)";
@@ -433,6 +472,8 @@ const POSITIONAL_INSERTS: &[(&str, &str)] = &[
     ("connection_sample", INSERT_CONNECTION_SAMPLE),
     ("singbox_log_sample", INSERT_SINGBOX_LOG_SAMPLE),
     ("neighbor_scan", INSERT_NEIGHBOR_SCAN),
+    ("egress_scan", INSERT_EGRESS_SCAN),
+    ("egress_dst", INSERT_EGRESS_DST),
     ("incident", INSERT_INCIDENT),
     ("blob_ref", INSERT_BLOB_REF),
     ("trigger_fired", INSERT_TRIGGER_FIRED),
@@ -781,6 +822,38 @@ impl Store for DuckdbStore {
                 l.ts_us
             ],
         )?;
+        Ok(())
+    }
+    fn write_egress_scan(
+        &self,
+        header: &EgressScanHeader,
+        rows: &[EgressDst],
+    ) -> Result<(), StoreError> {
+        // Header + its destination rows in one transaction, the `air` slice
+        // pattern: a reader must never meet an `egress_dst` row whose scan
+        // header is not yet there, nor a header without the rows it counts.
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        tx.execute(
+            INSERT_EGRESS_SCAN,
+            params![
+                header.ts_us,
+                header.iface,
+                header.verdict,
+                header.reason,
+                header.duration_ms,
+                header.packet_count,
+                header.dst_count,
+                header.byte_count
+            ],
+        )?;
+        for r in rows {
+            tx.execute(
+                INSERT_EGRESS_DST,
+                params![r.ts_us, r.dst_ip, r.packets, r.bytes],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
     fn open_incident(&self, i: &Incident) -> Result<(), StoreError> {
@@ -2368,6 +2441,124 @@ mod tests {
         );
         assert_eq!(
             s.query_scalar_i64("SELECT count(*) FROM air_ap").unwrap(),
+            0
+        );
+    }
+
+    /// One egress scan lands as its header row plus one row per destination,
+    /// joined by `ts_us` — the header carries the true totals, the rows the
+    /// stored slice (realm net-observer, node #170).
+    #[test]
+    fn write_and_read_back_egress_scan() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_egress_scan(
+            &EgressScanHeader {
+                ts_us: 5000,
+                iface: "en0".into(),
+                verdict: "OK".into(),
+                reason: None,
+                duration_ms: 5000,
+                packet_count: 900,
+                dst_count: 3,
+                byte_count: 1_234_567,
+            },
+            &[
+                EgressDst {
+                    ts_us: 5000,
+                    dst_ip: "203.0.113.7".into(),
+                    packets: 800,
+                    bytes: 1_200_000,
+                },
+                EgressDst {
+                    ts_us: 5000,
+                    dst_ip: "198.51.100.9".into(),
+                    packets: 100,
+                    bytes: 34_567,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM egress_scan WHERE ts_us=5000 AND iface='en0' \
+                 AND verdict='OK' AND reason IS NULL AND packet_count=900 AND dst_count=3 \
+                 AND byte_count=1234567"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM egress_dst WHERE ts_us=5000 AND dst_ip='203.0.113.7' \
+                 AND packets=800 AND bytes=1200000"
+            )
+            .unwrap(),
+            1
+        );
+        // The stored slice is only its two rows even though the header counts 3
+        // destinations — the third is a real destination the top-N left out.
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM egress_dst WHERE ts_us=5000")
+                .unwrap(),
+            2
+        );
+    }
+
+    /// The distinction the SKIP rule exists for, at the storage layer: a scan
+    /// whose capture could not run leaves a `SKIP` header with its reason and no
+    /// destinations, while a scan that ran and saw nothing leaves an `OK` header
+    /// with `dst_count = 0`. Both are rows; they are not the same row — a false
+    /// zero under an active tunnel would mislead the whole security question.
+    #[test]
+    fn a_skipped_egress_scan_is_not_stored_as_a_silent_zero() {
+        let s = DuckdbStore::in_memory().unwrap();
+        s.write_egress_scan(
+            &EgressScanHeader {
+                ts_us: 6000,
+                iface: "en0".into(),
+                verdict: "SKIP".into(),
+                reason: Some("could not start tcpdump (needs root + BPF)".into()),
+                duration_ms: 0,
+                packet_count: 0,
+                dst_count: 0,
+                byte_count: 0,
+            },
+            &[],
+        )
+        .unwrap();
+        s.write_egress_scan(
+            &EgressScanHeader {
+                ts_us: 6100,
+                iface: "en0".into(),
+                verdict: "OK".into(),
+                reason: None,
+                duration_ms: 5000,
+                packet_count: 0,
+                dst_count: 0,
+                byte_count: 0,
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM egress_scan WHERE ts_us=6000 AND verdict='SKIP' \
+                 AND reason LIKE 'could not start%' AND dst_count=0"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM egress_scan WHERE ts_us=6100 AND verdict='OK' \
+                 AND reason IS NULL AND dst_count=0"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64("SELECT count(*) FROM egress_dst")
+                .unwrap(),
             0
         );
     }

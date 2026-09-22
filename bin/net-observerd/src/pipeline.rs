@@ -957,6 +957,38 @@ pub trait TopologyScanner: Send + Sync {
     fn scan(&self) -> Vec<types::TopologyLink>;
 }
 
+/// One operator-pressed egress capture behind a trait, so `api` holds no
+/// platform code and the control path is testable without a real `tcpdump`
+/// child (realm net-observer, node #170). The production impl is
+/// [`crate::SystemEgressScanner`].
+///
+/// Like [`TopologyScanner`], this returns only after the capture finishes:
+/// `ScanEgress`'s round-trip is SYNCHRONOUS, because the ~5s budget fits well
+/// inside the CLI's `SCAN_TIMEOUT` — the operator is answered with the real
+/// destination/byte totals, not just an "accepted" ack. Blocking is therefore
+/// expected; the production impl runs it under `tokio::task::block_in_place`,
+/// exactly like [`crate::SystemTopologyScanner::scan`].
+pub trait EgressScanner: Send + Sync {
+    /// Capture the outgoing IP packets NOW and fold them by destination,
+    /// returning the header the daemon already wrote plus the stored top-slice
+    /// rows. Unlike topology, the outcome is a two-state
+    /// [`EgressScanOutcome`]: a capture that could not run answers a SKIP
+    /// header with its reason and no rows, never an empty OK — the two are
+    /// never conflated (SKIP is not silence).
+    fn scan(&self) -> EgressScanOutcome;
+}
+
+/// What one egress scan did and found, in the shape the control path needs: the
+/// header row already written to the store (verdict, counts) and the stored
+/// destination rows (already sorted, top-N by bytes). The `api` handler reads
+/// the header's verdict/counts to word its one-line answer; the rows travel so
+/// the outcome is a complete description of what was recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressScanOutcome {
+    pub header: store::EgressScanHeader,
+    pub rows: Vec<store::EgressDst>,
+}
+
 /// What one scan did and found, in the shape the control path needs: the
 /// entities to upsert, and the durable rows saying the daemon spoke.
 #[derive(Debug, Clone, PartialEq)]

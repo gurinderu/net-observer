@@ -1,5 +1,6 @@
 pub mod air;
 pub mod connection;
+pub mod egress;
 pub mod experiment;
 pub mod incident;
 pub mod mac;
@@ -19,6 +20,7 @@ pub use connection::{
     ConnectionRow, ConnectionScope, ConnectionsGroupBy, ConnectionsSample, LiveConnection,
     ParseScopeError, classify_scope,
 };
+pub use egress::{EgressPacket, dst_and_len};
 pub use experiment::{
     ExperimentReport, ExperimentWindow, FlowTotals, NetworkFacts, OwnFrames, TierRestore,
     WindowEdges,

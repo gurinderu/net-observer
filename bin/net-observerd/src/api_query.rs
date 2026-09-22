@@ -78,6 +78,10 @@ pub fn run_query(
         DiagnosticQuery::Topology { iface } => {
             PreparedSql::plain(diagnosis::topology_sql(iface.as_deref()).map_err(|e| bad(&e))?)
         }
+        DiagnosticQuery::EgressScan => {
+            PreparedSql::plain(diagnosis::EGRESS_LATEST_SCAN_SQL.to_string())
+        }
+        DiagnosticQuery::EgressDsts { scan_ts_us } => diagnosis::egress_dsts_at_sql(scan_ts_us),
         DiagnosticQuery::Connections { group_by } => {
             PreparedSql::plain(diagnosis::connections_sql(group_by))
         }
@@ -275,6 +279,23 @@ mod tests {
         expect(
             DiagnosticQuery::AirSelfChannel,
             &["ts_us", "channel", "channel_band", "channel_width_mhz"],
+        );
+        expect(
+            DiagnosticQuery::EgressScan,
+            &[
+                "ts_us",
+                "iface",
+                "verdict",
+                "reason",
+                "duration_ms",
+                "packet_count",
+                "dst_count",
+                "byte_count",
+            ],
+        );
+        expect(
+            DiagnosticQuery::EgressDsts { scan_ts_us: 1 },
+            &["dst_ip", "packets", "bytes"],
         );
     }
 

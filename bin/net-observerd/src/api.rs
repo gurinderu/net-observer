@@ -50,8 +50,8 @@ use types::{
 
 use crate::acting;
 use crate::pipeline::{
-    AirScanRequest, AirScanner, CveLookupOutcome, NeighborScanner, PcapRingSlot, TopologyScanner,
-    confidence_token,
+    AirScanRequest, AirScanner, CveLookupOutcome, EgressScanner, NeighborScanner, PcapRingSlot,
+    TopologyScanner, confidence_token,
 };
 
 /// The uid `root` runs as. Always authorised for control: root can already stop
@@ -469,6 +469,10 @@ pub struct ApiServer {
     /// The on-demand topology scanner, when the platform has one. `None` makes
     /// `ScanTopology` a refusal with a message, never a silent success.
     pub topology_scanner: Option<Arc<dyn TopologyScanner>>,
+    /// The on-demand egress scanner, when the platform has one. `None` makes
+    /// `ScanEgress` a refusal with a message, never a silent success (realm
+    /// net-observer, node #170).
+    pub egress_scanner: Option<Arc<dyn EgressScanner>>,
     /// The configured CVE snapshot directory, when one is set. The `cve` rung is
     /// UNAVAILABLE unless this is `Some` AND the directory exists — checked at
     /// scan time so a snapshot removed after boot is honestly reported as
@@ -832,6 +836,7 @@ async fn handle_conn(
                 scanner: srv.scanner.as_deref(),
                 air_scanner: srv.air_scanner.as_deref(),
                 topology_scanner: srv.topology_scanner.as_deref(),
+                egress_scanner: srv.egress_scanner.as_deref(),
                 scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
                 blob_dir: &srv.blob_dir,
                 resume_at_us: &srv.resume_at_us,
@@ -1162,6 +1167,8 @@ pub(crate) struct ControlCtx<'a> {
     pub air_scanner: Option<&'a dyn AirScanner>,
     /// The on-demand topology scanner, when the platform has one.
     pub topology_scanner: Option<&'a dyn TopologyScanner>,
+    /// The on-demand egress scanner, when the platform has one.
+    pub egress_scanner: Option<&'a dyn EgressScanner>,
     /// The configured CVE snapshot directory, when one is set (see the field of
     /// the same name on the server). Checked for existence at scan time.
     pub scan_cve_snapshot: Option<&'a Path>,
@@ -1394,6 +1401,7 @@ fn control_response(
         ControlCmd::ScanNeighbors(opts) => scan_now(cx, &opts, Some(authorized.uid())),
         ControlCmd::ScanAir => air_scan_now(cx, authorized.uid()),
         ControlCmd::ScanTopology => topology_scan_now(cx, authorized.uid()),
+        ControlCmd::ScanEgress => egress_scan_now(cx, authorized.uid()),
         ControlCmd::KickstartProxy => match acting::kickstart_proxy(&cx.acting.singbox_service) {
             Ok(message) => ControlResult { ok: true, message },
             Err(message) => ControlResult { ok: false, message },
@@ -1853,6 +1861,69 @@ fn topology_scan_now(cx: &ControlCtx<'_>, peer_uid: u32) -> ControlResult {
         "topology scan requested via control socket"
     );
     ControlResult { ok: true, message }
+}
+
+/// Capture what physically leaves the egress interface now — a fresh ~5s
+/// `tcpdump -Q out`, folded by destination (realm net-observer, node #170).
+///
+/// Mirrors [`topology_scan_now`]'s self-control, synchronous shape: the ~5s
+/// budget fits well inside the CLI's `SCAN_TIMEOUT`, so the operator is answered
+/// with the real destination/byte totals. The result carries the SKIP-never-
+/// silence distinction the store keeps: a capture that could not run answers
+/// `ok: false` with its reason (a scanner that ran and failed is a failure to
+/// report, exactly like a refused freeze), while a capture that ran — even one
+/// that saw nothing — answers `ok: true`, with a zero when nothing left the
+/// interface. Under an active tunnel that zero-vs-SKIP difference is the whole
+/// security question.
+///
+/// A PAUSE still refuses, for the same reason a neighbour/air/topology scan
+/// does: the pause is bracketed silence, and a capture stamped inside that
+/// bracket would make the `observing_edge` row and the data disagree about the
+/// same seconds.
+fn egress_scan_now(cx: &ControlCtx<'_>, peer_uid: u32) -> ControlResult {
+    if !cx.observing.load(Ordering::Acquire) {
+        return ControlResult {
+            ok: false,
+            message: "observation is paused; resume before scanning egress".to_string(),
+        };
+    }
+    let Some(scanner) = cx.egress_scanner else {
+        return ControlResult {
+            ok: false,
+            message: "egress scanning not available on this host".to_string(),
+        };
+    };
+    let outcome = scanner.scan();
+    let header = &outcome.header;
+    // `reason` is `Some` exactly when the capture was a SKIP (see
+    // `run_egress_capture`): a SKIP is `ok: false` with its reason, an OK the
+    // real totals — the two are never conflated.
+    let (ok, message) = match &header.reason {
+        Some(reason) => (false, format!("egress scan skipped: {reason}")),
+        None => (
+            true,
+            format!(
+                "{} egress: {} dst, {} bytes out over {}s",
+                header.iface,
+                header.dst_count,
+                header.byte_count,
+                header.duration_ms / 1000
+            ),
+        ),
+    };
+    tracing::info!(
+        iface = %header.iface,
+        dst_count = header.dst_count,
+        byte_count = header.byte_count,
+        // How many destinations were actually stored (the top slice), against
+        // `dst_count`'s true total — the gap is what the top-N left out.
+        stored_dsts = outcome.rows.len(),
+        ok,
+        peer_uid,
+        %message,
+        "egress scan requested via control socket"
+    );
+    ControlResult { ok, message }
 }
 
 /// Copy the pcap ring out on operator demand, into a timestamped freeze
@@ -2512,6 +2583,7 @@ mod tests {
             scanner: None,
             air_scanner: None,
             topology_scanner: None,
+            egress_scanner: None,
             scan_cve_snapshot: None,
             blob_dir: std::env::temp_dir().join("net-observerd-test-blobs"),
             resume_at_us: Arc::new(AtomicI64::new(0)),
@@ -2540,6 +2612,7 @@ mod tests {
             scanner: srv.scanner.as_deref(),
             air_scanner: srv.air_scanner.as_deref(),
             topology_scanner: srv.topology_scanner.as_deref(),
+            egress_scanner: srv.egress_scanner.as_deref(),
             scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
             blob_dir: &srv.blob_dir,
             resume_at_us: &srv.resume_at_us,
@@ -2743,6 +2816,157 @@ mod tests {
         let asked = with_topology(&mut srv, vec![fake_topology_link(1)]);
         let cx = test_ctx(&srv);
         let r = control_request(ControlCmd::ScanTopology, None, &cx);
+        assert!(!r.ok, "{}", r.message);
+        assert_eq!(asked.load(Ordering::Acquire), 0);
+    }
+
+    /// A scanner that records how many times it was asked and returns a canned
+    /// outcome (realm net-observer, node #170).
+    struct FakeEgressScanner {
+        outcome: crate::pipeline::EgressScanOutcome,
+        asked: Arc<AtomicUsize>,
+    }
+
+    impl crate::pipeline::EgressScanner for FakeEgressScanner {
+        fn scan(&self) -> crate::pipeline::EgressScanOutcome {
+            self.asked.fetch_add(1, Ordering::AcqRel);
+            self.outcome.clone()
+        }
+    }
+
+    fn with_egress(
+        srv: &mut ApiServer,
+        outcome: crate::pipeline::EgressScanOutcome,
+    ) -> Arc<AtomicUsize> {
+        let asked = Arc::new(AtomicUsize::new(0));
+        srv.egress_scanner = Some(Arc::new(FakeEgressScanner {
+            outcome,
+            asked: Arc::clone(&asked),
+        }) as Arc<dyn crate::pipeline::EgressScanner>);
+        asked
+    }
+
+    /// An `OK` outcome that saw `dst_count` destinations and `byte_count` bytes.
+    fn egress_ok(dst_count: i32, byte_count: u64) -> crate::pipeline::EgressScanOutcome {
+        crate::pipeline::EgressScanOutcome {
+            header: store::EgressScanHeader {
+                ts_us: 1,
+                iface: "en0".to_string(),
+                verdict: "OK".to_string(),
+                reason: None,
+                duration_ms: 5000,
+                packet_count: 900,
+                dst_count,
+                byte_count,
+            },
+            rows: Vec::new(),
+        }
+    }
+
+    /// A `SKIP` outcome carrying the reason the capture could not run.
+    fn egress_skip(reason: &str) -> crate::pipeline::EgressScanOutcome {
+        crate::pipeline::EgressScanOutcome {
+            header: store::EgressScanHeader {
+                ts_us: 1,
+                iface: "en0".to_string(),
+                verdict: "SKIP".to_string(),
+                reason: Some(reason.to_string()),
+                duration_ms: 0,
+                packet_count: 0,
+                dst_count: 0,
+                byte_count: 0,
+            },
+            rows: Vec::new(),
+        }
+    }
+
+    /// An authorised press reaches the scanner on a default server, and an `OK`
+    /// result is reported `ok: true` with the real totals — the sync-round-trip
+    /// design carries the outcome itself, not just an ack (realm net-observer,
+    /// nodes #91, #170).
+    #[test]
+    fn an_egress_scan_reaches_the_scanner_and_reports_the_totals() {
+        let mut srv = test_server("/tmp/unused-egr-1.sock", test_acting(), TEST_DAEMON_UID);
+        let asked = with_egress(&mut srv, egress_ok(3, 1_234_567));
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanEgress, Some(TEST_DAEMON_UID), &cx);
+        assert!(r.ok, "{}", r.message);
+        assert!(r.message.contains("3 dst"), "{}", r.message);
+        assert!(r.message.contains("1234567 bytes"), "{}", r.message);
+        assert_eq!(asked.load(Ordering::Acquire), 1);
+    }
+
+    /// A capture that could not run is a FAILURE with its reason — `ok: false` —
+    /// never a silent zero. On a tunneled uplink a false "nothing observed"
+    /// would mislead exactly the question this answers (SKIP is not silence).
+    #[test]
+    fn an_egress_scan_that_could_not_capture_is_a_failure_with_its_reason() {
+        let mut srv = test_server("/tmp/unused-egr-2.sock", test_acting(), TEST_DAEMON_UID);
+        with_egress(
+            &mut srv,
+            egress_skip("could not start tcpdump (needs root + BPF)"),
+        );
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanEgress, Some(TEST_DAEMON_UID), &cx);
+        assert!(
+            !r.ok,
+            "a capture that could not run must not report success"
+        );
+        assert!(
+            r.message.contains("could not start tcpdump"),
+            "{}",
+            r.message
+        );
+    }
+
+    /// A ran-but-empty capture is a real zero, reported `ok: true` — distinct
+    /// from the SKIP above: the scan looked and this machine sent nothing on the
+    /// interface in the window.
+    #[test]
+    fn an_egress_scan_that_saw_nothing_is_ok_with_a_zero() {
+        let mut srv = test_server("/tmp/unused-egr-3.sock", test_acting(), TEST_DAEMON_UID);
+        with_egress(&mut srv, egress_ok(0, 0));
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanEgress, Some(TEST_DAEMON_UID), &cx);
+        assert!(r.ok, "{}", r.message);
+        assert!(r.message.contains("0 dst"), "{}", r.message);
+    }
+
+    /// A pause DOES refuse, for the same reason a neighbour/air/topology scan
+    /// does: the pause is bracketed silence, and a capture stamped inside the
+    /// bracket would make the `observing_edge` row and the data disagree.
+    /// Nothing is asked of the capture.
+    #[test]
+    fn a_paused_daemon_refuses_an_egress_scan_without_touching_the_capture() {
+        let mut srv = test_server("/tmp/unused-egr-4.sock", test_acting(), TEST_DAEMON_UID);
+        let asked = with_egress(&mut srv, egress_ok(3, 1000));
+        srv.observing.store(false, Ordering::Release);
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanEgress, Some(TEST_DAEMON_UID), &cx);
+        assert!(!r.ok);
+        assert!(r.message.contains("paused"), "{}", r.message);
+        assert_eq!(asked.load(Ordering::Acquire), 0);
+    }
+
+    /// No scanner wired at all is a refusal with a message, never a silent
+    /// success — the same rule `FreezePcap`/`ScanAir`/`ScanTopology` follow.
+    #[test]
+    fn an_egress_scan_without_a_scanner_is_a_refusal_with_a_reason() {
+        let srv = test_server("/tmp/unused-egr-5.sock", test_acting(), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanEgress, Some(TEST_DAEMON_UID), &cx);
+        assert!(!r.ok);
+        assert!(r.message.contains("not available"), "{}", r.message);
+    }
+
+    /// Self-control is not no-control: an unauthorised peer is still refused,
+    /// and the capture is not run for it.
+    #[test]
+    fn an_unauthorised_peer_cannot_scan_egress() {
+        let mut srv = test_server("/tmp/unused-egr-6.sock", test_acting(), TEST_DAEMON_UID);
+        let asked = with_egress(&mut srv, egress_ok(3, 1000));
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanEgress, None, &cx);
         assert!(!r.ok, "{}", r.message);
         assert_eq!(asked.load(Ordering::Acquire), 0);
     }
@@ -3087,6 +3311,13 @@ mod tests {
         fn write_topology_link(&self, l: &types::TopologyLink) -> Result<(), store::StoreError> {
             self.inner.write_topology_link(l)
         }
+        fn write_egress_scan(
+            &self,
+            header: &store::EgressScanHeader,
+            rows: &[store::EgressDst],
+        ) -> Result<(), store::StoreError> {
+            self.inner.write_egress_scan(header, rows)
+        }
         fn neighbor_lifetimes(
             &self,
             network_key: Option<&str>,
@@ -3285,6 +3516,7 @@ mod tests {
             ControlCmd::ScanNeighbors(ScanOptions::default()),
             ControlCmd::ScanAir,
             ControlCmd::ScanTopology,
+            ControlCmd::ScanEgress,
             ControlCmd::StartExperiment { minutes: 5 },
         ] {
             // Exhaustive on purpose — a new variant breaks this arm list.
@@ -3296,6 +3528,7 @@ mod tests {
                 | ControlCmd::ScanNeighbors(_)
                 | ControlCmd::ScanAir
                 | ControlCmd::ScanTopology
+                | ControlCmd::ScanEgress
                 | ControlCmd::StartExperiment { .. } => {}
             }
             // A refusal here can only come from the peer gate: there is no
