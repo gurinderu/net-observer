@@ -886,6 +886,7 @@ mod tests {
         assert!(shows_hosts(ConnectionsGroupBy::Ip));
         assert!(shows_hosts(ConnectionsGroupBy::IpPort));
         assert!(shows_hosts(ConnectionsGroupBy::Process));
+        assert!(shows_hosts(ConnectionsGroupBy::ProcessHost));
     }
 
     /// A tick with flows becomes one worded row per group, in the daemon's
