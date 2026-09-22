@@ -2274,6 +2274,9 @@ mod tests {
             DiagnosticQuery::Connections {
                 group_by: ConnectionsGroupBy::IpPort,
             },
+            DiagnosticQuery::Connections {
+                group_by: ConnectionsGroupBy::ProcessHost,
+            },
             DiagnosticQuery::AirScan,
             DiagnosticQuery::AirAps {
                 scan_ts_us: 1_756_731_900_000_000,
@@ -2464,6 +2467,14 @@ mod tests {
             q,
             DiagnosticQuery::Connections {
                 group_by: ConnectionsGroupBy::IpPort
+            }
+        );
+        let q: DiagnosticQuery =
+            serde_json::from_str(r#"{"Connections":{"group_by":"process-host"}}"#).unwrap();
+        assert_eq!(
+            q,
+            DiagnosticQuery::Connections {
+                group_by: ConnectionsGroupBy::ProcessHost
             }
         );
     }

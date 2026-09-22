@@ -250,7 +250,8 @@ impl ConnectionsSample {
 /// does: it travels. The CLI parses it from `--by`, `store::diagnosis` turns it
 /// into SQL, and `net_observer_ipc::DiagnosticQuery::Connections` carries it to a
 /// running daemon. Serialised as the same lowercase tokens the CLI accepts
-/// (`host` / `ip` / `ip-port` / `process`); a sender that omits it means `host`.
+/// (`host` / `ip` / `ip-port` / `process` / `process-host`); a sender that
+/// omits it means `host`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConnectionsGroupBy {
@@ -264,6 +265,11 @@ pub enum ConnectionsGroupBy {
     IpPort,
     /// By the client process.
     Process,
+    /// By the pair (client process, destination host) — the same host-key
+    /// expression `Host` uses, but never folded across a process's other
+    /// destinations: "who talks to where, and how much" (realm net-observer,
+    /// node #168).
+    ProcessHost,
 }
 
 #[cfg(test)]
@@ -417,6 +423,7 @@ mod tests {
             (ConnectionsGroupBy::Ip, "\"ip\""),
             (ConnectionsGroupBy::IpPort, "\"ip-port\""),
             (ConnectionsGroupBy::Process, "\"process\""),
+            (ConnectionsGroupBy::ProcessHost, "\"process-host\""),
         ] {
             assert_eq!(serde_json::to_string(&v).unwrap(), s);
             assert_eq!(serde_json::from_str::<ConnectionsGroupBy>(s).unwrap(), v);

@@ -248,6 +248,15 @@ mod tests {
             ],
         );
         expect(
+            DiagnosticQuery::Connections {
+                group_by: types::ConnectionsGroupBy::ProcessHost,
+            },
+            &[
+                "ts_us", "verdict", "key", "process", "scope", "count", "upload", "download",
+                "hosts",
+            ],
+        );
+        expect(
             DiagnosticQuery::AirScan,
             &["ts_us", "air", "reason", "ap_count"],
         );

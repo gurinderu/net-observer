@@ -1122,9 +1122,17 @@ ORDER BY last_seen_us DESC, iface, remote_chassis, remote_port"
 /// and `verdict` with every other column NULL, so a reader sees "could not
 /// look" and "nothing is talking" as different answers, and neither as an
 /// empty table indistinguishable from a record with no ticks at all.
+///
+/// **`process-host` groups by the pair, not by either alone.** `process`
+/// collapses a process's destinations into one row; `host` carries no process
+/// column at all. `ProcessHost` groups by (process, host-key) — the same
+/// host-key expression `Host` uses — so the same process talking to two
+/// hosts still answers two rows, each with its own count/upload/download,
+/// and a `process` column rides next to `key` naming who. Every other
+/// grouping's column set is untouched (realm net-observer, node #168).
 pub fn connections_sql(group_by: ConnectionsGroupBy) -> String {
     let key = match group_by {
-        ConnectionsGroupBy::Host => "coalesce(host, dst_ip, '-')",
+        ConnectionsGroupBy::Host | ConnectionsGroupBy::ProcessHost => "coalesce(host, dst_ip, '-')",
         ConnectionsGroupBy::Ip => "coalesce(dst_ip, host, '-')",
         // A v6 address carries colons of its own, so it is bracketed the way
         // a socket address is written (`[2a00::1]:443`); a name never is.
@@ -1135,12 +1143,21 @@ pub fn connections_sql(group_by: ConnectionsGroupBy) -> String {
         }
         ConnectionsGroupBy::Process => "coalesce(process, '-')",
     };
+    // Only `process-host` carries the extra `process` column, placed right
+    // next to `key`; every other grouping's SELECT/GROUP BY/marker row is
+    // byte-for-byte what it always was.
+    let (process_key, process_group, process_null) = if group_by == ConnectionsGroupBy::ProcessHost
+    {
+        (", coalesce(process, '-') AS process", ", process", ", NULL")
+    } else {
+        ("", "", "")
+    };
     format!(
         "WITH tick AS (
   SELECT * FROM connection_sample
   WHERE ts_us = (SELECT max(ts_us) FROM connection_sample)
 )
-SELECT ts_us, verdict, {key} AS key,
+SELECT ts_us, verdict, {key} AS key{process_key},
        CASE WHEN count(DISTINCT iface) = 1 AND count(iface) = count(*)
             THEN max(iface) ELSE NULL END AS iface,
        coalesce(scope, 'external') AS scope,
@@ -1148,9 +1165,9 @@ SELECT ts_us, verdict, {key} AS key,
        string_agg(DISTINCT host, ',' ORDER BY host) AS hosts
 FROM tick
 WHERE network IS NOT NULL
-GROUP BY ts_us, verdict, key, coalesce(scope, 'external')
+GROUP BY ts_us, verdict, key{process_group}, coalesce(scope, 'external')
 UNION ALL
-SELECT ts_us, verdict, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+SELECT ts_us, verdict, NULL{process_null}, NULL, NULL, NULL, NULL, NULL, NULL
 FROM tick
 WHERE network IS NULL
 ORDER BY count DESC NULLS LAST, key, scope"
@@ -3577,6 +3594,101 @@ mod tests {
         assert!(keys.contains(&"Telegram".to_string()), "{keys:?}");
         assert!(keys.contains(&"-".to_string()), "{keys:?}");
         assert_eq!(keys.len(), 3, "{keys:?}");
+    }
+
+    /// `process-host` groups by the PAIR: unlike `process`, which folds the
+    /// two `stable` flows into one row (count 3), here they stay two rows —
+    /// one per host, each keeping its own count/upload — with a `process`
+    /// column naming who. A flow the proxy could not attribute is still
+    /// keyed `-`, not dropped (realm net-observer, node #168).
+    #[test]
+    fn connections_by_process_host_keeps_a_processs_hosts_apart() {
+        let s = DuckdbStore::in_memory().unwrap();
+        fixture_tick(&s, 20 * SEC);
+
+        let by_process = s.connections(ConnectionsGroupBy::Process).unwrap();
+        let stable = (0..by_process.rows.len())
+            .find(|&i| cell(&by_process, i, "key") == "stable")
+            .expect("stable is a process key");
+        assert_eq!(
+            cell(&by_process, stable, "count"),
+            "3",
+            "process alone folds the two stable flows together"
+        );
+
+        let t = s.connections(ConnectionsGroupBy::ProcessHost).unwrap();
+        let claude = (0..t.rows.len())
+            .find(|&i| cell(&t, i, "key") == "claude.ai")
+            .expect("claude.ai is a key");
+        assert_eq!(cell(&t, claude, "process"), "stable");
+        assert_eq!(cell(&t, claude, "count"), "2");
+        assert_eq!(cell(&t, claude, "upload"), "100");
+        let sentry = (0..t.rows.len())
+            .find(|&i| cell(&t, i, "key") == "o540343.ingest.sentry.io")
+            .expect("sentry is a key");
+        assert_eq!(cell(&t, sentry, "process"), "stable");
+        assert_eq!(cell(&t, sentry, "count"), "1");
+        assert_eq!(cell(&t, sentry, "upload"), "4");
+        let unattributed = (0..t.rows.len())
+            .find(|&i| cell(&t, i, "key") == "149.154.167.41")
+            .expect("the unattributed flow is a key");
+        assert_eq!(cell(&t, unattributed, "process"), "-");
+        // Same row count as `host`: the fixture's rows already have distinct
+        // host keys, so pairing with process neither merges nor splits
+        // further here.
+        assert_eq!(t.rows.len(), 5, "{:?}", t.rows);
+    }
+
+    /// Scope stays a second group key under `process-host` too: the SAME
+    /// (process, host) pair split across scopes answers one row per scope,
+    /// never folded into one (realm net-observer, node #168).
+    #[test]
+    fn connections_by_process_host_still_splits_by_scope() {
+        let s = DuckdbStore::in_memory().unwrap();
+        connections(
+            &s,
+            20 * SEC,
+            types::ConnectionsVerdict::Ok,
+            vec![
+                conn_row(
+                    Some("claude.ai"),
+                    Some("172.19.0.1"),
+                    Some(53),
+                    Some("stable"),
+                    500,
+                    1,
+                ),
+                conn_row(Some("claude.ai"), None, Some(443), Some("stable"), 2, 100),
+            ],
+        );
+        let t = s.connections(ConnectionsGroupBy::ProcessHost).unwrap();
+        let rows: Vec<(String, String, String, String)> = (0..t.rows.len())
+            .map(|i| {
+                (
+                    cell(&t, i, "process"),
+                    cell(&t, i, "key"),
+                    cell(&t, i, "scope"),
+                    cell(&t, i, "count"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "stable".into(),
+                    "claude.ai".into(),
+                    "internal".into(),
+                    "500".into()
+                ),
+                (
+                    "stable".into(),
+                    "claude.ai".into(),
+                    "external".into(),
+                    "2".into()
+                ),
+            ]
+        );
     }
 
     /// The refusal survives the read: a newest tick on which the API did not

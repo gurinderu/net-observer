@@ -464,7 +464,8 @@ enum Command {
     /// route exclusion) does not appear here at all.
     Connections {
         /// Group the flows by the name asked for, the destination address,
-        /// address and port, the client process, or the egress interface.
+        /// address and port, the client process, the (process, destination)
+        /// pair, or the egress interface.
         #[arg(long, value_enum, default_value_t = GroupByArg::Host)]
         by: GroupByArg,
         /// List every flow whatever its scope, with a `scope` column.
@@ -845,10 +846,10 @@ impl ObserveState {
 }
 
 /// The grouping accepted by `connections --by`. A thin CLI mirror of
-/// [`ConnectionsGroupBy`] so `clap` renders `<host|ip|ip-port|process|iface>`
-/// in the help without leaking the wire type into the argument surface —
-/// except `Iface`, which the wire type does not have at all (see
-/// [`GroupByArg::to_group_by`]).
+/// [`ConnectionsGroupBy`] so `clap` renders
+/// `<host|ip|ip-port|process|process-host|iface>` in the help without
+/// leaking the wire type into the argument surface — except `Iface`, which
+/// the wire type does not have at all (see [`GroupByArg::to_group_by`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum GroupByArg {
     /// By the name asked for (a bare-address flow is keyed by its address).
@@ -860,6 +861,9 @@ enum GroupByArg {
     IpPort,
     /// By the client process.
     Process,
+    /// By the pair (client process, destination): one row per process/host,
+    /// never folded across a process's other destinations.
+    ProcessHost,
     /// By egress interface (the TUN interface name, the physical interface,
     /// or `blocked`) — answered client-side over the daemon's ordinary
     /// `host` grouping, since a new wire grouping is a hazard to an older
@@ -878,6 +882,7 @@ impl GroupByArg {
             GroupByArg::Ip => ConnectionsGroupBy::Ip,
             GroupByArg::IpPort => ConnectionsGroupBy::IpPort,
             GroupByArg::Process => ConnectionsGroupBy::Process,
+            GroupByArg::ProcessHost => ConnectionsGroupBy::ProcessHost,
         }
     }
 }
@@ -5036,7 +5041,7 @@ mod tests {
         assert_eq!(EventKindArg::Link.to_kinds(), vec![EventKind::Link]);
     }
 
-    /// `connections --by` takes the five groupings by their lowercase names,
+    /// `connections --by` takes the six groupings by their lowercase names,
     /// defaults to `host`, and maps onto the wire type the daemon reads —
     /// `iface` has none of its own and rides on `host` (see
     /// [`GroupByArg::to_group_by`]).
@@ -5058,6 +5063,11 @@ mod tests {
             ("ip", GroupByArg::Ip, ConnectionsGroupBy::Ip),
             ("ip-port", GroupByArg::IpPort, ConnectionsGroupBy::IpPort),
             ("process", GroupByArg::Process, ConnectionsGroupBy::Process),
+            (
+                "process-host",
+                GroupByArg::ProcessHost,
+                ConnectionsGroupBy::ProcessHost,
+            ),
             ("iface", GroupByArg::Iface, ConnectionsGroupBy::Host),
         ] {
             let by = parse(&["connections", "--by", token]);

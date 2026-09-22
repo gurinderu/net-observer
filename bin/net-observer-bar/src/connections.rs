@@ -92,6 +92,10 @@ fn group_label(group_by: ConnectionsGroupBy) -> &'static str {
         ConnectionsGroupBy::Ip => "ip",
         ConnectionsGroupBy::IpPort => "ip:port",
         ConnectionsGroupBy::Process => "process",
+        // No toolbar toggle asks for this grouping yet (CLI-only so far,
+        // realm net-observer, node #168) — the arm exists so the match
+        // stays exhaustive against a wire variant this window can receive.
+        ConnectionsGroupBy::ProcessHost => "process+host",
     }
 }
 
