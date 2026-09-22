@@ -2084,6 +2084,11 @@ impl EgressScanner for SystemEgressScanner {
     /// for why that always holds here. A physical interface that cannot be
     /// resolved is a SKIP with its reason, never a silent zero.
     fn scan(&self) -> EgressScanOutcome {
+        // The no-interface SKIP branch below writes through the concrete
+        // `Arc<DuckdbStore>`, so the `Store` trait must be in scope here (a
+        // trait method on a concrete type, unlike `run_egress_capture`'s
+        // `&dyn Store`, needs the trait imported).
+        use store::Store as _;
         tokio::task::block_in_place(|| {
             let rt = tokio::runtime::Handle::current();
             let now = types::now_us();
