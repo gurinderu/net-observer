@@ -23635,6 +23635,12 @@ rec {
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./crates/types; };
         dependencies = [
           {
+            name = "etherparse";
+            packageId = "etherparse";
+            usesDefaultFeatures = false;
+            features = [ "std" ];
+          }
+          {
             name = "jiff";
             packageId = "jiff";
             features = [ "serde" ];
