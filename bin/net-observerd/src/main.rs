@@ -56,7 +56,7 @@ use types::{ProbingEdge, ProbingTier, Sample};
 
 use pipeline::{
     AirScanner, CveLookupOutcome, FreezePcapHandler, NeighborScanner, OnDemandAirScan, PcapFreezer,
-    PcapRingSlot, ScanReport, SnapshotHandler, run, spawn_event_collector,
+    PcapRingSlot, ScanReport, SnapshotHandler, TopologyScanner, run, spawn_event_collector,
     spawn_interval_collector,
 };
 
@@ -232,10 +232,48 @@ fn load_oui_db(dir: Option<&str>) -> Option<Arc<oui_db::OuiDb>> {
     }
 }
 
-/// Spawn the topology patrol: on a slow interval, open a bounded LLDP/CDP
-/// capture on `iface`, map every received frame to a [`types::TopologyLink`],
-/// upsert each into the store, and mirror the current set onto the live
-/// snapshot the socket serves.
+/// Capture once, map every received frame to a [`types::TopologyLink`],
+/// upsert each into the store, and return the de-duplicated set — the one
+/// body [`spawn_topology_patrol`] and an operator-forced
+/// [`pipeline::TopologyScanner::scan`] both run, so there is exactly one
+/// capture→store implementation (AGENTS.md principle 4), never two that could
+/// drift apart.
+///
+/// Blocking end to end: `capture.capture()` spawns a `tcpdump` child and
+/// waits up to its own budget. A caller on the async runtime must therefore
+/// run this off the reactor — the patrol via `spawn_blocking`, the on-demand
+/// scanner via `block_in_place` (see [`SystemTopologyScanner::scan`]).
+fn run_topology_capture(
+    capture: &dyn LldpCapture,
+    store: &dyn store::Store,
+    iface: &str,
+    now: i64,
+) -> Vec<types::TopologyLink> {
+    let frames = capture.capture(TOPOLOGY_CAPTURE_BUDGET);
+    let mut latest: Vec<types::TopologyLink> = Vec::new();
+    for frame in &frames {
+        let Some(link) = types::link_from_frame(frame, iface, now) else {
+            continue;
+        };
+        if let Err(e) = store.write_topology_link(&link) {
+            tracing::warn!(error = %e,
+                "store write failed; topology link dropped from DB (gap logged)");
+        }
+        // De-duplicate by the stable key so the returned set carries one node
+        // per uplink even if a switch advertised several times this run.
+        if !latest.iter().any(|l| {
+            l.iface == link.iface
+                && l.remote_chassis == link.remote_chassis
+                && l.remote_port == link.remote_port
+        }) {
+            latest.push(link);
+        }
+    }
+    latest
+}
+
+/// Spawn the topology patrol: on a slow interval, run [`run_topology_capture`]
+/// on `iface` and mirror the result onto the live snapshot the socket serves.
 ///
 /// While paused (`observing == false`) the patrol skips its capture entirely —
 /// an operator pause stops collection outright rather than emitting synthetic
@@ -263,37 +301,24 @@ fn spawn_topology_patrol(
             // The capture blocks (spawns a child, waits its budget), so run it off
             // the async runtime rather than stalling the reactor.
             let cap = capture.clone();
-            let frames =
-                match tokio::task::spawn_blocking(move || cap.capture(TOPOLOGY_CAPTURE_BUDGET))
-                    .await
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "topology capture task failed to join");
-                        continue;
-                    }
-                };
-
-            let now = types::now_us();
-            let mut latest: Vec<types::TopologyLink> = Vec::new();
-            for frame in &frames {
-                let Some(link) = types::link_from_frame(frame, &iface, now) else {
+            let store_for_capture = Arc::clone(&store);
+            let iface_for_capture = iface.clone();
+            let latest = match tokio::task::spawn_blocking(move || {
+                run_topology_capture(
+                    &cap,
+                    store_for_capture.as_ref(),
+                    &iface_for_capture,
+                    types::now_us(),
+                )
+            })
+            .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(error = %e, "topology capture task failed to join");
                     continue;
-                };
-                if let Err(e) = store.write_topology_link(&link) {
-                    tracing::warn!(error = %e,
-                        "store write failed; topology link dropped from DB (gap logged)");
                 }
-                // De-duplicate by the stable key so the live set carries one node
-                // per uplink even if a switch advertised several times this run.
-                if !latest.iter().any(|l| {
-                    l.iface == link.iface
-                        && l.remote_chassis == link.remote_chassis
-                        && l.remote_port == link.remote_port
-                }) {
-                    latest.push(link);
-                }
-            }
+            };
 
             if !latest.is_empty() {
                 // The record's first/last seen for the uplinks, read before the
@@ -1847,6 +1872,45 @@ impl NeighborScanner for SystemScanner {
     }
 }
 
+/// The production [`TopologyScanner`]: resolves the physical interface fresh
+/// at scan time — never a boot-time value, which a `RunAtLoad` daemon may have
+/// started without — the same "ask the OS now" precedent [`SystemScanner`]
+/// already uses for `phys_iface`, not a second one. Then runs
+/// [`run_topology_capture`] on it, writing through the SAME store handle the
+/// patrol uses.
+pub(crate) struct SystemTopologyScanner {
+    facts: SystemFacts,
+    store: Arc<DuckdbStore>,
+}
+
+impl SystemTopologyScanner {
+    fn new(facts: SystemFacts, store: Arc<DuckdbStore>) -> Self {
+        Self { facts, store }
+    }
+}
+
+impl TopologyScanner for SystemTopologyScanner {
+    /// Blocking work (an async interface lookup, then a `tcpdump` child held
+    /// open for up to 65s) inside an async request handler, so it runs under
+    /// `block_in_place` exactly like [`SystemScanner::scan`]: the worker
+    /// thread is handed back to the runtime for the duration instead of
+    /// stalling every other connection behind one capture.
+    ///
+    /// **Requires the multi-thread runtime** — see `SystemScanner::scan`'s
+    /// doc for why that always holds here.
+    fn scan(&self) -> Vec<types::TopologyLink> {
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            let Some(iface) = rt.block_on(self.facts.phys_iface()) else {
+                tracing::info!("topology scan: no physical interface resolved; no links this run");
+                return Vec::new();
+            };
+            let capture = TcpdumpLldpCapture::new(iface.clone());
+            run_topology_capture(&capture, self.store.as_ref(), &iface, types::now_us())
+        })
+    }
+}
+
 /// A test-only interval collector whose readiness the test flips at will, so the
 /// per-tick preflight retry in `spawn_interval_collector` can be driven directly.
 /// Every real collector in `AnyCollector` is a concrete type wired to real ports
@@ -2323,6 +2387,19 @@ fn build_api_server(
             // read: a pause landing mid-scan must reach the in-flight read.
             observing.clone(),
         )) as Arc<dyn AirScanner>),
+        // Built unconditionally, exactly like `scanner`/`air_scanner`: whether
+        // there is a physical interface and an answering switch/AP is decided
+        // per request, not once at boot (realm net-observer, node #91). Shares
+        // the SAME store handle the patrol writes through, so an operator-
+        // forced capture and a patrol tick land in the same table by the same
+        // path (`run_topology_capture`).
+        topology_scanner: Some(Arc::new(SystemTopologyScanner::new(
+            SystemFacts::new(
+                cfg.collectors.link.gw.clone(),
+                cfg.collectors.link.phys_iface.clone(),
+            ),
+            Arc::clone(&store),
+        )) as Arc<dyn TopologyScanner>),
         // Where the `cve` rung loads its snapshot; the availability check in
         // `scan_now` decides whether the rung is effective this run.
         scan_cve_snapshot: cfg

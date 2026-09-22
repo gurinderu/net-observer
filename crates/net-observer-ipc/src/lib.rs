@@ -149,6 +149,19 @@ pub enum ControlCmd {
     /// as an ordinary [`Event::Air`] (a `Skip` one, with its reason, when the
     /// radio could not be read — never silence).
     ScanAir,
+    /// Force one LLDP/CDP topology capture NOW, instead of waiting for the
+    /// next slow patrol tick (a 65s capture every 5 minutes).
+    ///
+    /// **Self-control, like [`ControlCmd::ScanAir`].** The daemon opens its
+    /// own short-lived passive capture and originates no frame of its own —
+    /// it only listens for what switches/APs already advertise.
+    ///
+    /// Unlike `ScanAir`, the round-trip is SYNCHRONOUS: the capture's own
+    /// budget (~65s) fits well inside [`SCAN_TIMEOUT`], so the daemon answers
+    /// with the real uplink count rather than an "accepted" ack. Zero links
+    /// is reported `ok: true` — absence is the honest answer on a segment
+    /// with no managed switch or enterprise AP, never a failure.
+    ScanTopology,
     /// Run an experiment window of `minutes` (realm net-observer, node #61):
     /// "is it us or the network", as a command. The daemon goes passive for
     /// the window — bracketed by a `probing_edge` whose reason is
@@ -2122,6 +2135,49 @@ mod tests {
         match serde_json::from_str::<Request>(&line).unwrap() {
             Request::Control(ControlCmd::ScanAir) => {}
             other => panic!("expected ScanAir, got {other:?}"),
+        }
+    }
+
+    /// `ScanTopology` must survive the wire intact next to the commands that
+    /// already exist — the CLI's `scan topology` and the daemon's dispatch
+    /// read the same variant.
+    #[test]
+    fn scan_topology_round_trips_as_a_control_command() {
+        let line =
+            String::from_utf8(encode_frame(&Request::Control(ControlCmd::ScanTopology)).unwrap())
+                .unwrap();
+        match serde_json::from_str::<Request>(&line).unwrap() {
+            Request::Control(ControlCmd::ScanTopology) => {}
+            other => panic!("expected ScanTopology, got {other:?}"),
+        }
+    }
+
+    /// The `ScanAir`/`StartExperiment` precedent: a daemon built before
+    /// `ScanTopology` existed cannot decode the request and answers its
+    /// one-shot `Response::Error("bad request: …")`, which the client must
+    /// read as `Unsupported` — never as a refusal, which would claim the
+    /// daemon CAN force a capture and declined to.
+    #[test]
+    fn an_old_daemon_rejects_scan_topology_as_unsupported_not_refused() {
+        /// The control vocabulary as a pre-topology daemon decodes it.
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        enum OldControlCmd {
+            KickstartProxy,
+            SetObserving(bool),
+            FreezePcap,
+            SetProbing(ProbingTier),
+            ScanNeighbors(ScanOptions),
+            ScanAir,
+            StartExperiment { minutes: u32 },
+        }
+        let line = String::from_utf8(encode_frame(&ControlCmd::ScanTopology).unwrap()).unwrap();
+        let e = serde_json::from_str::<OldControlCmd>(&line)
+            .expect_err("an old daemon cannot decode ScanTopology");
+        let answer = Response::Error(format!("{UNDECODABLE_REQUEST_PREFIX}{e}"));
+        match classify_control(answer).unwrap() {
+            ControlOutcome::Unsupported(m) => assert!(m.contains("ScanTopology"), "{m}"),
+            other => panic!("expected Unsupported, got {other:?}"),
         }
     }
 
