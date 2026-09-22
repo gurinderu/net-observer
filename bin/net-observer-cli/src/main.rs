@@ -2735,17 +2735,28 @@ fn clear_scan_spinner() {
 /// [`net_observer_ipc::SCAN_TIMEOUT`]), so nothing is leaked even though
 /// Ctrl-C here does not stop the scan on the daemon (see
 /// [`scan_starting_line`]).
-fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
-    let _ = writeln!(std::io::stderr(), "{}", scan_starting_line(&opts));
+/// Send one long-running control command and show a spinner on a TTY until the
+/// daemon answers, reading with [`net_observer_ipc::SCAN_TIMEOUT`] rather than
+/// the default 2s budget: the daemon replies only after the whole capture/scan
+/// finishes, and a client that gives up first would read its own timeout
+/// instead of the daemon's real result. The channel/spinner loop is identical
+/// for every such command — [`fetch_scan_neighbors`] and [`fetch_scan_topology`]
+/// call this one body (AGENTS.md principle 4); only the starting line, the
+/// command, and the two failure messages differ, so those are parameters.
+fn run_scan_with_spinner(
+    socket_path: &str,
+    cmd: ControlCmd,
+    starting_line: &str,
+    map_socket_error: impl FnOnce(&str, &std::io::Error) -> anyhow::Error,
+    unsupported: impl FnOnce(String) -> anyhow::Error,
+) -> Result<ControlResult> {
+    let _ = writeln!(std::io::stderr(), "{starting_line}");
 
     let (tx, rx) = std::sync::mpsc::channel();
     let socket_path_for_thread = socket_path.to_string();
     std::thread::spawn(move || {
-        let outcome = net_observer_ipc::control_within(
-            &socket_path_for_thread,
-            ControlCmd::ScanNeighbors(opts),
-            net_observer_ipc::SCAN_TIMEOUT,
-        );
+        let outcome =
+            net_observer_ipc::control_within(&socket_path_for_thread, cmd, net_observer_ipc::SCAN_TIMEOUT);
         // The receiver only ever drops after taking the result below, so a
         // failed send here would mean it dropped first — nothing left to
         // tell.
@@ -2780,93 +2791,53 @@ fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlR
         }
     };
 
-    let outcome = outcome.map_err(|e| scan_socket_error(socket_path, &e))?;
+    let outcome = outcome.map_err(|e| map_socket_error(socket_path, &e))?;
     match outcome {
         net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
-        net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
-            "net-observerd cannot scan for neighbours (built before it existed): {e}"
-        )),
+        net_observer_ipc::ControlOutcome::Unsupported(e) => Err(unsupported(e)),
     }
+}
+
+fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
+    let starting_line = scan_starting_line(&opts);
+    run_scan_with_spinner(
+        socket_path,
+        ControlCmd::ScanNeighbors(opts),
+        &starting_line,
+        scan_socket_error,
+        |e| anyhow!("net-observerd cannot scan for neighbours (built before it existed): {e}"),
+    )
 }
 
 /// Send `Control(ScanTopology)` and return the daemon's verdict.
 ///
-/// Reads with [`net_observer_ipc::SCAN_TIMEOUT`], not the default 2s
-/// [`daemon_query`] budget: the daemon answers only after the whole capture
-/// (~65s, `TOPOLOGY_CAPTURE_BUDGET` on the daemon) finishes, and a client that
-/// gives up first would read its own timeout instead of the daemon's real
-/// uplink count. The spinner/background-thread shape mirrors
-/// [`fetch_scan_neighbors`] exactly, over the same [`net_observer_ipc::control_within`]
-/// and [`SPINNER_TICK`] machinery — only the starting line and the two
-/// topology-specific messages differ.
+/// Shares the spinner/timeout machinery of [`run_scan_with_spinner`] with
+/// [`fetch_scan_neighbors`] — the daemon answers only after the whole capture
+/// (~65s, `TOPOLOGY_CAPTURE_BUDGET` on the daemon) finishes, so this reads with
+/// [`net_observer_ipc::SCAN_TIMEOUT`], not the default 2s budget. Only the
+/// starting line and the two topology-specific failure messages differ from the
+/// neighbour scan.
 fn fetch_scan_topology(socket_path: &str) -> Result<ControlResult> {
-    let _ = writeln!(
-        std::io::stderr(),
+    run_scan_with_spinner(
+        socket_path,
+        ControlCmd::ScanTopology,
         "capturing LLDP/CDP for up to ~65s… this is normal, not stuck. Ctrl-C leaves the \
-         capture running on net-observerd; read results later with `net-observer-cli topology`."
-    );
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    let socket_path_for_thread = socket_path.to_string();
-    std::thread::spawn(move || {
-        let outcome = net_observer_ipc::control_within(
-            &socket_path_for_thread,
-            ControlCmd::ScanTopology,
-            net_observer_ipc::SCAN_TIMEOUT,
-        );
-        // The receiver only ever drops after taking the result below, so a
-        // failed send here would mean it dropped first — nothing left to
-        // tell.
-        let _ = tx.send(outcome);
-    });
-
-    let live = std::io::stderr().is_terminal();
-    let start = Instant::now();
-    let mut tick: u64 = 0;
-    let outcome = loop {
-        match rx.recv_timeout(SPINNER_TICK) {
-            Ok(outcome) => {
-                if live {
-                    clear_scan_spinner();
-                }
-                break outcome;
+         capture running on net-observerd; read results later with `net-observer-cli topology`.",
+        |socket_path, e| {
+            use std::io::ErrorKind::{TimedOut, WouldBlock};
+            if matches!(e.kind(), WouldBlock | TimedOut) {
+                anyhow!(
+                    "the capture is still running on net-observerd and will finish there — its \
+                     uplinks land in the record. Read them with `net-observer-cli topology`."
+                )
+            } else if daemon_not_running(e) {
+                anyhow!("net-observerd not running (socket {socket_path} unavailable)")
+            } else {
+                anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if live {
-                    render_scan_spinner(tick, start.elapsed());
-                    tick += 1;
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                if live {
-                    clear_scan_spinner();
-                }
-                return Err(anyhow!(
-                    "internal error: the scan's background thread ended without a result"
-                ));
-            }
-        }
-    };
-
-    let outcome = outcome.map_err(|e| {
-        use std::io::ErrorKind::{TimedOut, WouldBlock};
-        if matches!(e.kind(), WouldBlock | TimedOut) {
-            anyhow!(
-                "the capture is still running on net-observerd and will finish there — its \
-                 uplinks land in the record. Read them with `net-observer-cli topology`."
-            )
-        } else if daemon_not_running(&e) {
-            anyhow!("net-observerd not running (socket {socket_path} unavailable)")
-        } else {
-            anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
-        }
-    })?;
-    match outcome {
-        net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
-        net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
-            "net-observerd cannot force a topology capture (built before it existed): {e}"
-        )),
-    }
+        },
+        |e| anyhow!("net-observerd cannot force a topology capture (built before it existed): {e}"),
+    )
 }
 
 /// Render a [`ControlResult`] as a single status line: `ok: <message>` when the

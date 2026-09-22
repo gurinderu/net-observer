@@ -3284,6 +3284,7 @@ mod tests {
             ControlCmd::KickstartProxy,
             ControlCmd::ScanNeighbors(ScanOptions::default()),
             ControlCmd::ScanAir,
+            ControlCmd::ScanTopology,
             ControlCmd::StartExperiment { minutes: 5 },
         ] {
             // Exhaustive on purpose — a new variant breaks this arm list.
@@ -3294,6 +3295,7 @@ mod tests {
                 | ControlCmd::KickstartProxy
                 | ControlCmd::ScanNeighbors(_)
                 | ControlCmd::ScanAir
+                | ControlCmd::ScanTopology
                 | ControlCmd::StartExperiment { .. } => {}
             }
             // A refusal here can only come from the peer gate: there is no
