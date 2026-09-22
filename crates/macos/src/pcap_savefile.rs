@@ -15,6 +15,20 @@
 
 use std::path::Path;
 
+/// The classic-pcap savefile global header size. `tcpdump` writes it on
+/// opening the capture device, before any packet — so a savefile shorter than
+/// this never held a real capture, which lets a caller tell "ran, saw nothing"
+/// from "never ran" (realm net-observer, node #170).
+pub(crate) const PCAP_GLOBAL_HEADER: usize = 24;
+
+/// Whether `path` holds at least a full pcap global header — i.e. `tcpdump`
+/// actually opened the device and began a capture. `false` for a missing or
+/// header-short file: the capture never started, which the egress scan must
+/// not mistake for an honest empty capture (realm net-observer, node #170).
+pub(crate) fn has_pcap_header(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() >= PCAP_GLOBAL_HEADER as u64)
+}
+
 /// Read a classic-`pcap` savefile and return each record's captured frame
 /// bytes. A missing/short/garbage file yields an empty vec, never a panic.
 pub(crate) fn read_pcap_frames(path: &Path) -> Vec<Vec<u8>> {
@@ -34,9 +48,8 @@ pub(crate) fn read_pcap_frames(path: &Path) -> Vec<Vec<u8>> {
 /// with what was decoded so far — a truncated tail (a child killed mid-write) is
 /// not a panic and not a lost prefix.
 pub(crate) fn parse_pcap_records(bytes: &[u8]) -> Vec<Vec<u8>> {
-    const GLOBAL_HEADER: usize = 24;
     const RECORD_HEADER: usize = 16;
-    if bytes.len() < GLOBAL_HEADER {
+    if bytes.len() < PCAP_GLOBAL_HEADER {
         return Vec::new();
     }
     let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
@@ -57,7 +70,7 @@ pub(crate) fn parse_pcap_records(bytes: &[u8]) -> Vec<Vec<u8>> {
     };
 
     let mut frames = Vec::new();
-    let mut off = GLOBAL_HEADER;
+    let mut off = PCAP_GLOBAL_HEADER;
     while off + RECORD_HEADER <= bytes.len() {
         let incl_len = u32_at(&bytes[off + 8..off + 12]) as usize;
         let start = off + RECORD_HEADER;
@@ -105,6 +118,25 @@ mod tests {
             out.extend_from_slice(rec);
         }
         out
+    }
+
+    /// The egress scan leans on this to tell "tcpdump ran and saw nothing"
+    /// (header present, no records) from "tcpdump was killed before it opened
+    /// the device" (no header) — the false-zero the egress capture must never
+    /// produce (realm net-observer, node #170).
+    #[test]
+    fn has_pcap_header_tells_a_started_capture_from_a_killed_before_header_one() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file: the child never wrote anything.
+        assert!(!has_pcap_header(&dir.path().join("missing.pcap")));
+        // Shorter than the global header: killed before it opened the device.
+        let short = dir.path().join("short.pcap");
+        std::fs::write(&short, [0u8; PCAP_GLOBAL_HEADER - 1]).unwrap();
+        assert!(!has_pcap_header(&short));
+        // A header-only file is a real capture that genuinely saw nothing.
+        let empty = dir.path().join("empty.pcap");
+        std::fs::write(&empty, pcap_file(&[], false)).unwrap();
+        assert!(has_pcap_header(&empty));
     }
 
     #[test]

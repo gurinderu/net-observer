@@ -187,6 +187,28 @@ impl EgressCapture for TcpdumpEgressCapture {
             return EgressCaptureOutcome::CouldNotStart(reason);
         }
 
+        // A capture that genuinely ran writes tcpdump's pcap global header on
+        // opening the device, before any packet. A missing or header-short
+        // savefile means tcpdump was killed (or died) before it opened the
+        // interface — it hung acquiring root/BPF, not "saw nothing". That is a
+        // SKIP, never the honest zero a header-present, record-empty file would
+        // be: on a tunneled uplink the difference is the whole security question
+        // (realm net-observer, node #170). This closes the one gap the pre-budget
+        // exit check above cannot: a child killed AT the budget before it ever
+        // opened the device leaves an empty file that would otherwise read as a
+        // false zero.
+        if !crate::pcap_savefile::has_pcap_header(&out) {
+            let reason = if stderr.is_empty() {
+                "tcpdump was killed before it opened the capture (no pcap header written); \
+                 it likely could not acquire the interface — root/BPF/entitlement"
+                    .to_string()
+            } else {
+                format!("tcpdump did not open the capture: {stderr}")
+            };
+            tracing::warn!(iface = %self.iface, %reason, "egress capture: {reason}");
+            return EgressCaptureOutcome::CouldNotStart(reason);
+        }
+
         let frames = crate::pcap_savefile::read_pcap_frames(&out);
         if frames.is_empty() {
             // A real zero: the capture ran and this machine sent no IP packet on
