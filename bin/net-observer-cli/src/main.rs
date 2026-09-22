@@ -30,7 +30,7 @@
 mod diagnose;
 
 use anyhow::{Result, anyhow};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{CellAlignment, ContentArrangement, presets::UTF8_FULL_CONDENSED};
 use config::Config;
 use net_observer_ipc::{
@@ -73,13 +73,16 @@ struct Cli {
     /// a `source:` line on stderr.
     #[arg(long)]
     db: Option<String>,
-    /// Never pipe rendered output through a pager, even on a terminal. Every
-    /// table this CLI prints normally pages the way `git log` does — through
-    /// `$PAGER` (or `less -RFX`) on a terminal, direct otherwise (a pipe, a
-    /// redirect, a script never pages either way). Accepted after the
-    /// subcommand too (`connections --no-pager`), not only before it.
+    /// Print every row instead of capping the console output at the first N.
+    ///
+    /// On an interactive terminal a long table (vulns, connections,
+    /// neighbors, a diagnosis, …) shows only the first 40 rows
+    /// (`DEFAULT_ROW_LIMIT`) and notes how many more exist; piping or
+    /// redirecting always shows every row regardless of this flag (`vulns |
+    /// less` needs no flag). Accepted after the subcommand too (`connections
+    /// --full`), not only before it.
     #[arg(long, global = true)]
-    no_pager: bool,
+    full: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -273,16 +276,26 @@ enum Command {
         #[arg(long)]
         sweep_max: Option<u32>,
     },
-    /// The neighbours the record knows on each segment, newest first.
+    /// The neighbours the record knows on each segment, newest tick first.
     ///
     /// MAC, address, vendor OUI, name if one was ever learned, and how it
     /// came to be known. Asks the running daemon first, reads the DB file
     /// only when no daemon answers.
+    ///
+    /// `neighbor` is never pruned and is upserted by passive collection every
+    /// tick, so without `--all` this shows only the rows sharing the newest
+    /// `last_seen_us` — the current segment's live roster — rather than every
+    /// neighbour this machine has ever recorded, on every segment, including
+    /// stale ones.
     Neighbors {
         /// Restrict to one segment, by its gateway MAC. Omit for every segment
         /// this machine has recorded.
         #[arg(long)]
         network: Option<String>,
+        /// Show every recorded neighbour across all networks and time, not
+        /// just the most recent tick.
+        #[arg(long)]
+        all: bool,
     },
     /// The CVEs the record hypothesises for open ports, newest first.
     ///
@@ -347,14 +360,18 @@ enum Command {
     /// Inherently a LIVE operation either way — the daemon holds the only
     /// scan record / cached snapshot — so a global `--db` (offline file) is
     /// refused rather than silently reading an unrelated record.
+    #[command(group(
+        ArgGroup::new("check_target")
+            .required(true)
+            .args(["ip", "product"])
+    ))]
     CheckCve {
-        /// The host to scan. Mutually exclusive with `--product`; exactly
-        /// one of the two is required.
-        #[arg(required_unless_present = "product")]
+        /// Provide an IP to scan a host, or `--product` to look a product up
+        /// in the snapshot — exactly one.
         ip: Option<IpAddr>,
-        /// Look this product up directly in the local CVE snapshot instead
-        /// of scanning a host. Mutually exclusive with `<ip>`.
-        #[arg(long, conflicts_with = "ip", required_unless_present = "ip")]
+        /// Provide `--product` to look a product up in the snapshot, or an
+        /// IP to scan a host instead — exactly one.
+        #[arg(long, conflicts_with = "ip")]
         product: Option<String>,
         /// Narrow the lookup to one version. Only valid with `--product`.
         #[arg(long, requires = "product")]
@@ -371,11 +388,20 @@ enum Command {
     /// is a HYPOTHESIS — LLDP/CDP are unauthenticated and spoofable — never
     /// an asserted fact. Asks the running daemon first, reads the DB file
     /// only when no daemon answers.
+    ///
+    /// `topology_link` is never pruned and is upserted, and the patrol only
+    /// writes on a non-empty capture, so without `--all` this shows only the
+    /// rows sharing the newest `last_seen_us` — the last capture that
+    /// actually found a link — rather than every uplink ever recorded.
     Topology {
         /// Restrict to one local interface (e.g. `en0`). Omit for every
         /// interface this machine has recorded an uplink on.
         #[arg(long)]
         iface: Option<String>,
+        /// Show every recorded uplink across all time, not just the most
+        /// recent capture.
+        #[arg(long)]
+        all: bool,
     },
     /// What this machine talks to: the live sing-box flow table, grouped.
     ///
@@ -1182,12 +1208,19 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Status => {
             let cfg = load_config(cli)?;
             let snap = fetch_status(&cfg.socket_path)?;
-            print_paged(&format_status(&snap), cli.no_pager);
+            print!("{}", format_status(&snap));
         }
         Command::Incidents { limit, ids } => {
             let cfg = load_config(cli)?;
-            let incidents = fetch_incidents(&cfg.socket_path, *limit)?;
-            print_paged(&format_incidents(&incidents, *ids), cli.no_pager);
+            let mut incidents = fetch_incidents(&cfg.socket_path, *limit)?;
+            // `--limit` bounds the query (default 50, over `DEFAULT_ROW_LIMIT`);
+            // the cap bounds the interactive display — the same two-axis split
+            // `check-cve --all` has against the row cap.
+            let note = cap_rows(&mut incidents, std::io::stdout().is_terminal(), cli.full);
+            print!("{}", format_incidents(&incidents, *ids));
+            if let Some(note) = note {
+                print!("{note}");
+            }
         }
         Command::Events { kind } => {
             let cfg = load_config(cli)?;
@@ -1203,7 +1236,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Kickstart => {
             let cfg = load_config(cli)?;
             let result = fetch_kickstart(&cfg.socket_path)?;
-            print_paged(&format_control(&result), cli.no_pager);
+            print!("{}", format_control(&result));
             // A refusal (unauthorised peer) or a failed action is a non-zero
             // exit, even though the request itself round-tripped fine.
             if !result.ok {
@@ -1213,7 +1246,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Observe { state } => {
             let cfg = load_config(cli)?;
             let result = fetch_set_observing(&cfg.socket_path, state.as_bool())?;
-            print_paged(&format_control(&result), cli.no_pager);
+            print!("{}", format_control(&result));
             // The request round-trips fine; a non-`ok` result means the daemon
             // declined or failed, which is a non-zero exit.
             if !result.ok {
@@ -1223,7 +1256,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Probe { tier } => {
             let cfg = load_config(cli)?;
             let result = fetch_set_probing(&cfg.socket_path, tier.to_tier())?;
-            print_paged(&format_control(&result), cli.no_pager);
+            print!("{}", format_control(&result));
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
@@ -1231,7 +1264,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Experiment { minutes, no_wait } => {
             let cfg = load_config(cli)?;
             let result = fetch_start_experiment(&cfg.socket_path, *minutes)?;
-            print_paged(&format_control(&result), cli.no_pager);
+            print!("{}", format_control(&result));
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
@@ -1254,7 +1287,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 net_observer_ipc::diagnose,
                 std::thread::sleep,
             )?;
-            print_paged(&format_table(&table, true), cli.no_pager);
+            print_table(&table, true, cli.full);
         }
         Command::ExperimentReport { id } => {
             let table =
@@ -1270,7 +1303,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         rows: table.rows,
                     })
                 })?;
-            print_paged(&format_table(&table, true), cli.no_pager);
+            print_table(&table, true, cli.full);
         }
         Command::ScanNeighbors {
             ports,
@@ -1292,7 +1325,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     sweep_max: *sweep_max,
                 },
             )?;
-            print_paged(&format_control(&result), cli.no_pager);
+            print!("{}", format_control(&result));
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
@@ -1301,7 +1334,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         // or file is touched, so a bad key is the builder's own error and never
         // a round-trip — then the daemon is asked, and the file read only when
         // no daemon answers (see `diagnose_table`).
-        Command::Neighbors { network } => {
+        Command::Neighbors { network, all } => {
             let sql = diagnosis::neighbors_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
             let table = diagnose_table(
                 cli,
@@ -1310,7 +1343,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
-            print_paged(&format_table(&table, true), cli.no_pager);
+            let table = if *all { table } else { keep_last_run(&table) };
+            print_table(&table, true, cli.full);
         }
         Command::Vulns { network, all } => {
             let sql = diagnosis::vulns_sql(network.as_deref()).map_err(|e| anyhow!("{e}"))?;
@@ -1325,7 +1359,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             // converts `last_seen_us` in place, and `keep_last_run` needs the
             // raw epoch value to find the maximum.
             let table = if *all { table } else { keep_last_run(&table) };
-            print_paged(&format_table(&table, true), cli.no_pager);
+            print_table(&table, true, cli.full);
         }
         Command::CheckCve {
             product, version, ..
@@ -1370,7 +1404,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                              for iOS)"
                         );
                     } else {
-                        print_paged(&format_table(&sorted, true), cli.no_pager);
+                        print_table(&sorted, true, cli.full);
                     }
                     eprintln!(
                         "Names in the CVE data are messy — a product like iOS may be recorded \
@@ -1458,7 +1492,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     scan.message
                 ),
                 CheckCveOutcome::Findings => {
-                    print_paged(&format_table(&focused, true), cli.no_pager);
+                    print_table(&focused, true, cli.full);
                     eprintln!(
                         "These are hypotheses matched from the service banner. A backported \
                          patch can leave a version that looks in-range not actually \
@@ -1468,7 +1502,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 }
             }
         }
-        Command::Topology { iface } => {
+        Command::Topology { iface, all } => {
             let sql = diagnosis::topology_sql(iface.as_deref()).map_err(|e| anyhow!("{e}"))?;
             let table = diagnose_table(
                 cli,
@@ -1477,7 +1511,8 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
-            print_paged(&format_table(&table, true), cli.no_pager);
+            let table = if *all { table } else { keep_last_run(&table) };
+            print_table(&table, true, cli.full);
         }
         Command::Connections {
             by,
@@ -1501,12 +1536,10 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             } else {
                 table
             };
-            let mut out = format_table(&table, true);
+            print_table(&table, true, cli.full);
             if let Some(line) = hidden_line(hidden) {
-                out.push_str(&line);
-                out.push('\n');
+                println!("{line}");
             }
-            print_paged(&out, cli.no_pager);
         }
         Command::Air => {
             // Three reads, one moment: the scan itself (so a SKIP is rendered as
@@ -1552,7 +1585,10 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                         (scan, aps, own)
                     }
                 };
-            print_paged(&diagnose::format_air(&scan, &aps, &own)?, cli.no_pager);
+            print!(
+                "{}",
+                diagnose::format_air(&scan, &aps, &own, std::io::stdout().is_terminal(), cli.full)?
+            );
         }
         Command::Query { sql } => {
             let table = table_from_query(run_query(&file_only(cli)?, sql)?);
@@ -1561,20 +1597,27 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             // local time — there is no `--json`/`--raw` flag to route
             // around the conversion instead, so a script or agent reading
             // this output must see the integer it asked for.
-            print_paged(&format_table(&table, false), cli.no_pager);
+            print_table(&table, false, cli.full);
         }
         Command::Why { at } => {
             let ts_us = diagnose::parse_at(at)?;
             let table = diagnose_table(cli, DiagnosticQuery::Why { ts_us }, |off| {
                 run_prepared(off, &diagnosis::verdict_at_sql(ts_us, LOAD_THRESHOLD))
             })?;
-            print_paged(&diagnose::format_verdict_at(&table, ts_us)?, cli.no_pager);
+            print!("{}", diagnose::format_verdict_at(&table, ts_us)?);
         }
         Command::IncidentContext => {
             let table = diagnose_table(cli, DiagnosticQuery::IncidentContext, |off| {
                 run_prepared(off, &diagnosis::incident_context_sql(LOAD_THRESHOLD))
             })?;
-            print_paged(&diagnose::format_incident_context(&table)?, cli.no_pager);
+            print!(
+                "{}",
+                diagnose::format_incident_context(
+                    &table,
+                    std::io::stdout().is_terminal(),
+                    cli.full
+                )?
+            );
         }
         Command::WedgeOrStarvation => {
             let table = diagnose_table(cli, DiagnosticQuery::WedgeVsStarvation, |off| {
@@ -1586,7 +1629,14 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     ),
                 )
             })?;
-            print_paged(&diagnose::format_wedge_vs_starvation(&table)?, cli.no_pager);
+            print!(
+                "{}",
+                diagnose::format_wedge_vs_starvation(
+                    &table,
+                    std::io::stdout().is_terminal(),
+                    cli.full
+                )?
+            );
         }
         Command::GatewayRamp { drop, window_us } => {
             let drop_ts_us = match drop {
@@ -1601,9 +1651,15 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_prepared(off, &diagnosis::gateway_ramp_sql(drop_ts_us, *window_us)),
             )?;
-            print_paged(
-                &diagnose::format_gateway_ramp(&table, drop_ts_us, *window_us)?,
-                cli.no_pager,
+            print!(
+                "{}",
+                diagnose::format_gateway_ramp(
+                    &table,
+                    drop_ts_us,
+                    *window_us,
+                    std::io::stdout().is_terminal(),
+                    cli.full
+                )?
             );
         }
         Command::Gaps => {
@@ -1625,13 +1681,20 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &diagnosis::silences_sql()),
             )?;
-            print_paged(&diagnose::format_observation_gaps(&table)?, cli.no_pager);
+            print!(
+                "{}",
+                diagnose::format_observation_gaps(
+                    &table,
+                    std::io::stdout().is_terminal(),
+                    cli.full
+                )?
+            );
         }
         Command::Segments => {
             let table = diagnose_table(cli, DiagnosticQuery::Segments, |off| {
                 run_query(off, &diagnosis::segments_sql())
             })?;
-            print_paged(&format_table(&table, true), cli.no_pager);
+            print_table(&table, true, cli.full);
         }
         Command::History {
             network,
@@ -1659,7 +1722,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 },
                 |off| run_query(off, &sql),
             )?;
-            print_paged(&format_table(&table, true), cli.no_pager);
+            print_table(&table, true, cli.full);
         }
         Command::Completions { shell } => {
             clap_complete::generate(
@@ -2636,87 +2699,82 @@ fn format_status(snap: &StatusSnapshot) -> String {
     out
 }
 
-/// Whether [`print_paged`] should pipe through a pager (owner ask, Part C):
-/// stdout is a terminal AND paging was not explicitly disabled. Pure over
-/// its inputs — `is_tty` and `no_pager` — so the one real decision in the
-/// pager funnel is unit-tested directly; the TTY check itself cannot run in
-/// a test.
-fn should_page(is_tty: bool, no_pager: bool) -> bool {
-    is_tty && !no_pager
-}
+/// A screenful: how many rows of a table this CLI shows on an interactive
+/// terminal before it cuts off and notes the rest ([`row_cap`]) — an
+/// interactive-readability cap, not a claim about how much data exists.
+/// Piping, redirecting, or `--full` always shows every row.
+const DEFAULT_ROW_LIMIT: usize = 40;
 
-/// The pager command to spawn: `$PAGER` when set and non-blank (split on
-/// whitespace, so `"less -S"` carries its own flag), else `less -RFX` — `-F`
-/// quits at once when the content fits one screen, so a short table feels
-/// unpaged; `-X` keeps it in scrollback after quitting; `-R` lets
-/// comfy-table's UTF-8 box-drawing through untouched.
-fn pager_command() -> (String, Vec<String>) {
-    match std::env::var("PAGER") {
-        Ok(p) if !p.trim().is_empty() => {
-            let mut parts = p.split_whitespace().map(str::to_string);
-            let cmd = parts.next().unwrap_or_else(|| "less".to_string());
-            (cmd, parts.collect())
-        }
-        _ => ("less".to_string(), vec!["-RFX".to_string()]),
+/// How many of `total_rows` to render, or `None` for "render them all, no
+/// note": piping/redirecting (`!is_tty`) and `--full` both mean "show
+/// everything" (so `vulns | less` and a script see the full data), and an
+/// interactive terminal needs no cap either when the table already fits
+/// under [`DEFAULT_ROW_LIMIT`]. Otherwise the first `DEFAULT_ROW_LIMIT` rows
+/// are shown and the caller notes how many were left out
+/// ([`more_rows_note`]). Pure over its inputs so the cap decision is
+/// unit-tested directly; the TTY check itself cannot run in a test.
+fn row_cap(is_tty: bool, full: bool, total_rows: usize) -> Option<usize> {
+    if is_tty && !full && total_rows > DEFAULT_ROW_LIMIT {
+        Some(DEFAULT_ROW_LIMIT)
+    } else {
+        None
     }
 }
 
-/// Whether [`print_paged`] should default the pager child's own `LESS` env
-/// var to `FRX` — git does the same, for the same reason: an operator's
-/// `$PAGER` is often a bare `less -R` (color, no `-F`), so `less` opens
-/// full-screen and waits even for a one-line result. `-F` quits at once when
-/// the content fits one screen, `-R` keeps comfy-table's UTF-8 box-drawing
-/// untouched, `-X` keeps it in scrollback after quitting. `None` when the
-/// operator already set `LESS` themselves — a deliberate choice is never
-/// overridden — and harmless when the pager isn't `less` at all (an
-/// unrelated env var to another program). An empty/whitespace-only `LESS`
-/// (e.g. a shell profile exporting `LESS=`) is treated the same as unset:
-/// that is almost always a stray export, not a deliberate "run less with no
-/// flags", and leaving it alone would trap the operator in full-screen
-/// `less` on short output — precisely the bug `FRX` exists to avoid. Only a
-/// `LESS` carrying real content counts as the operator's own.
-fn pager_less_default() -> Option<&'static str> {
-    let set_deliberately =
-        std::env::var_os("LESS").is_some_and(|v| !v.to_string_lossy().trim().is_empty());
-    if set_deliberately { None } else { Some("FRX") }
+/// The note printed under a capped table, naming how many rows were left out
+/// and the two ways to see them. Shared so every capped command reads the
+/// same line.
+fn more_rows_note(total_rows: usize, shown: usize) -> String {
+    format!(
+        "… and {} more rows — pass --full to show all, or pipe to less\n",
+        total_rows - shown
+    )
 }
 
-/// Print `content` — git-style: through a pager when stdout is a terminal
-/// and paging was not disabled with `--no-pager` ([`should_page`]), direct
-/// otherwise (a pipe, a redirect, a script — byte-identical to a plain
-/// `print!`). This is the ONE funnel every table-printing subcommand's final
-/// output goes through, so pagination and the `ts_us`→local-time conversion
-/// ([`format_table`], `diagnose`'s own tables) ride together.
-///
-/// If the pager cannot even be spawned, this falls back to a direct print
-/// rather than erroring — a broken `$PAGER` must not block every command.
-/// The pager's stdin is a pipe: the operator quitting early breaks it, and
-/// that write failure is swallowed, never a panic or a reported error; the
-/// child is always waited on so it neither zombies nor races the shell
-/// prompt's return against the pager's own screen paint.
-fn print_paged(content: &str, no_pager: bool) {
-    if !should_page(std::io::stdout().is_terminal(), no_pager) {
-        print!("{content}");
-        return;
+/// The ONE place `total_rows → row_cap → truncate → note` happens: truncates
+/// `rows` in place to [`DEFAULT_ROW_LIMIT`] when [`row_cap`] says to, and
+/// returns the trailing note to append when it did (`None` otherwise).
+/// Generic over the row type so every renderer shares this exact sequence —
+/// [`render_table_capped`]'s `Table.rows`, `diagnose`'s hand-rolled
+/// `Vec<Vec<String>>`/ranked-AP rows, and `Command::Incidents`'s
+/// `Vec<IncidentSummary>` alike — rather than each hand-rolling its own
+/// `if let Some(shown) = row_cap(...) { rows.truncate(shown); }` copy. Pure
+/// over `is_tty`/`full` (a real terminal check happens only at the call
+/// site), so a renderer's cap wiring is unit-tested without one.
+fn cap_rows<T>(rows: &mut Vec<T>, is_tty: bool, full: bool) -> Option<String> {
+    let total = rows.len();
+    row_cap(is_tty, full, total).map(|shown| {
+        rows.truncate(shown);
+        more_rows_note(total, shown)
+    })
+}
+
+/// Render `table` the way [`format_table`] does, capped to
+/// [`DEFAULT_ROW_LIMIT`] rows with a trailing note when `is_tty && !full` and
+/// the table does not fit ([`row_cap`], via [`cap_rows`]); every row
+/// otherwise. Pure over its inputs — including a simulated `is_tty` — so the
+/// capped rendering is unit-tested without a real terminal; [`print_table`]
+/// is the thin real-stdout wrapper around it.
+fn render_table_capped(table: &Table, readable_time: bool, is_tty: bool, full: bool) -> String {
+    let mut capped = table.clone();
+    let note = cap_rows(&mut capped.rows, is_tty, full);
+    let mut out = format_table(&capped, readable_time);
+    if let Some(note) = note {
+        out.push_str(&note);
     }
-    let (cmd, args) = pager_command();
-    let mut command = std::process::Command::new(&cmd);
-    command.args(&args).stdin(std::process::Stdio::piped());
-    if let Some(less) = pager_less_default() {
-        command.env("LESS", less);
-    }
-    let child = command.spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(_) => {
-            print!("{content}");
-            return;
-        }
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(content.as_bytes());
-    }
-    let _ = child.wait();
+    out
+}
+
+/// Print a [`Table`] through [`render_table_capped`] against the real
+/// terminal state. This is the funnel every table-printing subcommand's
+/// final output goes through now that the pager is gone — pagination is
+/// replaced by a row cap, but the readable-time conversion ([`format_table`])
+/// still rides along.
+fn print_table(table: &Table, readable_time: bool, full: bool) {
+    print!(
+        "{}",
+        render_table_capped(table, readable_time, std::io::stdout().is_terminal(), full)
+    );
 }
 
 /// One table style for every rendered table in this CLI ([`format_incidents`]
@@ -3362,113 +3420,104 @@ mod tests {
         assert_eq!(rename_ts_column(&no_ts), no_ts);
     }
 
-    /// [`should_page`]'s full truth table (owner ask, Part C): pages only
-    /// when stdout is a terminal AND paging was not explicitly disabled.
-    /// This is also the proof the non-TTY path in [`print_paged`] is
-    /// byte-identical to a plain `print!`: `should_page(false, _)` is always
-    /// `false`, and that branch of `print_paged` is exactly `print!` — the
-    /// TTY branch itself is the one piece that cannot run in a test.
+    /// [`row_cap`]'s full truth table: capped only when stdout is a terminal
+    /// AND `--full` was not given AND the table does not already fit under
+    /// [`DEFAULT_ROW_LIMIT`] — every other combination shows everything. The
+    /// "N more" count is `total - shown`.
     #[test]
-    fn should_page_truth_table() {
-        assert!(should_page(true, false));
-        assert!(!should_page(true, true));
-        assert!(!should_page(false, false));
-        assert!(!should_page(false, true));
+    fn row_cap_truth_table() {
+        assert_eq!(row_cap(false, false, DEFAULT_ROW_LIMIT + 1), None);
+        assert_eq!(row_cap(false, true, DEFAULT_ROW_LIMIT + 1), None);
+        assert_eq!(row_cap(true, true, DEFAULT_ROW_LIMIT + 1), None);
+        assert_eq!(row_cap(true, false, DEFAULT_ROW_LIMIT), None);
+        assert_eq!(
+            row_cap(true, false, DEFAULT_ROW_LIMIT + 1),
+            Some(DEFAULT_ROW_LIMIT)
+        );
+        let total = DEFAULT_ROW_LIMIT + 7;
+        let shown = row_cap(true, false, total).unwrap();
+        assert_eq!(total - shown, 7);
     }
 
-    /// `pager_command` honours `$PAGER` (split on whitespace, so it carries
-    /// its own flags — `less -S`) when set and non-blank, and falls back to
-    /// `less -RFX` otherwise; a `PAGER` that is empty or only whitespace is
-    /// treated as unset, never as "run nothing".
+    /// [`cap_rows`] is the ONE place `total_rows → row_cap → truncate → note`
+    /// happens, shared by every renderer (the comfy_table path here and
+    /// diagnose.rs's five hand-rolled tables alike) — pinned generically over
+    /// a plain `Vec<usize>` rather than through any one renderer's shape.
     #[test]
-    fn pager_command_honors_pager_env_or_falls_back_to_less() {
-        // SAFETY: this test owns `PAGER` for its duration — set/read/restored
-        // single-threaded within this one test body — and no other test in
-        // this crate touches the variable.
-        let saved = std::env::var("PAGER").ok();
-        unsafe {
-            std::env::set_var("PAGER", "less -S");
-        }
-        assert_eq!(
-            pager_command(),
-            ("less".to_string(), vec!["-S".to_string()])
-        );
-
-        unsafe {
-            std::env::set_var("PAGER", "   ");
-        }
-        assert_eq!(
-            pager_command(),
-            ("less".to_string(), vec!["-RFX".to_string()])
-        );
-
-        unsafe {
-            std::env::remove_var("PAGER");
-        }
-        assert_eq!(
-            pager_command(),
-            ("less".to_string(), vec!["-RFX".to_string()])
-        );
-
-        unsafe {
-            match &saved {
-                Some(v) => std::env::set_var("PAGER", v),
-                None => std::env::remove_var("PAGER"),
-            }
-        }
+    fn cap_rows_truncates_and_notes_when_capped() {
+        let mut rows: Vec<usize> = (0..DEFAULT_ROW_LIMIT + 3).collect();
+        let note = cap_rows(&mut rows, true, false);
+        assert_eq!(rows, (0..DEFAULT_ROW_LIMIT).collect::<Vec<_>>());
+        assert!(note.unwrap().contains("3 more rows"));
     }
 
-    /// `pager_less_default` — the `LESS=FRX` git-style default — fires when
-    /// the operator has not set `LESS` themselves, and also when `LESS` is
-    /// set but empty or whitespace-only (a stray `LESS=` export is not a
-    /// deliberate flag choice, and leaving it alone would trap the operator
-    /// in full-screen `less` on short output); only a `LESS` carrying real
-    /// content is left alone.
+    /// Off a terminal (or with `--full`), `cap_rows` leaves `rows` untouched
+    /// and returns no note — the complement of the case above.
     #[test]
-    fn pager_less_default_when_less_is_unset_or_empty() {
-        // SAFETY: this test owns `LESS` for its duration — set/read/restored
-        // single-threaded within this one test body — and no other test in
-        // this crate touches the variable (distinct from `PAGER`, which
-        // `pager_command_honors_pager_env_or_falls_back_to_less` owns).
-        let saved = std::env::var("LESS").ok();
-        unsafe {
-            std::env::remove_var("LESS");
-        }
-        assert_eq!(pager_less_default(), Some("FRX"));
+    fn cap_rows_leaves_everything_when_not_capped() {
+        let mut rows: Vec<usize> = (0..DEFAULT_ROW_LIMIT + 3).collect();
+        let original = rows.clone();
+        assert!(cap_rows(&mut rows, false, false).is_none());
+        assert_eq!(rows, original);
+        assert!(cap_rows(&mut rows, true, true).is_none());
+        assert_eq!(rows, original);
+    }
 
-        unsafe {
-            std::env::set_var("LESS", "");
-        }
-        assert_eq!(pager_less_default(), Some("FRX"));
-
-        unsafe {
-            std::env::set_var("LESS", "  ");
-        }
-        assert_eq!(pager_less_default(), Some("FRX"));
-
-        unsafe {
-            std::env::set_var("LESS", "-X");
-        }
-        assert_eq!(pager_less_default(), None);
-
-        unsafe {
-            match &saved {
-                Some(v) => std::env::set_var("LESS", v),
-                None => std::env::remove_var("LESS"),
-            }
+    /// A table of `n` rows, each cell a fixed-width `row-NN` label so no
+    /// value is ever a substring of another (unlike bare `0`..`9` inside
+    /// `10`..`44`), which lets a test count exactly how many data rows a
+    /// render actually carries.
+    fn table_of(n: usize) -> Table {
+        Table {
+            columns: vec!["n".to_string()],
+            rows: (0..n).map(|i| vec![format!("row-{i:02}")]).collect(),
         }
     }
 
-    /// `--no-pager` is `global = true`: accepted before the subcommand and
-    /// after it alike, and absent by default.
+    /// A table over [`DEFAULT_ROW_LIMIT`] rows, rendered on a simulated
+    /// interactive terminal: capped to `DEFAULT_ROW_LIMIT` data rows plus the
+    /// "more rows" note.
     #[test]
-    fn no_pager_flag_parses_before_and_after_the_subcommand() {
+    fn render_table_capped_caps_on_a_tty() {
+        let table = table_of(DEFAULT_ROW_LIMIT + 5);
+        let out = render_table_capped(&table, false, true, false);
+        assert_eq!(out.matches("row-").count(), DEFAULT_ROW_LIMIT);
+        for i in 0..DEFAULT_ROW_LIMIT {
+            assert!(
+                out.contains(&format!("row-{i:02}")),
+                "row {i} missing from capped output"
+            );
+        }
+        for i in DEFAULT_ROW_LIMIT..table.rows.len() {
+            assert!(
+                !out.contains(&format!("row-{i:02}")),
+                "row {i} should have been capped out"
+            );
+        }
+        assert!(out.contains("more rows"));
+        assert!(out.contains("5 more rows"));
+    }
+
+    /// The same table, not on a terminal (a pipe/redirect/script): every row
+    /// renders, no "more rows" note — piping shows everything.
+    #[test]
+    fn render_table_capped_shows_everything_off_a_tty() {
+        let table = table_of(DEFAULT_ROW_LIMIT + 5);
+        let out = render_table_capped(&table, false, false, false);
+        assert_eq!(out.matches("row-").count(), table.rows.len());
+        assert!(!out.contains("more rows"));
+    }
+
+    /// `--full` is `global = true`: accepted before the subcommand and after
+    /// it alike, and absent by default.
+    #[test]
+    fn full_flag_parses_before_and_after_the_subcommand() {
         let cli = Cli::try_parse_from(["net-observer-cli", "status"]).unwrap();
-        assert!(!cli.no_pager);
-        let cli = Cli::try_parse_from(["net-observer-cli", "--no-pager", "status"]).unwrap();
-        assert!(cli.no_pager);
-        let cli = Cli::try_parse_from(["net-observer-cli", "status", "--no-pager"]).unwrap();
-        assert!(cli.no_pager);
+        assert!(!cli.full);
+        let cli = Cli::try_parse_from(["net-observer-cli", "--full", "status"]).unwrap();
+        assert!(cli.full);
+        let cli = Cli::try_parse_from(["net-observer-cli", "status", "--full"]).unwrap();
+        assert!(cli.full);
     }
 
     /// `--target`, `--slow` and `--sweep-max` (realm net-observer, node #154)
@@ -3619,6 +3668,27 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
+    /// The `check_target` `ArgGroup` (`ip`/`--product`) renders the bare
+    /// invocation as ONE required choice, not two arguments that each read
+    /// as independently required — the confusing shape this replaced (owner
+    /// ask). Captured from an actual `try_parse_from` error, not guessed.
+    #[test]
+    fn check_cve_bare_invocation_names_one_required_choice() {
+        let err = Cli::try_parse_from(["net-observer-cli", "check-cve"])
+            .err()
+            .expect("neither <ip> nor --product must be rejected");
+        let rendered = err.to_string();
+        // Old shape (pre-ArgGroup): `--product <PRODUCT>` and `<IP>` were
+        // listed as two separate required arguments, each on its own line —
+        // reading as "both are required". The group instead names the pair
+        // as a single alternative, `<IP|--product <PRODUCT>>`, once.
+        assert_eq!(
+            rendered.matches("<IP|--product <PRODUCT>>").count(),
+            2, // once in "required arguments", once in the Usage: line
+            "expected the group to render as one <IP|--product <PRODUCT>> choice, got:\n{rendered}"
+        );
+    }
+
     #[test]
     fn vulns_parses_all() {
         let cli = Cli::try_parse_from(["net-observer-cli", "vulns"]).unwrap();
@@ -3630,6 +3700,38 @@ mod tests {
         match cli.command {
             Command::Vulns { all, .. } => assert!(all),
             _ => panic!("did not parse as `vulns`"),
+        }
+    }
+
+    /// `neighbors --all` parses, mirroring `vulns --all` — the client-side
+    /// `keep_last_run` filter (already unit-tested on its own) applies by
+    /// default and is skipped with `--all`.
+    #[test]
+    fn neighbors_parses_all() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "neighbors"]).unwrap();
+        match cli.command {
+            Command::Neighbors { all, .. } => assert!(!all),
+            _ => panic!("did not parse as `neighbors`"),
+        }
+        let cli = Cli::try_parse_from(["net-observer-cli", "neighbors", "--all"]).unwrap();
+        match cli.command {
+            Command::Neighbors { all, .. } => assert!(all),
+            _ => panic!("did not parse as `neighbors`"),
+        }
+    }
+
+    /// `topology --all` parses, the same mechanism as `neighbors --all`.
+    #[test]
+    fn topology_parses_all() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "topology"]).unwrap();
+        match cli.command {
+            Command::Topology { all, .. } => assert!(!all),
+            _ => panic!("did not parse as `topology`"),
+        }
+        let cli = Cli::try_parse_from(["net-observer-cli", "topology", "--all"]).unwrap();
+        match cli.command {
+            Command::Topology { all, .. } => assert!(all),
+            _ => panic!("did not parse as `topology`"),
         }
     }
 
