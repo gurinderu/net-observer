@@ -50,7 +50,8 @@ use types::{
 
 use crate::acting;
 use crate::pipeline::{
-    AirScanRequest, AirScanner, CveLookupOutcome, NeighborScanner, PcapRingSlot, confidence_token,
+    AirScanRequest, AirScanner, CveLookupOutcome, NeighborScanner, PcapRingSlot, TopologyScanner,
+    confidence_token,
 };
 
 /// The uid `root` runs as. Always authorised for control: root can already stop
@@ -465,6 +466,9 @@ pub struct ApiServer {
     /// The on-demand air scanner, when the platform has one. `None` makes
     /// `ScanAir` a refusal with a message, never a silent success.
     pub air_scanner: Option<Arc<dyn AirScanner>>,
+    /// The on-demand topology scanner, when the platform has one. `None` makes
+    /// `ScanTopology` a refusal with a message, never a silent success.
+    pub topology_scanner: Option<Arc<dyn TopologyScanner>>,
     /// The configured CVE snapshot directory, when one is set. The `cve` rung is
     /// UNAVAILABLE unless this is `Some` AND the directory exists — checked at
     /// scan time so a snapshot removed after boot is honestly reported as
@@ -827,6 +831,7 @@ async fn handle_conn(
                 freezer: &srv.freezer,
                 scanner: srv.scanner.as_deref(),
                 air_scanner: srv.air_scanner.as_deref(),
+                topology_scanner: srv.topology_scanner.as_deref(),
                 scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
                 blob_dir: &srv.blob_dir,
                 resume_at_us: &srv.resume_at_us,
@@ -1155,6 +1160,8 @@ pub(crate) struct ControlCtx<'a> {
     pub scanner: Option<&'a dyn NeighborScanner>,
     /// The on-demand air scanner, when the platform has one.
     pub air_scanner: Option<&'a dyn AirScanner>,
+    /// The on-demand topology scanner, when the platform has one.
+    pub topology_scanner: Option<&'a dyn TopologyScanner>,
     /// The configured CVE snapshot directory, when one is set (see the field of
     /// the same name on the server). Checked for existence at scan time.
     pub scan_cve_snapshot: Option<&'a Path>,
@@ -1386,6 +1393,7 @@ fn control_response(
         ControlCmd::FreezePcap => freeze_now(cx),
         ControlCmd::ScanNeighbors(opts) => scan_now(cx, &opts, Some(authorized.uid())),
         ControlCmd::ScanAir => air_scan_now(cx, authorized.uid()),
+        ControlCmd::ScanTopology => topology_scan_now(cx, authorized.uid()),
         ControlCmd::KickstartProxy => match acting::kickstart_proxy(&cx.acting.singbox_service) {
             Ok(message) => ControlResult { ok: true, message },
             Err(message) => ControlResult { ok: false, message },
@@ -1799,6 +1807,52 @@ fn air_scan_now(cx: &ControlCtx<'_>, peer_uid: u32) -> ControlResult {
     };
     tracing::info!(ok, peer_uid, %message, "air scan requested via control socket");
     ControlResult { ok, message }
+}
+
+/// Force one LLDP/CDP topology capture now, instead of waiting for the next
+/// slow patrol tick (`TOPOLOGY_PATROL_INTERVAL`, a 65s capture every 5
+/// minutes).
+///
+/// Mirrors [`air_scan_now`]'s self-control shape, with one difference: the
+/// round-trip is SYNCHRONOUS. The capture's own budget (~65s) fits well
+/// inside the CLI's `SCAN_TIMEOUT` (180s), so the operator is answered with
+/// the real uplink count rather than an "accepted" ack — there is no useful
+/// "started" state to report separately for a capture this short. Zero links
+/// is reported `ok: true`: absence is the honest SKIP-never-silence answer on
+/// a segment with no managed switch or enterprise AP, never a failure.
+///
+/// A PAUSE still refuses, for the same reason a neighbour/air scan does: the
+/// pause is bracketed silence and a link stamped inside that bracket would
+/// make the `observing_edge` row and the data disagree about the same
+/// seconds.
+fn topology_scan_now(cx: &ControlCtx<'_>, peer_uid: u32) -> ControlResult {
+    if !cx.observing.load(Ordering::Acquire) {
+        return ControlResult {
+            ok: false,
+            message: "observation is paused; resume before scanning topology".to_string(),
+        };
+    }
+    let Some(scanner) = cx.topology_scanner else {
+        return ControlResult {
+            ok: false,
+            message: "topology scanning not available on this host".to_string(),
+        };
+    };
+    let links = scanner.scan();
+    let message = if links.is_empty() {
+        "no LLDP/CDP frames seen — only managed switches and enterprise APs advertise these; a \
+         consumer Wi-Fi network has none"
+            .to_string()
+    } else {
+        format!("found {} uplink(s) via LLDP/CDP", links.len())
+    };
+    tracing::info!(
+        found = links.len(),
+        peer_uid,
+        %message,
+        "topology scan requested via control socket"
+    );
+    ControlResult { ok: true, message }
 }
 
 /// Copy the pcap ring out on operator demand, into a timestamped freeze
@@ -2457,6 +2511,7 @@ mod tests {
             freezer: Arc::new(PcapRingSlot::empty()),
             scanner: None,
             air_scanner: None,
+            topology_scanner: None,
             scan_cve_snapshot: None,
             blob_dir: std::env::temp_dir().join("net-observerd-test-blobs"),
             resume_at_us: Arc::new(AtomicI64::new(0)),
@@ -2484,6 +2539,7 @@ mod tests {
             freezer: &srv.freezer,
             scanner: srv.scanner.as_deref(),
             air_scanner: srv.air_scanner.as_deref(),
+            topology_scanner: srv.topology_scanner.as_deref(),
             scan_cve_snapshot: srv.scan_cve_snapshot.as_deref(),
             blob_dir: &srv.blob_dir,
             resume_at_us: &srv.resume_at_us,
@@ -2581,6 +2637,112 @@ mod tests {
         let asked = with_air(&mut srv, AirScanRequest::Started);
         let cx = test_ctx(&srv);
         let r = control_request(ControlCmd::ScanAir, None, &cx);
+        assert!(!r.ok, "{}", r.message);
+        assert_eq!(asked.load(Ordering::Acquire), 0);
+    }
+
+    /// A scanner that records how many times it was asked and returns a
+    /// canned set of links.
+    struct FakeTopologyScanner {
+        links: Vec<types::TopologyLink>,
+        asked: Arc<AtomicUsize>,
+    }
+
+    impl crate::pipeline::TopologyScanner for FakeTopologyScanner {
+        fn scan(&self) -> Vec<types::TopologyLink> {
+            self.asked.fetch_add(1, Ordering::AcqRel);
+            self.links.clone()
+        }
+    }
+
+    fn with_topology(srv: &mut ApiServer, links: Vec<types::TopologyLink>) -> Arc<AtomicUsize> {
+        let asked = Arc::new(AtomicUsize::new(0));
+        srv.topology_scanner = Some(Arc::new(FakeTopologyScanner {
+            links,
+            asked: Arc::clone(&asked),
+        }) as Arc<dyn crate::pipeline::TopologyScanner>);
+        asked
+    }
+
+    /// A minimal link for tests that only care about the count, not the
+    /// content.
+    fn fake_topology_link(n: u8) -> types::TopologyLink {
+        types::TopologyLink {
+            iface: "en0".to_string(),
+            remote_chassis: format!("aa:bb:cc:dd:ee:{n:02x}"),
+            remote_port: "1".to_string(),
+            remote_system_name: None,
+            capabilities: String::new(),
+            learned_via: types::LearnedVia::Lldp,
+            ts_us: 1,
+        }
+    }
+
+    /// An authorised press reaches the scanner on a default server, and a
+    /// non-empty result is reported ok with the real count — mirrors
+    /// `an_air_scan_reaches_the_scanner`, but the answer carries the outcome
+    /// itself rather than just an "accepted" ack (the sync-round-trip design,
+    /// AGENTS.md realm net-observer node #91).
+    #[test]
+    fn a_topology_scan_reaches_the_scanner_and_reports_the_count() {
+        let mut srv = test_server("/tmp/unused-topo-1.sock", test_acting(), TEST_DAEMON_UID);
+        let asked = with_topology(&mut srv, vec![fake_topology_link(1), fake_topology_link(2)]);
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanTopology, Some(TEST_DAEMON_UID), &cx);
+        assert!(r.ok, "{}", r.message);
+        assert!(r.message.contains("2 uplink"), "{}", r.message);
+        assert_eq!(asked.load(Ordering::Acquire), 1);
+    }
+
+    /// Zero links is reported `ok: true` with the honest "no frames" message —
+    /// absence is the SKIP-never-silence answer (a consumer Wi-Fi segment has
+    /// no managed switch/AP to hear from), never a failure.
+    #[test]
+    fn a_topology_scan_with_no_links_is_ok_with_an_honest_message() {
+        let mut srv = test_server("/tmp/unused-topo-2.sock", test_acting(), TEST_DAEMON_UID);
+        with_topology(&mut srv, Vec::new());
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanTopology, Some(TEST_DAEMON_UID), &cx);
+        assert!(r.ok, "{}", r.message);
+        assert!(r.message.contains("no LLDP/CDP frames"), "{}", r.message);
+    }
+
+    /// A pause DOES refuse, for the same reason a neighbour/air scan does: the
+    /// pause is bracketed silence, and a link stamped inside the bracket
+    /// would make the `observing_edge` row and the data disagree about the
+    /// same seconds. Nothing is asked of the capture.
+    #[test]
+    fn a_paused_daemon_refuses_a_topology_scan_without_touching_the_capture() {
+        let mut srv = test_server("/tmp/unused-topo-3.sock", test_acting(), TEST_DAEMON_UID);
+        let asked = with_topology(&mut srv, vec![fake_topology_link(1)]);
+        srv.observing.store(false, Ordering::Release);
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanTopology, Some(TEST_DAEMON_UID), &cx);
+        assert!(!r.ok);
+        assert!(r.message.contains("paused"), "{}", r.message);
+        assert_eq!(asked.load(Ordering::Acquire), 0);
+    }
+
+    /// No scanner wired at all is a refusal with a message, never a silent
+    /// success — the same rule `FreezePcap`/`ScanAir` follow for an absent
+    /// port.
+    #[test]
+    fn a_topology_scan_without_a_scanner_is_a_refusal_with_a_reason() {
+        let srv = test_server("/tmp/unused-topo-4.sock", test_acting(), TEST_DAEMON_UID);
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanTopology, Some(TEST_DAEMON_UID), &cx);
+        assert!(!r.ok);
+        assert!(r.message.contains("not available"), "{}", r.message);
+    }
+
+    /// Self-control is not no-control: an unauthorised peer is still
+    /// refused, and the capture is not run for it.
+    #[test]
+    fn an_unauthorised_peer_cannot_scan_topology() {
+        let mut srv = test_server("/tmp/unused-topo-5.sock", test_acting(), TEST_DAEMON_UID);
+        let asked = with_topology(&mut srv, vec![fake_topology_link(1)]);
+        let cx = test_ctx(&srv);
+        let r = control_request(ControlCmd::ScanTopology, None, &cx);
         assert!(!r.ok, "{}", r.message);
         assert_eq!(asked.load(Ordering::Acquire), 0);
     }
@@ -3122,6 +3284,7 @@ mod tests {
             ControlCmd::KickstartProxy,
             ControlCmd::ScanNeighbors(ScanOptions::default()),
             ControlCmd::ScanAir,
+            ControlCmd::ScanTopology,
             ControlCmd::StartExperiment { minutes: 5 },
         ] {
             // Exhaustive on purpose — a new variant breaks this arm list.
@@ -3132,6 +3295,7 @@ mod tests {
                 | ControlCmd::KickstartProxy
                 | ControlCmd::ScanNeighbors(_)
                 | ControlCmd::ScanAir
+                | ControlCmd::ScanTopology
                 | ControlCmd::StartExperiment { .. } => {}
             }
             // A refusal here can only come from the peer gate: there is no

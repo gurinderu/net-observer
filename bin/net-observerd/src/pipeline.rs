@@ -938,6 +938,25 @@ impl Drop for LatchGuard {
     }
 }
 
+/// One operator-pressed LLDP/CDP capture behind a trait, so `api` holds no
+/// platform code and the control path is testable without a real `tcpdump`
+/// child. The production impl is [`crate::SystemTopologyScanner`].
+///
+/// Unlike [`AirScanner`], this returns only after the capture finishes:
+/// `ScanTopology`'s round-trip is SYNCHRONOUS, because the capture's own
+/// budget (~65s) fits well inside the CLI's `SCAN_TIMEOUT` (180s) — the
+/// operator is answered with the real uplink count, not just an "accepted"
+/// ack. Blocking is therefore expected; the production impl runs it under
+/// `tokio::task::block_in_place`, exactly like [`crate::SystemScanner::scan`]'s
+/// network sweep.
+pub trait TopologyScanner: Send + Sync {
+    /// Run one capture now, returning the de-duplicated uplinks it found (an
+    /// empty vec when the segment spoke no LLDP/CDP, or when the capture
+    /// itself could not run — both are the honest SKIP-never-silence
+    /// answer, never a distinct error).
+    fn scan(&self) -> Vec<types::TopologyLink>;
+}
+
 /// What one scan did and found, in the shape the control path needs: the
 /// entities to upsert, and the durable rows saying the daemon spoke.
 #[derive(Debug, Clone, PartialEq)]

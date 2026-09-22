@@ -56,7 +56,7 @@ use types::{ProbingEdge, ProbingTier, Sample};
 
 use pipeline::{
     AirScanner, CveLookupOutcome, FreezePcapHandler, NeighborScanner, OnDemandAirScan, PcapFreezer,
-    PcapRingSlot, ScanReport, SnapshotHandler, run, spawn_event_collector,
+    PcapRingSlot, ScanReport, SnapshotHandler, TopologyScanner, run, spawn_event_collector,
     spawn_interval_collector,
 };
 
@@ -232,17 +232,89 @@ fn load_oui_db(dir: Option<&str>) -> Option<Arc<oui_db::OuiDb>> {
     }
 }
 
-/// Spawn the topology patrol: on a slow interval, open a bounded LLDP/CDP
-/// capture on `iface`, map every received frame to a [`types::TopologyLink`],
-/// upsert each into the store, and mirror the current set onto the live
-/// snapshot the socket serves.
+/// Capture once, map every received frame to a [`types::TopologyLink`],
+/// upsert each into the store, mirror the de-duplicated set onto the live
+/// snapshot the socket serves, and return it — the one body
+/// [`spawn_topology_patrol`] and an operator-forced
+/// [`pipeline::TopologyScanner::scan`] both run, so there is exactly one
+/// capture→store→snapshot implementation (AGENTS.md principle 4), never two
+/// that could drift apart. Because the snapshot update lives here, a
+/// patrol tick and a forced `scan topology` land in ALL three readers at once —
+/// the DB, `net-observer-cli topology` over the socket, and the bar's live map
+/// (`snapshot.topology`) — with no path that updates only some of them.
+///
+/// Blocking end to end: `capture.capture()` spawns a `tcpdump` child and
+/// waits up to its own budget. A caller on the async runtime must therefore
+/// run this off the reactor — the patrol via `spawn_blocking`, the on-demand
+/// scanner via `block_in_place` (see [`SystemTopologyScanner::scan`]). The
+/// snapshot lock taken at the end is a brief `std::sync::Mutex`, never held
+/// across an await, so taking it inside either blocking context is sound.
+fn run_topology_capture(
+    capture: &dyn LldpCapture,
+    store: &dyn store::Store,
+    snapshot: &Mutex<StatusSnapshot>,
+    iface: &str,
+    now: i64,
+) -> Vec<types::TopologyLink> {
+    let frames = capture.capture(TOPOLOGY_CAPTURE_BUDGET);
+    let mut latest: Vec<types::TopologyLink> = Vec::new();
+    for frame in &frames {
+        let Some(link) = types::link_from_frame(frame, iface, now) else {
+            continue;
+        };
+        if let Err(e) = store.write_topology_link(&link) {
+            tracing::warn!(error = %e,
+                "store write failed; topology link dropped from DB (gap logged)");
+        }
+        // De-duplicate by the stable key so the returned set carries one node
+        // per uplink even if a switch advertised several times this run.
+        if !latest.iter().any(|l| {
+            l.iface == link.iface
+                && l.remote_chassis == link.remote_chassis
+                && l.remote_port == link.remote_port
+        }) {
+            latest.push(link);
+        }
+    }
+
+    // Mirror onto the live snapshot the socket serves. A capture that maps no
+    // links leaves the snapshot's last discovered set in place rather than
+    // blanking it, so one quiet interval (or a forced scan on a silent segment)
+    // does not erase a real uplink from the live view — the durable record is
+    // the store, which keeps first/last seen. (realm net-observer, node #43)
+    if !latest.is_empty() {
+        // The record's first/last seen for the uplinks — `TopologyLink::ts_us`
+        // is only this run's sighting, so this read is the sole path by which
+        // `first_seen_us` reaches the socket. A failed read yields no bounds,
+        // which the bar renders as "unknown" rather than as a freshly-discovered
+        // uplink.
+        let lifetimes = match store.topology_lifetimes() {
+            Ok(l) => l
+                .into_iter()
+                .filter(|lt| latest.iter().any(|k| lt.bounds(k)))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e,
+                    "topology lifetime read failed; snapshot carries no first/last seen");
+                Vec::new()
+            }
+        };
+        let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        snap.topology.clone_from(&latest);
+        snap.topology_lifetimes = lifetimes;
+    }
+
+    latest
+}
+
+/// Spawn the topology patrol: on a slow interval, run [`run_topology_capture`]
+/// on `iface` — which captures, stores, de-duplicates, and mirrors the result
+/// onto the live snapshot the socket serves, the same body a forced
+/// `scan topology` runs.
 ///
 /// While paused (`observing == false`) the patrol skips its capture entirely —
 /// an operator pause stops collection outright rather than emitting synthetic
-/// readings (AGENTS.md: the sanctioned bracketed-pause exception). A capture
-/// that maps no links leaves the snapshot's last discovered set in place rather
-/// than blanking it, so one quiet interval does not erase a real uplink from the
-/// live view (the durable record is the store, which keeps first/last seen).
+/// readings (AGENTS.md: the sanctioned bracketed-pause exception).
 fn spawn_topology_patrol(
     store: Arc<DuckdbStore>,
     snapshot: Arc<Mutex<StatusSnapshot>>,
@@ -250,7 +322,6 @@ fn spawn_topology_patrol(
     iface: String,
 ) -> JoinHandle<()> {
     use std::sync::atomic::Ordering;
-    use store::Store as _;
 
     tokio::spawn(async move {
         let capture = TcpdumpLldpCapture::new(iface.clone());
@@ -263,59 +334,22 @@ fn spawn_topology_patrol(
             // The capture blocks (spawns a child, waits its budget), so run it off
             // the async runtime rather than stalling the reactor.
             let cap = capture.clone();
-            let frames =
-                match tokio::task::spawn_blocking(move || cap.capture(TOPOLOGY_CAPTURE_BUDGET))
-                    .await
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "topology capture task failed to join");
-                        continue;
-                    }
-                };
-
-            let now = types::now_us();
-            let mut latest: Vec<types::TopologyLink> = Vec::new();
-            for frame in &frames {
-                let Some(link) = types::link_from_frame(frame, &iface, now) else {
-                    continue;
-                };
-                if let Err(e) = store.write_topology_link(&link) {
-                    tracing::warn!(error = %e,
-                        "store write failed; topology link dropped from DB (gap logged)");
-                }
-                // De-duplicate by the stable key so the live set carries one node
-                // per uplink even if a switch advertised several times this run.
-                if !latest.iter().any(|l| {
-                    l.iface == link.iface
-                        && l.remote_chassis == link.remote_chassis
-                        && l.remote_port == link.remote_port
-                }) {
-                    latest.push(link);
-                }
-            }
-
-            if !latest.is_empty() {
-                // The record's first/last seen for the uplinks, read before the
-                // snapshot lock is taken — `TopologyLink::ts_us` is only this
-                // patrol's sighting, so this read is the sole path by which
-                // `first_seen_us` reaches the socket. A failed read yields no
-                // bounds, which the bar renders as "unknown" rather than as a
-                // freshly-discovered uplink. (realm net-observer, node #43)
-                let lifetimes = match store.topology_lifetimes() {
-                    Ok(l) => l
-                        .into_iter()
-                        .filter(|lt| latest.iter().any(|k| lt.bounds(k)))
-                        .collect(),
-                    Err(e) => {
-                        tracing::warn!(error = %e,
-                            "topology lifetime read failed; snapshot carries no first/last seen");
-                        Vec::new()
-                    }
-                };
-                let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
-                snap.topology = latest;
-                snap.topology_lifetimes = lifetimes;
+            let store_for_capture = Arc::clone(&store);
+            let snapshot_for_capture = Arc::clone(&snapshot);
+            let iface_for_capture = iface.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                run_topology_capture(
+                    &cap,
+                    store_for_capture.as_ref(),
+                    &snapshot_for_capture,
+                    &iface_for_capture,
+                    types::now_us(),
+                )
+            })
+            .await
+            {
+                tracing::warn!(error = %e, "topology capture task failed to join");
+                continue;
             }
         }
     })
@@ -1847,6 +1881,63 @@ impl NeighborScanner for SystemScanner {
     }
 }
 
+/// The production [`TopologyScanner`]: resolves the physical interface fresh
+/// at scan time — never a boot-time value, which a `RunAtLoad` daemon may have
+/// started without — the same "ask the OS now" precedent [`SystemScanner`]
+/// already uses for `phys_iface`, not a second one. Then runs
+/// [`run_topology_capture`] on it, writing through the SAME store handle AND
+/// the SAME live snapshot the patrol uses — so a forced capture reaches the DB,
+/// the socket, and the bar's map together, exactly as a patrol tick does.
+pub(crate) struct SystemTopologyScanner {
+    facts: SystemFacts,
+    store: Arc<DuckdbStore>,
+    /// The SAME live snapshot the patrol mirrors into, so a forced capture
+    /// updates the bar's map at once rather than only on the next patrol tick.
+    snapshot: Arc<Mutex<StatusSnapshot>>,
+}
+
+impl SystemTopologyScanner {
+    fn new(
+        facts: SystemFacts,
+        store: Arc<DuckdbStore>,
+        snapshot: Arc<Mutex<StatusSnapshot>>,
+    ) -> Self {
+        Self {
+            facts,
+            store,
+            snapshot,
+        }
+    }
+}
+
+impl TopologyScanner for SystemTopologyScanner {
+    /// Blocking work (an async interface lookup, then a `tcpdump` child held
+    /// open for up to 65s) inside an async request handler, so it runs under
+    /// `block_in_place` exactly like [`SystemScanner::scan`]: the worker
+    /// thread is handed back to the runtime for the duration instead of
+    /// stalling every other connection behind one capture.
+    ///
+    /// **Requires the multi-thread runtime** — see `SystemScanner::scan`'s
+    /// doc for why that always holds here.
+    fn scan(&self) -> Vec<types::TopologyLink> {
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            let Some(iface) = rt.block_on(self.facts.phys_iface()) else {
+                tracing::info!("topology scan: no physical interface resolved; no links this run");
+                return Vec::new();
+            };
+            let capture = TcpdumpLldpCapture::new(iface.clone());
+            run_topology_capture(
+                &capture,
+                self.store.as_ref(),
+                &self.snapshot,
+                &iface,
+                types::now_us(),
+            )
+        })
+    }
+}
+
 /// A test-only interval collector whose readiness the test flips at will, so the
 /// per-tick preflight retry in `spawn_interval_collector` can be driven directly.
 /// Every real collector in `AnyCollector` is a concrete type wired to real ports
@@ -2323,6 +2414,20 @@ fn build_api_server(
             // read: a pause landing mid-scan must reach the in-flight read.
             observing.clone(),
         )) as Arc<dyn AirScanner>),
+        // Built unconditionally, exactly like `scanner`/`air_scanner`: whether
+        // there is a physical interface and an answering switch/AP is decided
+        // per request, not once at boot (realm net-observer, node #91). Shares
+        // the SAME store handle the patrol writes through, so an operator-
+        // forced capture and a patrol tick land in the same table by the same
+        // path (`run_topology_capture`).
+        topology_scanner: Some(Arc::new(SystemTopologyScanner::new(
+            SystemFacts::new(
+                cfg.collectors.link.gw.clone(),
+                cfg.collectors.link.phys_iface.clone(),
+            ),
+            Arc::clone(&store),
+            Arc::clone(&snapshot),
+        )) as Arc<dyn TopologyScanner>),
         // Where the `cve` rung loads its snapshot; the availability check in
         // `scan_now` decides whether the rung is effective this run.
         scan_cve_snapshot: cfg
@@ -2697,6 +2802,75 @@ mod tests {
         fn freeze(&self, dest_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
             vec![dest_dir.join("ring.pcap0")]
         }
+    }
+
+    /// `run_topology_capture` is the ONE body the patrol and a forced
+    /// `scan topology` share: it must write the record AND mirror the live
+    /// snapshot the socket serves, so a forced capture reaches the bar's map at
+    /// once, not only on the next patrol tick (realm net-observer, node #43). A
+    /// later capture that hears nothing must leave the last set in place, never
+    /// blank it.
+    #[test]
+    fn run_topology_capture_writes_the_store_and_mirrors_the_snapshot() {
+        /// A fake LLDP capture returning canned raw ethernet frames — no
+        /// tcpdump, no root.
+        struct FakeCapture(Vec<Vec<u8>>);
+        impl LldpCapture for FakeCapture {
+            fn capture(&self, _budget: Duration) -> Vec<Vec<u8>> {
+                self.0.clone()
+            }
+        }
+
+        // One synthetic LLDP frame `types::link_from_frame` maps to an edge:
+        // chassis 00:11:22:33:44:55, port "Gi0/1" — the same PDU the types
+        // crate's own decode tests build (eth header + LLDP EtherType + LLDPDU).
+        let frame: Vec<u8> = vec![
+            0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e, // dst: LLDP multicast
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // src
+            0x88, 0xcc, // EtherType: LLDP
+            0x02, 0x07, 0x04, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // chassis id: MAC
+            0x04, 0x06, 0x05, b'G', b'i', b'0', b'/', b'1', // port id: "Gi0/1"
+            0x06, 0x02, 0x00, 0x78, // ttl: 120
+            0x0e, 0x04, 0x00, 0x04, 0x00, 0x04, // system capabilities
+            0x0a, 0x03, b's', b'w', b'1', // system name: "sw1"
+            0x00, 0x00, // end
+        ];
+
+        let store = DuckdbStore::in_memory().unwrap();
+        let snapshot = Mutex::new(StatusSnapshot::default());
+
+        let found = run_topology_capture(&FakeCapture(vec![frame]), &store, &snapshot, "en0", 100);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].remote_chassis, "00:11:22:33:44:55");
+
+        // The durable record has the row...
+        assert_eq!(
+            store
+                .query_scalar_i64("SELECT count(*) FROM topology_link")
+                .unwrap(),
+            1,
+            "the capture must write the uplink to the record"
+        );
+        // ...and the live snapshot mirrors it for the socket and the bar's map.
+        {
+            let snap = snapshot.lock().unwrap();
+            assert_eq!(
+                snap.topology.len(),
+                1,
+                "the snapshot must mirror the uplink"
+            );
+            assert_eq!(snap.topology[0].remote_chassis, "00:11:22:33:44:55");
+        }
+
+        // A capture that hears nothing must NOT blank the last discovered set.
+        let none = run_topology_capture(&FakeCapture(vec![]), &store, &snapshot, "en0", 200);
+        assert!(none.is_empty());
+        let snap = snapshot.lock().unwrap();
+        assert_eq!(
+            snap.topology.len(),
+            1,
+            "an empty capture must leave the last set in place, not blank it"
+        );
     }
 
     /// A fake ring whose liveness can be flipped, standing in for a `tcpdump`

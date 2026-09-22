@@ -300,6 +300,20 @@ enum Command {
         #[arg(long)]
         sweep_max: Option<u32>,
     },
+    /// Force one LLDP/CDP topology capture now, instead of waiting for the
+    /// 5-minute patrol.
+    ///
+    /// Sent as a `Control(ScanTopology)` request over the socket. The daemon
+    /// opens its own short-lived passive capture (~65s) and originates no
+    /// frame of its own — it only listens for what switches/APs already
+    /// advertise. Empty is normal on a consumer Wi-Fi network: only managed
+    /// switches and enterprise APs advertise LLDP/CDP at all. Exits non-zero
+    /// if the capture was refused or the daemon is unreachable.
+    ///
+    /// Hidden alias for `scan topology` — kept flat for old scripts and
+    /// muscle memory.
+    #[command(hide = true)]
+    ScanTopology,
     /// The neighbours the record knows on each segment, newest tick first.
     ///
     /// MAC, address, vendor OUI, name if one was ever learned, and how it
@@ -668,6 +682,16 @@ enum ScanCmd {
         #[arg(long)]
         sweep_max: Option<u32>,
     },
+    /// Force one LLDP/CDP topology capture now, instead of waiting for the
+    /// 5-minute patrol.
+    ///
+    /// Sent as a `Control(ScanTopology)` request over the socket. The daemon
+    /// opens its own short-lived passive capture (~65s) and originates no
+    /// frame of its own — it only listens for what switches/APs already
+    /// advertise. Empty is normal on a consumer Wi-Fi network: only managed
+    /// switches and enterprise APs advertise LLDP/CDP at all. Exits non-zero
+    /// if the capture was refused or the daemon is unreachable.
+    Topology,
 }
 
 /// Post-outage forensics — the named diagnoses that answer "which layer
@@ -1579,6 +1603,15 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             if !result.ok {
                 return Ok(ExitCode::FAILURE);
             }
+        }
+        Command::Scan(ScanCmd::Topology) | Command::ScanTopology => {
+            let cfg = load_config(cli)?;
+            let result = fetch_scan_topology(&cfg.socket_path)?;
+            print!("{}", format_control(&result));
+            if !result.ok {
+                return Ok(ExitCode::FAILURE);
+            }
+            eprintln!("read the uplinks with `net-observer-cli topology`");
         }
         // The named diagnoses: the filter is validated HERE, before any socket
         // or file is touched, so a bad key is the builder's own error and never
@@ -2681,36 +2714,38 @@ fn clear_scan_spinner() {
     let _ = std::io::stderr().flush();
 }
 
-/// Send `Control(ScanNeighbors)` and return the daemon's verdict.
+/// Send one long-running control command and show a spinner on a TTY until the
+/// daemon answers, reading with [`net_observer_ipc::SCAN_TIMEOUT`] rather than
+/// the default 2s budget: the daemon replies only after the whole capture/scan
+/// finishes, and a client that gives up first would read its own timeout
+/// instead of the daemon's real result. The channel/spinner loop is identical
+/// for every such command — [`fetch_scan_neighbors`] and [`fetch_scan_topology`]
+/// call this one body (AGENTS.md principle 4); only the starting line, the
+/// command, and the two failure messages differ, so those are parameters.
 ///
-/// Reads with [`net_observer_ipc::SCAN_TIMEOUT`], not the default 2s
-/// [`daemon_query`] budget: the daemon answers only after the whole sweep
-/// (ARP + mDNS, then the ports/banners rungs), tens of seconds on a real
-/// segment, and a client that gives up first reads its own timeout instead of
-/// the daemon's effective/dropped-rungs message — [`scan_socket_error`] turns
-/// that timeout into a message saying so, rather than [`socket_error`]'s
-/// generic transport wording. A daemon built before `ScanNeighbors` existed
-/// cannot decode the request; that is reported as "cannot", not as a refusal,
-/// through [`net_observer_ipc::control_within`].
-///
-/// The blocking socket call runs on a background thread while the main
-/// thread ticks a live spinner + elapsed-time indicator on stderr — client-
-/// side liveness only, not real per-stage progress. Only when stderr is a
-/// TTY: a pipe/redirect/script gets no spinner writes at all and the exact
-/// output a plain call would produce. The worker thread always ends when the
-/// socket call returns (success, error, or the client's own
-/// [`net_observer_ipc::SCAN_TIMEOUT`]), so nothing is leaked even though
-/// Ctrl-C here does not stop the scan on the daemon (see
-/// [`scan_starting_line`]).
-fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
-    let _ = writeln!(std::io::stderr(), "{}", scan_starting_line(&opts));
+/// The blocking socket call runs on a background thread while the main thread
+/// ticks a live spinner + elapsed-time indicator on stderr — client-side
+/// liveness only, not real per-stage progress, and only when stderr is a TTY: a
+/// pipe/redirect/script gets no spinner writes and the exact output a plain call
+/// would produce. The worker thread always ends when the socket call returns
+/// (success, error, or the client's own [`net_observer_ipc::SCAN_TIMEOUT`]), so
+/// nothing is leaked even though Ctrl-C here does not stop the work on the daemon
+/// (see [`scan_starting_line`]).
+fn run_scan_with_spinner(
+    socket_path: &str,
+    cmd: ControlCmd,
+    starting_line: &str,
+    map_socket_error: impl FnOnce(&str, &std::io::Error) -> anyhow::Error,
+    unsupported: impl FnOnce(String) -> anyhow::Error,
+) -> Result<ControlResult> {
+    let _ = writeln!(std::io::stderr(), "{starting_line}");
 
     let (tx, rx) = std::sync::mpsc::channel();
     let socket_path_for_thread = socket_path.to_string();
     std::thread::spawn(move || {
         let outcome = net_observer_ipc::control_within(
             &socket_path_for_thread,
-            ControlCmd::ScanNeighbors(opts),
+            cmd,
             net_observer_ipc::SCAN_TIMEOUT,
         );
         // The receiver only ever drops after taking the result below, so a
@@ -2747,13 +2782,63 @@ fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlR
         }
     };
 
-    let outcome = outcome.map_err(|e| scan_socket_error(socket_path, &e))?;
+    let outcome = outcome.map_err(|e| map_socket_error(socket_path, &e))?;
     match outcome {
         net_observer_ipc::ControlOutcome::Ran(result) => Ok(result),
-        net_observer_ipc::ControlOutcome::Unsupported(e) => Err(anyhow!(
-            "net-observerd cannot scan for neighbours (built before it existed): {e}"
-        )),
+        net_observer_ipc::ControlOutcome::Unsupported(e) => Err(unsupported(e)),
     }
+}
+
+/// Send `Control(ScanNeighbors)` and return the daemon's verdict, over the
+/// shared [`run_scan_with_spinner`] machinery.
+///
+/// The daemon answers only after the whole sweep (ARP + mDNS, then the
+/// ports/banners rungs) — tens of seconds on a real segment — so a client that
+/// gives up first reads its own timeout instead of the daemon's
+/// effective/dropped-rungs message; [`scan_socket_error`] turns that timeout
+/// into a message saying so, rather than [`socket_error`]'s generic transport
+/// wording. A daemon built before `ScanNeighbors` existed cannot decode the
+/// request; that is reported as "cannot", not as a refusal.
+fn fetch_scan_neighbors(socket_path: &str, opts: ScanOptions) -> Result<ControlResult> {
+    let starting_line = scan_starting_line(&opts);
+    run_scan_with_spinner(
+        socket_path,
+        ControlCmd::ScanNeighbors(opts),
+        &starting_line,
+        scan_socket_error,
+        |e| anyhow!("net-observerd cannot scan for neighbours (built before it existed): {e}"),
+    )
+}
+
+/// Send `Control(ScanTopology)` and return the daemon's verdict.
+///
+/// Shares the spinner/timeout machinery of [`run_scan_with_spinner`] with
+/// [`fetch_scan_neighbors`] — the daemon answers only after the whole capture
+/// (~65s, `TOPOLOGY_CAPTURE_BUDGET` on the daemon) finishes, so this reads with
+/// [`net_observer_ipc::SCAN_TIMEOUT`], not the default 2s budget. Only the
+/// starting line and the two topology-specific failure messages differ from the
+/// neighbour scan.
+fn fetch_scan_topology(socket_path: &str) -> Result<ControlResult> {
+    run_scan_with_spinner(
+        socket_path,
+        ControlCmd::ScanTopology,
+        "capturing LLDP/CDP for up to ~65s… this is normal, not stuck. Ctrl-C leaves the \
+         capture running on net-observerd; read results later with `net-observer-cli topology`.",
+        |socket_path, e| {
+            use std::io::ErrorKind::{TimedOut, WouldBlock};
+            if matches!(e.kind(), WouldBlock | TimedOut) {
+                anyhow!(
+                    "the capture is still running on net-observerd and will finish there — its \
+                     uplinks land in the record. Read them with `net-observer-cli topology`."
+                )
+            } else if daemon_not_running(e) {
+                anyhow!("net-observerd not running (socket {socket_path} unavailable)")
+            } else {
+                anyhow!("failed to query net-observerd over socket {socket_path}: {e}")
+            }
+        },
+        |e| anyhow!("net-observerd cannot force a topology capture (built before it existed): {e}"),
+    )
 }
 
 /// Render a [`ControlResult`] as a single status line: `ok: <message>` when the
@@ -3846,6 +3931,22 @@ mod tests {
             }
             _ => panic!("did not parse as `scan neighbors`"),
         }
+    }
+
+    /// The nested `scan topology` form parses as `ScanCmd::Topology`.
+    #[test]
+    fn scan_topology_nested_form_parses() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "scan", "topology"]).unwrap();
+        assert!(matches!(cli.command, Command::Scan(ScanCmd::Topology)));
+    }
+
+    /// The flat `scan-topology` legacy alias still parses, hidden but not
+    /// removed — kept flat for old scripts and muscle memory (realm
+    /// net-observer, node #164).
+    #[test]
+    fn scan_topology_flat_alias_parses() {
+        let cli = Cli::try_parse_from(["net-observer-cli", "scan-topology"]).unwrap();
+        assert!(matches!(cli.command, Command::ScanTopology));
     }
 
     /// `diag why --at …` parses into the nested form, same as the old flat
@@ -5968,6 +6069,7 @@ mod tests {
         }
         for legacy in [
             "scan-neighbors",
+            "scan-topology",
             "why",
             "incident-context",
             "wedge-or-starvation",
@@ -6030,6 +6132,7 @@ mod tests {
             .render_help()
             .to_string();
         assert!(scan.contains("neighbors"), "{scan}");
+        assert!(scan.contains("topology"), "{scan}");
 
         let mut cmd = Cli::command();
         let diag = cmd
@@ -6150,6 +6253,7 @@ mod tests {
         // this crate makes.
         for legacy in [
             "scan-neighbors",
+            "scan-topology",
             "why",
             "incident-context",
             "wedge-or-starvation",
