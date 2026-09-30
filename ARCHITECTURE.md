@@ -45,6 +45,7 @@ flowchart LR
         sblog["singbox-log\nInterval (log tail)"]
         evt["route-events\nEvent (PF_ROUTE)"]
         announce["announce\nEvent (tcpdump pcap pipe)"]
+        portal["portal\nReactive (probe series on a route event)"]
     end
 
     link -- "Sample::Link" --> stream
@@ -55,6 +56,7 @@ flowchart LR
     sblog -- "Sample::SingboxLog (per class seen)" --> stream
     evt -- "Sample::Route (event)" --> stream
     announce -- "Sample::Neighbors (every 15s)" --> stream
+    portal -- "Sample::Portal (per attempt)" --> stream
 
     stream(["mpsc stream (Sample)"]) --> consumer{{"consumer loop\n(pipeline::run)"}}
 
@@ -192,7 +194,10 @@ flowchart LR
   observed vocabulary (`no-route`, `unreachable`, `dial-timeout`, `canceled`,
   `no-default-iface`, `dns-servers-failed`, `dns-exchange-failed`,
   `dns-bad-packet`, `icmp-reply-timeout`, `stream-closed`,
-  `icmp-unsupported`, else `other` at those levels; at INFO, `started` — a
+  `icmp-unsupported`, `tls-cert-mismatch` — a handshake answered with
+  someone else's certificate, any component: the captive portal's passive
+  signature (realm net-observer, node #179) — else `other` at those levels;
+  at INFO, `started` — a
   restart of sing-box, which the reload agent kickstarts on every config
   write and the shell oracle's watchdog on "tunnel dead", each tearing the
   TUN down and producing the route-loss burst that follows — and
@@ -204,6 +209,24 @@ flowchart LR
   `unreadable` row with count 0 and the I/O error — SKIP's spirit. Reads a
   local file and sends nothing, so it runs under both probing tiers (realm
   net-observer, node #141).
+- **`portal`** — is the web intercepted by a captive portal, and where is its
+  login page. Reactive, not ticked: a fresh address on a physical interface
+  (`RTM_NEWADDR` on `en*`, tapped off the route-event stream by the
+  pipeline) arms a probe series at ~3/10/30/60 s — long enough to outlive
+  sing-box's rebind to the new interface, the ~13 s race that killed the
+  OS's own one-shot probe on the observed morning (realm net-observer, node
+  #173). Each attempt asks the lease's own DHCP resolver for
+  `captive.apple.com` and GETs `/hotspot-detect.html`, both sockets pinned
+  to the physical interface (`IP_BOUND_IF`) so the tunnel cannot answer for
+  the underlay; `Success` back is `OK`, any other parseable answer is
+  `PORTAL` (a redirect's `Location` is the login page), and a probe that
+  could not run is `SKIP` with its reason — including "withheld: passive
+  probing tier": the probe is an emission (`EmissionClass::CaptiveProbe`)
+  and the passive tier keeps it off the wire (nodes #88, #137). After a
+  `PORTAL`, the prober re-probes each minute until the answer is clean —
+  the close side of the `portal` incident, which the `Portal` condition
+  opens from the newest measured reading or, when nothing probed, from a
+  `tls-cert-mismatch` storm in sing-box's log (nodes #178, #179).
 - **TriggerEngine** — rules ported from the oracle and grown since: `wedge`,
   `gw-drop`, `gw-change` (unconditional pcap freeze on any gateway change),
   `roam` (three identity axes — a BSSID hop, a Wi-Fi channel hop (the router
@@ -212,7 +235,11 @@ flowchart LR
   DHCP lease was renewed; realm net-observer, node #126), `wifi-churn` (four
   or more Wi-Fi identity changes — bssid, link address, or channel — in a
   quarter hour read as one incident), `gw-mac-change` (pcap
-  freeze too), `neighbor-mac-collision`, `per-client-block` (gateway silent
+  freeze too), `neighbor-mac-collision`, `portal` (a captive portal stands
+  between this machine and the web: opened by the probe's own reading — the
+  login page rides the detail — or by the `tls-cert-mismatch` storm when
+  nothing probed, closed by the clean probe after login; realm net-observer,
+  node #179), `per-client-block` (gateway silent
   while probed LAN neighbors answer), `ban-cycle` (three or more gateway bans
   in the window read as one cycling incident with a period), `fakeip`,
   `fakeip-hijack` (a fakeip-pool address routes out a non-tunnel interface),
@@ -487,6 +514,7 @@ graph TD
     cconns["collector-connections\nConnectionFacts, build_connections_sample,\nConnectionsCollector, META (Interval)"]
     cannounce["collector-announce\npcap stream + ARP/mDNS/SSDP/DHCP decoders,\nAnnounceSource, AnnounceCollector, META (Event)"]
     csblog["collector-singbox-log\nLogTail, parse_line, classify, fold_lines,\nSingboxLogCollector, META (Interval)"]
+    cportal["collector-portal\nPortalProbe, series_trigger, schedule,\nhttp/dns readers, META (Reactive)"]
     triggers["triggers\nCondition/Handler/Trigger, engine"]
     config["config\nfigment per-subsystem toggles"]
     macos["macos\nreal adapters: ICMP, IP_BOUND_IF,\nClash API, DHCP/ARP, pcap ring,\nDNS resolve, PF_ROUTE, loadavg"]
@@ -507,6 +535,7 @@ graph TD
     ccore --> cconns
     ccore --> cannounce
     ccore --> csblog
+    ccore --> cportal
     types --> clink
     types --> cproxy
     types --> cdns
@@ -515,6 +544,7 @@ graph TD
     types --> cconns
     types --> cannounce
     types --> csblog
+    types --> cportal
 
     ccore --> macos
     clink --> macos
@@ -524,6 +554,7 @@ graph TD
     chost --> macos
     cconns --> macos
     cannounce --> macos
+    cportal --> macos
 
     store --> triggers
 
@@ -535,6 +566,7 @@ graph TD
     chost --> net-observerd
     cconns --> net-observerd
     csblog --> net-observerd
+    cportal --> net-observerd
     macos --> net-observerd
     store --> net-observerd
     triggers --> net-observerd
@@ -580,6 +612,14 @@ graph TD
   Its port is `SegmentIdentity` (the gateway's MAC, read at each window's
   start), implemented in `macos` over the same `SystemFacts::network_key`
   the neighbour-cache read and the scan use. (realm net-observer, node #92)
+- `collector-portal` is neither cadence — a **reactive** prober. It holds the
+  pure, unit-tested logic: the series/watch `schedule`, the `http` request
+  and its reading, the `dns` question and answer, and `series_trigger` (which
+  route events arm a series), plus the `PortalProbe` port. The real sockets
+  live in `macos` (`SystemPortalProbe`: DHCP resolver → bound DNS → bound
+  GET), and `net-observerd` owns the driving loop
+  (`portal::run_portal_prober`), fed route events by the pipeline's tap.
+  (realm net-observer, node #178)
 - `macos` implements every port trait with the real adapters, all on
   **async-native I/O** on the daemon's tokio runtime: `surge-ping` (raw ICMP),
   `socket2` + `tokio::net::TcpStream` with `IP_BOUND_IF` (bound TCP probes),
@@ -787,7 +827,8 @@ goes in the DB. Timestamps are microseconds since the epoch (`ts_us BIGINT`).
 | `wifi_sample` | `ts_us, wifi, reason, rssi_dbm, noise_dbm, snr_db, tx_rate_mbps, phy_mode, channel, channel_width_mhz, channel_band` | Wi-Fi air quality from CoreWLAN. `rssi_dbm`/`noise_dbm` are the raw pair and `snr_db` is derived (`rssi - noise`), so the derivation can be revisited from the columns actually measured. `wifi = SKIP` with a `reason` when the radio could not be read (no interface, powered off, not associated) — a row every tick, never an absent one. No SSID/BSSID: macOS gates them behind Location Services, which a LaunchDaemon cannot obtain. |
 | `connection_sample` | `ts_us, verdict, host, dst_ip, dst_port, process, network, chain, count, upload, download, scope` | What this machine talks to: the live flows sing-box's Clash API lists (`GET /connections`, realm net-observer, node #127), aggregated per tick by `(host, dst_ip, dst_port, process, network, chain, scope)` — `count` flows shared the key, `upload`/`download` their bytes summed. `host` is the name asked for (a sniffed SNI is whatever the client put there), `dst_ip` the real destination (NULL when the proxy resolves the name on the far side), `process` the client's executable name, `chain` the outbound that actually carried the flow — the first element of the Clash API's `chains` (sing-box lists them node-first; the last is the constant top-level selector), `scope` where `dst_ip` lies as the collector judged it (`internal` / `lan` / `external`, see the collector above; added by `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, NULL on rows written before it and read as `external`). One row per aggregate row per tick with the tick's `verdict` on each; a tick with no rows — the API did not answer (`SKIP`) or it listed nothing (`OK`) — writes ONE row with every key column NULL, so "could not look" and "nothing is talking" are different rows and neither is an absent tick (realm net-observer, node #75). |
 | `egress_scan` / `egress_dst` | header: `ts_us, iface, verdict, reason, duration_ms, packet_count, dst_count, byte_count`; slice: `ts_us, dst_ip, packets, bytes` (PK `ts_us, dst_ip`) | What physically leaves the egress interface, captured on operator demand (`scan egress`; realm net-observer, node #170). The daemon opens its own short-lived `tcpdump -Q out` on the physical uplink for ~5 s, decodes each **outgoing** IPv4/IPv6 frame in-process to `(dst_ip, on-wire length)`, and folds by destination. The `air` header+slice shape: `egress_scan` is one row per scan (`verdict` `OK`/`SKIP`, `reason` NULL unless `SKIP`, `packet_count`/`dst_count`/`byte_count` the TRUE totals across every destination), `egress_dst` the top 50 destinations by bytes for that scan, joined back by `ts_us`. This is the physical complement to `connection_sample`: `connections` reads sing-box's *tunneled* view (the Clash API) and structurally cannot see the encrypted uplink or route-excluded traffic, while this sees what the wire actually carried. `verdict = OK` with `dst_count = 0` is a real reading — the capture ran and this machine sent nothing on the interface in the window; `verdict = SKIP` is the different fact that the capture could not run (needs root + BPF, or the interface was gone), and the two are never conflated — under an active tunnel a false zero would mislead exactly the question this answers. On-demand records like `neighbor_scan`, so never pruned. |
-| `singbox_log_sample` | `ts_us, class, count, node, sample_message` | What sing-box itself says: its ERROR/WARN lines, read passively from its own log (`/var/log/sing-box.log`, realm net-observer, node #140) and classed — one row per `(class, node)` per tick of the `singbox-log` collector, `count` lines of that class in the tick, `node` the outbound the line names (`using outbound/vless[<node>]`; NULL when it names none), `sample_message` the first such line, ANSI stripped, at most 200 characters. `class` is the kebab-case token of `types::SingboxLogClass` (`no-route`, `unreachable`, `dial-timeout`, `canceled`, `no-default-iface`, `dns-servers-failed`, `dns-exchange-failed`, `dns-bad-packet`, `icmp-reply-timeout`, `stream-closed`, `icmp-unsupported`, `other`, and — the two INFO lines that are evidence — `started` (a restart of sing-box; its message is the sample) and `default-iface-updated`, for which `node` carries the interface name the line took (`en0`, `en13`, …), plus `unreadable`). A tick with no ERROR/WARN line writes NO row — the absence of errors is the healthy state, evidenced by the other collectors' rows for that tick; a tick on which the log could not be read writes one `unreadable` row with `count` 0 and the I/O error as its message, so a stretch where the reader could not look is never read as "no errors" (realm net-observer, node #141). |
+| `singbox_log_sample` | `ts_us, class, count, node, sample_message` | What sing-box itself says: its ERROR/WARN lines, read passively from its own log (`/var/log/sing-box.log`, realm net-observer, node #140) and classed — one row per `(class, node)` per tick of the `singbox-log` collector, `count` lines of that class in the tick, `node` the outbound the line names (`using outbound/vless[<node>]`; NULL when it names none), `sample_message` the first such line, ANSI stripped, at most 200 characters. `class` is the kebab-case token of `types::SingboxLogClass` (`no-route`, `unreachable`, `dial-timeout`, `canceled`, `no-default-iface`, `dns-servers-failed`, `dns-exchange-failed`, `dns-bad-packet`, `icmp-reply-timeout`, `stream-closed`, `icmp-unsupported`, `tls-cert-mismatch` (a TLS handshake answered with someone else's certificate — the captive portal's passive signature, realm net-observer, node #179), `other`, and — the two INFO lines that are evidence — `started` (a restart of sing-box; its message is the sample) and `default-iface-updated`, for which `node` carries the interface name the line took (`en0`, `en13`, …), plus `unreadable`). A tick with no ERROR/WARN line writes NO row — the absence of errors is the healthy state, evidenced by the other collectors' rows for that tick; a tick on which the log could not be read writes one `unreadable` row with `count` 0 and the I/O error as its message, so a stretch where the reader could not look is never read as "no errors" (realm net-observer, node #141). |
+| `portal_sample` | `ts_us, iface, verdict, login_url, reason` | The captive-portal probe's readings (realm net-observer, nodes #177, #178): one row per probe attempt, Event-cadence like `route_event` — a series at ~3/10/30/60 s after a fresh address on a physical interface, a watch row a minute while a portal stands, nothing on a quiet network. `verdict` is `OK` (the captive-detect request came back untouched), `PORTAL` (something intercepted it; `login_url` is the login page when the intercept was a redirect), or `SKIP` (the probe could not run — withheld by the passive tier, no DHCP resolver on the lease, transport failure — and `reason` says which). The probe rides its own DNS question to the lease's resolver and a bound `GET http://captive.apple.com/hotspot-detect.html`, every socket pinned to the physical interface so the tunnel cannot answer for the underlay (node #176). |
 | `neighbor_sample` | `ts_us, network_key, iface, verdict, reason, neighbor_count, heard_frames, own_frames, dropped_obs` | One row per neighbour reading — a neighbour-cache tick, an operator-pressed scan, or an `announce` listener flush — including its `SKIP`s. `heard_frames` / `own_frames` are the listener's counts for the window it flushed: every frame the capture delivered and, of those, the frames this machine itself sent that match the capture filter — the OS's own traffic and, during an operator-pressed scan, the sweep's ARP and the mDNS browse; never the periodic probes (ICMP, TCP and DNS do not pass the filter) — recognised by the interface's own MAC as read at that window's start, counted and never recorded as a neighbour. The count says the listener saw itself and ignored it, nothing more; the passivity proof stays the frozen pcap slice (realm net-observer, node #88). Both NULL on a cache tick or a scan, never a zero: `heard_frames = 0` is a window in which the segment said nothing, and `own_frames` NULL under a non-NULL `heard_frames` is a window whose own MAC could not be read, so nothing was dropped as ours. `dropped_obs` is how many observations that window refused — a sighting past the 512-device cap, an address or service past its per-device cap, a DHCP name past the pending cap, a service a Sleep Proxy announced on a sleeper's behalf — NULL exactly when `heard_frames` is, `0` when nothing was refused; a flush that refused anything is also warned about in the log and carries `dropped=<n>` on its bus line. The neighbour entity tables (`neighbor`, `neighbor_scan`, `neighbor_port`, `neighbor_vuln`) are documented in `crates/store/src/schema.rs`; `neighbor.source` now also takes `announce` — the device said so itself (realm net-observer, node #92). |
 | `neighbor_service` | `network_key, mac, ip, service, kind, detail, first_seen_us, last_seen_us` | A service a neighbour announced, heard passively by the `announce` listener. Keyed by `(network_key, mac, service)` with first/last seen like `neighbor_port`, so an announcement repeated every few seconds is one row: "this device has been announcing `_companion-link._tcp` since X". `service` is what was announced (an mDNS service type, an SSDP notification type, a DHCP role — `dhcp-server`, `vendor-class`), `kind` which protocol carried it (`mdns` / `ssdp` / `dhcp`), `detail` the specifics that came with it (the mDNS instance name, the SSDP `SERVER` string, the DHCP message type or vendor class), `ip` the address it was announced from (NULL for a DHCP client still without one). A later sighting that carries no `ip` or `detail` keeps the ones already learned. |
 | `incident` | `id PK, opened_us, closed_us, trigger_id, signature` | Open incident ⇒ `closed_us IS NULL`. |
@@ -843,7 +884,8 @@ proportional to the rows deleted, so the writers wait exactly that long; each
 result is logged (`pruned <n> rows older than <days> d from <table>`, `debug`
 when nothing went) and each failure logged as a gap and skipped, never fatal.
 `PRUNABLE_TABLES` is `connection_sample`, `air_sample`, `air_ap`,
-`wifi_sample`, `neighbor_sample`, `singbox_log_sample` — the complement of
+`wifi_sample`, `neighbor_sample`, `singbox_log_sample`, `portal_sample` — the
+complement of
 what the gap derivation reads: `link_sample`, `proxy_sample`, `host_sample`,
 `dns_sample` and `route_event` are the ticks `SAMPLE_TS_CTE` takes as "the
 daemon was collecting at this instant", from which every stop and sleep is

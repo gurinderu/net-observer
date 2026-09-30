@@ -33,6 +33,10 @@ pub enum EmissionClass {
     HeldStream,
     /// `dns`: the resolver queries.
     DnsQuery,
+    /// `portal`: the captive-detect HTTP GET and the DNS query to the
+    /// interface's DHCP resolver it rides on, both bound to the physical
+    /// interface (realm net-observer, node #178).
+    CaptiveProbe,
 }
 
 /// How much of its active surface the daemon is allowed to use right now.

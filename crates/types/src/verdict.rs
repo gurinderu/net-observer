@@ -32,6 +32,14 @@ pub struct ParseVerdictError(pub String);
 // `net-observer`, node #25.
 token_enum!(GwVerdict { Ok => "OK", Fail => "FAIL", NoGw => "NOGW", Skip => "SKIP" });
 token_enum!(TcpVerdict { Ok => "OK", Fail => "FAIL", Skip => "SKIP" });
+// The captive-portal probe's verdict. `Ok` = the captive-detect request came
+// back untouched (no portal); `Portal` = something intercepted it — a redirect
+// or a foreign body where `Success` belongs; `Skip` = the probe could not run
+// (withheld by the passive tier, no DHCP resolver on the interface, transport
+// failure or an unparseable answer) and `PortalSample::reason` says which.
+// There is deliberately no `Fail`: an intercepted request is a reading, and a
+// probe that died is the absence of one, never a portal.
+token_enum!(PortalVerdict { Ok => "OK", Portal => "PORTAL", Skip => "SKIP" });
 // The `wifi` collector's verdict. `Ok` = the radio was associated and the tick
 // carries a real reading; `Skip` = the probe could not run at all (no Wi-Fi
 // interface, radio off, not associated) and `WifiSample::reason` says which.

@@ -17,6 +17,7 @@ members = [
     "crates/collector-connections",
     "crates/collector-announce",
     "crates/collector-singbox-log",
+    "crates/collector-portal",
     "crates/triggers",
     "crates/macos",
     "crates/vuln-db",
@@ -50,6 +51,7 @@ default-members = [
     "crates/collector-connections",
     "crates/collector-announce",
     "crates/collector-singbox-log",
+    "crates/collector-portal",
     "crates/triggers",
     "crates/macos",
     "crates/vuln-db",
@@ -163,6 +165,7 @@ collector-air = { path = "crates/collector-air" }
 collector-connections = { path = "crates/collector-connections" }
 collector-announce = { path = "crates/collector-announce" }
 collector-singbox-log = { path = "crates/collector-singbox-log" }
+collector-portal = { path = "crates/collector-portal" }
 triggers = { path = "crates/triggers" }
 macos = { path = "crates/macos" }
 vuln-db = { path = "crates/vuln-db" }

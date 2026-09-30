@@ -54,6 +54,11 @@ pub enum SingboxLogClass {
     StreamClosed,
     /// WARN `inbound/tun: … icmp is not supported by default outbound`.
     IcmpUnsupported,
+    /// `x509: certificate is valid for *.<portal>, not <sni>` anywhere at
+    /// ERROR/WARN: a captive portal (or another middlebox) answered a TLS
+    /// handshake with its own certificate. A storm of these is the passive
+    /// portal signature (realm net-observer, node #179).
+    TlsCertMismatch,
     /// Any other ERROR/WARN line; the sample carries its message.
     Other,
     /// INFO `sing-box started (0.05s)`: a (re)start of sing-box — the reload
@@ -73,7 +78,7 @@ pub enum SingboxLogClass {
 
 impl SingboxLogClass {
     /// Every class, in declaration order.
-    pub const ALL: [SingboxLogClass; 15] = [
+    pub const ALL: [SingboxLogClass; 16] = [
         Self::NoRoute,
         Self::Unreachable,
         Self::DialTimeout,
@@ -85,6 +90,7 @@ impl SingboxLogClass {
         Self::IcmpReplyTimeout,
         Self::StreamClosed,
         Self::IcmpUnsupported,
+        Self::TlsCertMismatch,
         Self::Other,
         Self::Started,
         Self::DefaultIfaceUpdated,
@@ -106,6 +112,7 @@ impl SingboxLogClass {
             Self::IcmpReplyTimeout => "icmp-reply-timeout",
             Self::StreamClosed => "stream-closed",
             Self::IcmpUnsupported => "icmp-unsupported",
+            Self::TlsCertMismatch => "tls-cert-mismatch",
             Self::Other => "other",
             Self::Started => "started",
             Self::DefaultIfaceUpdated => "default-iface-updated",

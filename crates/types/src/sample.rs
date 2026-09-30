@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::air::AirSample;
 use crate::connection::ConnectionsSample;
 use crate::neighbor::NeighborsSample;
+use crate::portal::PortalSample;
 use crate::singbox_log::SingboxLogSample;
 use crate::verdict::{DnsVerdict, GwVerdict, LinkMedium, TcpVerdict, WifiVerdict};
 
@@ -315,6 +316,10 @@ pub enum Sample {
     /// the passive log reader — several rows per tick when several classes
     /// were seen, none when none were (realm net-observer, node #141).
     SingboxLog(SingboxLogSample),
+    /// One captive-portal probe's outcome — Event-cadence like `Route`: a
+    /// probe series starts on a route event, not on a tick (realm
+    /// net-observer, nodes #177, #178).
+    Portal(PortalSample),
 }
 
 impl Sample {
@@ -330,6 +335,7 @@ impl Sample {
             Sample::Air(a) => a.ts_us,
             Sample::Connections(c) => c.ts_us,
             Sample::SingboxLog(s) => s.ts_us,
+            Sample::Portal(p) => p.ts_us,
         }
     }
 }

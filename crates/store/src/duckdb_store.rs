@@ -449,6 +449,7 @@ const INSERT_NEIGHBOR: &str = "INSERT INTO neighbor VALUES (?,?,?,?,?,?,?,?,?)
 const INSERT_CONNECTION_SAMPLE: &str =
     "INSERT INTO connection_sample VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
 const INSERT_SINGBOX_LOG_SAMPLE: &str = "INSERT INTO singbox_log_sample VALUES (?,?,?,?,?)";
+const INSERT_PORTAL_SAMPLE: &str = "INSERT INTO portal_sample VALUES (?,?,?,?,?)";
 const INSERT_NEIGHBOR_SCAN: &str = "INSERT INTO neighbor_scan VALUES (?,?,?,?,?,?,?,?)";
 const INSERT_EGRESS_SCAN: &str = "INSERT INTO egress_scan VALUES (?,?,?,?,?,?,?,?)";
 const INSERT_EGRESS_DST: &str = "INSERT INTO egress_dst VALUES (?,?,?,?)";
@@ -471,6 +472,7 @@ const POSITIONAL_INSERTS: &[(&str, &str)] = &[
     ("neighbor", INSERT_NEIGHBOR),
     ("connection_sample", INSERT_CONNECTION_SAMPLE),
     ("singbox_log_sample", INSERT_SINGBOX_LOG_SAMPLE),
+    ("portal_sample", INSERT_PORTAL_SAMPLE),
     ("neighbor_scan", INSERT_NEIGHBOR_SCAN),
     ("egress_scan", INSERT_EGRESS_SCAN),
     ("egress_dst", INSERT_EGRESS_DST),
@@ -720,6 +722,18 @@ impl Store for DuckdbStore {
                     r.count,
                     r.node,
                     r.sample_message
+                ],
+            )?,
+            // The verdict lands as its Display token ('OK'|'PORTAL'|'SKIP'),
+            // like every other verdict column.
+            Sample::Portal(p) => c.execute(
+                INSERT_PORTAL_SAMPLE,
+                params![
+                    p.ts_us,
+                    p.iface,
+                    p.verdict.to_string(),
+                    p.login_url,
+                    p.reason
                 ],
             )?,
         };
@@ -2833,6 +2847,65 @@ mod tests {
         // The table is a sample table: it counts toward the record's newest
         // observation, which the startup sweep closes stale incidents at.
         assert_eq!(s.latest_sample_ts_us().unwrap(), Some(9015));
+    }
+
+    /// One row per probe attempt, the verdict as its Display token, absent
+    /// optionals NULL — and a SKIP is a row with its reason, never silence.
+    #[test]
+    fn write_and_read_back_portal_samples() {
+        use types::{PortalSample, PortalVerdict};
+        let s = DuckdbStore::in_memory().unwrap();
+        for (ts, verdict, login_url, reason) in [
+            (
+                9100,
+                PortalVerdict::Portal,
+                Some("http://login.wifi.smartspb.net/".to_string()),
+                Some("redirect 302".to_string()),
+            ),
+            (9160, PortalVerdict::Ok, None, None),
+            (
+                9220,
+                PortalVerdict::Skip,
+                None,
+                Some("withheld: passive probing tier".to_string()),
+            ),
+        ] {
+            s.write_sample(&Sample::Portal(PortalSample {
+                ts_us: ts,
+                iface: "en0".into(),
+                verdict,
+                login_url,
+                reason,
+            }))
+            .unwrap();
+        }
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM portal_sample WHERE ts_us=9100 AND iface='en0' \
+                 AND verdict='PORTAL' AND login_url='http://login.wifi.smartspb.net/' \
+                 AND reason='redirect 302'"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM portal_sample WHERE ts_us=9160 AND verdict='OK' \
+                 AND login_url IS NULL AND reason IS NULL"
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.query_scalar_i64(
+                "SELECT count(*) FROM portal_sample WHERE ts_us=9220 AND verdict='SKIP' \
+                 AND reason LIKE 'withheld%'"
+            )
+            .unwrap(),
+            1
+        );
+        // A sample table: the record's newest observation reads through it.
+        assert_eq!(s.latest_sample_ts_us().unwrap(), Some(9220));
     }
 
     /// The raw pair and the derived margin all reach their own columns, and a

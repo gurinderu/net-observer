@@ -232,7 +232,7 @@ pub(crate) async fn default_route_iface() -> Option<String> {
 /// From `ipconfig getpacket` output, find the first line whose key matches and
 /// return the first IPv4 literal on it (handles `key (ip): 1.2.3.4` and
 /// `key (ip_mult): {1.2.3.4, 5.6.7.8}` shapes).
-fn ip_for_key(text: &str, key: &str) -> Option<String> {
+pub(crate) fn ip_for_key(text: &str, key: &str) -> Option<String> {
     let line = text.lines().find(|l| l.trim_start().starts_with(key))?;
     first_ipv4(line)
 }
