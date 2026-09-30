@@ -37,3 +37,6 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `start_paused` tests: the portal prober's schedule runs under tokio's
+# paused clock, so a 60 s watch interval costs no wall time.
+tokio = { workspace = true, features = ["test-util"] }
