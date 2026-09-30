@@ -9,6 +9,7 @@ mod acting;
 mod api;
 mod api_query;
 mod pipeline;
+mod portal;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -39,16 +40,16 @@ use macos::LldpCapture;
 use macos::{
     AnnounceCapture, BoundTcpProber, ConnectionSystemFacts, CoreWlanFacts, DnsResolver,
     EgressCapture, EgressCaptureOutcome, FreezeAccess, HeldReferenceStreams, HostLoad, IcmpPinger,
-    PcapRing, PfRouteSource, ProxySystemFacts, SystemFacts, SystemNeighbors, SystemProfilerAir,
-    SystemSegment, TcpdumpEgressCapture, TcpdumpLldpCapture,
+    PcapRing, PfRouteSource, ProxySystemFacts, SystemFacts, SystemNeighbors, SystemPortalProbe,
+    SystemProfilerAir, SystemSegment, TcpdumpEgressCapture, TcpdumpLldpCapture,
 };
 use macos::{neighbor_scan, neighbors};
 use net_observer_ipc::{Capabilities, EncodedFrame, EventKind, StatusSnapshot};
 use store::DuckdbStore;
 use triggers::conditions::{
     BanCycle, EndpointBlock, EndpointDialStall, EstablishedStall, FakeIp, FakeIpHijack, Gated,
-    GwChange, GwDrop, GwMacChange, NeighborMacCollision, PerClientBlock, Roam, SingboxDialTimeout,
-    SingboxNoRoute, Starvation, Wedge, WifiChurn,
+    GwChange, GwDrop, GwMacChange, NeighborMacCollision, PerClientBlock, Portal, Roam,
+    SingboxDialTimeout, SingboxNoRoute, Starvation, Wedge, WifiChurn,
 };
 use triggers::engine::{Trigger, TriggerEngine};
 use triggers::handlers::{Handler, RecordHandler};
@@ -1333,6 +1334,25 @@ async fn run_daemon() -> anyhow::Result<()> {
             tracing::warn!(collector = name, ?os, "unsupported OS; skipping");
         }
     }
+    // The captive-portal prober: reactive, armed by route events the pipeline
+    // taps for it — never a tick — and feeding its readings to the same
+    // consumer loop every collector does (realm net-observer, node #178). No
+    // tap (config off) means no prober, and the pipeline copies nothing into
+    // the void.
+    let portal_tap = if cfg.collectors.portal.enabled {
+        let (tap_tx, tap_rx) = mpsc::unbounded_channel();
+        handles.push(tokio::spawn(portal::run_portal_prober(
+            SystemPortalProbe::new(),
+            tap_rx,
+            tx.clone(),
+            probing.clone(),
+            observing.clone(),
+        )));
+        Some(tap_tx)
+    } else {
+        None
+    };
+
     // Drop our own sender so the consumer stops once every collector is gone.
     drop(tx);
 
@@ -1453,6 +1473,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         events_tx,
         resume_at_us,
         session_end_us,
+        portal_tap,
     ));
 
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
@@ -2163,6 +2184,7 @@ fn collector_switch(kind: EventKind, c: &config::Collectors) -> Option<bool> {
         EventKind::Neighbors => c.neighbors.enabled,
         EventKind::Connections => c.connections.enabled,
         EventKind::SingboxLog => c.singbox_log.enabled,
+        EventKind::Portal => c.portal.enabled,
         // Not a collector: incidents are what the triggers write about the
         // collectors' samples, and a close is the end of one (realm
         // net-observer, node #135). `pcap_ring` is absent for the same reason
@@ -2655,9 +2677,10 @@ fn build_api_server(
 }
 
 /// Assemble the [`TriggerEngine`]'s rule set (wedge, gw-drop, gw-change,
-/// roam, wifi-churn, gw-mac-change, neighbor-mac-collision, per-client-block,
-/// ban-cycle, fakeip, fakeip-hijack, endpoint-block, established-stall,
-/// endpoint-dial-stall, singbox-no-route, singbox-dial-timeout, starvation).
+/// portal, roam, wifi-churn, gw-mac-change, neighbor-mac-collision,
+/// per-client-block, ban-cycle, fakeip, fakeip-hijack, endpoint-block,
+/// established-stall, endpoint-dial-stall, singbox-no-route,
+/// singbox-dial-timeout, starvation).
 /// Every rule records an incident (durable, in DuckDB) and mirrors it into the
 /// live snapshot's ring for the socket API; gw-change and gw-mac-change
 /// additionally freeze the pcap ring when one is available.
@@ -2713,6 +2736,17 @@ fn build_engine(
             BACKOFF_US,
         ),
         Trigger::new(Box::new(GwChange), gw_change_handlers, BACKOFF_US),
+        // The captive portal: opened by the probe's own reading (or the
+        // tls-cert storm in sing-box's log when nothing probed), closed by
+        // the clean probe after login (realm net-observer, node #179). Not
+        // gated — the probe is its own measurement context — and no pcap
+        // freeze: the evidence is the portal_sample rows and the log lines
+        // already in the record.
+        Trigger::new(
+            Box::new(Portal),
+            vec![record.clone(), snap.clone()],
+            BACKOFF_US,
+        ),
         // A roam — a BSSID hop, or a new link address on Wi-Fi — is its own
         // incident, not the `gw-drop`/`per-client-block` it used to
         // masquerade as. Not gated: the settle window would suppress exactly
@@ -2897,7 +2931,10 @@ mod tests {
         // One entry per `AnyCollector` variant, by the collector's own metadata —
         // all but `announce`, which produces no kind of its own: its samples are
         // `Sample::Neighbors`, declared under `neighbors`, and its supervisor
-        // starts it under that same switch (`neighbors.announce`).
+        // starts it under that same switch (`neighbors.announce`) — plus the
+        // portal prober, which is not an `AnyCollector` (reactive, driven by
+        // `portal::run_portal_prober`) but is spawned, switched and declared
+        // like one (realm net-observer, node #178).
         let spawnable: Vec<&'static str> = vec![
             collector_link::META.name,
             collector_proxy::META.name,
@@ -2909,6 +2946,7 @@ mod tests {
             collector_air::META.name,
             collector_connections::META.name,
             collector_singbox_log::META.name,
+            collector_portal::META.name,
         ];
 
         let cfg = config::Config::default();

@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use types::{
-    DnsSample, HostSample, LinkSample, NeighborsSample, ProxySample, Sample, SingboxLogSample,
-    WifiSample,
+    DnsSample, HostSample, LinkSample, NeighborsSample, PortalSample, ProxySample, Sample,
+    SingboxLogSample, WifiSample,
 };
 
 /// Capacity of the recent-sample window the daemon hands to the trigger
@@ -133,7 +133,8 @@ impl RecentWindow {
                 | Sample::Neighbors(_)
                 | Sample::Air(_)
                 | Sample::Connections(_)
-                | Sample::SingboxLog(_) => None,
+                | Sample::SingboxLog(_)
+                | Sample::Portal(_) => None,
             })
             .take(n)
             .collect()
@@ -154,7 +155,8 @@ impl RecentWindow {
                 | Sample::Neighbors(_)
                 | Sample::Air(_)
                 | Sample::Connections(_)
-                | Sample::SingboxLog(_) => None,
+                | Sample::SingboxLog(_)
+                | Sample::Portal(_) => None,
             })
             .take(n)
             .collect()
@@ -172,7 +174,8 @@ impl RecentWindow {
             | Sample::Neighbors(_)
             | Sample::Air(_)
             | Sample::Connections(_)
-            | Sample::SingboxLog(_) => None,
+            | Sample::SingboxLog(_)
+            | Sample::Portal(_) => None,
         })
     }
 
@@ -194,7 +197,8 @@ impl RecentWindow {
             | Sample::Neighbors(_)
             | Sample::Air(_)
             | Sample::Connections(_)
-            | Sample::SingboxLog(_) => None,
+            | Sample::SingboxLog(_)
+            | Sample::Portal(_) => None,
         })
     }
 
@@ -210,7 +214,8 @@ impl RecentWindow {
             | Sample::Neighbors(_)
             | Sample::Air(_)
             | Sample::Connections(_)
-            | Sample::SingboxLog(_) => None,
+            | Sample::SingboxLog(_)
+            | Sample::Portal(_) => None,
         })
     }
 
@@ -229,7 +234,8 @@ impl RecentWindow {
                 | Sample::Neighbors(_)
                 | Sample::Air(_)
                 | Sample::Connections(_)
-                | Sample::SingboxLog(_) => None,
+                | Sample::SingboxLog(_)
+                | Sample::Portal(_) => None,
             })
             .take(n)
             .collect()
@@ -247,7 +253,8 @@ impl RecentWindow {
             | Sample::Neighbors(_)
             | Sample::Air(_)
             | Sample::Connections(_)
-            | Sample::SingboxLog(_) => None,
+            | Sample::SingboxLog(_)
+            | Sample::Portal(_) => None,
         })
     }
 
@@ -263,7 +270,8 @@ impl RecentWindow {
             | Sample::Neighbors(_)
             | Sample::Air(_)
             | Sample::Connections(_)
-            | Sample::SingboxLog(_) => None,
+            | Sample::SingboxLog(_)
+            | Sample::Portal(_) => None,
         })
     }
 
@@ -287,7 +295,8 @@ impl RecentWindow {
             | Sample::Wifi(_)
             | Sample::Air(_)
             | Sample::Connections(_)
-            | Sample::SingboxLog(_) => None,
+            | Sample::SingboxLog(_)
+            | Sample::Portal(_) => None,
         })
     }
 
@@ -308,7 +317,33 @@ impl RecentWindow {
                 | Sample::Wifi(_)
                 | Sample::Neighbors(_)
                 | Sample::Air(_)
-                | Sample::Connections(_) => None,
+                | Sample::Connections(_)
+                | Sample::Portal(_) => None,
+            })
+            .take(n)
+            .collect()
+    }
+
+    /// The most recent `n` captive-portal probe readings, newest first — an
+    /// attempt series after a route event, a watch row a minute while a
+    /// portal stands, nothing on a quiet network (realm net-observer, node
+    /// #177).
+    pub fn recent_portal(&self, n: usize) -> Vec<&PortalSample> {
+        self.buf
+            .iter()
+            .rev()
+            .filter_map(|s| match s {
+                Sample::Portal(p) => Some(p),
+                Sample::Link(_)
+                | Sample::Proxy(_)
+                | Sample::Dns(_)
+                | Sample::Route(_)
+                | Sample::Host(_)
+                | Sample::Wifi(_)
+                | Sample::Neighbors(_)
+                | Sample::Air(_)
+                | Sample::Connections(_)
+                | Sample::SingboxLog(_) => None,
             })
             .take(n)
             .collect()
@@ -336,7 +371,8 @@ impl RecentWindow {
             | Sample::Neighbors(_)
             | Sample::Air(_)
             | Sample::Connections(_)
-            | Sample::SingboxLog(_) => None,
+            | Sample::SingboxLog(_)
+            | Sample::Portal(_) => None,
         });
         links.next()?;
         match links.next() {

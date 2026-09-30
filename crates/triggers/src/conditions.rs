@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use crate::window::{LinkProvenance, RecentWindow};
 use types::{
-    DnsVerdict, GwVerdict, LinkMedium, LinkSample, NeighborsVerdict, ProxySample, SingboxLogClass,
-    SingboxLogSample, TcpVerdict, local_instant, normalize_mac,
+    DnsVerdict, GwVerdict, LinkMedium, LinkSample, NeighborsVerdict, PortalVerdict, ProxySample,
+    SingboxLogClass, SingboxLogSample, TcpVerdict, local_instant, normalize_mac,
 };
 
 /// How many recent DNS samples the `fakeip` condition scans (one polling tick
@@ -1395,6 +1395,78 @@ fn singbox_restart_in(w: &RecentWindow, burst: &SingboxBurst<'_>) -> Option<i64>
                 && r.ts_us <= burst.newest_ts_us
         })
         .map(|r| r.ts_us)
+}
+
+/// How many recent portal probe readings the `portal` condition scans.
+/// Large on purpose: the close side of the incident is the WINDOW's own
+/// horizon, never a count — a run of SKIP watch rows (a dead lease resolver
+/// under a standing portal) must not bury the newest PORTAL reading and
+/// close what nothing measured closed. Portal rows are sparse (a series is
+/// four, the watch one a minute), so 256 reaches past everything the window
+/// can hold of them (realm net-observer, nodes #178, #179).
+const PORTAL_SCAN: usize = 256;
+
+/// Fires while a captive portal stands between this machine and the world
+/// (realm net-observer, node #179). Two ways in: the newest MEASURED probe
+/// reading says `PORTAL` — the login page rides the detail, for whatever
+/// acts on the incident from outside (node #174) — or, when nothing measured
+/// newer (the probe withheld by the passive tier, dead, or never triggered),
+/// a storm of `tls-cert-mismatch` in sing-box's log: something keeps
+/// answering TLS handshakes with its own certificate. One way out, the
+/// engine's Some→None edge: the newest measured probe reads `OK` (login
+/// happened — the close the probe's watch loop exists for), or the storm
+/// subsides ([`SINGBOX_CLEAR_TICKS`] quiet link ticks).
+///
+/// The measurement-context gate (node #64) is deliberately not taken: the
+/// probe is its own context — it ran on a live link, and a portal IS a live
+/// link with an intercept — and the storm path judges sing-box's own
+/// complaints, which no invalid sample context can fabricate.
+pub struct Portal;
+impl Condition for Portal {
+    fn id(&self) -> &'static str {
+        "portal"
+    }
+    fn eval(&self, w: &RecentWindow) -> Option<Fire> {
+        // The newest MEASURED reading — a SKIP is the absence of one, so a
+        // watch attempt that died must not close an open portal.
+        let measured = w
+            .recent_portal(PORTAL_SCAN)
+            .into_iter()
+            .find(|p| p.verdict != PortalVerdict::Skip);
+        let storm = || singbox_burst(w, |r| r.class == SingboxLogClass::TlsCertMismatch);
+        match measured {
+            Some(p) if p.verdict == PortalVerdict::Portal => {
+                let detail = match p.login_url.as_deref() {
+                    Some(url) => format!("captive portal on {}: login {url}", p.iface),
+                    None => format!(
+                        "captive portal on {}: {}",
+                        p.iface,
+                        p.reason
+                            .as_deref()
+                            .unwrap_or("intercepted without a login page")
+                    ),
+                };
+                Some(Fire { detail })
+            }
+            // A clean probe outranks everything OLDER than it; a storm
+            // strictly newer says the portal came back while nothing probed.
+            Some(p) => storm_fire(&storm().filter(|b| b.newest_ts_us > p.ts_us)?),
+            None => storm_fire(&storm()?),
+        }
+    }
+}
+
+/// The storm path's firing — `None` under [`SINGBOX_MIN_LINES`]. "Suspected"
+/// on purpose: a stranger's certificate is how a portal looks from inside
+/// the tunnel, but only the probe can name the login page.
+fn storm_fire(burst: &SingboxBurst<'_>) -> Option<Fire> {
+    let lines = burst.lines();
+    (lines >= SINGBOX_MIN_LINES).then(|| Fire {
+        detail: format!(
+            "captive portal suspected: sing-box got a stranger's certificate \
+             ({lines} lines in 60 s)"
+        ),
+    })
 }
 
 /// Fires when sing-box's own log says it has no route — `no-route`,
@@ -4500,6 +4572,133 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
         assert!(c.eval(&w).is_some(), "a new line reset the quiet count");
         w.push(link_with_router(45 * S, GwVerdict::Skip));
         assert!(c.eval(&w).is_none(), "two quiet ticks clear");
+    }
+
+    // ---- captive portal ----------------------------------------------------
+
+    use types::PortalSample;
+
+    /// One reading of the portal probe on `en0`.
+    fn portal_row(ts: i64, verdict: PortalVerdict, login: Option<&str>) -> Sample {
+        Sample::Portal(PortalSample {
+            ts_us: ts,
+            iface: "en0".into(),
+            verdict,
+            login_url: login.map(str::to_string),
+            reason: None,
+        })
+    }
+
+    /// The probe path: an intercepted probe opens with the login page, a
+    /// dead watch attempt does not close, the clean probe after login does.
+    #[test]
+    fn portal_fires_on_an_intercepted_probe_and_clears_on_a_clean_one() {
+        let c = Portal;
+        let mut w = RecentWindow::new(64);
+        w.push(portal_row(3 * S, PortalVerdict::Skip, None));
+        assert!(c.eval(&w).is_none(), "a SKIP is no measurement");
+        w.push(portal_row(
+            13 * S,
+            PortalVerdict::Portal,
+            Some("http://login.wifi.smartspb.net/"),
+        ));
+        let fire = c.eval(&w).expect("an intercepted probe is the portal");
+        assert_eq!(
+            fire.detail,
+            "captive portal on en0: login http://login.wifi.smartspb.net/"
+        );
+        w.push(portal_row(73 * S, PortalVerdict::Skip, None));
+        assert!(
+            c.eval(&w).is_some(),
+            "a dead watch attempt must not close an open portal"
+        );
+        // A whole RUN of dead watch attempts must not bury the reading
+        // either: the close side is the window, never a count.
+        for i in 0..12 {
+            w.push(portal_row((80 + 60 * i) * S, PortalVerdict::Skip, None));
+        }
+        assert!(
+            c.eval(&w).is_some(),
+            "twelve dead watch attempts must not close an open portal"
+        );
+        w.push(portal_row(900 * S, PortalVerdict::Ok, None));
+        assert!(c.eval(&w).is_none(), "the clean probe closes");
+    }
+
+    /// A portal that answered in place without a redirect still opens, named
+    /// by its shape.
+    #[test]
+    fn portal_without_a_redirect_names_the_shape() {
+        let c = Portal;
+        let mut w = RecentWindow::new(64);
+        w.push(Sample::Portal(PortalSample {
+            ts_us: S,
+            iface: "en0".into(),
+            verdict: PortalVerdict::Portal,
+            login_url: None,
+            reason: Some("HTTP 200 without Success".into()),
+        }));
+        assert_eq!(
+            c.eval(&w).unwrap().detail,
+            "captive portal on en0: HTTP 200 without Success"
+        );
+    }
+
+    /// The recorded morning (realm net-observer, node #173): no probe ran at
+    /// all and sing-box drowned in x509 for `*.wifi.smartspb.net` — the
+    /// storm alone opens the portal reading on that record's shape.
+    #[test]
+    fn portal_fires_on_a_tls_cert_storm_when_nothing_probed() {
+        let c = Portal;
+        let mut w = RecentWindow::new(64);
+        w.push(link_with_router(0, GwVerdict::Skip));
+        w.push(singbox_row(
+            1,
+            SingboxLogClass::TlsCertMismatch,
+            2,
+            Some("vless-out-8"),
+        ));
+        assert!(c.eval(&w).is_none(), "two lines are not yet a storm");
+        w.push(singbox_row(
+            15 * S,
+            SingboxLogClass::TlsCertMismatch,
+            230,
+            Some("vless-out-8"),
+        ));
+        let fire = c.eval(&w).expect("the storm opens the portal reading");
+        assert_eq!(
+            fire.detail,
+            "captive portal suspected: sing-box got a stranger's certificate \
+             (232 lines in 60 s)"
+        );
+        // Other certificate-free classes are not this signature.
+        let mut w = RecentWindow::new(64);
+        w.push(singbox_row(1, SingboxLogClass::NoRoute, 300, None));
+        assert!(c.eval(&w).is_none());
+    }
+
+    /// The probe is the authority over everything older than it — and only
+    /// over that: a storm strictly newer than the clean probe re-opens.
+    #[test]
+    fn a_clean_probe_outranks_an_older_storm_but_not_a_newer_one() {
+        let c = Portal;
+        let mut w = RecentWindow::new(64);
+        w.push(singbox_row(1, SingboxLogClass::TlsCertMismatch, 5, None));
+        w.push(portal_row(10 * S, PortalVerdict::Ok, None));
+        assert!(
+            c.eval(&w).is_none(),
+            "the probe measured a clean network after the storm"
+        );
+        w.push(singbox_row(
+            20 * S,
+            SingboxLogClass::TlsCertMismatch,
+            5,
+            None,
+        ));
+        let fire = c
+            .eval(&w)
+            .expect("a storm newer than the clean probe re-opens");
+        assert!(fire.detail.contains("suspected"), "{}", fire.detail);
     }
 
     /// The field's most frequent shape: sing-box restarted (the reload agent,

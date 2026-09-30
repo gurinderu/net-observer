@@ -292,6 +292,18 @@ ALTER TABLE connection_sample ADD COLUMN IF NOT EXISTS iface VARCHAR;
 -- open like `topology_link` above.
 CREATE TABLE IF NOT EXISTS singbox_log_sample (
   ts_us BIGINT, class VARCHAR, count UINTEGER, node VARCHAR, sample_message VARCHAR);
+-- The captive-portal probe's readings (realm net-observer, nodes #177, #178):
+-- one row per probe attempt, Event-cadence like `route_event` — a series
+-- starts on a fresh address, a watch re-probes while a portal stands, and a
+-- quiet network writes nothing. `verdict` is 'OK' (the captive-detect request
+-- came back untouched) | 'PORTAL' (something intercepted it) | 'SKIP' (the
+-- probe could not run — withheld by the passive tier, no DHCP resolver,
+-- transport failure — and `reason` says which). `login_url` is the portal's
+-- login page from the intercept's redirect, NULL when the intercept named
+-- none and always NULL outside 'PORTAL'. Added after the store first shipped,
+-- so an older DB file gains the table on open like `topology_link` above.
+CREATE TABLE IF NOT EXISTS portal_sample (
+  ts_us BIGINT, iface VARCHAR, verdict VARCHAR, login_url VARCHAR, reason VARCHAR);
 -- What physically leaves the egress interface, captured on operator demand
 -- (realm net-observer, node #170). Two tables, the header+slice shape `air`
 -- uses: `egress_scan` is one row per on-demand scan (its verdict included, so a
@@ -393,6 +405,7 @@ pub const SAMPLE_TABLES: &[&str] = &[
     "neighbor_sample",
     "connection_sample",
     "singbox_log_sample",
+    "portal_sample",
 ];
 
 /// The subset of [`SAMPLE_TABLES`] a retention prune may touch — the only
@@ -416,6 +429,7 @@ pub const PRUNABLE_TABLES: &[&str] = &[
     "wifi_sample",
     "neighbor_sample",
     "singbox_log_sample",
+    "portal_sample",
 ];
 
 /// The two halves of one air scan — the scan row and the access points it

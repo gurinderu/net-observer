@@ -123,6 +123,16 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "collector-portal" = rec {
+      packageId = "collector-portal";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "collector-portal";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "collector-proxy" = rec {
       packageId = "collector-proxy";
       build = internal.buildRustCrateWithFeatures {
@@ -4451,6 +4461,24 @@ rec {
             name = "tokio";
             packageId = "tokio";
             features = [ "rt-multi-thread" "macros" "sync" "time" "signal" "process" ];
+          }
+        ];
+
+      };
+      "collector-portal" = rec {
+        crateName = "collector-portal";
+        version = "0.0.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ./crates/collector-portal; };
+        libName = "collector_portal";
+        dependencies = [
+          {
+            name = "collector-core";
+            packageId = "collector-core";
+          }
+          {
+            name = "types";
+            packageId = "types";
           }
         ];
 
@@ -12532,6 +12560,10 @@ rec {
             packageId = "collector-neighbors";
           }
           {
+            name = "collector-portal";
+            packageId = "collector-portal";
+          }
+          {
             name = "collector-proxy";
             packageId = "collector-proxy";
           }
@@ -13401,6 +13433,10 @@ rec {
             packageId = "collector-neighbors";
           }
           {
+            name = "collector-portal";
+            packageId = "collector-portal";
+          }
+          {
             name = "collector-proxy";
             packageId = "collector-proxy";
           }
@@ -13475,6 +13511,11 @@ rec {
           {
             name = "tempfile";
             packageId = "tempfile";
+          }
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "rt-multi-thread" "macros" "sync" "time" "signal" "process" "test-util" ];
           }
         ];
 
@@ -22591,7 +22632,7 @@ rec {
           "tracing" = [ "dep:tracing" ];
           "windows-sys" = [ "dep:windows-sys" ];
         };
-        resolvedDefaultFeatures = [ "bytes" "default" "fs" "io-util" "libc" "macros" "mio" "net" "process" "rt" "rt-multi-thread" "signal" "signal-hook-registry" "socket2" "sync" "time" "tokio-macros" "windows-sys" ];
+        resolvedDefaultFeatures = [ "bytes" "default" "fs" "io-util" "libc" "macros" "mio" "net" "process" "rt" "rt-multi-thread" "signal" "signal-hook-registry" "socket2" "sync" "test-util" "time" "tokio-macros" "windows-sys" ];
       };
       "tokio-macros" = rec {
         crateName = "tokio-macros";

@@ -308,6 +308,7 @@ fn stays_out_of_the_window(sample: &Sample) -> bool {
         || matches!(sample, Sample::Neighbors(n) if n.is_listener_flush())
 }
 
+#[allow(clippy::too_many_arguments)] // the pipeline takes its whole wiring at once, like build_api_server
 pub async fn run(
     store: Arc<DuckdbStore>,
     mut engine: TriggerEngine,
@@ -329,6 +330,11 @@ pub async fn run(
     // none recorded — the edge's own `ts_us` is used instead (realm
     // net-observer, node #124).
     session_end_us: Arc<AtomicI64>,
+    // The captive-portal prober's trigger tap: every route event is copied
+    // to it, because a fresh address on a physical interface is what arms a
+    // probe series (realm net-observer, node #178). `None` = no prober
+    // (config off), and nothing is copied into the void.
+    portal_tap: Option<mpsc::UnboundedSender<types::RouteEvent>>,
 ) {
     let mut window = RecentWindow::new(triggers::WINDOW_CAP);
     // The bounded post-resume drain filter, replacing the raw
@@ -342,6 +348,16 @@ pub async fn run(
         let now_us = sample.ts_us();
         if let Err(e) = store.write_sample(&sample) {
             tracing::warn!(error = %e, "store write failed; sample dropped from DB (gap logged)");
+        }
+        // A route event that arms a probe series is also the portal
+        // prober's trigger — filtered HERE so the kernel's clone-route storm
+        // (`RTM_ADD` per neighbour) never wakes the prober at all. The send
+        // is unbounded and its error ignored: a prober that stopped must
+        // never stall or kill the pipeline.
+        if let (Some(tap), Sample::Route(r)) = (&portal_tap, &sample)
+            && collector_portal::series_trigger(r).is_some()
+        {
+            let _ = tap.send(r.clone());
         }
         // The record's lifetime bounds for this reading, read BEFORE the snapshot
         // lock is taken — a DB read must never happen under the mutex the socket
@@ -390,6 +406,10 @@ pub async fn run(
                 // Route events are a stream, not a "latest sample" field of the
                 // snapshot; they still bump `generated_us` above.
                 Sample::Route(_) => {}
+                // Portal readings are a stream like route events; the standing
+                // state a reader wants is the `portal` incident, which the
+                // trigger engine mirrors into the snapshot itself.
+                Sample::Portal(_) => {}
             }
         }
         // Publish the sample as a live `Event` (push, not poll), but only build it
@@ -411,6 +431,7 @@ pub async fn run(
                 Sample::Connections(c) => Event::Connections(ConnectionsSummary::of(c)),
                 Sample::SingboxLog(s) => Event::SingboxLog(s.clone()),
                 Sample::Route(r) => Event::Route(r.clone()),
+                Sample::Portal(p) => Event::Portal(p.clone()),
             };
             // Serialise ONCE here; every subscriber then clones an Arc, not a
             // second `serde_json` pass.
@@ -2220,6 +2241,7 @@ mod tests {
             events_tx,
             no_resume(),
             no_session_end(),
+            None,
         ));
         tx.send(Sample::Link(LinkSample {
             ts_us: 1,
@@ -2285,6 +2307,7 @@ mod tests {
             events_tx,
             no_resume(),
             no_session_end(),
+            None,
         ));
         // Ok -> Fail is a gateway-verdict change: gw-change must fire.
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -2368,6 +2391,7 @@ mod tests {
             events_tx,
             no_resume(),
             no_session_end(),
+            None,
         ));
         tx.send(cache_tick).await.unwrap();
         tx.send(flush).await.unwrap();
@@ -2981,6 +3005,7 @@ mod tests {
             events_tx,
             no_resume(),
             no_session_end(),
+            None,
         ));
 
         // A link sample then a proxy sample: each populates its own snapshot field,
@@ -3057,6 +3082,7 @@ mod tests {
             events_tx,
             no_resume(),
             no_session_end(),
+            None,
         ));
 
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -3104,6 +3130,7 @@ mod tests {
             events_tx,
             no_resume(),
             no_session_end(),
+            None,
         ));
 
         tx.send(link(11, GwVerdict::Ok)).await.unwrap();
@@ -3145,6 +3172,7 @@ mod tests {
             events_tx,
             no_resume(),
             no_session_end(),
+            None,
         ));
         tx.send(link(7, GwVerdict::Ok)).await.unwrap();
         tx.send(Sample::Host(HostSample {
@@ -3309,6 +3337,7 @@ mod tests {
             events_tx,
             no_resume(),
             no_session_end(),
+            None,
         ));
 
         tx.send(link(100, GwVerdict::NoGw)).await.unwrap();
@@ -3423,6 +3452,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             no_session_end(),
+            None,
         ));
 
         // Two wedge-shaped tick pairs before the pause.
@@ -3495,6 +3525,7 @@ mod tests {
             events_tx,
             no_resume(),
             no_session_end(),
+            None,
         ));
 
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -3571,6 +3602,7 @@ mod tests {
             events_tx,
             resume_at_us,
             no_session_end(),
+            None,
         ));
 
         // The straggler: the probe that spanned both edges.
@@ -3759,6 +3791,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             no_session_end(),
+            None,
         ));
 
         // Enough stale-looking samples to exhaust the drop cap on their own.
@@ -3822,6 +3855,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             no_session_end(),
+            None,
         ));
 
         // Fires once, then stays latched while the fault persists.
@@ -3894,6 +3928,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             session_end_us,
+            None,
         ));
 
         // Fires once; stays latched while the fault persists across the
@@ -3979,6 +4014,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             session_end_us.clone(),
+            None,
         ));
 
         tx.send(link(1, GwVerdict::Fail)).await.unwrap();
@@ -4062,6 +4098,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             session_end_us.clone(),
+            None,
         ));
 
         // Cycle 1: fires at t=1 (A), pauses at t=10, resumes at t=20 — the
@@ -4168,6 +4205,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             session_end_us.clone(),
+            None,
         ));
 
         tx.send(link(1, GwVerdict::Fail)).await.unwrap();
@@ -4239,6 +4277,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             session_end_us.clone(),
+            None,
         ));
 
         // Fires at t=1, RECOVERS at t=2 (a live edge, not close_all): armed,
@@ -4319,6 +4358,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             no_session_end(),
+            None,
         ));
 
         // Fires once at ts 1, then RECOVERS live at ts 2 (an ordinary healthy
@@ -4395,6 +4435,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             no_session_end(),
+            None,
         ));
 
         // The last gateway state observed before the pause.
@@ -4460,6 +4501,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             no_session_end(),
+            None,
         ));
 
         tx.send(link(1, GwVerdict::Ok)).await.unwrap();
@@ -4542,6 +4584,7 @@ mod tests {
             events_tx,
             resume_at_us.clone(),
             no_session_end(),
+            None,
         ));
 
         // No predecessor yet, so `GwChange::eval` returns `None` and the trigger

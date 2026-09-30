@@ -42,8 +42,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use types::{
     AirSample, ConnectionsGroupBy, ConnectionsSample, ConnectionsVerdict, DnsSample,
     ExperimentReport, HistoryWindow, HostSample, LinkSample, NeighborLifetime, NeighborsSample,
-    ObservingEdge, ProbingEdge, ProbingTier, ProxySample, RouteEvent, SingboxLogClass,
-    SingboxLogSample, TopologyLifetime, TopologyLink, WifiSample,
+    ObservingEdge, PortalSample, ProbingEdge, ProbingTier, ProxySample, RouteEvent,
+    SingboxLogClass, SingboxLogSample, TopologyLifetime, TopologyLink, WifiSample,
 };
 
 /// A request from a client (the bar or cli) to the daemon.
@@ -565,6 +565,9 @@ event_kinds! {
     /// What sing-box's own log says: one `(class, node)` of its ERROR/WARN
     /// lines per tick of the passive log reader (realm net-observer, node #141).
     SingboxLog => "singbox-log",
+    /// The captive-portal probe's reading: a route event started a probe
+    /// series pinned to the physical interface (realm net-observer, node #178).
+    Portal => "portal",
     Incident => "incident",
     /// An incident's close: the condition that opened it stopped asserting, or
     /// a pause / tier edge ended its observation session (realm net-observer,
@@ -635,6 +638,10 @@ pub enum Event {
     /// One `(class, node)` row of sing-box's own log for a tick — several
     /// frames per tick when several classes were seen, none on a quiet tick.
     SingboxLog(SingboxLogSample),
+    /// One captive-portal probe's outcome, login page and all — the frame an
+    /// external reactor opens the portal page from (realm net-observer,
+    /// nodes #174, #178).
+    Portal(PortalSample),
     Incident(IncidentSummary),
     /// The close of an incident an earlier [`Event::Incident`] opened, a frame
     /// of its own: a repeated `Incident` carrying `closed_us` would read as a
@@ -688,6 +695,7 @@ impl Event {
             Event::Air(_) => EventKind::Air,
             Event::Connections(_) => EventKind::Connections,
             Event::SingboxLog(_) => EventKind::SingboxLog,
+            Event::Portal(_) => EventKind::Portal,
             Event::Incident(_) => EventKind::Incident,
             Event::IncidentClosed { .. } => EventKind::IncidentClosed,
         }
@@ -707,6 +715,7 @@ impl Event {
             Event::Air(a) => a.ts_us,
             Event::Connections(c) => c.ts_us,
             Event::SingboxLog(s) => s.ts_us,
+            Event::Portal(p) => p.ts_us,
             Event::Incident(i) => i.opened_us,
             Event::IncidentClosed { closed_us, .. } => *closed_us,
         }
@@ -837,6 +846,19 @@ impl Event {
                     },
                 }
             }
+            // A portal names its login page when the intercept gave one; a
+            // SKIP renders as its reason, like every other withheld probe.
+            Event::Portal(p) => match p.verdict {
+                types::PortalVerdict::Skip => {
+                    format!("SKIP {}", p.reason.as_deref().unwrap_or("-"))
+                }
+                types::PortalVerdict::Portal => format!(
+                    "PORTAL on {} login {}",
+                    p.iface,
+                    p.login_url.as_deref().unwrap_or("-")
+                ),
+                types::PortalVerdict::Ok => format!("OK on {}", p.iface),
+            },
             Event::Incident(i) => format!("{} {}", i.trigger_id, i.signature),
             // The closing instant is the frame's own `ts_us`, which every
             // renderer prints as the line's clock; the duration is what the
@@ -2984,6 +3006,7 @@ mod tests {
                 "air",
                 "connections",
                 "singbox-log",
+                "portal",
                 "incident",
                 "incident-closed",
             ]

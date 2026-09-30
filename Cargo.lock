@@ -1325,6 +1325,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "collector-portal"
+version = "0.0.0"
+dependencies = [
+ "collector-core",
+ "types",
+]
+
+[[package]]
 name = "collector-proxy"
 version = "0.0.0"
 dependencies = [
@@ -3903,6 +3911,7 @@ dependencies = [
  "collector-host",
  "collector-link",
  "collector-neighbors",
+ "collector-portal",
  "collector-proxy",
  "collector-route",
  "collector-wifi",
@@ -4164,6 +4173,7 @@ dependencies = [
  "collector-host",
  "collector-link",
  "collector-neighbors",
+ "collector-portal",
  "collector-proxy",
  "collector-route",
  "collector-singbox-log",

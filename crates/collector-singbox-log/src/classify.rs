@@ -35,6 +35,13 @@ pub fn classify(line: &LogLine) -> Option<(SingboxLogClass, Option<String>)> {
     if !line.level.is_alert() {
         return None;
     }
+    // A TLS handshake answered with someone else's certificate, wherever in
+    // sing-box's pipeline it surfaces: the captive portal's passive
+    // signature — a storm of these opened the portal reading on the morning
+    // the OS probe died (realm net-observer, node #179).
+    if msg.contains("x509: certificate is valid for") {
+        return Some((C::TlsCertMismatch, outbound_node(msg)));
+    }
     let class = match line.component.as_str() {
         // `connection: open connection to <ip:port> using outbound/vless[<node>]: dial tcp <ip:port>: <error>`
         "connection" if msg.starts_with("open connection to") => {
@@ -236,6 +243,26 @@ mod tests {
                 "[1 0ms] inbound/tun[0]: link icmp connection from 198.18.0.5 to 1.1.1.1: icmp is not supported by default outbound: vless-auto"
             )),
             Some((SingboxLogClass::IcmpUnsupported, None))
+        );
+    }
+
+    /// The captive-portal storm: a VLESS dial whose TLS handshake was
+    /// answered by the portal's own wildcard certificate (the observed
+    /// SmartSPB shape — ~4400 such lines in 19 minutes).
+    #[test]
+    fn a_foreign_certificate_is_tls_cert_mismatch_and_names_the_node() {
+        assert_eq!(
+            class_of(&error(
+                "[179023894 0ms] connection: open connection to 1.2.3.4:443 using outbound/vless[vless-out-8]: process connection from 198.18.0.5:54321: x509: certificate is valid for *.wifi.smartspb.net, not nks.lab.mirari.ru"
+            )),
+            Some((SingboxLogClass::TlsCertMismatch, Some("vless-out-8".into())))
+        );
+        // The same complaint without an outbound in the message still counts.
+        assert_eq!(
+            class_of(&warn(
+                "[1 0ms] connection: TLS handshake: x509: certificate is valid for *.portal.example, not example.com"
+            )),
+            Some((SingboxLogClass::TlsCertMismatch, None))
         );
     }
 

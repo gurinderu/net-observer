@@ -6,6 +6,7 @@ pub mod incident;
 pub mod mac;
 pub mod neighbor;
 pub mod observing;
+pub mod portal;
 pub mod probing;
 pub mod sample;
 pub mod singbox_log;
@@ -32,6 +33,7 @@ pub use neighbor::{
     NeighborsSample, RoleConfidence,
 };
 pub use observing::{ObservingCause, ObservingEdge};
+pub use portal::PortalSample;
 pub use probing::{EmissionClass, ProbingEdge, ProbingReason, ProbingTier};
 pub use sample::{
     DnsSample, HostSample, LinkSample, ProxySample, RouteEvent, Sample, WifiSample,
@@ -43,5 +45,5 @@ pub use topology::{
 };
 pub use verdict::{
     AirVerdict, AnnounceKind, ConnectionsVerdict, DnsVerdict, GwVerdict, LinkMedium,
-    NeighborSource, NeighborsVerdict, ParseVerdictError, TcpVerdict, WifiVerdict,
+    NeighborSource, NeighborsVerdict, ParseVerdictError, PortalVerdict, TcpVerdict, WifiVerdict,
 };

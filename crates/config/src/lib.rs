@@ -169,6 +169,9 @@ pub struct Collectors {
     /// Tolerated absent, like `connections`.
     #[serde(default)]
     pub singbox_log: SingboxLogCfg,
+    /// Tolerated absent, like `connections`.
+    #[serde(default)]
+    pub portal: PortalCfg,
     pub pcap_ring: PcapCfg,
 }
 
@@ -324,6 +327,22 @@ impl Default for SingboxLogCfg {
     }
 }
 
+/// The captive-portal prober: reactive, not ticked — a fresh address on a
+/// physical interface starts a probe series, a standing portal is re-probed
+/// until the answer is clean (realm net-observer, node #178). On by default:
+/// its emission is gated by the probing tier like every other probe, so a
+/// passive daemon writes SKIP rows instead of packets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortalCfg {
+    pub enabled: bool,
+}
+
+impl Default for PortalCfg {
+    fn default() -> Self {
+        PortalCfg { enabled: true }
+    }
+}
+
 /// The serde default for a `bool` field that should default to `true` when the
 /// key is absent (deriving `Default` would give `false`).
 fn default_true() -> bool {
@@ -468,6 +487,7 @@ impl Default for Config {
                 },
                 connections: ConnectionsCfg::default(),
                 singbox_log: SingboxLogCfg::default(),
+                portal: PortalCfg::default(),
                 pcap_ring: PcapCfg {
                     enabled: true,
                     ring_mb: 8,

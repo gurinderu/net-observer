@@ -1448,7 +1448,7 @@ impl ProbeTier {
 
 /// The event kind accepted by `events --kind`. A thin CLI mirror of
 /// [`EventKind`] so `clap` renders
-/// `<link|proxy|dns|route|host|wifi|neighbors|air|connections|singbox-log|incident|incident-closed>`
+/// `<link|proxy|dns|route|host|wifi|neighbors|air|connections|singbox-log|portal|incident|incident-closed>`
 /// in the help without leaking the wire type into the argument surface.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum EventKindArg {
@@ -1462,6 +1462,7 @@ enum EventKindArg {
     Air,
     Connections,
     SingboxLog,
+    Portal,
     Incident,
     /// `incident-closed` — clap's kebab-case of the variant, the same label
     /// [`EventKind::as_str`] gives it (realm net-observer, node #135).
@@ -1482,6 +1483,7 @@ impl EventKindArg {
             EventKindArg::Air => EventKind::Air,
             EventKindArg::Connections => EventKind::Connections,
             EventKindArg::SingboxLog => EventKind::SingboxLog,
+            EventKindArg::Portal => EventKind::Portal,
             EventKindArg::Incident => EventKind::Incident,
             EventKindArg::IncidentClosed => EventKind::IncidentClosed,
         }
@@ -5284,6 +5286,7 @@ mod tests {
         assert_eq!(EventKindArg::Neighbors.to_kind(), EventKind::Neighbors);
         assert_eq!(EventKindArg::Connections.to_kind(), EventKind::Connections);
         assert_eq!(EventKindArg::SingboxLog.to_kind(), EventKind::SingboxLog);
+        assert_eq!(EventKindArg::Portal.to_kind(), EventKind::Portal);
         assert_eq!(EventKindArg::Incident.to_kind(), EventKind::Incident);
         assert_eq!(
             EventKindArg::IncidentClosed.to_kind(),
