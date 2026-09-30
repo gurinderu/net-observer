@@ -2930,7 +2930,10 @@ mod tests {
         // One entry per `AnyCollector` variant, by the collector's own metadata —
         // all but `announce`, which produces no kind of its own: its samples are
         // `Sample::Neighbors`, declared under `neighbors`, and its supervisor
-        // starts it under that same switch (`neighbors.announce`).
+        // starts it under that same switch (`neighbors.announce`) — plus the
+        // portal prober, which is not an `AnyCollector` (reactive, driven by
+        // `portal::run_portal_prober`) but is spawned, switched and declared
+        // like one (realm net-observer, node #178).
         let spawnable: Vec<&'static str> = vec![
             collector_link::META.name,
             collector_proxy::META.name,
@@ -2942,6 +2945,7 @@ mod tests {
             collector_air::META.name,
             collector_connections::META.name,
             collector_singbox_log::META.name,
+            collector_portal::META.name,
         ];
 
         let cfg = config::Config::default();
