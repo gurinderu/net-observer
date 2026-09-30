@@ -1397,10 +1397,14 @@ fn singbox_restart_in(w: &RecentWindow, burst: &SingboxBurst<'_>) -> Option<i64>
         .map(|r| r.ts_us)
 }
 
-/// How many recent portal probe readings the `portal` condition scans: a
-/// series is four attempts and the watch adds one a minute, so eight reach
-/// past the newest series (realm net-observer, node #178).
-const PORTAL_SCAN: usize = 8;
+/// How many recent portal probe readings the `portal` condition scans.
+/// Large on purpose: the close side of the incident is the WINDOW's own
+/// horizon, never a count — a run of SKIP watch rows (a dead lease resolver
+/// under a standing portal) must not bury the newest PORTAL reading and
+/// close what nothing measured closed. Portal rows are sparse (a series is
+/// four, the watch one a minute), so 256 reaches past everything the window
+/// can hold of them (realm net-observer, nodes #178, #179).
+const PORTAL_SCAN: usize = 256;
 
 /// Fires while a captive portal stands between this machine and the world
 /// (realm net-observer, node #179). Two ways in: the newest MEASURED probe
@@ -4608,7 +4612,16 @@ ip 192.168.1.51 claimed by cc:cc:cc:cc:cc:cc, dd:dd:dd:dd:dd:dd"
             c.eval(&w).is_some(),
             "a dead watch attempt must not close an open portal"
         );
-        w.push(portal_row(133 * S, PortalVerdict::Ok, None));
+        // A whole RUN of dead watch attempts must not bury the reading
+        // either: the close side is the window, never a count.
+        for i in 0..12 {
+            w.push(portal_row((80 + 60 * i) * S, PortalVerdict::Skip, None));
+        }
+        assert!(
+            c.eval(&w).is_some(),
+            "twelve dead watch attempts must not close an open portal"
+        );
+        w.push(portal_row(900 * S, PortalVerdict::Ok, None));
         assert!(c.eval(&w).is_none(), "the clean probe closes");
     }
 

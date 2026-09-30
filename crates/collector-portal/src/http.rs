@@ -59,6 +59,12 @@ pub fn read_response(bytes: &[u8]) -> ProbeReading {
     if status == 200 && body.contains("Success") {
         return ProbeReading::Clean;
     }
+    // A 200 whose body never arrived (deadline, error, truncation) is
+    // indistinguishable from Apple's page cut short: the absence of a
+    // reading, never a portal.
+    if status == 200 && body.trim().is_empty() {
+        return ProbeReading::Unreadable("HTTP 200 with no body read".into());
+    }
     let location = lines
         .filter_map(|l| l.split_once(':'))
         .find(|(name, _)| name.eq_ignore_ascii_case("location"))
@@ -146,6 +152,16 @@ mod tests {
             ProbeReading::Unreadable(_)
         ));
         assert!(matches!(read_response(b""), ProbeReading::Unreadable(_)));
+        // A genuine 200 whose body was cut short (read deadline on a slow
+        // link) must not fabricate a portal.
+        assert!(matches!(
+            read_response(b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n"),
+            ProbeReading::Unreadable(_)
+        ));
+        assert!(matches!(
+            read_response(b"HTTP/1.0 200 OK\r\nContent-Ty"),
+            ProbeReading::Unreadable(_)
+        ));
         // Truncated mid-headers: the status line alone still reads as an
         // intercepted answer only if it parses — here it does, and carries no
         // Location.

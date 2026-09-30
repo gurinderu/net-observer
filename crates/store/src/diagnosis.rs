@@ -595,6 +595,43 @@ singbox_log_lines AS (
     )
 }
 
+/// How far either side of the asked moment `verdict_at` looks for the
+/// captive-portal probe's readings, and how many it lists. Wider than the
+/// sing-box window on purpose: the watch probes once a minute, so ±30 s
+/// could fall between two readings of a standing portal (realm
+/// net-observer, nodes #177, #179).
+const PORTAL_NEAR_US: i64 = 90_000_000;
+const PORTAL_NEAR_MAX: i64 = 3;
+
+/// The `portal_sample` rows within [`PORTAL_NEAR_US`] of the asked moment,
+/// rendered one line each — `PORTAL on <iface> login <url> at <RFC3339>` /
+/// `OK on <iface> at …` / `SKIP on <iface> (<reason>) at …` — newest first,
+/// at most [`PORTAL_NEAR_MAX`], joined by newlines into one `portal` cell.
+/// `NULL` when nothing probed around the moment: an unarmed probe is the
+/// absence of a reading, never a clean one. Binds the moment twice, like
+/// [`singbox_log_near_cte`].
+fn portal_near_cte() -> String {
+    format!(
+        "\
+portal_near AS (
+  SELECT ts_us, iface, verdict, login_url, reason
+  FROM portal_sample
+  WHERE ts_us BETWEEN ? - {PORTAL_NEAR_US} AND ? + {PORTAL_NEAR_US}
+  ORDER BY ts_us DESC
+  LIMIT {PORTAL_NEAR_MAX}
+),
+portal_lines AS (
+  SELECT string_agg(
+           verdict || ' on ' || iface
+             || CASE WHEN login_url IS NULL THEN '' ELSE ' login ' || login_url END
+             || CASE WHEN reason IS NULL THEN '' ELSE ' (' || reason || ')' END
+             || ' at ' || strftime(make_timestamp(ts_us), '%Y-%m-%dT%H:%M:%SZ'),
+           chr(10) ORDER BY ts_us DESC) AS portal
+  FROM portal_near
+)"
+    )
+}
+
 /// **Verdict at a moment** — the state of every layer as of `ts_us`, and the
 /// layer the record blames.
 ///
@@ -608,18 +645,23 @@ singbox_log_lines AS (
 /// before the pause is a reading from before the pause, not a reading at
 /// `ts_us`, and it is withheld rather than labelled.
 ///
-/// The last column, `singbox_log`, is what sing-box's own log said within
-/// ±30 s of the moment ([`singbox_log_near_cte`]) — one line per row, or
-/// `NULL`. It rides both branches: the log's rows carry their own time, so a
-/// moment inside a gap can still show what sing-box wrote around it.
+/// The two trailing columns ride both branches (their rows carry their own
+/// time, so a moment inside a gap can still show them): `singbox_log` is
+/// what sing-box's own log said within ±30 s of the moment
+/// ([`singbox_log_near_cte`]), and `portal` what the captive-portal probe
+/// read within ±90 s ([`portal_near_cte`]) — the relay the recorded morning
+/// was missing: a `why` at the moment the web died can now name the portal
+/// and its login page (realm net-observer, nodes #173, #177).
 pub fn verdict_at_sql(ts_us: i64, load_threshold: f64) -> PreparedSql {
     let sql = format!(
         "{},
 {GAP_AT_CTE},
+{},
 {}
 SELECT ts_us, gw, gw_rtt_ms, direct, vless, tun_code, load1, layer,
        CAST(NULL AS BIGINT) AS gap_opened_us, CAST(NULL AS BIGINT) AS gap_closed_us,
-       (SELECT singbox_log FROM singbox_log_lines) AS singbox_log
+       (SELECT singbox_log FROM singbox_log_lines) AS singbox_log,
+       (SELECT portal FROM portal_lines) AS portal
 FROM (
   SELECT ts_us, gw, gw_rtt_ms, direct, vless, tun_code, load1, layer
   FROM layer_state
@@ -632,18 +674,22 @@ UNION ALL
 SELECT CAST(NULL AS BIGINT), CAST(NULL AS VARCHAR), CAST(NULL AS DOUBLE),
        CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), CAST(NULL AS USMALLINT),
        CAST(NULL AS DOUBLE), 'gap', gap_opened_us, gap_closed_us,
-       (SELECT singbox_log FROM singbox_log_lines)
+       (SELECT singbox_log FROM singbox_log_lines),
+       (SELECT portal FROM portal_lines)
 FROM gap_at",
         layer_state_with(),
         singbox_log_near_cte(),
+        portal_near_cte(),
     );
     // Bound in the order their `?` appear: the threshold in `layer_state_with`,
     // then the moment twice in `GAP_AT_CTE`, twice in `singbox_log_near_cte`,
-    // then once more in the final `WHERE`.
+    // twice in `portal_near_cte`, then once more in the final `WHERE`.
     PreparedSql {
         sql,
         params: vec![
             Value::Double(load_threshold),
+            Value::BigInt(ts_us),
+            Value::BigInt(ts_us),
             Value::BigInt(ts_us),
             Value::BigInt(ts_us),
             Value::BigInt(ts_us),
@@ -1738,6 +1784,42 @@ mod tests {
 
         let t = s.verdict_at(20 * SEC).unwrap();
         assert_eq!(cell(&t, 0, "layer"), "proxy");
+    }
+
+    /// The recorded morning's missing relay: a `why` at the moment the web
+    /// died lists the captive-portal probe's reading beside the verdict —
+    /// the login page included — and stays NULL when nothing probed around
+    /// the moment (an unarmed probe is the absence of a reading).
+    #[test]
+    fn verdict_at_lists_the_portal_probe_reading_beside_the_verdict() {
+        use types::{PortalSample, PortalVerdict};
+        let s = DuckdbStore::in_memory().unwrap();
+        link(&s, 20 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy(&s, 20 * SEC, TcpVerdict::Ok, Some(200));
+        host(&s, 20 * SEC, 1.2);
+        s.write_sample(&Sample::Portal(PortalSample {
+            ts_us: 25 * SEC,
+            iface: "en0".into(),
+            verdict: PortalVerdict::Portal,
+            login_url: Some("http://login.wifi.smartspb.net/".into()),
+            reason: Some("redirect 302".into()),
+        }))
+        .unwrap();
+
+        let t = s.verdict_at(20 * SEC).unwrap();
+        let portal = cell(&t, 0, "portal");
+        assert!(
+            portal.contains("PORTAL on en0 login http://login.wifi.smartspb.net/"),
+            "{portal}"
+        );
+        assert!(portal.contains("(redirect 302)"), "{portal}");
+
+        // A moment far from any probe row: the cell is NULL, not clean.
+        link(&s, 1000 * SEC, GwVerdict::Ok, Some(2.0), TcpVerdict::Ok);
+        proxy(&s, 1000 * SEC, TcpVerdict::Ok, Some(204));
+        host(&s, 1000 * SEC, 1.2);
+        let far = s.verdict_at(1000 * SEC).unwrap();
+        assert_eq!(cell(&far, 0, "portal"), "");
     }
 
     /// The same captive-portal answer under load is still the proxy's fault,

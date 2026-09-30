@@ -13,6 +13,11 @@ use collector_portal::{PortalProbe, attempt_fields, build_sample, series_trigger
 use tokio::sync::mpsc;
 use types::{EmissionClass, PortalVerdict, RouteEvent, Sample, now_us};
 
+/// How soon a deferred attempt is retried while an operator pause stands, or
+/// after an edge landed mid-probe: a cheap atomic read a few times a minute,
+/// so the series is still armed when collection resumes.
+const PAUSE_RETRY: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Drive the prober until the pipeline goes away: arm a series on a relevant
 /// route event, run each due attempt, and hand every reading to the same
 /// consumer loop every collector feeds.
@@ -46,9 +51,8 @@ pub(crate) async fn run_portal_prober<P: PortalProbe>(
             ev = route_rx.recv() => {
                 // The tap's sender lives in the pipeline: its end is shutdown.
                 let Some(ev) = ev else { break };
-                if let Some(iface) = series_trigger(&ev)
-                    && let Some(delay) = sched.on_trigger(iface)
-                {
+                if let Some(iface) = series_trigger(&ev) {
+                    let delay = sched.on_trigger(iface);
                     tracing::debug!(iface, "route event armed a captive-portal probe series");
                     deadline = Some(tokio::time::Instant::now() + delay);
                 }
@@ -58,14 +62,22 @@ pub(crate) async fn run_portal_prober<P: PortalProbe>(
                     deadline = None;
                     continue;
                 };
+                // An operator pause DEFERS the attempt rather than spending
+                // it: a resume always resumes collecting, and the series must
+                // still be there to run — a network seconds old at resume is
+                // exactly what it exists for.
                 if !observing.load(Ordering::Relaxed) {
-                    deadline = sched
-                        .on_attempt_done(PortalVerdict::Skip)
-                        .map(|d| tokio::time::Instant::now() + d);
+                    deadline = Some(tokio::time::Instant::now() + PAUSE_RETRY);
                     continue;
                 }
+                // The stamp is taken BEFORE the fetch, like every interval
+                // collector's: a reading always dates from before any edge
+                // that lands mid-probe, so the consumer's post-resume drain
+                // can drop it too.
+                let ts_us = now_us();
+                let tier = probing.tier();
                 let (verdict, login_url, reason) =
-                    if probing.tier().emits(EmissionClass::CaptiveProbe) {
+                    if tier.emits(EmissionClass::CaptiveProbe) {
                         attempt_fields(probe.fetch(&iface).await)
                     } else {
                         (
@@ -74,7 +86,20 @@ pub(crate) async fn run_portal_prober<P: PortalProbe>(
                             Some("withheld: passive probing tier".to_string()),
                         )
                     };
-                let sample = build_sample(now_us(), &iface, verdict, login_url, reason);
+                // A probe in flight across a pause or a tier switch is
+                // dropped whole at the source, like every straddling tick
+                // (realm net-observer, nodes #25, #88): its sample would
+                // otherwise stand as a measurement inside a bracketed
+                // stretch. The attempt is deferred, not spent.
+                if !observing.load(Ordering::Relaxed) || probing.tier() != tier {
+                    tracing::info!(
+                        iface,
+                        "portal probe straddled a pause or tier switch; dropped whole"
+                    );
+                    deadline = Some(tokio::time::Instant::now() + PAUSE_RETRY);
+                    continue;
+                }
+                let sample = build_sample(ts_us, &iface, verdict, login_url, reason);
                 if samples_tx.send(Sample::Portal(sample)).await.is_err() {
                     break;
                 }

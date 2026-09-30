@@ -349,10 +349,14 @@ pub async fn run(
         if let Err(e) = store.write_sample(&sample) {
             tracing::warn!(error = %e, "store write failed; sample dropped from DB (gap logged)");
         }
-        // A route event is also the portal prober's trigger. The send is
-        // unbounded and its error ignored: a prober that stopped must never
-        // stall or kill the pipeline.
-        if let (Some(tap), Sample::Route(r)) = (&portal_tap, &sample) {
+        // A route event that arms a probe series is also the portal
+        // prober's trigger — filtered HERE so the kernel's clone-route storm
+        // (`RTM_ADD` per neighbour) never wakes the prober at all. The send
+        // is unbounded and its error ignored: a prober that stopped must
+        // never stall or kill the pipeline.
+        if let (Some(tap), Sample::Route(r)) = (&portal_tap, &sample)
+            && collector_portal::series_trigger(r).is_some()
+        {
             let _ = tap.send(r.clone());
         }
         // The record's lifetime bounds for this reading, read BEFORE the snapshot

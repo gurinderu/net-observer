@@ -21,6 +21,13 @@ pub const SERIES_DELAYS: [Duration; 4] = [
 /// the close side of the incident.
 pub const WATCH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How many consecutive dead attempts end a watch: ten minutes of probes
+/// that could not run mean the interface is gone, not that the portal
+/// stands — the prober goes idle instead of running a SKIP-row generator
+/// for the life of the daemon. A live network re-arms by its next address;
+/// the standing incident ends by its own window.
+pub const WATCH_SKIP_LIMIT: u32 = 10;
+
 #[derive(Debug, Default)]
 enum Phase {
     #[default]
@@ -28,8 +35,8 @@ enum Phase {
     /// The post-trigger series: `attempt` indexes [`SERIES_DELAYS`].
     Series { iface: String, attempt: usize },
     /// A portal was seen and its incident may stand: keep probing until the
-    /// answer is clean.
-    Watch { iface: String },
+    /// answer is clean, `skips` dead attempts in a row so far.
+    Watch { iface: String, skips: u32 },
 }
 
 /// The probe scheduler: feed it triggers and finished attempts, it answers
@@ -45,21 +52,19 @@ impl Scheduler {
         Self::default()
     }
 
-    /// A relevant route event landed on `iface`. Starts a series when idle,
-    /// retargets when the network moved to another interface, and changes
-    /// nothing while this interface is already being probed or watched — the
-    /// running series absorbs the churn of a network still settling.
-    pub fn on_trigger(&mut self, iface: &str) -> Option<Duration> {
-        match &self.phase {
-            Phase::Series { iface: cur, .. } | Phase::Watch { iface: cur } if cur == iface => None,
-            _ => {
-                self.phase = Phase::Series {
-                    iface: iface.to_string(),
-                    attempt: 0,
-                };
-                Some(SERIES_DELAYS[0])
-            }
-        }
+    /// A relevant route event landed on `iface`: restart the series there.
+    /// Always a restart, the same interface included — the ordinary portal
+    /// is the SAME `en0` joining another network, and only a fresh series
+    /// beats the rebind race there; a watch on a fresh address would probe
+    /// the new network at the old 60 s pace and keep the old login page. A
+    /// settling network's burst of `RTM_NEWADDR` coalesces into one series
+    /// counted from the last event.
+    pub fn on_trigger(&mut self, iface: &str) -> Duration {
+        self.phase = Phase::Series {
+            iface: iface.to_string(),
+            attempt: 0,
+        };
+        SERIES_DELAYS[0]
     }
 
     /// The interface the next probe is for, while one is scheduled.
@@ -67,7 +72,7 @@ impl Scheduler {
     pub fn target(&self) -> Option<&str> {
         match &self.phase {
             Phase::Idle => None,
-            Phase::Series { iface, .. } | Phase::Watch { iface } => Some(iface),
+            Phase::Series { iface, .. } | Phase::Watch { iface, .. } => Some(iface),
         }
     }
 
@@ -77,13 +82,15 @@ impl Scheduler {
         match (std::mem::take(&mut self.phase), verdict) {
             // A clean answer ends everything: no portal, or the portal fell.
             (Phase::Series { .. } | Phase::Watch { .. } | Phase::Idle, PortalVerdict::Ok) => None,
-            // A portal holds the watch, from either phase.
-            (Phase::Series { iface, .. } | Phase::Watch { iface }, PortalVerdict::Portal) => {
-                self.phase = Phase::Watch { iface };
+            // A portal holds the watch, from either phase; a fresh reading
+            // resets the dead-attempt count.
+            (Phase::Series { iface, .. } | Phase::Watch { iface, .. }, PortalVerdict::Portal) => {
+                self.phase = Phase::Watch { iface, skips: 0 };
                 Some(WATCH_INTERVAL)
             }
             // No measurement: the series walks on; the watch keeps trying —
-            // an open portal incident must not be orphaned by one dead probe.
+            // an open portal incident must not be orphaned by one dead probe
+            // — up to [`WATCH_SKIP_LIMIT`] dead attempts in a row.
             (Phase::Series { iface, attempt }, PortalVerdict::Skip) => {
                 let next = attempt + 1;
                 let delay = SERIES_DELAYS.get(next).copied()?;
@@ -93,8 +100,12 @@ impl Scheduler {
                 };
                 Some(delay)
             }
-            (Phase::Watch { iface }, PortalVerdict::Skip) => {
-                self.phase = Phase::Watch { iface };
+            (Phase::Watch { iface, skips }, PortalVerdict::Skip) => {
+                let skips = skips + 1;
+                if skips >= WATCH_SKIP_LIMIT {
+                    return None;
+                }
+                self.phase = Phase::Watch { iface, skips };
                 Some(WATCH_INTERVAL)
             }
             (Phase::Idle, _) => None,
@@ -107,14 +118,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_trigger_starts_the_series_and_churn_is_absorbed() {
+    fn every_trigger_restarts_the_series_same_interface_included() {
         let mut s = Scheduler::new();
-        assert_eq!(s.on_trigger("en0"), Some(SERIES_DELAYS[0]));
+        assert_eq!(s.on_trigger("en0"), SERIES_DELAYS[0]);
         assert_eq!(s.target(), Some("en0"));
-        // The same interface settling (more RTM_NEWADDR) changes nothing.
-        assert_eq!(s.on_trigger("en0"), None);
-        // Another interface is another network: restart at attempt 0.
-        assert_eq!(s.on_trigger("en13"), Some(SERIES_DELAYS[0]));
+        // The ordinary portal: the SAME en0 joins another network mid-series
+        // or mid-watch — the series restarts at attempt 0 both times.
+        s.on_attempt_done(PortalVerdict::Skip);
+        assert_eq!(s.on_trigger("en0"), SERIES_DELAYS[0]);
+        s.on_attempt_done(PortalVerdict::Portal);
+        assert_eq!(s.on_trigger("en0"), SERIES_DELAYS[0]);
+        // Another interface is another network too.
+        assert_eq!(s.on_trigger("en13"), SERIES_DELAYS[0]);
         assert_eq!(s.target(), Some("en13"));
     }
 
@@ -150,10 +165,33 @@ mod tests {
         assert_eq!(s.target(), Some("en0"));
         // A dead probe does not orphan the open incident.
         assert_eq!(s.on_attempt_done(PortalVerdict::Skip), Some(WATCH_INTERVAL));
-        // Still watching; a trigger on the same interface changes nothing.
-        assert_eq!(s.on_trigger("en0"), None);
         // Login happened: the clean answer ends the watch.
         assert_eq!(s.on_attempt_done(PortalVerdict::Ok), None);
+        assert_eq!(s.target(), None);
+    }
+
+    /// An interface that went away for good must not leave a permanent
+    /// once-a-minute SKIP generator: the watch gives up after
+    /// [`WATCH_SKIP_LIMIT`] dead attempts in a row, and a fresh reading
+    /// resets the count.
+    #[test]
+    fn the_watch_gives_up_after_a_run_of_dead_attempts() {
+        let mut s = Scheduler::new();
+        s.on_trigger("en0");
+        s.on_attempt_done(PortalVerdict::Portal);
+        // A fresh PORTAL reading mid-run resets the count.
+        for _ in 0..WATCH_SKIP_LIMIT - 1 {
+            assert_eq!(s.on_attempt_done(PortalVerdict::Skip), Some(WATCH_INTERVAL));
+        }
+        assert_eq!(
+            s.on_attempt_done(PortalVerdict::Portal),
+            Some(WATCH_INTERVAL)
+        );
+        for _ in 0..WATCH_SKIP_LIMIT - 1 {
+            assert_eq!(s.on_attempt_done(PortalVerdict::Skip), Some(WATCH_INTERVAL));
+        }
+        // The limit-th dead attempt ends the watch.
+        assert_eq!(s.on_attempt_done(PortalVerdict::Skip), None);
         assert_eq!(s.target(), None);
     }
 
